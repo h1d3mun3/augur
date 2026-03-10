@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# llm-docker インストールスクリプト
+# 使い方: bash install
+
+set -euo pipefail
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INSTALL_DIR="$HOME/.llm-docker"
+
+# ANSI colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+RESET='\033[0m'
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+info()    { echo -e "${CYAN}[install]${RESET} $*"; }
+success() { echo -e "${GREEN}[install]${RESET} $*"; }
+warn()    { echo -e "${YELLOW}[install]${RESET} $*"; }
+error()   { echo -e "${RED}[install]${RESET} $*" >&2; }
+
+# ── Installation Steps ────────────────────────────────────────────────────────
+
+info "llm-docker インストールを開始します..."
+echo ""
+
+# Step 1: Check if files exist
+if [[ ! -f "$SCRIPT_DIR/llm-docker" ]]; then
+    error "llm-docker ファイルが見つかりません"
+    exit 1
+fi
+
+if [[ ! -f "$SCRIPT_DIR/Dockerfile" ]]; then
+    error "Dockerfile が見つかりません"
+    exit 1
+fi
+
+# Step 2: Copy files to ~/.llm-docker
+info "ファイルを $INSTALL_DIR にコピーしています..."
+mkdir -p "$INSTALL_DIR"
+cp "$SCRIPT_DIR/llm-docker" "$INSTALL_DIR/llm-docker"
+cp "$SCRIPT_DIR/Dockerfile" "$INSTALL_DIR/Dockerfile"
+chmod +x "$INSTALL_DIR/llm-docker"
+success "ファイルをコピーしました"
+
+# Step 3: Add to PATH
+info "シェル設定を更新しています..."
+
+SHELL_CONFIG=""
+if [[ -f "$HOME/.zshrc" ]]; then
+    SHELL_CONFIG="$HOME/.zshrc"
+elif [[ -f "$HOME/.bashrc" ]]; then
+    SHELL_CONFIG="$HOME/.bashrc"
+else
+    warn "~/.zshrc と ~/.bashrc の両方が見つかりません"
+    exit 1
+fi
+
+# Check if PATH is already set
+if grep -q 'export PATH=.*\.llm-docker' "$SHELL_CONFIG" 2>/dev/null; then
+    warn "PATH はすでに設定されています"
+else
+    echo "" >> "$SHELL_CONFIG"
+    echo "# llm-docker PATH" >> "$SHELL_CONFIG"
+    echo "export PATH=\"\$HOME/.llm-docker:\$PATH\"" >> "$SHELL_CONFIG"
+    success "PATH を $SHELL_CONFIG に追加しました"
+fi
+
+# Step 4: Show completion message
+echo ""
+success "インストール完了！"
+echo ""
+echo -e "  ${BOLD}次のステップ:${RESET}"
+echo ""
+echo "  1. シェル設定を反映:"
+echo -e "     ${CYAN}source $SHELL_CONFIG${RESET}"
+echo ""
+echo "  2. API キーを設定（オプション）:"
+echo -e "     ${CYAN}export ANTHROPIC_API_KEY=\"sk-ant-...\"${RESET}  # Claude Code"
+echo -e "     ${CYAN}export OPENAI_API_KEY=\"sk-...\"${RESET}       # Codex"
+echo ""
+echo "  3. Docker イメージをビルド:"
+echo -e "     ${CYAN}llm-docker build${RESET}"
+echo ""
+echo "  4. Codex ブラウザ認証（必要な場合）:"
+echo -e "     ${CYAN}llm-docker login${RESET}"
+echo ""
+echo "  詳細は README.md を参照してください"
+echo ""
