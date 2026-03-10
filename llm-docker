@@ -94,8 +94,10 @@ cmd_up() {
     fi
 
     if container_exists; then
-        info "Removing stale container '${CONTAINER_NAME}'..."
-        docker rm -f "$CONTAINER_NAME" &>/dev/null
+        info "Restarting container '${CONTAINER_NAME}'..."
+        docker start "$CONTAINER_NAME" &>/dev/null
+        success "Container '${CONTAINER_NAME}' is up."
+        return 0
     fi
 
     info "Starting container '${CONTAINER_NAME}'..."
@@ -198,9 +200,10 @@ cmd_down() {
         return 0
     fi
 
-    info "Stopping and removing container '${CONTAINER_NAME}'..."
-    docker rm -f "$CONTAINER_NAME" &>/dev/null
-    success "Container '${CONTAINER_NAME}' has been stopped and removed."
+    info "Stopping container '${CONTAINER_NAME}'..."
+    docker stop "$CONTAINER_NAME" &>/dev/null
+    success "Container '${CONTAINER_NAME}' has been stopped."
+    info "Settings and authentication are preserved. Run ${BOLD}llm-docker up${RESET} to restart."
 }
 
 cmd_status() {
