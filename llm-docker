@@ -231,6 +231,21 @@ cmd_status() {
     fi
 }
 
+cmd_version() {
+    require_docker
+    echo ""
+    echo -e "  ${BOLD}llm-docker version${RESET}"
+    echo ""
+    echo -e "    llm-docker:   ${CYAN}1.0.0${RESET}"
+    echo ""
+    ensure_image
+    echo -e "  ${BOLD}Container tools versions:${RESET}"
+    docker run --rm "$IMAGE_NAME" claude --version 2>/dev/null || echo "    claude:       (unable to fetch)"
+    docker run --rm "$IMAGE_NAME" codex --version 2>/dev/null || echo "    codex:        (unable to fetch)"
+    docker run --rm "$IMAGE_NAME" docker --version 2>/dev/null || echo "    docker:       (unable to fetch)"
+    echo ""
+}
+
 cmd_help() {
     echo ""
     echo -e "  ${BOLD}llm-docker${RESET} — Claude Code と Codex を同一コンテナで動かすツール"
@@ -244,6 +259,7 @@ cmd_help() {
     echo -e "    llm-docker ${CYAN}down${RESET}     コンテナを停止・削除"
     echo -e "    llm-docker ${CYAN}status${RESET}   状態と認証情報を確認"
     echo -e "    llm-docker ${CYAN}build${RESET}    Docker イメージをビルド"
+    echo -e "    llm-docker ${CYAN}version${RESET}  バージョン情報を表示"
     echo -e "    llm-docker ${CYAN}help${RESET}     このヘルプを表示"
     echo ""
     echo -e "  ${BOLD}ENVIRONMENT${RESET}"
@@ -271,6 +287,7 @@ case "$COMMAND" in
     shell)         cmd_shell ;;
     down)          cmd_down ;;
     status)        cmd_status ;;
+    version)       cmd_version ;;
     build)         cmd_build ;;
     help|--help|-h) cmd_help ;;
     *)
