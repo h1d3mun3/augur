@@ -1,0 +1,281 @@
+#!/usr/bin/env bash
+# llm-docker - Run Claude Code and Codex CLI in an isolated Docker container
+# Usage:
+#   llm-docker up       - Start the container for the current directory
+#   llm-docker claude   - Launch Claude Code
+#   llm-docker codex    - Launch Codex
+#   llm-docker login    - Authenticate Codex via device auth
+#   llm-docker shell    - Open a bash shell in the container
+#   llm-docker down     - Stop and remove the container
+#   llm-docker status   - Show container status
+
+set -euo pipefail
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+IMAGE_NAME="llm-docker"
+WORKSPACE_DIR="$(pwd)"
+
+# Container name derived from current directory
+CONTAINER_NAME="llm-docker-$(basename "$WORKSPACE_DIR" | tr '[:upper:]' ' [:punct:]' | tr -cs '[:alnum:]' '-' | sed 's/-$//')"
+
+# ANSI colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+RESET='\033[0m'
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+info()    { echo -e "${CYAN}[llm-docker]${RESET} $*"; }
+success() { echo -e "${GREEN}[llm-docker]${RESET} $*"; }
+warn()    { echo -e "${YELLOW}[llm-docker]${RESET} $*"; }
+error()   { echo -e "${RED}[llm-docker]${RESET} $*" >&2; }
+
+container_running() {
+    docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"
+}
+
+container_exists() {
+    docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"
+}
+
+require_docker() {
+    if ! command -v docker &>/dev/null; then
+        error "Docker is not installed or not in PATH."
+        exit 1
+    fi
+    if ! docker info &>/dev/null; then
+        error "Docker daemon is not running."
+        exit 1
+    fi
+}
+
+ensure_image() {
+    if ! docker image inspect "$IMAGE_NAME" &>/dev/null; then
+        info "Docker image '${IMAGE_NAME}' not found. Building..."
+        cmd_build
+    fi
+}
+
+ensure_running() {
+    if ! container_running; then
+        if container_exists; then
+            info "Container exists but is stopped. Starting it..."
+            docker start "$CONTAINER_NAME" &>/dev/null
+        else
+            warn "No container found for this directory."
+            warn "Run ${BOLD}llm-docker up${RESET} first."
+            exit 1
+        fi
+    fi
+}
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+
+cmd_build() {
+    require_docker
+    info "Building Docker image '${IMAGE_NAME}'..."
+    docker build -t "$IMAGE_NAME" "$SCRIPT_DIR"
+    success "Image '${IMAGE_NAME}' built successfully."
+}
+
+cmd_up() {
+    require_docker
+    ensure_image
+
+    if container_running; then
+        warn "Container '${CONTAINER_NAME}' is already running."
+        warn "Run ${BOLD}llm-docker claude${RESET} or ${BOLD}llm-docker codex${RESET} to start coding."
+        return 0
+    fi
+
+    if container_exists; then
+        info "Removing stale container '${CONTAINER_NAME}'..."
+        docker rm -f "$CONTAINER_NAME" &>/dev/null
+    fi
+
+    info "Starting container '${CONTAINER_NAME}'..."
+    info "Mounting: ${BOLD}${WORKSPACE_DIR}${RESET} → /workspace"
+
+    DOCKER_ARGS=(
+        run -dit
+        --name "$CONTAINER_NAME"
+        -v "${WORKSPACE_DIR}:/workspace"
+        -w /workspace
+    )
+
+    # Anthropic API key
+    if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+        DOCKER_ARGS+=(-e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}")
+    elif [[ -f "$HOME/.anthropic_api_key" ]]; then
+        DOCKER_ARGS+=(-e "ANTHROPIC_API_KEY=$(cat "$HOME/.anthropic_api_key")")
+    fi
+
+    # OpenAI API key
+    if [[ -n "${OPENAI_API_KEY:-}" ]]; then
+        DOCKER_ARGS+=(-e "OPENAI_API_KEY=${OPENAI_API_KEY}")
+    elif [[ -f "$HOME/.openai_api_key" ]]; then
+        DOCKER_ARGS+=(-e "OPENAI_API_KEY=$(cat "$HOME/.openai_api_key")")
+    fi
+
+    # Mount ~/.claude for Claude Code (auth + settings)
+    mkdir -p "$HOME/.claude"
+    DOCKER_ARGS+=(-v "${HOME}/.claude:/home/dev/.claude")
+
+    # Mount ~/.codex for Codex (auth + settings + history)
+    mkdir -p "$HOME/.codex"
+    DOCKER_ARGS+=(-v "${HOME}/.codex:/home/dev/.codex")
+
+    # Mount git config for commit identity
+    if [[ -f "$HOME/.gitconfig" ]]; then
+        DOCKER_ARGS+=(-v "${HOME}/.gitconfig:/home/dev/.gitconfig:ro")
+    fi
+
+    DOCKER_ARGS+=("$IMAGE_NAME" bash)
+
+    docker "${DOCKER_ARGS[@]}" &>/dev/null
+    success "Container '${CONTAINER_NAME}' is up."
+    echo ""
+    echo -e "  ${BOLD}llm-docker claude${RESET}  → Launch Claude Code"
+    echo -e "  ${BOLD}llm-docker codex${RESET}   → Launch Codex"
+    echo -e "  ${BOLD}llm-docker login${RESET}   → Codex browser login"
+    echo -e "  ${BOLD}llm-docker shell${RESET}   → Open bash shell"
+    echo -e "  ${BOLD}llm-docker down${RESET}    → Stop and remove"
+}
+
+cmd_claude() {
+    require_docker
+    ensure_running
+    info "Launching Claude Code in '${CONTAINER_NAME}'..."
+    docker exec -it "$CONTAINER_NAME" claude
+}
+
+cmd_codex() {
+    require_docker
+    ensure_running
+    info "Launching Codex in '${CONTAINER_NAME}'..."
+    docker exec -it "$CONTAINER_NAME" codex
+}
+
+cmd_login() {
+    require_docker
+    ensure_image
+
+    mkdir -p "$HOME/.codex"
+
+    info "Starting Codex device auth login..."
+    info "A URL and code will appear — open the URL in your browser and enter the code."
+    echo ""
+
+    # Use --device-auth: Docker containers are headless so the standard
+    # browser-redirect OAuth flow cannot receive the localhost callback.
+    # Device auth shows a URL + code instead — no localhost needed.
+    docker run --rm -it \
+        --name "llm-docker-login" \
+        -v "${HOME}/.codex:/home/dev/.codex" \
+        "$IMAGE_NAME" \
+        codex login --device-auth
+
+    success "Login complete. Credentials saved to ~/.codex"
+}
+
+cmd_shell() {
+    require_docker
+    ensure_running
+    info "Opening bash shell in '${CONTAINER_NAME}'..."
+    docker exec -it "$CONTAINER_NAME" bash
+}
+
+cmd_down() {
+    require_docker
+
+    if ! container_exists; then
+        warn "No container found for this directory (${CONTAINER_NAME})."
+        return 0
+    fi
+
+    info "Stopping and removing container '${CONTAINER_NAME}'..."
+    docker rm -f "$CONTAINER_NAME" &>/dev/null
+    success "Container '${CONTAINER_NAME}' has been stopped and removed."
+}
+
+cmd_status() {
+    require_docker
+    echo -e "${BOLD}Container:${RESET}  ${CONTAINER_NAME}"
+    echo -e "${BOLD}Directory:${RESET}  ${WORKSPACE_DIR}"
+    echo -e "${BOLD}Image:${RESET}      ${IMAGE_NAME}"
+    if container_running; then
+        echo -e "${BOLD}Status:${RESET}     ${GREEN}running${RESET}"
+    elif container_exists; then
+        echo -e "${BOLD}Status:${RESET}     ${YELLOW}stopped${RESET}"
+    else
+        echo -e "${BOLD}Status:${RESET}     ${RED}not created${RESET}"
+    fi
+    echo ""
+    # Show which API keys are available
+    if [[ -n "${ANTHROPIC_API_KEY:-}" ]] || [[ -f "$HOME/.anthropic_api_key" ]]; then
+        echo -e "  ${GREEN}✓${RESET} ANTHROPIC_API_KEY"
+    else
+        echo -e "  ${RED}✗${RESET} ANTHROPIC_API_KEY (not set)"
+    fi
+    if [[ -n "${OPENAI_API_KEY:-}" ]] || [[ -f "$HOME/.openai_api_key" ]]; then
+        echo -e "  ${GREEN}✓${RESET} OPENAI_API_KEY"
+    elif [[ -f "$HOME/.codex/auth.json" ]]; then
+        echo -e "  ${GREEN}✓${RESET} Codex (browser auth)"
+    else
+        echo -e "  ${RED}✗${RESET} OPENAI_API_KEY / Codex auth (not set)"
+    fi
+}
+
+cmd_help() {
+    echo ""
+    echo -e "  ${BOLD}llm-docker${RESET} — Claude Code と Codex を同一コンテナで動かすツール"
+    echo ""
+    echo -e "  ${BOLD}USAGE${RESET}"
+    echo -e "    llm-docker ${CYAN}up${RESET}       カレントディレクトリのコンテナを起動"
+    echo -e "    llm-docker ${CYAN}claude${RESET}   Claude Code を起動"
+    echo -e "    llm-docker ${CYAN}codex${RESET}    Codex を起動"
+    echo -e "    llm-docker ${CYAN}login${RESET}    Codex をブラウザ認証（デバイスフロー）"
+    echo -e "    llm-docker ${CYAN}shell${RESET}    bash シェルを開く"
+    echo -e "    llm-docker ${CYAN}down${RESET}     コンテナを停止・削除"
+    echo -e "    llm-docker ${CYAN}status${RESET}   状態と認証情報を確認"
+    echo -e "    llm-docker ${CYAN}build${RESET}    Docker イメージをビルド"
+    echo -e "    llm-docker ${CYAN}help${RESET}     このヘルプを表示"
+    echo ""
+    echo -e "  ${BOLD}ENVIRONMENT${RESET}"
+    echo -e "    ANTHROPIC_API_KEY   Anthropic API キー（または ~/.anthropic_api_key）"
+    echo -e "    OPENAI_API_KEY      OpenAI API キー（または ~/.openai_api_key）"
+    echo -e "                        API キーなしの場合は ${CYAN}llm-docker login${RESET} で認証"
+    echo ""
+    echo -e "  ${BOLD}NOTES${RESET}"
+    echo -e "    • カレントディレクトリのみ /workspace にマウント"
+    echo -e "    • ~/.claude と ~/.codex はホストと共有（設定・認証の永続化）"
+    echo -e "    • ~/.gitconfig は読み取り専用でマウント"
+    echo -e "    • ディレクトリごとに独立したコンテナが作られる"
+    echo ""
+}
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+COMMAND="${1:-help}"
+
+case "$COMMAND" in
+    up)            cmd_up ;;
+    claude)        cmd_claude ;;
+    codex)         cmd_codex ;;
+    login)         cmd_login ;;
+    shell)         cmd_shell ;;
+    down)          cmd_down ;;
+    status)        cmd_status ;;
+    build)         cmd_build ;;
+    help|--help|-h) cmd_help ;;
+    *)
+        error "Unknown command: '$COMMAND'"
+        cmd_help
+        exit 1
+        ;;
+esac
