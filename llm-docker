@@ -153,7 +153,7 @@ cmd_claude() {
     require_docker
     ensure_running
     info "Launching Claude Code in '${CONTAINER_NAME}'..."
-    docker exec -it "$CONTAINER_NAME" claude
+    docker exec -it -e DISABLE_AUTOUPDATER=1 "$CONTAINER_NAME" claude
 }
 
 cmd_codex() {
@@ -234,6 +234,14 @@ cmd_status() {
     fi
 }
 
+cmd_update() {
+    require_docker
+    info "Updating Docker image '${IMAGE_NAME}' to latest versions..."
+    docker build --no-cache -t "$IMAGE_NAME" "$SCRIPT_DIR"
+    success "Image '${IMAGE_NAME}' updated successfully."
+    warn "Existing containers use the old image. Run ${BOLD}llm-docker down${RESET} and ${BOLD}llm-docker up${RESET} to apply the update."
+}
+
 cmd_version() {
     require_docker
     echo ""
@@ -261,6 +269,7 @@ cmd_help() {
     echo -e "    llm-docker ${CYAN}shell${RESET}    Open a bash shell inside the container"
     echo -e "    llm-docker ${CYAN}down${RESET}     Stop and remove the container"
     echo -e "    llm-docker ${CYAN}status${RESET}   Check container status and authentication info"
+    echo -e "    llm-docker ${CYAN}update${RESET}   Rebuild image with latest Claude Code and Codex versions"
     echo -e "    llm-docker ${CYAN}build${RESET}    Build the Docker image"
     echo -e "    llm-docker ${CYAN}version${RESET}  Show version information"
     echo -e "    llm-docker ${CYAN}help${RESET}     Show this help message"
@@ -290,6 +299,7 @@ case "$COMMAND" in
     shell)         cmd_shell ;;
     down)          cmd_down ;;
     status)        cmd_status ;;
+    update)        cmd_update ;;
     version)       cmd_version ;;
     build)         cmd_build ;;
     help|--help|-h) cmd_help ;;
