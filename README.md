@@ -10,21 +10,17 @@ Claude Code と Codex CLI を同一の Docker コンテナで動かすツール�
 セットアップを自動化するスクリプトが用意されています：
 
 ```bash
-# 1. インストールスクリプトに実行権限を付与
-chmod +x install
-
-# 2. スクリプトを実行（Dockerfile と llm-docker を ~/.llm-docker/ にコピー、PATH を設定）
+# 1. スクリプトを実行（Dockerfile と llm-docker を ~/.llm-docker/ にコピー、PATH を設定）
 bash install
 
-# 3. シェル設定を反映
+# 2. シェル設定を反映
 source ~/.zshrc  # または source ~/.bashrc
 
-# 4. Docker イメージをビルド
+# 3. Docker イメージをビルド
 llm-docker build
 ```
 
 **注意事項：**
-- `install` スクリプトに実行権限を付与する必要があります（`chmod +x install`）
 - このスクリプトは **セットアップとアップデートの両方** に使用できます。既にインストール済みの場合も実行して構いません。PATH は重複して追加されません。
 
 ---
