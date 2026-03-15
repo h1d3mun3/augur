@@ -14,11 +14,10 @@ set -euo pipefail
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-IMAGE_NAME="llm-docker"
 WORKSPACE_DIR="$(pwd)"
+SWIFT_VERSION="${SWIFT_VERSION:-6.0}"
 
-# Container name derived from current directory
-CONTAINER_NAME="llm-docker-$(basename "$WORKSPACE_DIR" | tr '[:upper:]' ' [:punct:]' | tr -cs '[:alnum:]' '-' | sed 's/-$//')"
+# IMAGE_NAME and CONTAINER_NAME are set after argument parsing (see entry point)
 
 # ANSI colors
 RED='\033[0;31m'
@@ -78,8 +77,8 @@ ensure_running() {
 
 cmd_build() {
     require_docker
-    info "Building Docker image '${IMAGE_NAME}'..."
-    docker build -t "$IMAGE_NAME" "$SCRIPT_DIR"
+    info "Building Docker image '${IMAGE_NAME}' (Swift ${SWIFT_VERSION})..."
+    docker build --build-arg SWIFT_VERSION="${SWIFT_VERSION}" -t "$IMAGE_NAME" "$SCRIPT_DIR"
     success "Image '${IMAGE_NAME}' built successfully."
 }
 
@@ -236,8 +235,8 @@ cmd_status() {
 
 cmd_update() {
     require_docker
-    info "Updating Docker image '${IMAGE_NAME}' to latest versions..."
-    docker build --no-cache -t "$IMAGE_NAME" "$SCRIPT_DIR"
+    info "Updating Docker image '${IMAGE_NAME}' (Swift ${SWIFT_VERSION}) to latest versions..."
+    docker build --no-cache --build-arg SWIFT_VERSION="${SWIFT_VERSION}" -t "$IMAGE_NAME" "$SCRIPT_DIR"
     success "Image '${IMAGE_NAME}' updated successfully."
     warn "Existing containers use the old image. Run ${BOLD}llm-docker down${RESET} and ${BOLD}llm-docker up${RESET} to apply the update."
 }
@@ -248,12 +247,13 @@ cmd_version() {
     echo -e "  ${BOLD}llm-docker version${RESET}"
     echo ""
     echo -e "    llm-docker:   ${CYAN}1.0.0${RESET}"
+    echo -e "    Swift:        ${CYAN}${SWIFT_VERSION}${RESET}  (image: ${IMAGE_NAME})"
     echo ""
     ensure_image
     echo -e "  ${BOLD}Container tools versions:${RESET}"
+    docker run --rm "$IMAGE_NAME" swift --version 2>/dev/null || echo "    swift:        (unable to fetch)"
     docker run --rm "$IMAGE_NAME" claude --version 2>/dev/null || echo "    claude:       (unable to fetch)"
     docker run --rm "$IMAGE_NAME" codex --version 2>/dev/null || echo "    codex:        (unable to fetch)"
-    docker run --rm "$IMAGE_NAME" docker --version 2>/dev/null || echo "    docker:       (unable to fetch)"
     echo ""
 }
 
@@ -262,22 +262,30 @@ cmd_help() {
     echo -e "  ${BOLD}llm-docker${RESET} — Tool for running Claude Code and Codex together in one container"
     echo ""
     echo -e "  ${BOLD}USAGE${RESET}"
-    echo -e "    llm-docker ${CYAN}up${RESET}       Start the container for the current directory"
-    echo -e "    llm-docker ${CYAN}claude${RESET}   Launch Claude Code"
-    echo -e "    llm-docker ${CYAN}codex${RESET}    Launch Codex"
-    echo -e "    llm-docker ${CYAN}login${RESET}    Authenticate Codex via browser (device flow)"
-    echo -e "    llm-docker ${CYAN}shell${RESET}    Open a bash shell inside the container"
-    echo -e "    llm-docker ${CYAN}down${RESET}     Stop and remove the container"
-    echo -e "    llm-docker ${CYAN}status${RESET}   Check container status and authentication info"
-    echo -e "    llm-docker ${CYAN}update${RESET}   Rebuild image with latest Claude Code and Codex versions"
-    echo -e "    llm-docker ${CYAN}build${RESET}    Build the Docker image"
-    echo -e "    llm-docker ${CYAN}version${RESET}  Show version information"
-    echo -e "    llm-docker ${CYAN}help${RESET}     Show this help message"
+    echo -e "    llm-docker ${CYAN}up${RESET}       [--swift VERSION]  Start the container for the current directory"
+    echo -e "    llm-docker ${CYAN}claude${RESET}                     Launch Claude Code"
+    echo -e "    llm-docker ${CYAN}codex${RESET}                      Launch Codex"
+    echo -e "    llm-docker ${CYAN}login${RESET}                      Authenticate Codex via browser (device flow)"
+    echo -e "    llm-docker ${CYAN}shell${RESET}                      Open a bash shell inside the container"
+    echo -e "    llm-docker ${CYAN}down${RESET}                       Stop and remove the container"
+    echo -e "    llm-docker ${CYAN}status${RESET}                     Check container status and authentication info"
+    echo -e "    llm-docker ${CYAN}update${RESET}  [--swift VERSION]  Rebuild image with latest versions"
+    echo -e "    llm-docker ${CYAN}build${RESET}   [--swift VERSION]  Build the Docker image"
+    echo -e "    llm-docker ${CYAN}version${RESET} [--swift VERSION]  Show version information"
+    echo -e "    llm-docker ${CYAN}help${RESET}                       Show this help message"
+    echo ""
+    echo -e "  ${BOLD}SWIFT VERSION${RESET}"
+    echo -e "    Default: ${CYAN}6.0${RESET}  (override with --swift or SWIFT_VERSION env var)"
+    echo -e "    Example: llm-docker build --swift 5.10"
+    echo -e "             llm-docker up    --swift 6.0"
+    echo -e "             SWIFT_VERSION=6.0 llm-docker up"
+    echo -e "    Each Swift version gets its own image and container (versions coexist)"
     echo ""
     echo -e "  ${BOLD}ENVIRONMENT${RESET}"
     echo -e "    ANTHROPIC_API_KEY   Anthropic API key (or ~/.anthropic_api_key)"
     echo -e "    OPENAI_API_KEY      OpenAI API key (or ~/.openai_api_key)"
     echo -e "                        Without API keys, authenticate via ${CYAN}llm-docker login${RESET}"
+    echo -e "    SWIFT_VERSION       Default Swift version (default: 6.0)"
     echo ""
     echo -e "  ${BOLD}NOTES${RESET}"
     echo -e "    • Only the current directory is mounted at /workspace"
@@ -290,6 +298,24 @@ cmd_help() {
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 COMMAND="${1:-help}"
+shift || true
+
+# Parse flags (e.g. --swift 6.0)
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --swift)
+            SWIFT_VERSION="${2:?'--swift requires a version (e.g. --swift 6.0)'}"
+            shift 2
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+# Set image and container names now that SWIFT_VERSION is resolved
+IMAGE_NAME="llm-docker:swift-${SWIFT_VERSION}"
+CONTAINER_NAME="llm-docker-$(basename "$WORKSPACE_DIR" | tr '[:upper:]' ' [:punct:]' | tr -cs '[:alnum:]' '-' | sed 's/-$//')-swift-${SWIFT_VERSION//./-}"
 
 case "$COMMAND" in
     up)            cmd_up ;;
