@@ -60,6 +60,22 @@ ensure_image() {
     fi
 }
 
+warn_if_image_stale() {
+    local created created_epoch now_epoch age_days
+    created=$(docker image inspect --format '{{.Created}}' "$IMAGE_NAME" 2>/dev/null) || return 0
+    # Support both GNU date (Linux) and BSD date (macOS)
+    if created_epoch=$(date -d "$created" +%s 2>/dev/null); then
+        :
+    else
+        created_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%S" "${created:0:19}" +%s 2>/dev/null) || return 0
+    fi
+    now_epoch=$(date +%s)
+    age_days=$(( (now_epoch - created_epoch) / 86400 ))
+    if (( age_days >= 14 )); then
+        warn "Image was built ${age_days} days ago. Run ${BOLD}llm-docker update${RESET} to get the latest versions."
+    fi
+}
+
 ensure_running() {
     if ! container_running; then
         if container_exists; then
@@ -85,6 +101,7 @@ cmd_build() {
 cmd_up() {
     require_docker
     ensure_image
+    warn_if_image_stale
 
     if container_running; then
         warn "Container '${CONTAINER_NAME}' is already running."
