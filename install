@@ -4,91 +4,56 @@
 
 set -euo pipefail
 
-# ── Configuration ─────────────────────────────────────────────────────────────
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="$HOME/.llm-docker"
 
-# ANSI colors
-RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+RED='\033[0;31m'
 CYAN='\033[0;36m'
 BOLD='\033[1m'
 RESET='\033[0m'
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
 info()    { echo -e "${CYAN}[install]${RESET} $*"; }
 success() { echo -e "${GREEN}[install]${RESET} $*"; }
 warn()    { echo -e "${YELLOW}[install]${RESET} $*"; }
 error()   { echo -e "${RED}[install]${RESET} $*" >&2; }
 
-# ── Installation Steps ────────────────────────────────────────────────────────
+# Validate source files exist
+for f in llm-docker Dockerfile; do
+    if [[ ! -f "$SCRIPT_DIR/$f" ]]; then
+        error "$f not found in $SCRIPT_DIR"
+        exit 1
+    fi
+done
 
-info "Starting llm-docker installation..."
-echo ""
-
-# Step 1: Check if files exist
-if [[ ! -f "$SCRIPT_DIR/llm-docker" ]]; then
-    error "llm-docker file not found"
-    exit 1
-fi
-
-if [[ ! -f "$SCRIPT_DIR/Dockerfile" ]]; then
-    error "Dockerfile not found"
-    exit 1
-fi
-
-# Step 2: Copy files to ~/.llm-docker
-info "Copying files to $INSTALL_DIR..."
+# Copy files
+info "Installing to $INSTALL_DIR..."
 mkdir -p "$INSTALL_DIR"
 cp "$SCRIPT_DIR/llm-docker" "$INSTALL_DIR/llm-docker"
 cp "$SCRIPT_DIR/Dockerfile" "$INSTALL_DIR/Dockerfile"
 chmod +x "$INSTALL_DIR/llm-docker"
-success "Files copied"
+success "Files copied."
 
-# Step 3: Add to PATH
-info "Updating shell configuration..."
-
+# Add to PATH
 SHELL_CONFIG=""
-if [[ -f "$HOME/.zshrc" ]]; then
-    SHELL_CONFIG="$HOME/.zshrc"
-elif [[ -f "$HOME/.bashrc" ]]; then
-    SHELL_CONFIG="$HOME/.bashrc"
-else
-    warn "Neither ~/.zshrc nor ~/.bashrc was found"
-    exit 1
-fi
+[[ -f "$HOME/.zshrc" ]]  && SHELL_CONFIG="$HOME/.zshrc"
+[[ -z "$SHELL_CONFIG" ]] && [[ -f "$HOME/.bashrc" ]] && SHELL_CONFIG="$HOME/.bashrc"
 
-# Check if PATH is already set
-if grep -q 'export PATH=.*\.llm-docker' "$SHELL_CONFIG" 2>/dev/null; then
-    warn "PATH is already configured"
+if [[ -z "$SHELL_CONFIG" ]]; then
+    warn "Neither ~/.zshrc nor ~/.bashrc found. Add $INSTALL_DIR to PATH manually."
+elif grep -q 'export PATH=.*\.llm-docker' "$SHELL_CONFIG" 2>/dev/null; then
+    warn "PATH already configured in $SHELL_CONFIG"
 else
-    echo "" >> "$SHELL_CONFIG"
-    echo "# llm-docker PATH" >> "$SHELL_CONFIG"
-    echo "export PATH=\"\$HOME/.llm-docker:\$PATH\"" >> "$SHELL_CONFIG"
+    printf '\n# llm-docker\nexport PATH="$HOME/.llm-docker:$PATH"\n' >> "$SHELL_CONFIG"
     success "Added PATH entry to $SHELL_CONFIG"
 fi
 
-# Step 4: Show completion message
 echo ""
 success "Installation complete!"
 echo ""
 echo -e "  ${BOLD}Next steps:${RESET}"
-echo ""
-echo "  1. Reload your shell configuration:"
-echo -e "     ${CYAN}source $SHELL_CONFIG${RESET}"
-echo ""
-echo "  2. (Optional) set API keys:"
-echo -e "     ${CYAN}export ANTHROPIC_API_KEY=\"sk-ant-...\"${RESET}  # Claude Code"
-echo -e "     ${CYAN}export OPENAI_API_KEY=\"sk-...\"${RESET}       # Codex"
-echo ""
-echo "  3. Build the Docker image:"
-echo -e "     ${CYAN}llm-docker build${RESET}"
-echo ""
-echo "  4. Codex browser authentication (if needed):"
-echo -e "     ${CYAN}llm-docker login${RESET}"
-echo ""
-echo "  See README.md for more details"
+echo -e "    1. ${CYAN}source ${SHELL_CONFIG:-~/.zshrc}${RESET}"
+echo -e "    2. ${CYAN}llm-docker build${RESET}"
+echo -e "    3. ${CYAN}llm-docker up${RESET} (in any project directory)"
 echo ""
