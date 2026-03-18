@@ -166,6 +166,11 @@ cmd_up() {
     docker_args+=(-v "${HOME}/.claude:/home/dev/.claude")
     docker_args+=(-v "${HOME}/.codex:/home/dev/.codex")
 
+    # Claude Code stores config (oauthAccount, onboarding state) in ~/.claude.json
+    # (separate from ~/.claude/ directory). Persist it so re-login isn't required.
+    touch "$HOME/.claude.json"
+    docker_args+=(-v "${HOME}/.claude.json:/home/dev/.claude.json")
+
     # Git config
     [[ -f "$HOME/.gitconfig" ]] && docker_args+=(-v "${HOME}/.gitconfig:/home/dev/.gitconfig:ro")
 
