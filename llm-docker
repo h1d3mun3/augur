@@ -120,6 +120,7 @@ cmd_up() {
     DOCKER_ARGS=(
         run -dit
         --name "$CONTAINER_NAME"
+        --hostname "llm-docker"
         -v "${WORKSPACE_DIR}:/workspace"
         -w /workspace
     )
