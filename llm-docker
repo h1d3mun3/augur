@@ -16,7 +16,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="$(pwd)"
 SWIFT_VERSION="${SWIFT_VERSION:-6.0}"
-LLM_DOCKER_HOME="${HOME}/.llm-docker"
 
 # ANSI colors
 RED='\033[0;31m'
@@ -95,16 +94,6 @@ ensure_running() {
     fi
 }
 
-# Ensure a persistent machine-id exists for auth consistency across containers
-ensure_machine_id() {
-    local id_file="${LLM_DOCKER_HOME}/machine-id"
-    if [[ ! -f "$id_file" ]]; then
-        mkdir -p "$LLM_DOCKER_HOME"
-        # Generate a stable machine-id (hex, 32 chars, matching /etc/machine-id format)
-        od -x /dev/urandom | head -1 | awk '{OFS=""; print $2,$3,$4,$5,$6,$7,$8,$9}' > "$id_file"
-    fi
-}
-
 # Resolve an API key: env var > file > empty
 resolve_api_key() {
     local env_val="$1" file_path="$2"
@@ -128,7 +117,6 @@ cmd_up() {
     require_docker
     ensure_image
     warn_if_image_stale
-    ensure_machine_id
 
     if container_running; then
         warn "Container '${CONTAINER_NAME}' is already running."
@@ -146,13 +134,9 @@ cmd_up() {
     local docker_args=(
         run -dit
         --name "$CONTAINER_NAME"
-        --hostname "llm-docker"
         -v "${WORKSPACE_DIR}:/workspace"
         -w /workspace
     )
-
-    # Persistent machine-id — keeps auth tokens valid across container recreations
-    docker_args+=(-v "${LLM_DOCKER_HOME}/machine-id:/etc/machine-id:ro")
 
     # API keys
     local anthropic_key openai_key
@@ -317,7 +301,7 @@ cmd_help() {
     echo -e "    • Current directory is mounted at /workspace"
     echo -e "    • ~/.claude and ~/.codex are shared with the host (auth/settings)"
     echo -e "    • ~/.gitconfig is mounted read-only"
-    echo -e "    • Auth is shared across all projects via persistent machine-id"
+    echo -e "    • Auth is shared across all projects via persistent ~/.claude.json"
     echo ""
 }
 
