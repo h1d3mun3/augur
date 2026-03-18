@@ -16,8 +16,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="$(pwd)"
 SWIFT_VERSION="${SWIFT_VERSION:-6.0}"
-
-# IMAGE_NAME and CONTAINER_NAME are set after argument parsing (see entry point)
+LLM_DOCKER_HOME="${HOME}/.llm-docker"
 
 # ANSI colors
 RED='\033[0;31m'
@@ -34,12 +33,20 @@ success() { echo -e "${GREEN}[llm-docker]${RESET} $*"; }
 warn()    { echo -e "${YELLOW}[llm-docker]${RESET} $*"; }
 error()   { echo -e "${RED}[llm-docker]${RESET} $*" >&2; }
 
+# Derive a safe container name from the directory path
+make_container_name() {
+    local dir_name
+    dir_name="$(basename "$WORKSPACE_DIR")"
+    dir_name="$(echo "$dir_name" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]' '-' | sed 's/^-//;s/-$//')"
+    echo "llm-docker-${dir_name}-swift-${SWIFT_VERSION//./-}"
+}
+
 container_running() {
-    docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"
+    docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$CONTAINER_NAME"
 }
 
 container_exists() {
-    docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"
+    docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$CONTAINER_NAME"
 }
 
 require_docker() {
@@ -63,7 +70,6 @@ ensure_image() {
 warn_if_image_stale() {
     local created created_epoch now_epoch age_days
     created=$(docker image inspect --format '{{.Created}}' "$IMAGE_NAME" 2>/dev/null) || return 0
-    # Support both GNU date (Linux) and BSD date (macOS)
     if created_epoch=$(date -d "$created" +%s 2>/dev/null); then
         :
     else
@@ -89,6 +95,26 @@ ensure_running() {
     fi
 }
 
+# Ensure a persistent machine-id exists for auth consistency across containers
+ensure_machine_id() {
+    local id_file="${LLM_DOCKER_HOME}/machine-id"
+    if [[ ! -f "$id_file" ]]; then
+        mkdir -p "$LLM_DOCKER_HOME"
+        # Generate a stable machine-id (hex, 32 chars, matching /etc/machine-id format)
+        od -x /dev/urandom | head -1 | awk '{OFS=""; print $2,$3,$4,$5,$6,$7,$8,$9}' > "$id_file"
+    fi
+}
+
+# Resolve an API key: env var > file > empty
+resolve_api_key() {
+    local env_val="$1" file_path="$2"
+    if [[ -n "$env_val" ]]; then
+        echo "$env_val"
+    elif [[ -f "$file_path" ]]; then
+        cat "$file_path"
+    fi
+}
+
 # ── Commands ──────────────────────────────────────────────────────────────────
 
 cmd_build() {
@@ -102,10 +128,10 @@ cmd_up() {
     require_docker
     ensure_image
     warn_if_image_stale
+    ensure_machine_id
 
     if container_running; then
         warn "Container '${CONTAINER_NAME}' is already running."
-        warn "Run ${BOLD}llm-docker claude${RESET} or ${BOLD}llm-docker codex${RESET} to start coding."
         return 0
     fi
 
@@ -117,7 +143,7 @@ cmd_up() {
     info "Starting container '${CONTAINER_NAME}'..."
     info "Mounting: ${BOLD}${WORKSPACE_DIR}${RESET} → /workspace"
 
-    DOCKER_ARGS=(
+    local docker_args=(
         run -dit
         --name "$CONTAINER_NAME"
         --hostname "llm-docker"
@@ -125,41 +151,31 @@ cmd_up() {
         -w /workspace
     )
 
-    # Anthropic API key
-    if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
-        DOCKER_ARGS+=(-e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}")
-    elif [[ -f "$HOME/.anthropic_api_key" ]]; then
-        DOCKER_ARGS+=(-e "ANTHROPIC_API_KEY=$(cat "$HOME/.anthropic_api_key")")
-    fi
+    # Persistent machine-id — keeps auth tokens valid across container recreations
+    docker_args+=(-v "${LLM_DOCKER_HOME}/machine-id:/etc/machine-id:ro")
 
-    # OpenAI API key
-    if [[ -n "${OPENAI_API_KEY:-}" ]]; then
-        DOCKER_ARGS+=(-e "OPENAI_API_KEY=${OPENAI_API_KEY}")
-    elif [[ -f "$HOME/.openai_api_key" ]]; then
-        DOCKER_ARGS+=(-e "OPENAI_API_KEY=$(cat "$HOME/.openai_api_key")")
-    fi
+    # API keys
+    local anthropic_key openai_key
+    anthropic_key="$(resolve_api_key "${ANTHROPIC_API_KEY:-}" "$HOME/.anthropic_api_key")"
+    openai_key="$(resolve_api_key "${OPENAI_API_KEY:-}" "$HOME/.openai_api_key")"
+    [[ -n "$anthropic_key" ]] && docker_args+=(-e "ANTHROPIC_API_KEY=${anthropic_key}")
+    [[ -n "$openai_key" ]]    && docker_args+=(-e "OPENAI_API_KEY=${openai_key}")
 
-    # Mount ~/.claude for Claude Code (auth + settings)
-    mkdir -p "$HOME/.claude"
-    DOCKER_ARGS+=(-v "${HOME}/.claude:/home/dev/.claude")
+    # Auth & settings directories
+    mkdir -p "$HOME/.claude" "$HOME/.codex"
+    docker_args+=(-v "${HOME}/.claude:/home/dev/.claude")
+    docker_args+=(-v "${HOME}/.codex:/home/dev/.codex")
 
-    # Mount ~/.codex for Codex (auth + settings + history)
-    mkdir -p "$HOME/.codex"
-    DOCKER_ARGS+=(-v "${HOME}/.codex:/home/dev/.codex")
+    # Git config
+    [[ -f "$HOME/.gitconfig" ]] && docker_args+=(-v "${HOME}/.gitconfig:/home/dev/.gitconfig:ro")
 
-    # Mount git config for commit identity
-    if [[ -f "$HOME/.gitconfig" ]]; then
-        DOCKER_ARGS+=(-v "${HOME}/.gitconfig:/home/dev/.gitconfig:ro")
-    fi
+    docker_args+=("$IMAGE_NAME" bash)
 
-    DOCKER_ARGS+=("$IMAGE_NAME" bash)
-
-    docker "${DOCKER_ARGS[@]}" &>/dev/null
+    docker "${docker_args[@]}" &>/dev/null
     success "Container '${CONTAINER_NAME}' is up."
     echo ""
     echo -e "  ${BOLD}llm-docker claude${RESET}  → Launch Claude Code"
     echo -e "  ${BOLD}llm-docker codex${RESET}   → Launch Codex"
-    echo -e "  ${BOLD}llm-docker login${RESET}   → Codex browser login"
     echo -e "  ${BOLD}llm-docker shell${RESET}   → Open bash shell"
     echo -e "  ${BOLD}llm-docker down${RESET}    → Stop and remove"
 }
@@ -181,16 +197,12 @@ cmd_codex() {
 cmd_login() {
     require_docker
     ensure_image
-
     mkdir -p "$HOME/.codex"
 
     info "Starting Codex device auth login..."
     info "A URL and code will appear — open the URL in your browser and enter the code."
     echo ""
 
-    # Use --device-auth: Docker containers are headless so the standard
-    # browser-redirect OAuth flow cannot receive the localhost callback.
-    # Device auth shows a URL + code instead — no localhost needed.
     docker run --rm -it \
         --name "llm-docker-login" \
         -v "${HOME}/.codex:/home/dev/.codex" \
@@ -225,6 +237,7 @@ cmd_status() {
     echo -e "${BOLD}Container:${RESET}  ${CONTAINER_NAME}"
     echo -e "${BOLD}Directory:${RESET}  ${WORKSPACE_DIR}"
     echo -e "${BOLD}Image:${RESET}      ${IMAGE_NAME}"
+
     if container_running; then
         echo -e "${BOLD}Status:${RESET}     ${GREEN}running${RESET}"
     elif container_exists; then
@@ -233,7 +246,7 @@ cmd_status() {
         echo -e "${BOLD}Status:${RESET}     ${RED}not created${RESET}"
     fi
     echo ""
-    # Show which API keys are available
+
     if [[ -n "${ANTHROPIC_API_KEY:-}" ]] || [[ -f "$HOME/.anthropic_api_key" ]]; then
         echo -e "  ${GREEN}✓${RESET} ANTHROPIC_API_KEY"
     else
@@ -253,60 +266,53 @@ cmd_update() {
     info "Updating Docker image '${IMAGE_NAME}' (Swift ${SWIFT_VERSION}) to latest versions..."
     docker build --no-cache --build-arg SWIFT_VERSION="${SWIFT_VERSION}" -t "$IMAGE_NAME" "$SCRIPT_DIR"
     success "Image '${IMAGE_NAME}' updated successfully."
-    warn "Existing containers use the old image. Run ${BOLD}llm-docker down${RESET} and ${BOLD}llm-docker up${RESET} to apply the update."
+    warn "Existing containers use the old image. Run ${BOLD}llm-docker down && llm-docker up${RESET} to apply."
 }
 
 cmd_version() {
     require_docker
     echo ""
-    echo -e "  ${BOLD}llm-docker version${RESET}"
-    echo ""
-    echo -e "    llm-docker:   ${CYAN}1.0.0${RESET}"
-    echo -e "    Swift:        ${CYAN}${SWIFT_VERSION}${RESET}  (image: ${IMAGE_NAME})"
+    echo -e "  ${BOLD}llm-docker${RESET}  ${CYAN}1.1.0${RESET}"
+    echo -e "  ${BOLD}Swift${RESET}       ${CYAN}${SWIFT_VERSION}${RESET}  (image: ${IMAGE_NAME})"
     echo ""
     ensure_image
-    echo -e "  ${BOLD}Container tools versions:${RESET}"
-    docker run --rm "$IMAGE_NAME" swift --version 2>/dev/null || echo "    swift:        (unable to fetch)"
-    docker run --rm "$IMAGE_NAME" claude --version 2>/dev/null || echo "    claude:       (unable to fetch)"
-    docker run --rm "$IMAGE_NAME" codex --version 2>/dev/null || echo "    codex:        (unable to fetch)"
+    echo -e "  ${BOLD}Container tool versions:${RESET}"
+    docker run --rm "$IMAGE_NAME" swift --version 2>/dev/null || echo "    swift:  (unable to fetch)"
+    docker run --rm "$IMAGE_NAME" claude --version 2>/dev/null || echo "    claude: (unable to fetch)"
+    docker run --rm "$IMAGE_NAME" codex --version 2>/dev/null || echo "    codex:  (unable to fetch)"
     echo ""
 }
 
 cmd_help() {
     echo ""
-    echo -e "  ${BOLD}llm-docker${RESET} — Tool for running Claude Code and Codex together in one container"
+    echo -e "  ${BOLD}llm-docker${RESET} — Run Claude Code and Codex in an isolated Docker container"
     echo ""
     echo -e "  ${BOLD}USAGE${RESET}"
-    echo -e "    llm-docker ${CYAN}up${RESET}       [--swift VERSION]  Start the container for the current directory"
+    echo -e "    llm-docker ${CYAN}up${RESET}       [--swift VERSION]  Start the container"
     echo -e "    llm-docker ${CYAN}claude${RESET}                     Launch Claude Code"
     echo -e "    llm-docker ${CYAN}codex${RESET}                      Launch Codex"
-    echo -e "    llm-docker ${CYAN}login${RESET}                      Authenticate Codex via browser (device flow)"
-    echo -e "    llm-docker ${CYAN}shell${RESET}                      Open a bash shell inside the container"
+    echo -e "    llm-docker ${CYAN}login${RESET}                      Authenticate Codex (device flow)"
+    echo -e "    llm-docker ${CYAN}shell${RESET}                      Open a bash shell"
     echo -e "    llm-docker ${CYAN}down${RESET}                       Stop and remove the container"
-    echo -e "    llm-docker ${CYAN}status${RESET}                     Check container status and authentication info"
+    echo -e "    llm-docker ${CYAN}status${RESET}                     Check status and auth info"
     echo -e "    llm-docker ${CYAN}update${RESET}  [--swift VERSION]  Rebuild image with latest versions"
     echo -e "    llm-docker ${CYAN}build${RESET}   [--swift VERSION]  Build the Docker image"
     echo -e "    llm-docker ${CYAN}version${RESET} [--swift VERSION]  Show version information"
-    echo -e "    llm-docker ${CYAN}help${RESET}                       Show this help message"
+    echo -e "    llm-docker ${CYAN}help${RESET}                       Show this help"
     echo ""
-    echo -e "  ${BOLD}SWIFT VERSION${RESET}"
-    echo -e "    Default: ${CYAN}6.0${RESET}  (override with --swift or SWIFT_VERSION env var)"
-    echo -e "    Example: llm-docker build --swift 5.10"
-    echo -e "             llm-docker up    --swift 6.0"
-    echo -e "             SWIFT_VERSION=6.0 llm-docker up"
-    echo -e "    Each Swift version gets its own image and container (versions coexist)"
+    echo -e "  ${BOLD}OPTIONS${RESET}"
+    echo -e "    --swift VERSION    Swift version (default: ${CYAN}6.0${RESET})"
     echo ""
     echo -e "  ${BOLD}ENVIRONMENT${RESET}"
     echo -e "    ANTHROPIC_API_KEY   Anthropic API key (or ~/.anthropic_api_key)"
     echo -e "    OPENAI_API_KEY      OpenAI API key (or ~/.openai_api_key)"
-    echo -e "                        Without API keys, authenticate via ${CYAN}llm-docker login${RESET}"
     echo -e "    SWIFT_VERSION       Default Swift version (default: 6.0)"
     echo ""
     echo -e "  ${BOLD}NOTES${RESET}"
-    echo -e "    • Only the current directory is mounted at /workspace"
-    echo -e "    • ~/.claude and ~/.codex are shared with the host to persist settings/auth"
+    echo -e "    • Current directory is mounted at /workspace"
+    echo -e "    • ~/.claude and ~/.codex are shared with the host (auth/settings)"
     echo -e "    • ~/.gitconfig is mounted read-only"
-    echo -e "    • Each directory gets its own isolated container"
+    echo -e "    • Auth is shared across all projects via persistent machine-id"
     echo ""
 }
 
@@ -315,7 +321,6 @@ cmd_help() {
 COMMAND="${1:-help}"
 shift || true
 
-# Parse flags (e.g. --swift 6.0)
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --swift)
@@ -328,21 +333,20 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Set image and container names now that SWIFT_VERSION is resolved
 IMAGE_NAME="llm-docker:swift-${SWIFT_VERSION}"
-CONTAINER_NAME="llm-docker-$(basename "$WORKSPACE_DIR" | tr '[:upper:]' ' [:punct:]' | tr -cs '[:alnum:]' '-' | sed 's/-$//')-swift-${SWIFT_VERSION//./-}"
+CONTAINER_NAME="$(make_container_name)"
 
 case "$COMMAND" in
-    up)            cmd_up ;;
-    claude)        cmd_claude ;;
-    codex)         cmd_codex ;;
-    login)         cmd_login ;;
-    shell)         cmd_shell ;;
-    down)          cmd_down ;;
-    status)        cmd_status ;;
-    update)        cmd_update ;;
-    version)       cmd_version ;;
-    build)         cmd_build ;;
+    up)             cmd_up ;;
+    claude)         cmd_claude ;;
+    codex)          cmd_codex ;;
+    login)          cmd_login ;;
+    shell)          cmd_shell ;;
+    down)           cmd_down ;;
+    status)         cmd_status ;;
+    update)         cmd_update ;;
+    version)        cmd_version ;;
+    build)          cmd_build ;;
     help|--help|-h) cmd_help ;;
     *)
         error "Unknown command: '$COMMAND'"
