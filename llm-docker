@@ -273,7 +273,7 @@ cmd_version() {
 
 cmd_help() {
     echo ""
-    echo -e "  ${BOLD}llm-docker${RESET} — Run Claude Code and Codex in an isolated Docker container"
+    echo -e "  ${BOLD}llm-docker${RESET} — Run Claude Code, Codex, and Gemini CLI in an isolated Docker container"
     echo ""
     echo -e "  ${BOLD}USAGE${RESET}"
     echo -e "    llm-docker ${CYAN}up${RESET}       [--swift VERSION]  Start the container"
@@ -298,7 +298,7 @@ cmd_help() {
     echo ""
     echo -e "  ${BOLD}NOTES${RESET}"
     echo -e "    • Current directory is mounted at /workspace"
-    echo -e "    • ~/.claude and ~/.codex are shared with the host (auth/settings)"
+    echo -e "    • ~/.claude, ~/.codex, and ~/.gemini are shared with the host (auth/settings)"
     echo -e "    • ~/.gitconfig is mounted read-only"
     echo -e "    • Auth is shared across all projects via persistent ~/.claude.json"
     echo ""

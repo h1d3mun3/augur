@@ -1,113 +1,108 @@
 # llm-docker
 
-Claude Code・Codex CLI・Gemini CLI を同一の Docker コンテナで動かすツールです。  
-任意のディレクトリで使え、ホストのファイルシステムはカレントディレクトリのみに限定されます。
+Run Claude Code, Codex CLI, and Gemini CLI in an isolated Docker container.
+Works in any directory — only the current directory is exposed to the container.
 
-## セットアップ
+## Setup
 
-### クイックスタート（インストールスクリプト使用）
-
-セットアップを自動化するスクリプトが用意されています：
+### Quick start (install script)
 
 ```bash
-# 1. スクリプトを実行（Dockerfile と llm-docker を ~/.llm-docker/ にコピー、PATH を設定）
+# 1. Run the script (copies Dockerfile and llm-docker to ~/.llm-docker/, configures PATH)
 bash install
 
-# 2. シェル設定を反映
-source ~/.zshrc  # または source ~/.bashrc
+# 2. Reload shell config
+source ~/.zshrc  # or source ~/.bashrc
 
-# 3. Docker イメージをビルド
+# 3. Build the Docker image
 llm-docker build
 ```
 
-**注意事項：**
-- このスクリプトは **セットアップとアップデートの両方** に使用できます。既にインストール済みの場合も実行して構いません。PATH は重複して追加されません。
+**Note:** The script handles both initial setup and updates. Safe to re-run — PATH entry is not duplicated.
 
 ---
 
-### 手動セットアップ
+### Manual setup
 
-自動スクリプトを使わない場合は、以下の手順で手動でセットアップできます。
-
-### 1. ファイルを配置
+### 1. Place files
 
 ```bash
 mv ~/Downloads/llm-docker ~/.llm-docker
 chmod +x ~/.llm-docker/llm-docker
 ```
 
-### 2. PATH に追加
+### 2. Add to PATH
 
-`~/.zshrc`（または `~/.bashrc`）に追記：
+Add to `~/.zshrc` (or `~/.bashrc`):
 
 ```bash
 export PATH="$HOME/.llm-docker:$PATH"
 ```
 
-反映：
+Reload:
 
 ```bash
 source ~/.zshrc
 ```
 
-### 3. API キーを設定
+### 3. Set API keys
 
-使うものだけでOKです。`~/.zshrc` に追記：
+Only set what you need. Add to `~/.zshrc`:
 
 ```bash
-export ANTHROPIC_API_KEY="sk-ant-..."   # Claude Code 用
-export OPENAI_API_KEY="sk-..."          # Codex 用（APIキー認証の場合）
-export GEMINI_API_KEY="..."             # Gemini CLI 用（APIキー認証の場合）
+export ANTHROPIC_API_KEY="sk-ant-..."   # for Claude Code
+export OPENAI_API_KEY="sk-..."          # for Codex (API key auth)
+export GEMINI_API_KEY="..."             # for Gemini CLI (API key auth)
 ```
 
-API キーなしで Google アカウントを使う場合は、`llm-docker gemini` を初回起動した際に表示される URL からブラウザ認証できます。認証情報は `~/.gemini/` に保存されるので次回以降は不要です。
+To use Gemini with a Google account instead of an API key, run `llm-docker gemini` for the first time — it will display a URL for browser-based OAuth. Credentials are saved to `~/.gemini/` and reused on subsequent runs.
 
-### 4. Docker イメージをビルド
+### 4. Build the Docker image
 
 ```bash
 llm-docker build
 ```
 
-初回のみ必要です（数分かかります）。
+Only needed once (takes a few minutes).
 
 ---
 
-## 使い方
+## Usage
 
 ```bash
 cd ~/projects/my-app
 
-llm-docker up        # コンテナ起動
-llm-docker claude    # Claude Code を起動
-llm-docker codex     # Codex を起動
-llm-docker gemini    # Gemini CLI を起動
-llm-docker down      # コンテナを停止・削除
+llm-docker up        # start the container
+llm-docker claude    # launch Claude Code
+llm-docker codex     # launch Codex
+llm-docker gemini    # launch Gemini CLI
+llm-docker down      # stop and remove the container
 ```
 
-その他のコマンド：
+Other commands:
 
 ```bash
-llm-docker shell     # bash でコンテナに入る（デバッグ用）
-llm-docker status    # 状態と認証情報を確認
-llm-docker build     # Docker イメージをビルド
+llm-docker shell     # open a bash shell (for debugging)
+llm-docker status    # show status and auth info
+llm-docker build     # build the Docker image
 ```
 
 ---
 
-## ファイルの扱い
+## File access
 
-| パス | 説明 |
-|------|------|
-| カレントディレクトリ | `/workspace` にマウント（読み書き可） |
-| `~/.claude/` | コンテナと共有（Claude の認証情報・設定） |
-| `~/.codex/` | コンテナと共有（Codex の認証情報・設定・履歴） |
-| `~/.gemini/` | コンテナと共有（Gemini の認証情報・設定） |
-| `~/.gitconfig` | 読み取り専用でマウント（git の commit 名を統一） |
-| それ以外 | **コンテナから見えない**（ホスト保護） |
+| Path | Description |
+|------|-------------|
+| Current directory | mounted at `/workspace` (read/write) |
+| `~/.claude/` | shared with container (Claude auth and settings) |
+| `~/.codex/` | shared with container (Codex auth, settings, history) |
+| `~/.gemini/` | shared with container (Gemini auth and settings) |
+| `~/.gitconfig` | mounted read-only (consistent git identity) |
+| Everything else | **not visible to the container** (host protection) |
 
 ---
 
-## 動作要件
+## Requirements
 
-- Docker（Docker Desktop または Docker Engine）
+- Docker (Docker Desktop or Docker Engine)
 - bash
