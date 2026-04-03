@@ -1,6 +1,6 @@
 # llm-docker
 
-Claude Code と Codex CLI を同一の Docker コンテナで動かすツールです。  
+Claude Code・Codex CLI・Gemini CLI を同一の Docker コンテナで動かすツールです。  
 任意のディレクトリで使え、ホストのファイルシステムはカレントディレクトリのみに限定されます。
 
 ## セットアップ
@@ -57,7 +57,10 @@ source ~/.zshrc
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."   # Claude Code 用
 export OPENAI_API_KEY="sk-..."          # Codex 用（APIキー認証の場合）
+export GEMINI_API_KEY="..."             # Gemini CLI 用（APIキー認証の場合）
 ```
+
+API キーなしで Google アカウントを使う場合は、`llm-docker gemini` を初回起動した際に表示される URL からブラウザ認証できます。認証情報は `~/.gemini/` に保存されるので次回以降は不要です。
 
 ### 4. Docker イメージをビルド
 
@@ -77,6 +80,7 @@ cd ~/projects/my-app
 llm-docker up        # コンテナ起動
 llm-docker claude    # Claude Code を起動
 llm-docker codex     # Codex を起動
+llm-docker gemini    # Gemini CLI を起動
 llm-docker down      # コンテナを停止・削除
 ```
 
@@ -97,6 +101,7 @@ llm-docker build     # Docker イメージをビルド
 | カレントディレクトリ | `/workspace` にマウント（読み書き可） |
 | `~/.claude/` | コンテナと共有（Claude の認証情報・設定） |
 | `~/.codex/` | コンテナと共有（Codex の認証情報・設定・履歴） |
+| `~/.gemini/` | コンテナと共有（Gemini の認証情報・設定） |
 | `~/.gitconfig` | 読み取り専用でマウント（git の commit 名を統一） |
 | それ以外 | **コンテナから見えない**（ホスト保護） |
 

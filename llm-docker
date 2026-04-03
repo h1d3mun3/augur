@@ -4,6 +4,7 @@
 #   llm-docker up       - Start the container for the current directory
 #   llm-docker claude   - Launch Claude Code
 #   llm-docker codex    - Launch Codex
+#   llm-docker gemini   - Launch Gemini CLI
 #   llm-docker shell    - Open a bash shell in the container
 #   llm-docker down     - Stop and remove the container
 #   llm-docker status   - Show container status
@@ -138,16 +139,19 @@ cmd_up() {
     )
 
     # API keys
-    local anthropic_key openai_key
+    local anthropic_key openai_key gemini_key
     anthropic_key="$(resolve_api_key "${ANTHROPIC_API_KEY:-}" "$HOME/.anthropic_api_key")"
     openai_key="$(resolve_api_key "${OPENAI_API_KEY:-}" "$HOME/.openai_api_key")"
+    gemini_key="$(resolve_api_key "${GEMINI_API_KEY:-}" "$HOME/.gemini_api_key")"
     [[ -n "$anthropic_key" ]] && docker_args+=(-e "ANTHROPIC_API_KEY=${anthropic_key}")
     [[ -n "$openai_key" ]]    && docker_args+=(-e "OPENAI_API_KEY=${openai_key}")
+    [[ -n "$gemini_key" ]]    && docker_args+=(-e "GEMINI_API_KEY=${gemini_key}")
 
     # Auth & settings directories
-    mkdir -p "$HOME/.claude" "$HOME/.codex"
+    mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.gemini"
     docker_args+=(-v "${HOME}/.claude:/home/dev/.claude")
     docker_args+=(-v "${HOME}/.codex:/home/dev/.codex")
+    docker_args+=(-v "${HOME}/.gemini:/home/dev/.gemini")
 
     # Claude Code stores config (oauthAccount, onboarding state) in ~/.claude.json
     # (separate from ~/.claude/ directory). Persist it so re-login isn't required.
@@ -164,6 +168,7 @@ cmd_up() {
     echo ""
     echo -e "  ${BOLD}llm-docker claude${RESET}  → Launch Claude Code"
     echo -e "  ${BOLD}llm-docker codex${RESET}   → Launch Codex"
+    echo -e "  ${BOLD}llm-docker gemini${RESET}  → Launch Gemini CLI"
     echo -e "  ${BOLD}llm-docker shell${RESET}   → Open bash shell"
     echo -e "  ${BOLD}llm-docker down${RESET}    → Stop and remove"
 }
@@ -180,6 +185,13 @@ cmd_codex() {
     ensure_running
     info "Launching Codex in '${CONTAINER_NAME}'..."
     docker exec -it "$CONTAINER_NAME" codex
+}
+
+cmd_gemini() {
+    require_docker
+    ensure_running
+    info "Launching Gemini CLI in '${CONTAINER_NAME}'..."
+    docker exec -it "$CONTAINER_NAME" gemini
 }
 
 
@@ -225,10 +237,15 @@ cmd_status() {
     fi
     if [[ -n "${OPENAI_API_KEY:-}" ]] || [[ -f "$HOME/.openai_api_key" ]]; then
         echo -e "  ${GREEN}✓${RESET} OPENAI_API_KEY"
-    elif [[ -f "$HOME/.codex/auth.json" ]]; then
-        echo -e "  ${GREEN}✓${RESET} Codex (browser auth)"
     else
-        echo -e "  ${RED}✗${RESET} OPENAI_API_KEY / Codex auth (not set)"
+        echo -e "  ${RED}✗${RESET} OPENAI_API_KEY (not set)"
+    fi
+    if [[ -n "${GEMINI_API_KEY:-}" ]] || [[ -f "$HOME/.gemini_api_key" ]]; then
+        echo -e "  ${GREEN}✓${RESET} GEMINI_API_KEY"
+    elif [[ -f "$HOME/.gemini/oauth_creds.json" ]]; then
+        echo -e "  ${GREEN}✓${RESET} Gemini (Google account auth)"
+    else
+        echo -e "  ${RED}✗${RESET} GEMINI_API_KEY / Gemini auth (not set)"
     fi
 }
 
@@ -262,6 +279,7 @@ cmd_help() {
     echo -e "    llm-docker ${CYAN}up${RESET}       [--swift VERSION]  Start the container"
     echo -e "    llm-docker ${CYAN}claude${RESET}                     Launch Claude Code"
     echo -e "    llm-docker ${CYAN}codex${RESET}                      Launch Codex"
+    echo -e "    llm-docker ${CYAN}gemini${RESET}                     Launch Gemini CLI"
     echo -e "    llm-docker ${CYAN}shell${RESET}                      Open a bash shell"
     echo -e "    llm-docker ${CYAN}down${RESET}                       Stop and remove the container"
     echo -e "    llm-docker ${CYAN}status${RESET}                     Check status and auth info"
@@ -310,6 +328,7 @@ case "$COMMAND" in
     up)             cmd_up ;;
     claude)         cmd_claude ;;
     codex)          cmd_codex ;;
+    gemini)         cmd_gemini ;;
     shell)          cmd_shell ;;
     down)           cmd_down ;;
     status)         cmd_status ;;
