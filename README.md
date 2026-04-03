@@ -59,8 +59,6 @@ export ANTHROPIC_API_KEY="sk-ant-..."   # Claude Code 用
 export OPENAI_API_KEY="sk-..."          # Codex 用（APIキー認証の場合）
 ```
 
-Codex を ChatGPT アカウントで使う場合は API キー不要です。代わりに後述の `llm-docker login` で認証します。
-
 ### 4. Docker イメージをビルド
 
 ```bash
@@ -68,14 +66,6 @@ llm-docker build
 ```
 
 初回のみ必要です（数分かかります）。
-
-### 5. Codex のブラウザ認証（ChatGPT アカウントを使う場合）
-
-```bash
-llm-docker login
-```
-
-ターミナルに URL とコードが表示されます。URL をブラウザで開いてコードを入力すれば完了です。認証情報は `~/.codex` に保存されるので次回以降は不要です。
 
 ---
 
@@ -95,7 +85,6 @@ llm-docker down      # コンテナを停止・削除
 ```bash
 llm-docker shell     # bash でコンテナに入る（デバッグ用）
 llm-docker status    # 状態と認証情報を確認
-llm-docker login     # Codex のブラウザ認証（デバイスフロー）
 llm-docker build     # Docker イメージをビルド
 ```
 

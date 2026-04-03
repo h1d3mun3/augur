@@ -4,7 +4,6 @@
 #   llm-docker up       - Start the container for the current directory
 #   llm-docker claude   - Launch Claude Code
 #   llm-docker codex    - Launch Codex
-#   llm-docker login    - Authenticate Codex via device auth
 #   llm-docker shell    - Open a bash shell in the container
 #   llm-docker down     - Stop and remove the container
 #   llm-docker status   - Show container status
@@ -183,23 +182,6 @@ cmd_codex() {
     docker exec -it "$CONTAINER_NAME" codex
 }
 
-cmd_login() {
-    require_docker
-    ensure_image
-    mkdir -p "$HOME/.codex"
-
-    info "Starting Codex device auth login..."
-    info "A URL and code will appear — open the URL in your browser and enter the code."
-    echo ""
-
-    docker run --rm -it \
-        --name "llm-docker-login" \
-        -v "${HOME}/.codex:/home/dev/.codex" \
-        "$IMAGE_NAME" \
-        codex login --device-auth
-
-    success "Login complete. Credentials saved to ~/.codex"
-}
 
 cmd_shell() {
     require_docker
@@ -280,7 +262,6 @@ cmd_help() {
     echo -e "    llm-docker ${CYAN}up${RESET}       [--swift VERSION]  Start the container"
     echo -e "    llm-docker ${CYAN}claude${RESET}                     Launch Claude Code"
     echo -e "    llm-docker ${CYAN}codex${RESET}                      Launch Codex"
-    echo -e "    llm-docker ${CYAN}login${RESET}                      Authenticate Codex (device flow)"
     echo -e "    llm-docker ${CYAN}shell${RESET}                      Open a bash shell"
     echo -e "    llm-docker ${CYAN}down${RESET}                       Stop and remove the container"
     echo -e "    llm-docker ${CYAN}status${RESET}                     Check status and auth info"
@@ -329,7 +310,6 @@ case "$COMMAND" in
     up)             cmd_up ;;
     claude)         cmd_claude ;;
     codex)          cmd_codex ;;
-    login)          cmd_login ;;
     shell)          cmd_shell ;;
     down)           cmd_down ;;
     status)         cmd_status ;;
