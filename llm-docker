@@ -231,14 +231,18 @@ cmd_status() {
     echo ""
 
     if [[ -n "${ANTHROPIC_API_KEY:-}" ]] || [[ -f "$HOME/.anthropic_api_key" ]]; then
-        echo -e "  ${GREEN}✓${RESET} ANTHROPIC_API_KEY"
+        echo -e "  ${GREEN}✓${RESET} Claude (API key)"
+    elif [[ -f "$HOME/.claude.json" ]] && grep -q '"oauthAccount"' "$HOME/.claude.json" 2>/dev/null; then
+        echo -e "  ${GREEN}✓${RESET} Claude (account auth)"
     else
-        echo -e "  ${RED}✗${RESET} ANTHROPIC_API_KEY (not set)"
+        echo -e "  ${RED}✗${RESET} Claude (not authenticated)"
     fi
     if [[ -n "${OPENAI_API_KEY:-}" ]] || [[ -f "$HOME/.openai_api_key" ]]; then
-        echo -e "  ${GREEN}✓${RESET} OPENAI_API_KEY"
+        echo -e "  ${GREEN}✓${RESET} Codex (API key)"
+    elif [[ -f "$HOME/.codex/auth.json" ]]; then
+        echo -e "  ${GREEN}✓${RESET} Codex (account auth)"
     else
-        echo -e "  ${RED}✗${RESET} OPENAI_API_KEY (not set)"
+        echo -e "  ${RED}✗${RESET} Codex (not authenticated)"
     fi
     if [[ -n "${GEMINI_API_KEY:-}" ]] || [[ -f "$HOME/.gemini_api_key" ]]; then
         echo -e "  ${GREEN}✓${RESET} GEMINI_API_KEY"
