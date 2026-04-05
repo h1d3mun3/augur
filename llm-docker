@@ -245,11 +245,11 @@ cmd_status() {
         echo -e "  ${RED}✗${RESET} Codex (not authenticated)"
     fi
     if [[ -n "${GEMINI_API_KEY:-}" ]] || [[ -f "$HOME/.gemini_api_key" ]]; then
-        echo -e "  ${GREEN}✓${RESET} GEMINI_API_KEY"
+        echo -e "  ${GREEN}✓${RESET} Gemini (API key)"
     elif [[ -f "$HOME/.gemini/oauth_creds.json" ]]; then
-        echo -e "  ${GREEN}✓${RESET} Gemini (Google account auth)"
+        echo -e "  ${GREEN}✓${RESET} Gemini (account auth)"
     else
-        echo -e "  ${RED}✗${RESET} GEMINI_API_KEY / Gemini auth (not set)"
+        echo -e "  ${RED}✗${RESET} Gemini (not authenticated)"
     fi
 }
 
