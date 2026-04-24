@@ -57,6 +57,17 @@ export GEMINI_API_KEY="..."             # for Gemini CLI (API key auth)
 
 To use Gemini with a Google account instead of an API key, run `llm-docker gemini` for the first time — it will display a URL for browser-based OAuth. Credentials are saved to `~/.gemini/` and reused on subsequent runs.
 
+### GitHub CLI (gh)
+
+Install `gh` on the host and authenticate once:
+
+```bash
+brew install gh   # macOS
+gh auth login
+```
+
+`gh` is available inside the container automatically — credentials in `~/.config/gh/` are shared.
+
 ### 4. Build the Docker image
 
 ```bash
@@ -97,6 +108,7 @@ llm-docker build     # build the Docker image
 | `~/.claude/` | shared with container (Claude auth and settings) |
 | `~/.codex/` | shared with container (Codex auth, settings, history) |
 | `~/.gemini/` | shared with container (Gemini auth and settings) |
+| `~/.config/gh/` | shared with container (GitHub CLI auth) |
 | `~/.gitconfig` | mounted read-only (consistent git identity) |
 | Everything else | **not visible to the container** (host protection) |
 
