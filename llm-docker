@@ -161,6 +161,10 @@ cmd_up() {
     # Git config
     [[ -f "$HOME/.gitconfig" ]] && docker_args+=(-v "${HOME}/.gitconfig:/home/dev/.gitconfig:ro")
 
+    # GitHub CLI config (gh pr create, gh auth, etc.)
+    mkdir -p "$HOME/.config/gh"
+    docker_args+=(-v "${HOME}/.config/gh:/home/dev/.config/gh")
+
     docker_args+=("$IMAGE_NAME" bash)
 
     docker "${docker_args[@]}" &>/dev/null
@@ -251,6 +255,11 @@ cmd_status() {
     else
         echo -e "  ${RED}✗${RESET} Gemini (not authenticated)"
     fi
+    if [[ -f "$HOME/.config/gh/hosts.yml" ]]; then
+        echo -e "  ${GREEN}✓${RESET} GitHub CLI (gh) (authenticated)"
+    else
+        echo -e "  ${RED}✗${RESET} GitHub CLI (gh) (run: gh auth login)"
+    fi
 }
 
 cmd_update() {
@@ -272,6 +281,7 @@ cmd_version() {
     docker run --rm "$IMAGE_NAME" swift --version 2>/dev/null || echo "    swift:  (unable to fetch)"
     docker run --rm "$IMAGE_NAME" claude --version 2>/dev/null || echo "    claude: (unable to fetch)"
     docker run --rm "$IMAGE_NAME" codex --version 2>/dev/null || echo "    codex:  (unable to fetch)"
+    docker run --rm "$IMAGE_NAME" gh --version 2>/dev/null | head -1 || echo "    gh:     (unable to fetch)"
     echo ""
 }
 
@@ -302,9 +312,10 @@ cmd_help() {
     echo ""
     echo -e "  ${BOLD}NOTES${RESET}"
     echo -e "    • Current directory is mounted at /workspace"
-    echo -e "    • ~/.claude, ~/.codex, and ~/.gemini are shared with the host (auth/settings)"
+    echo -e "    • ~/.claude, ~/.codex, ~/.gemini, ~/.config/gh are shared with the host"
     echo -e "    • ~/.gitconfig is mounted read-only"
     echo -e "    • Auth is shared across all projects via persistent ~/.claude.json"
+    echo -e "    • Run ${BOLD}gh auth login${RESET} on the host once to enable gh inside the container"
     echo ""
 }
 
