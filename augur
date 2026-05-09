@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# llm-docker - Run Claude Code and Codex CLI in an isolated Docker container
+# augur - Run Claude Code and Codex CLI in an isolated Docker container
 # Usage:
-#   llm-docker up       - Start the container for the current directory
-#   llm-docker claude   - Launch Claude Code
-#   llm-docker codex    - Launch Codex
-#   llm-docker gemini   - Launch Gemini CLI
-#   llm-docker shell    - Open a bash shell in the container
-#   llm-docker down     - Stop and remove the container
-#   llm-docker status   - Show container status
+#   augur up       - Start the container for the current directory
+#   augur claude   - Launch Claude Code
+#   augur codex    - Launch Codex
+#   augur gemini   - Launch Gemini CLI
+#   augur shell    - Open a bash shell in the container
+#   augur down     - Stop and remove the container
+#   augur status   - Show container status
 
 set -euo pipefail
 
@@ -27,17 +27,17 @@ RESET='\033[0m'
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-info()    { echo -e "${CYAN}[llm-docker]${RESET} $*"; }
-success() { echo -e "${GREEN}[llm-docker]${RESET} $*"; }
-warn()    { echo -e "${YELLOW}[llm-docker]${RESET} $*"; }
-error()   { echo -e "${RED}[llm-docker]${RESET} $*" >&2; }
+info()    { echo -e "${CYAN}[augur]${RESET} $*"; }
+success() { echo -e "${GREEN}[augur]${RESET} $*"; }
+warn()    { echo -e "${YELLOW}[augur]${RESET} $*"; }
+error()   { echo -e "${RED}[augur]${RESET} $*" >&2; }
 
 # Derive a safe container name from the directory path
 make_container_name() {
     local dir_name
     dir_name="$(basename "$WORKSPACE_DIR")"
     dir_name="$(echo "$dir_name" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]' '-' | sed 's/^-//;s/-$//')"
-    echo "llm-docker-${dir_name}-swift-${SWIFT_VERSION//./-}"
+    echo "augur-${dir_name}-swift-${SWIFT_VERSION//./-}"
 }
 
 container_running() {
@@ -77,7 +77,7 @@ warn_if_image_stale() {
     now_epoch=$(date +%s)
     age_days=$(( (now_epoch - created_epoch) / 86400 ))
     if (( age_days >= 14 )); then
-        warn "Image was built ${age_days} days ago. Run ${BOLD}llm-docker update${RESET} to get the latest versions."
+        warn "Image was built ${age_days} days ago. Run ${BOLD}augur update${RESET} to get the latest versions."
     fi
 }
 
@@ -88,7 +88,7 @@ ensure_running() {
             docker start "$CONTAINER_NAME" &>/dev/null
         else
             warn "No container found for this directory."
-            warn "Run ${BOLD}llm-docker up${RESET} first."
+            warn "Run ${BOLD}augur up${RESET} first."
             exit 1
         fi
     fi
@@ -175,11 +175,11 @@ cmd_up() {
     docker "${docker_args[@]}" &>/dev/null
     success "Container '${CONTAINER_NAME}' is up."
     echo ""
-    echo -e "  ${BOLD}llm-docker claude${RESET}  → Launch Claude Code"
-    echo -e "  ${BOLD}llm-docker codex${RESET}   → Launch Codex"
-    echo -e "  ${BOLD}llm-docker gemini${RESET}  → Launch Gemini CLI"
-    echo -e "  ${BOLD}llm-docker shell${RESET}   → Open bash shell"
-    echo -e "  ${BOLD}llm-docker down${RESET}    → Stop and remove"
+    echo -e "  ${BOLD}augur claude${RESET}  → Launch Claude Code"
+    echo -e "  ${BOLD}augur codex${RESET}   → Launch Codex"
+    echo -e "  ${BOLD}augur gemini${RESET}  → Launch Gemini CLI"
+    echo -e "  ${BOLD}augur shell${RESET}   → Open bash shell"
+    echo -e "  ${BOLD}augur down${RESET}    → Stop and remove"
 }
 
 cmd_claude() {
@@ -272,13 +272,13 @@ cmd_update() {
     info "Updating Docker image '${IMAGE_NAME}' (Swift ${SWIFT_VERSION}) to latest versions..."
     docker build --no-cache --build-arg SWIFT_VERSION="${SWIFT_VERSION}" -t "$IMAGE_NAME" "$SCRIPT_DIR"
     success "Image '${IMAGE_NAME}' updated successfully."
-    warn "Existing containers use the old image. Run ${BOLD}llm-docker down && llm-docker up${RESET} to apply."
+    warn "Existing containers use the old image. Run ${BOLD}augur down && augur up${RESET} to apply."
 }
 
 cmd_version() {
     require_docker
     echo ""
-    echo -e "  ${BOLD}llm-docker${RESET}  ${CYAN}1.1.0${RESET}"
+    echo -e "  ${BOLD}augur${RESET}  ${CYAN}1.1.0${RESET}"
     echo -e "  ${BOLD}Swift${RESET}       ${CYAN}${SWIFT_VERSION}${RESET}  (image: ${IMAGE_NAME})"
     echo ""
     ensure_image
@@ -292,20 +292,20 @@ cmd_version() {
 
 cmd_help() {
     echo ""
-    echo -e "  ${BOLD}llm-docker${RESET} — Run Claude Code, Codex, and Gemini CLI in an isolated Docker container"
+    echo -e "  ${BOLD}augur${RESET} — Run Claude Code, Codex, and Gemini CLI in an isolated Docker container"
     echo ""
     echo -e "  ${BOLD}USAGE${RESET}"
-    echo -e "    llm-docker ${CYAN}up${RESET}       [--swift VERSION]  Start the container"
-    echo -e "    llm-docker ${CYAN}claude${RESET}                     Launch Claude Code"
-    echo -e "    llm-docker ${CYAN}codex${RESET}                      Launch Codex"
-    echo -e "    llm-docker ${CYAN}gemini${RESET}                     Launch Gemini CLI"
-    echo -e "    llm-docker ${CYAN}shell${RESET}                      Open a bash shell"
-    echo -e "    llm-docker ${CYAN}down${RESET}                       Stop and remove the container"
-    echo -e "    llm-docker ${CYAN}status${RESET}                     Check status and auth info"
-    echo -e "    llm-docker ${CYAN}update${RESET}  [--swift VERSION]  Rebuild image with latest versions"
-    echo -e "    llm-docker ${CYAN}build${RESET}   [--swift VERSION]  Build the Docker image"
-    echo -e "    llm-docker ${CYAN}version${RESET} [--swift VERSION]  Show version information"
-    echo -e "    llm-docker ${CYAN}help${RESET}                       Show this help"
+    echo -e "    augur ${CYAN}up${RESET}       [--swift VERSION]  Start the container"
+    echo -e "    augur ${CYAN}claude${RESET}                     Launch Claude Code"
+    echo -e "    augur ${CYAN}codex${RESET}                      Launch Codex"
+    echo -e "    augur ${CYAN}gemini${RESET}                     Launch Gemini CLI"
+    echo -e "    augur ${CYAN}shell${RESET}                      Open a bash shell"
+    echo -e "    augur ${CYAN}down${RESET}                       Stop and remove the container"
+    echo -e "    augur ${CYAN}status${RESET}                     Check status and auth info"
+    echo -e "    augur ${CYAN}update${RESET}  [--swift VERSION]  Rebuild image with latest versions"
+    echo -e "    augur ${CYAN}build${RESET}   [--swift VERSION]  Build the Docker image"
+    echo -e "    augur ${CYAN}version${RESET} [--swift VERSION]  Show version information"
+    echo -e "    augur ${CYAN}help${RESET}                       Show this help"
     echo ""
     echo -e "  ${BOLD}OPTIONS${RESET}"
     echo -e "    --swift VERSION    Swift version (default: ${CYAN}6.0${RESET})"
@@ -341,7 +341,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-IMAGE_NAME="llm-docker:swift-${SWIFT_VERSION}"
+IMAGE_NAME="augur:swift-${SWIFT_VERSION}"
 CONTAINER_NAME="$(make_container_name)"
 
 case "$COMMAND" in
