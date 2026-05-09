@@ -1,4 +1,4 @@
-# llm-docker
+# augur
 
 Run Claude Code, Codex CLI, and Gemini CLI in an isolated Docker container.
 Works in any directory — only the current directory is exposed to the container.
@@ -8,14 +8,14 @@ Works in any directory — only the current directory is exposed to the containe
 ### Quick start (install script)
 
 ```bash
-# 1. Run the script (copies Dockerfile and llm-docker to ~/.llm-docker/, configures PATH)
+# 1. Run the script (copies Dockerfile and augur to ~/.augur/, configures PATH)
 bash install
 
 # 2. Reload shell config
 source ~/.zshrc  # or source ~/.bashrc
 
 # 3. Build the Docker image
-llm-docker build
+augur build
 ```
 
 **Note:** The script handles both initial setup and updates. Safe to re-run — PATH entry is not duplicated.
@@ -27,8 +27,8 @@ llm-docker build
 ### 1. Place files
 
 ```bash
-mv ~/Downloads/llm-docker ~/.llm-docker
-chmod +x ~/.llm-docker/llm-docker
+mv ~/Downloads/augur ~/.augur
+chmod +x ~/.augur/augur
 ```
 
 ### 2. Add to PATH
@@ -36,7 +36,7 @@ chmod +x ~/.llm-docker/llm-docker
 Add to `~/.zshrc` (or `~/.bashrc`):
 
 ```bash
-export PATH="$HOME/.llm-docker:$PATH"
+export PATH="$HOME/.augur:$PATH"
 ```
 
 Reload:
@@ -55,7 +55,7 @@ export OPENAI_API_KEY="sk-..."          # for Codex (API key auth)
 export GEMINI_API_KEY="..."             # for Gemini CLI (API key auth)
 ```
 
-To use Gemini with a Google account instead of an API key, run `llm-docker gemini` for the first time — it will display a URL for browser-based OAuth. Credentials are saved to `~/.gemini/` and reused on subsequent runs.
+To use Gemini with a Google account instead of an API key, run `augur gemini` for the first time — it will display a URL for browser-based OAuth. Credentials are saved to `~/.gemini/` and reused on subsequent runs.
 
 ### GitHub CLI (gh)
 
@@ -71,7 +71,7 @@ gh auth login
 ### 4. Build the Docker image
 
 ```bash
-llm-docker build
+augur build
 ```
 
 Only needed once (takes a few minutes).
@@ -83,19 +83,19 @@ Only needed once (takes a few minutes).
 ```bash
 cd ~/projects/my-app
 
-llm-docker up        # start the container
-llm-docker claude    # launch Claude Code
-llm-docker codex     # launch Codex
-llm-docker gemini    # launch Gemini CLI
-llm-docker down      # stop and remove the container
+augur up        # start the container
+augur claude    # launch Claude Code
+augur codex     # launch Codex
+augur gemini    # launch Gemini CLI
+augur down      # stop and remove the container
 ```
 
 Other commands:
 
 ```bash
-llm-docker shell     # open a bash shell (for debugging)
-llm-docker status    # show status and auth info
-llm-docker build     # build the Docker image
+augur shell     # open a bash shell (for debugging)
+augur status    # show status and auth info
+augur build     # build the Docker image
 ```
 
 ---
