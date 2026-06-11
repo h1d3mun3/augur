@@ -1,5 +1,5 @@
-ARG SWIFT_VERSION=6.0
-FROM swift:${SWIFT_VERSION}-jammy
+ARG SWIFT_VERSION=latest
+FROM swift:${SWIFT_VERSION}
 
 # System dependencies + Node.js 22 + GitHub CLI
 RUN apt-get update \
