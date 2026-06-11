@@ -15,7 +15,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="$(pwd)"
-SWIFT_VERSION="${SWIFT_VERSION:-6.0}"
+SWIFT_VERSION="${SWIFT_VERSION:-}"
 
 # ANSI colors
 RED='\033[0;31m'
@@ -37,7 +37,7 @@ make_container_name() {
     local dir_name
     dir_name="$(basename "$WORKSPACE_DIR")"
     dir_name="$(echo "$dir_name" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]' '-' | sed 's/^-//;s/-$//')"
-    echo "augur-${dir_name}-swift-${SWIFT_VERSION//./-}"
+    echo "augur-${dir_name}-swift-${SWIFT_IMAGE_TAG//./-}"
 }
 
 container_running() {
@@ -108,8 +108,8 @@ resolve_api_key() {
 
 cmd_build() {
     require_docker
-    info "Building Docker image '${IMAGE_NAME}' (Swift ${SWIFT_VERSION})..."
-    docker build --build-arg SWIFT_VERSION="${SWIFT_VERSION}" -t "$IMAGE_NAME" "$SCRIPT_DIR"
+    info "Building Docker image '${IMAGE_NAME}' (Swift ${SWIFT_IMAGE_TAG})..."
+    docker build --build-arg SWIFT_VERSION="${SWIFT_IMAGE_TAG}" -t "$IMAGE_NAME" "$SCRIPT_DIR"
     success "Image '${IMAGE_NAME}' built successfully."
 }
 
@@ -269,8 +269,8 @@ cmd_status() {
 
 cmd_update() {
     require_docker
-    info "Updating Docker image '${IMAGE_NAME}' (Swift ${SWIFT_VERSION}) to latest versions..."
-    docker build --no-cache --build-arg SWIFT_VERSION="${SWIFT_VERSION}" -t "$IMAGE_NAME" "$SCRIPT_DIR"
+    info "Updating Docker image '${IMAGE_NAME}' (Swift ${SWIFT_IMAGE_TAG}) to latest versions..."
+    docker build --no-cache --build-arg SWIFT_VERSION="${SWIFT_IMAGE_TAG}" -t "$IMAGE_NAME" "$SCRIPT_DIR"
     success "Image '${IMAGE_NAME}' updated successfully."
     warn "Existing containers use the old image. Run ${BOLD}augur down && augur up${RESET} to apply."
 }
@@ -279,7 +279,7 @@ cmd_version() {
     require_docker
     echo ""
     echo -e "  ${BOLD}augur${RESET}  ${CYAN}1.1.0${RESET}"
-    echo -e "  ${BOLD}Swift${RESET}       ${CYAN}${SWIFT_VERSION}${RESET}  (image: ${IMAGE_NAME})"
+    echo -e "  ${BOLD}Swift${RESET}       ${CYAN}${SWIFT_IMAGE_TAG}${RESET}  (image: ${IMAGE_NAME})"
     echo ""
     ensure_image
     echo -e "  ${BOLD}Container tool versions:${RESET}"
@@ -308,12 +308,12 @@ cmd_help() {
     echo -e "    augur ${CYAN}help${RESET}                       Show this help"
     echo ""
     echo -e "  ${BOLD}OPTIONS${RESET}"
-    echo -e "    --swift VERSION    Swift version (default: ${CYAN}6.0${RESET})"
+    echo -e "    --swift VERSION    Swift version (default: ${CYAN}latest${RESET})"
     echo ""
     echo -e "  ${BOLD}ENVIRONMENT${RESET}"
     echo -e "    ANTHROPIC_API_KEY   Anthropic API key (or ~/.anthropic_api_key)"
     echo -e "    OPENAI_API_KEY      OpenAI API key (or ~/.openai_api_key)"
-    echo -e "    SWIFT_VERSION       Default Swift version (default: 6.0)"
+    echo -e "    SWIFT_VERSION       Default Swift version (default: latest)"
     echo ""
     echo -e "  ${BOLD}NOTES${RESET}"
     echo -e "    • Current directory is mounted at /workspace"
@@ -341,7 +341,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-IMAGE_NAME="augur:swift-${SWIFT_VERSION}"
+SWIFT_IMAGE_TAG="${SWIFT_VERSION:-latest}"
+IMAGE_NAME="augur:swift-${SWIFT_IMAGE_TAG}"
 CONTAINER_NAME="$(make_container_name)"
 
 case "$COMMAND" in
