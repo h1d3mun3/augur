@@ -1,13 +1,7 @@
 #!/usr/bin/env bash
-# augur - Run Claude Code and Codex CLI in an isolated Docker container
-# Usage:
-#   augur up       - Start the container for the current directory
-#   augur claude   - Launch Claude Code
-#   augur codex    - Launch Codex
-#   augur gemini   - Launch Gemini CLI
-#   augur shell    - Open a bash shell in the container
-#   augur down     - Stop and remove the container
-#   augur status   - Show container status
+# augur - Run AI coding agents in an isolated environment
+#   Docker mode (default): lightweight Linux container
+#   macOS VM mode (--macos): macOS VM with full Xcode support
 
 set -euo pipefail
 
@@ -16,6 +10,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="$(pwd)"
 SWIFT_VERSION="${SWIFT_VERSION:-}"
+MACOS_MODE=false
 
 # ANSI colors
 RED='\033[0;31m'
@@ -25,6 +20,12 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 RESET='\033[0m'
 
+# macOS VM mode: VM names and SSH key
+MACOS_BASE_VM="augur-macos-base"
+MACOS_BUILD_VM="augur-macos-build"
+MACOS_SSH_USER="admin"
+MACOS_SSH_KEY="$HOME/.augur/vm_key"
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 info()    { echo -e "${CYAN}[augur]${RESET} $*"; }
@@ -32,7 +33,6 @@ success() { echo -e "${GREEN}[augur]${RESET} $*"; }
 warn()    { echo -e "${YELLOW}[augur]${RESET} $*"; }
 error()   { echo -e "${RED}[augur]${RESET} $*" >&2; }
 
-# Derive a safe container name from the directory path
 make_container_name() {
     local dir_name
     dir_name="$(basename "$WORKSPACE_DIR")"
@@ -94,7 +94,6 @@ ensure_running() {
     fi
 }
 
-# Resolve an API key: env var > file > empty
 resolve_api_key() {
     local env_val="$1" file_path="$2"
     if [[ -n "$env_val" ]]; then
@@ -104,7 +103,72 @@ resolve_api_key() {
     fi
 }
 
-# ── Commands ──────────────────────────────────────────────────────────────────
+# ── macOS VM mode helpers ─────────────────────────────────────────────────────
+
+require_tart() {
+    command -v tart &>/dev/null || {
+        error "Tart is not installed."
+        error "Install with: brew install cirruslabs/cli/tart"
+        exit 1
+    }
+}
+
+macos_project_vm() {
+    local dir_name
+    dir_name="$(basename "$WORKSPACE_DIR" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]' '-' | sed 's/^-//;s/-$//')"
+    echo "augur-macos-${dir_name}"
+}
+
+macos_vm_exists() {
+    tart list 2>/dev/null | awk 'NR>1 {print $2}' | grep -qx "$1"
+}
+
+macos_vm_running() {
+    tart list 2>/dev/null | awk 'NR>1 {print $2, $NF}' | grep -qx "${1} running"
+}
+
+# Poll until VM IP is available (boot takes ~30s); prints IP on success
+macos_vm_ip() {
+    local vm="$1" ip
+    for _ in {1..30}; do
+        ip=$(tart ip "$vm" 2>/dev/null) && [[ -n "$ip" ]] && { echo "$ip"; return 0; }
+        sleep 3
+    done
+    return 1
+}
+
+ssh_macos() {
+    local vm="$1"; shift
+    local ip
+    ip="$(tart ip "$vm" 2>/dev/null)" || { error "Cannot get IP for '${vm}'."; exit 1; }
+    local key_opts=()
+    if [[ -f "$MACOS_SSH_KEY" ]]; then
+        key_opts=(-i "$MACOS_SSH_KEY" -o PasswordAuthentication=no -o BatchMode=yes)
+    fi
+    ssh -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o LogLevel=ERROR \
+        -o ConnectTimeout=10 \
+        "${key_opts[@]}" \
+        "${MACOS_SSH_USER}@${ip}" "$@"
+}
+
+scp_to_macos() {
+    local vm="$1" src="$2" dst="$3"
+    local ip
+    ip="$(tart ip "$vm" 2>/dev/null)" || { error "Cannot get IP for '${vm}'."; exit 1; }
+    local key_opts=()
+    if [[ -f "$MACOS_SSH_KEY" ]]; then
+        key_opts=(-i "$MACOS_SSH_KEY" -o PasswordAuthentication=no -o BatchMode=yes)
+    fi
+    scp -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o LogLevel=ERROR \
+        "${key_opts[@]}" \
+        "$src" "${MACOS_SSH_USER}@${ip}:${dst}"
+}
+
+# ── Docker mode commands ──────────────────────────────────────────────────────
 
 cmd_build() {
     require_docker
@@ -138,7 +202,6 @@ cmd_up() {
         -w /workspace
     )
 
-    # API keys
     local anthropic_key openai_key gemini_key
     anthropic_key="$(resolve_api_key "${ANTHROPIC_API_KEY:-}" "$HOME/.anthropic_api_key")"
     openai_key="$(resolve_api_key "${OPENAI_API_KEY:-}" "$HOME/.openai_api_key")"
@@ -147,7 +210,6 @@ cmd_up() {
     [[ -n "$openai_key" ]]    && docker_args+=(-e "OPENAI_API_KEY=${openai_key}")
     [[ -n "$gemini_key" ]]    && docker_args+=(-e "GEMINI_API_KEY=${gemini_key}")
 
-    # Auth & settings directories
     mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.gemini"
     docker_args+=(-v "${HOME}/.claude:/home/dev/.claude")
     docker_args+=(-v "${HOME}/.codex:/home/dev/.codex")
@@ -158,10 +220,8 @@ cmd_up() {
     touch "$HOME/.claude.json"
     docker_args+=(-v "${HOME}/.claude.json:/home/dev/.claude.json")
 
-    # Git config
     [[ -f "$HOME/.gitconfig" ]] && docker_args+=(-v "${HOME}/.gitconfig:/home/dev/.gitconfig:ro")
 
-    # GitHub CLI config (gh pr create, gh auth, etc.)
     mkdir -p "$HOME/.config/gh"
     docker_args+=(-v "${HOME}/.config/gh:/home/dev/.config/gh")
     # On macOS, gh stores OAuth tokens in Keychain (not in hosts.yml), so the
@@ -203,7 +263,6 @@ cmd_gemini() {
     docker exec -it "$CONTAINER_NAME" gemini
 }
 
-
 cmd_shell() {
     require_docker
     ensure_running
@@ -213,12 +272,10 @@ cmd_shell() {
 
 cmd_down() {
     require_docker
-
     if ! container_exists; then
         warn "No container found for this directory (${CONTAINER_NAME})."
         return 0
     fi
-
     info "Stopping and removing container '${CONTAINER_NAME}'..."
     docker rm -f "$CONTAINER_NAME" &>/dev/null
     success "Container '${CONTAINER_NAME}' has been stopped and removed."
@@ -239,9 +296,11 @@ cmd_status() {
     fi
     echo ""
 
-    if [[ -n "${ANTHROPIC_API_KEY:-}" ]] || [[ -f "$HOME/.anthropic_api_key" ]]; then
+    if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]] || [[ -f "$HOME/.claude_code_oauth_token" ]]; then
+        echo -e "  ${GREEN}✓${RESET} Claude (OAuth token)"
+    elif [[ -n "${ANTHROPIC_API_KEY:-}" ]] || [[ -f "$HOME/.anthropic_api_key" ]]; then
         echo -e "  ${GREEN}✓${RESET} Claude (API key)"
-    elif [[ -f "$HOME/.claude.json" ]] && grep -q '"oauthAccount"' "$HOME/.claude.json" 2>/dev/null; then
+    elif [[ -f "$HOME/.claude/.credentials.json" ]]; then
         echo -e "  ${GREEN}✓${RESET} Claude (account auth)"
     else
         echo -e "  ${RED}✗${RESET} Claude (not authenticated)"
@@ -278,7 +337,7 @@ cmd_update() {
 cmd_version() {
     require_docker
     echo ""
-    echo -e "  ${BOLD}augur${RESET}  ${CYAN}1.1.0${RESET}"
+    echo -e "  ${BOLD}augur${RESET}  ${CYAN}1.2.0${RESET}"
     echo -e "  ${BOLD}Swift${RESET}       ${CYAN}${SWIFT_IMAGE_TAG}${RESET}  (image: ${IMAGE_NAME})"
     echo ""
     ensure_image
@@ -290,11 +349,479 @@ cmd_version() {
     echo ""
 }
 
+# ── macOS VM mode commands ────────────────────────────────────────────────────
+
+cmd_build_macos() {
+    require_tart
+
+    local ipsw_path="" xcode_xip_path=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --ipsw)      ipsw_path="${2:?'--ipsw requires a file path'}";           shift 2 ;;
+            --xcode-xip) xcode_xip_path="${2:?'--xcode-xip requires a file path'}"; shift 2 ;;
+            *) error "Unknown option: $1"; exit 1 ;;
+        esac
+    done
+
+    [[ -n "$ipsw_path" ]]      || { error "--ipsw <path> is required.";      exit 1; }
+    [[ -f "$ipsw_path" ]]      || { error "IPSW not found: ${ipsw_path}";    exit 1; }
+    [[ -n "$xcode_xip_path" ]] || { error "--xcode-xip <path> is required."; exit 1; }
+    [[ -f "$xcode_xip_path" ]] || { error "XIP not found: ${xcode_xip_path}"; exit 1; }
+
+    # Step 1: Warn if base VM already exists
+    if macos_vm_exists "$MACOS_BASE_VM"; then
+        warn "Existing base VM '${MACOS_BASE_VM}' will be replaced."
+        read -rp "$(echo -e "${CYAN}[augur]${RESET} Continue? [y/N] ")" yn
+        [[ "$yn" == [yY] ]] || { info "Aborted."; exit 0; }
+        macos_vm_running "$MACOS_BASE_VM" && tart stop "$MACOS_BASE_VM" 2>/dev/null || true
+        tart delete "$MACOS_BASE_VM"
+    fi
+    if macos_vm_exists "$MACOS_BUILD_VM"; then
+        macos_vm_running "$MACOS_BUILD_VM" && tart stop "$MACOS_BUILD_VM" 2>/dev/null || true
+        tart delete "$MACOS_BUILD_VM"
+    fi
+
+    trap '
+        if macos_vm_exists "$MACOS_BUILD_VM"; then
+            macos_vm_running "$MACOS_BUILD_VM" && tart stop "$MACOS_BUILD_VM" 2>/dev/null || true
+            tart delete "$MACOS_BUILD_VM" 2>/dev/null || true
+        fi
+    ' EXIT
+
+    # Step 2: Create VM from IPSW
+    info "Creating VM from IPSW — this takes 15–30 minutes..."
+    tart create "$MACOS_BUILD_VM" --from-ipsw "$(realpath "$ipsw_path")" --disk-size 120
+    tart set "$MACOS_BUILD_VM" --cpu 4 --memory 8192
+
+    # Step 3: Run with GUI for manual Setup Assistant completion
+    echo ""
+    echo -e "${BOLD}── Setup Assistant (manual) ──────────────────────────────────────────────────${RESET}"
+    echo ""
+    echo -e "  A VM window will open. Complete Setup Assistant, then:"
+    echo ""
+    echo -e "  1. Create a user account with these exact credentials:"
+    echo -e "       Username : ${CYAN}${MACOS_SSH_USER}${RESET}"
+    echo -e "       Password : ${CYAN}${MACOS_SSH_USER}${RESET}"
+    echo -e "  2. After reaching the desktop, enable Remote Login:"
+    echo -e "       System Settings → General → Sharing → Remote Login → ON"
+    echo -e "  3. Close the VM window."
+    echo ""
+    echo -e "${BOLD}─────────────────────────────────────────────────────────────────────────────${RESET}"
+    echo ""
+    read -rp "$(echo -e "${CYAN}[augur]${RESET} Press Enter to open the VM window...")"
+    tart run "$MACOS_BUILD_VM"
+
+    read -rp "$(echo -e "${CYAN}[augur]${RESET} Remote Login enabled? Ready to continue? [y/N] ")" yn
+    [[ "$yn" == [yY] ]] || { info "Aborted."; exit 0; }
+
+    # Step 4: Restart headlessly and wait for SSH
+    info "Restarting VM headlessly..."
+    tart run --no-graphics "$MACOS_BUILD_VM" &>/dev/null &
+    local tart_pid=$!
+
+    info "Waiting for SSH..."
+    local vm_ip
+    vm_ip="$(macos_vm_ip "$MACOS_BUILD_VM")" || {
+        kill "$tart_pid" 2>/dev/null; wait "$tart_pid" 2>/dev/null || true
+        error "VM did not become reachable. Check that Remote Login is enabled."
+        exit 1
+    }
+
+    # Configure passwordless sudo so subsequent ssh_macos calls don't need a TTY
+    info "Configuring passwordless sudo..."
+    ssh -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o LogLevel=ERROR \
+        -o ConnectTimeout=10 \
+        "${MACOS_SSH_USER}@${vm_ip}" \
+        "echo '${MACOS_SSH_USER}' | sudo -S bash -c \
+            'echo \"${MACOS_SSH_USER} ALL=(ALL) NOPASSWD:ALL\" > /etc/sudoers.d/augur \
+             && chmod 440 /etc/sudoers.d/augur'"
+
+    # Set up SSH key authentication (password only needed this once)
+    info "Setting up SSH key authentication..."
+    if [[ ! -f "$MACOS_SSH_KEY" ]]; then
+        mkdir -p "$(dirname "$MACOS_SSH_KEY")"
+        ssh-keygen -t ed25519 -f "$MACOS_SSH_KEY" -N "" -C "augur-vm"
+    fi
+    ssh -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o LogLevel=ERROR \
+        -o ConnectTimeout=10 \
+        "${MACOS_SSH_USER}@${vm_ip}" \
+        "mkdir -p ~/.ssh && chmod 700 ~/.ssh && \
+         echo '$(cat "${MACOS_SSH_KEY}.pub")' >> ~/.ssh/authorized_keys && \
+         chmod 600 ~/.ssh/authorized_keys"
+
+    # NOTE: the workspace is exposed at ~/workspace (a symlink to Tart's auto-mount under
+    # "/Volumes/My Shared Files/"), created at runtime by ensure_macos_workspace — no
+    # /etc/synthetic.conf / mount_virtiofs needed (the sealed root cannot host a runtime symlink).
+
+    # Enable auto-login so a GUI (Aqua) session exists at boot. `xcodebuild test` needs an Aqua
+    # session to reach testmanagerd; a headless SSH login has none, so tests fail without this
+    # (Apple: "Once a user is logged in, running xcodebuild from ssh works for all test types").
+    # `sysadminctl -autologin` is broken (error 22) on current macOS, so write kcpassword directly.
+    # The bytes are the literal password "admin" XOR'd with the kcpassword cipher — they match the
+    # MACOS_SSH_USER/password (admin/admin) set during Setup Assistant. (Method per cirruslabs.)
+    info "Enabling auto-login (required for headless xcodebuild test)..."
+    ssh_macos "$MACOS_BUILD_VM" "
+        echo '00000000: 1ced 3f4a bcbc ba2c caca 4e82' | sudo xxd -r - /etc/kcpassword
+        sudo chmod 600 /etc/kcpassword
+        sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser ${MACOS_SSH_USER}
+        sudo systemsetup -setsleep Off 2>/dev/null || true
+    "
+
+    # Step 5: Install Xcode via SSH
+    local xip_name
+    xip_name="$(basename "$xcode_xip_path")"
+
+    info "Copying Xcode XIP to VM ($(du -sh "$xcode_xip_path" | cut -f1))..."
+    scp_to_macos "$MACOS_BUILD_VM" "$xcode_xip_path" "/tmp/${xip_name}"
+
+    info "Expanding Xcode XIP — this takes ~20 minutes..."
+    ssh_macos "$MACOS_BUILD_VM" "cd /tmp && xip --expand '${xip_name}' && rm '${xip_name}'"
+
+    info "Installing Xcode..."
+    ssh_macos "$MACOS_BUILD_VM" "sudo mv /tmp/Xcode.app /Applications/Xcode.app && \
+        sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"
+
+    info "Accepting Xcode license..."
+    ssh_macos "$MACOS_BUILD_VM" "sudo xcodebuild -license accept"
+
+    info "Running Xcode first launch..."
+    ssh_macos "$MACOS_BUILD_VM" "sudo xcodebuild -runFirstLaunch"
+
+    # Step 6: Install CLI tools (Homebrew + Claude Code)
+    info "Installing Homebrew and CLI tools..."
+    ssh_macos "$MACOS_BUILD_VM" '
+        NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+        eval "$(/opt/homebrew/bin/brew shellenv)"
+        echo '\''eval "$(/opt/homebrew/bin/brew shellenv)"'\'' >> ~/.zprofile
+        # Claude Code: do NOT use npm. The npm-distributed native binary arrives with a code
+        # signature that gets corrupted during tar extraction, so Apple Silicon AMFI kills it
+        # on launch (SIGKILL / "zsh: killed"). The official installer downloads a correctly
+        # Developer-ID-signed + notarized binary straight from Anthropic, which passes AMFI.
+        # Pin to the stable channel and verify the signer to fail closed on a tampered binary.
+        curl -fsSL https://claude.ai/install.sh | bash -s stable
+        echo '\''export PATH="$HOME/.local/bin:$PATH"'\'' >> ~/.zprofile
+        codesign -dvv "$HOME/.local/bin/claude" 2>&1 | grep -qi "Anthropic" \
+            || { echo "augur: ERROR claude binary is not signed by Anthropic — aborting build" >&2; exit 1; }
+    '
+
+    # Re-assert Xcode as the active developer dir: installing Homebrew also installs the Command
+    # Line Tools and switches xcode-select to them, which breaks `xcodebuild` ("requires Xcode").
+    info "Selecting full Xcode as the active developer directory..."
+    ssh_macos "$MACOS_BUILD_VM" "sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"
+
+    # Step 7: Save as base VM
+    info "Saving base VM '${MACOS_BASE_VM}'..."
+    tart stop "$MACOS_BUILD_VM" 2>/dev/null || true
+    wait "$tart_pid" 2>/dev/null || true
+
+    tart clone "$MACOS_BUILD_VM" "$MACOS_BASE_VM"
+    tart delete "$MACOS_BUILD_VM"
+    trap - EXIT
+
+    success "macOS base VM '${MACOS_BASE_VM}' is ready."
+    echo ""
+    echo -e "  ${BOLD}augur up --macos${RESET}     → Start VM for current directory"
+    echo -e "  ${BOLD}augur claude --macos${RESET} → Launch Claude Code in VM"
+    echo ""
+}
+
+# Poll until SSH is actually accepting connections (tart ip returning an IP does not guarantee
+# the SSH daemon is ready). Waits up to ~2 min (40 × 3s). Prints the IP on success.
+wait_for_macos_ssh() {
+    local vm="$1"
+    local ip retries=40 key_opts=()
+    [[ -f "$MACOS_SSH_KEY" ]] && key_opts=(-i "$MACOS_SSH_KEY" -o PasswordAuthentication=no -o BatchMode=yes)
+    while ((retries-- > 0)); do
+        ip="$(tart ip "$vm" 2>/dev/null)" && [[ -n "$ip" ]] && \
+            ssh -o StrictHostKeyChecking=no \
+                -o UserKnownHostsFile=/dev/null \
+                -o LogLevel=ERROR \
+                -o ConnectTimeout=5 \
+                "${key_opts[@]}" \
+                "${MACOS_SSH_USER}@${ip}" true 2>/dev/null && { echo "$ip"; return 0; }
+        sleep 3
+    done
+    return 1
+}
+
+# Expose the shared workspace inside the VM. Tart auto-mounts every --dir share (read-write,
+# owned by the guest user) under "/Volumes/My Shared Files/<name>". There is NO per-name virtiofs
+# tag, so `mount_virtiofs workspace /workspace` silently fails — that was the "/workspace is empty"
+# bug. We just symlink the auto-mounted share to a stable path. The sealed system volume cannot
+# host a runtime symlink at /workspace (read-only), so we use ~/workspace. Idempotent.
+#
+# NOTE: ~/.claude is deliberately NOT shared — on macOS Claude's credential lives in the Keychain
+# (not ~/.claude), so sharing it persisted nothing; auth is injected via the environment instead
+# (see cmd_up_macos / ~/.augur-env). ~/.claude is a normal writable local dir in the VM.
+ensure_macos_workspace() {
+    local vm="$1"
+    ssh_macos "$vm" 'ln -sfn "/Volumes/My Shared Files/workspace" "$HOME/workspace"'
+}
+
+ensure_macos_claude_bin() {
+    local vm="$1"
+    # Claude is installed via the official installer into ~/.local/bin (see cmd_build_macos).
+    # A properly built base VM already has it, so this is a fast no-op. If it is missing
+    # (base VM built before this change), self-heal via the official installer. ~/.claude is a
+    # local writable dir now (not virtiofs-mounted), so the installer's staging dir works here.
+    ssh_macos "$vm" "zsh -l -c '
+        \"\$HOME/.local/bin/claude\" --version &>/dev/null && exit 0
+        echo \"augur: claude not found in VM — installing via official installer...\" >&2
+        curl -fsSL https://claude.ai/install.sh | bash -s stable || \
+            echo \"augur: install failed. Run: augur update --macos (patches the base VM).\" >&2
+    '"
+}
+
+cmd_up_macos() {
+    require_tart
+    local project_vm
+    project_vm="$(macos_project_vm)"
+
+    macos_vm_exists "$MACOS_BASE_VM" || {
+        error "Base VM '${MACOS_BASE_VM}' not found."
+        error "Run: augur build --macos --ipsw <path> --xcode-xip <path>"
+        exit 1
+    }
+
+    if macos_vm_running "$project_vm"; then
+        warn "VM '${project_vm}' is already running."
+        return 0
+    fi
+
+    if ! macos_vm_exists "$project_vm"; then
+        info "Cloning base VM to '${project_vm}'..."
+        tart clone "$MACOS_BASE_VM" "$project_vm"
+    fi
+
+    mkdir -p "$HOME/.config/gh"
+    info "Starting VM '${project_vm}'..."
+    info "Mounting: ${BOLD}${WORKSPACE_DIR}${RESET} → ~/workspace"
+    tart run --no-graphics \
+        --dir="workspace:${WORKSPACE_DIR}" \
+        --dir="gh-config:${HOME}/.config/gh" \
+        "$project_vm" &>/dev/null &
+    disown
+
+    info "Waiting for VM to boot and SSH to be ready..."
+    wait_for_macos_ssh "$project_vm" &>/dev/null || {
+        error "VM SSH did not become available in time."
+        exit 1
+    }
+
+    ensure_macos_workspace "$project_vm"
+    ensure_macos_claude_bin "$project_vm"
+
+    # Copy git config, and copy .claude.json one-way for onboarding state only (NOT auth — on
+    # macOS the OAuth token lives in the Keychain, not in this file; see docs/macos-vm-architecture-review.md).
+    [[ -f "$HOME/.claude.json" ]] && \
+        scp_to_macos "$project_vm" "$HOME/.claude.json" "/Users/${MACOS_SSH_USER}/.claude.json"
+    [[ -f "$HOME/.gitconfig" ]] && \
+        scp_to_macos "$project_vm" "$HOME/.gitconfig" "/Users/${MACOS_SSH_USER}/.gitconfig"
+
+    # Write credentials to ~/.augur-env (sourced from ~/.zshenv for all zsh sessions). This is
+    # how Claude auth survives a fresh `tart clone` and works over SSH: the macOS Keychain is
+    # unreadable over SSH, so we inject a token via the environment instead.
+    # Precedence (official): ANTHROPIC_API_KEY > CLAUDE_CODE_OAUTH_TOKEN — if both are set the
+    # API key wins. Provide either via env or a file (~/.anthropic_api_key / ~/.claude_code_oauth_token).
+    local anthropic_key claude_oauth_token gh_token
+    anthropic_key="$(resolve_api_key "${ANTHROPIC_API_KEY:-}" "$HOME/.anthropic_api_key")"
+    claude_oauth_token="$(resolve_api_key "${CLAUDE_CODE_OAUTH_TOKEN:-}" "$HOME/.claude_code_oauth_token")"
+    gh_token="$(gh auth token 2>/dev/null || true)"
+    {
+        echo '# augur (regenerated at VM startup)'
+        echo 'eval "$(/opt/homebrew/bin/brew shellenv)" 2>/dev/null || true'
+        echo 'export PATH="$HOME/.local/bin:$PATH"   # claude (official installer)'
+        [[ -n "$anthropic_key" ]]      && echo "export ANTHROPIC_API_KEY='${anthropic_key}'"
+        [[ -n "$claude_oauth_token" ]] && echo "export CLAUDE_CODE_OAUTH_TOKEN='${claude_oauth_token}'"
+        [[ -n "$gh_token" ]]           && echo "export GH_TOKEN='${gh_token}'"
+    } | ssh_macos "$project_vm" "cat > /Users/${MACOS_SSH_USER}/.augur-env && chmod 600 /Users/${MACOS_SSH_USER}/.augur-env"
+    ssh_macos "$project_vm" \
+        "grep -q '.augur-env' ~/.zshenv 2>/dev/null || echo '[[ -f ~/.augur-env ]] && source ~/.augur-env' >> ~/.zshenv"
+
+    # Enable HTTPS `git push` with GH_TOKEN (gh is not installed in the VM, so configure git's
+    # credential helper directly to read GH_TOKEN from the environment).
+    if [[ -n "$gh_token" ]]; then
+        ssh_macos "$project_vm" \
+            "git config --global 'credential.https://github.com.helper' '!f() { test \"\$1\" = get && echo username=x-access-token && echo password=\$GH_TOKEN; }; f'"
+    fi
+
+    success "VM '${project_vm}' is up."
+    echo ""
+    echo -e "  ${BOLD}augur claude --macos${RESET} → Launch Claude Code"
+    echo -e "  ${BOLD}augur shell --macos${RESET}  → Open bash shell"
+    echo -e "  ${BOLD}augur down --macos${RESET}   → Stop and remove"
+}
+
+cmd_claude_macos() {
+    require_tart
+    local project_vm
+    project_vm="$(macos_project_vm)"
+    macos_vm_running "$project_vm" || cmd_up_macos
+    ensure_macos_workspace "$project_vm"
+    ensure_macos_claude_bin "$project_vm"
+    info "Launching Claude Code in '${project_vm}'..."
+    ssh_macos "$project_vm" -t "zsh -l -c 'cd ~/workspace && DISABLE_AUTOUPDATER=1 claude'"
+}
+
+cmd_shell_macos() {
+    require_tart
+    local project_vm
+    project_vm="$(macos_project_vm)"
+    macos_vm_running "$project_vm" || cmd_up_macos
+    ensure_macos_workspace "$project_vm"
+    info "Opening shell in '${project_vm}'..."
+    ssh_macos "$project_vm" -t "cd ~/workspace && exec zsh -l"
+}
+
+cmd_down_macos() {
+    require_tart
+    local project_vm
+    project_vm="$(macos_project_vm)"
+    if ! macos_vm_exists "$project_vm"; then
+        warn "No VM found for this directory (${project_vm})."
+        return 0
+    fi
+    info "Stopping VM '${project_vm}'..."
+    tart stop "$project_vm" 2>/dev/null || true
+    success "VM '${project_vm}' stopped (clone kept; CoW so it costs ~0 on disk)."
+    echo -e "  ${BOLD}augur up --macos${RESET}      → restart it (fast, no re-clone)"
+    echo -e "  ${BOLD}augur destroy --macos${RESET} → remove the clone entirely"
+}
+
+cmd_destroy_macos() {
+    require_tart
+    local project_vm
+    project_vm="$(macos_project_vm)"
+    if ! macos_vm_exists "$project_vm"; then
+        warn "No VM found for this directory (${project_vm})."
+        return 0
+    fi
+    info "Stopping and removing VM '${project_vm}'..."
+    tart stop "$project_vm" 2>/dev/null || true
+    tart delete "$project_vm"
+    success "VM '${project_vm}' has been removed."
+}
+
+cmd_status_macos() {
+    require_tart
+    local project_vm
+    project_vm="$(macos_project_vm)"
+
+    echo -e "${BOLD}VM (project):${RESET}  ${project_vm}"
+    echo -e "${BOLD}VM (base):${RESET}     ${MACOS_BASE_VM}"
+    echo -e "${BOLD}Directory:${RESET}     ${WORKSPACE_DIR}"
+
+    if macos_vm_running "$project_vm"; then
+        local ip
+        ip="$(tart ip "$project_vm" 2>/dev/null || echo '?')"
+        echo -e "${BOLD}Status:${RESET}        ${GREEN}running${RESET}  (${ip})"
+    elif macos_vm_exists "$project_vm"; then
+        echo -e "${BOLD}Status:${RESET}        ${YELLOW}stopped${RESET}"
+    else
+        echo -e "${BOLD}Status:${RESET}        ${RED}not created${RESET}"
+    fi
+    echo ""
+
+    if macos_vm_exists "$MACOS_BASE_VM"; then
+        echo -e "  ${GREEN}✓${RESET} Base VM (${MACOS_BASE_VM})"
+    else
+        echo -e "  ${RED}✗${RESET} Base VM not found"
+        echo -e "    Run: augur build --macos --ipsw <path> --xcode-xip <path>"
+    fi
+
+    echo ""
+    if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]] || [[ -f "$HOME/.claude_code_oauth_token" ]]; then
+        echo -e "  ${GREEN}✓${RESET} Claude (OAuth token)"
+    elif [[ -n "${ANTHROPIC_API_KEY:-}" ]] || [[ -f "$HOME/.anthropic_api_key" ]]; then
+        echo -e "  ${GREEN}✓${RESET} Claude (API key)"
+    elif [[ -f "$HOME/.claude/.credentials.json" ]]; then
+        echo -e "  ${GREEN}✓${RESET} Claude (account auth)"
+    else
+        echo -e "  ${RED}✗${RESET} Claude (not authenticated)"
+    fi
+    if [[ -f "$HOME/.config/gh/hosts.yml" ]]; then
+        echo -e "  ${GREEN}✓${RESET} GitHub CLI (gh) (authenticated)"
+    else
+        echo -e "  ${RED}✗${RESET} GitHub CLI (gh) (run: gh auth login)"
+    fi
+}
+
+cmd_update_macos() {
+    require_tart
+    macos_vm_exists "$MACOS_BASE_VM" || {
+        error "Base VM '${MACOS_BASE_VM}' not found."
+        error "Run: augur build --macos --ipsw <path> --xcode-xip <path>"
+        exit 1
+    }
+    info "Updating CLI tools in base VM '${MACOS_BASE_VM}'..."
+    tart run --no-graphics "$MACOS_BASE_VM" &>/dev/null &
+    local tart_pid=$!
+    macos_vm_ip "$MACOS_BASE_VM" &>/dev/null || {
+        kill "$tart_pid" 2>/dev/null; wait "$tart_pid" 2>/dev/null || true
+        error "VM did not become reachable in time."
+        exit 1
+    }
+    ssh_macos "$MACOS_BASE_VM" '
+        # Claude Code via the official installer (see cmd_build_macos for why npm is avoided).
+        # The base VM has no virtiofs mounts here, so ~/.claude is local and writable.
+        curl -fsSL https://claude.ai/install.sh | bash -s stable
+        grep -q ".local/bin" ~/.zprofile 2>/dev/null || echo '\''export PATH="$HOME/.local/bin:$PATH"'\'' >> ~/.zprofile
+        codesign -dvv "$HOME/.local/bin/claude" 2>&1 | grep -qi "Anthropic" \
+            || echo "augur: WARNING claude binary is not signed by Anthropic" >&2
+    '
+    # Ensure auto-login is set (so `xcodebuild test` can reach testmanagerd) and that full Xcode is
+    # the active developer dir (Homebrew's Command Line Tools can hijack xcode-select). Both let an
+    # existing base VM be fixed without a full rebuild — see cmd_build_macos.
+    ssh_macos "$MACOS_BASE_VM" "
+        echo '00000000: 1ced 3f4a bcbc ba2c caca 4e82' | sudo xxd -r - /etc/kcpassword
+        sudo chmod 600 /etc/kcpassword
+        sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser ${MACOS_SSH_USER}
+        sudo systemsetup -setsleep Off 2>/dev/null || true
+        [ -d /Applications/Xcode.app ] && sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+    "
+    tart stop "$MACOS_BASE_VM" 2>/dev/null || true
+    wait "$tart_pid" 2>/dev/null || true
+    success "CLI tools updated in '${MACOS_BASE_VM}'."
+    warn "Project VMs cloned before this update will not be affected."
+    warn "Run ${BOLD}augur down --macos && augur up --macos${RESET} to apply to the current project."
+}
+
+cmd_version_macos() {
+    require_tart
+    macos_vm_exists "$MACOS_BASE_VM" || {
+        error "Base VM '${MACOS_BASE_VM}' not found."
+        exit 1
+    }
+    echo ""
+    echo -e "  ${BOLD}augur${RESET}  ${CYAN}1.2.0${RESET}  (macOS VM mode)"
+    echo ""
+    echo -e "  ${BOLD}Base VM tool versions:${RESET}"
+    tart run --no-graphics "$MACOS_BASE_VM" &>/dev/null &
+    local tart_pid=$!
+    if macos_vm_ip "$MACOS_BASE_VM" &>/dev/null; then
+        ssh_macos "$MACOS_BASE_VM" '
+            eval "$(/opt/homebrew/bin/brew shellenv)" 2>/dev/null
+            export PATH="$HOME/.local/bin:$PATH"
+            echo "    xcode:  $(xcodebuild -version 2>/dev/null | head -1 || echo "(unable to fetch)")"
+            echo "    claude: $(claude --version 2>/dev/null || echo "(unable to fetch)")"
+        ' || true
+    fi
+    tart stop "$MACOS_BASE_VM" 2>/dev/null || true
+    wait "$tart_pid" 2>/dev/null || true
+    echo ""
+}
+
+# ── Help ──────────────────────────────────────────────────────────────────────
+
 cmd_help() {
     echo ""
-    echo -e "  ${BOLD}augur${RESET} — Run Claude Code, Codex, and Gemini CLI in an isolated Docker container"
+    echo -e "  ${BOLD}augur${RESET} — Run AI coding agents in an isolated environment"
     echo ""
-    echo -e "  ${BOLD}USAGE${RESET}"
+    echo -e "  ${BOLD}DOCKER MODE (default)${RESET}"
     echo -e "    augur ${CYAN}up${RESET}       [--swift VERSION]  Start the container"
     echo -e "    augur ${CYAN}claude${RESET}                     Launch Claude Code"
     echo -e "    augur ${CYAN}codex${RESET}                      Launch Codex"
@@ -302,25 +829,43 @@ cmd_help() {
     echo -e "    augur ${CYAN}shell${RESET}                      Open a bash shell"
     echo -e "    augur ${CYAN}down${RESET}                       Stop and remove the container"
     echo -e "    augur ${CYAN}status${RESET}                     Check status and auth info"
-    echo -e "    augur ${CYAN}update${RESET}  [--swift VERSION]  Rebuild image with latest versions"
     echo -e "    augur ${CYAN}build${RESET}   [--swift VERSION]  Build the Docker image"
-    echo -e "    augur ${CYAN}version${RESET} [--swift VERSION]  Show version information"
-    echo -e "    augur ${CYAN}help${RESET}                       Show this help"
+    echo -e "    augur ${CYAN}update${RESET}  [--swift VERSION]  Rebuild image with latest versions"
+    echo -e "    augur ${CYAN}version${RESET}                    Show version information"
+    echo ""
+    echo -e "  ${BOLD}MACOS VM MODE${RESET}  ${YELLOW}(macOS VM — full Xcode, xcodebuild, Simulator)${RESET}"
+    echo -e "    augur ${CYAN}build${RESET}  --macos --ipsw <path> --xcode-xip <path>  Build base VM (one-time)"
+    echo -e "    augur ${CYAN}up${RESET}     --macos                                   Start project VM"
+    echo -e "    augur ${CYAN}claude${RESET} --macos                                   Launch Claude Code"
+    echo -e "    augur ${CYAN}shell${RESET}  --macos                                   Open bash shell"
+    echo -e "    augur ${CYAN}down${RESET}    --macos                                   Stop the VM (keep the clone)"
+    echo -e "    augur ${CYAN}destroy${RESET} --macos                                   Stop and remove the VM clone"
+    echo -e "    augur ${CYAN}status${RESET}  --macos                                   Check VM status"
+    echo -e "    augur ${CYAN}update${RESET}  --macos                                   Update CLI tools in base VM"
+    echo -e "    augur ${CYAN}version${RESET} --macos                                   Show tool versions in base VM"
     echo ""
     echo -e "  ${BOLD}OPTIONS${RESET}"
-    echo -e "    --swift VERSION    Swift version (default: ${CYAN}latest${RESET})"
+    echo -e "    --swift VERSION    Swift version for Docker mode (default: ${CYAN}latest${RESET})"
+    echo -e "    --macos            Use macOS VM with Xcode instead of Docker"
+    echo -e "    --ipsw <path>      macOS IPSW file  (for: augur build --macos)"
+    echo -e "    --xcode-xip <path> Xcode XIP file   (for: augur build --macos)"
     echo ""
     echo -e "  ${BOLD}ENVIRONMENT${RESET}"
-    echo -e "    ANTHROPIC_API_KEY   Anthropic API key (or ~/.anthropic_api_key)"
-    echo -e "    OPENAI_API_KEY      OpenAI API key (or ~/.openai_api_key)"
-    echo -e "    SWIFT_VERSION       Default Swift version (default: latest)"
+    echo -e "    ANTHROPIC_API_KEY        Anthropic API key (or ~/.anthropic_api_key)"
+    echo -e "    CLAUDE_CODE_OAUTH_TOKEN  Claude subscription token (or ~/.claude_code_oauth_token; run: claude setup-token)"
+    echo -e "    OPENAI_API_KEY           OpenAI API key (or ~/.openai_api_key) — Docker mode"
+    echo -e "    SWIFT_VERSION            Default Swift version (default: latest)"
     echo ""
     echo -e "  ${BOLD}NOTES${RESET}"
-    echo -e "    • Current directory is mounted at /workspace"
-    echo -e "    • ~/.claude, ~/.codex, ~/.gemini, ~/.config/gh are shared with the host"
-    echo -e "    • ~/.gitconfig is mounted read-only"
-    echo -e "    • Auth is shared across all projects via persistent ~/.claude.json"
-    echo -e "    • Run ${BOLD}gh auth login${RESET} on the host once to enable gh inside the container"
+    echo -e "    • Docker mode:   current directory mounted at /workspace (Linux container)"
+    echo -e "    • macOS VM mode: current directory exposed at ~/workspace (macOS VM)"
+    echo -e "    • macOS VM mode requires: tart"
+    echo -e "      brew install cirruslabs/cli/tart"
+    echo -e "    • Docker mode shares ~/.claude, ~/.config/gh, ~/.gitconfig; macOS mode injects"
+    echo -e "      Claude/GitHub credentials via env (see ENVIRONMENT) and copies ~/.gitconfig"
+    echo -e "    • macOS VM mode IPSW + XIP must be downloaded from Apple directly:"
+    echo -e "      IPSW: https://ipsw.me or System Preferences > Software Update"
+    echo -e "      XIP:  https://developer.apple.com/download/all/"
     echo ""
 }
 
@@ -331,13 +876,12 @@ shift || true
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --macos) MACOS_MODE=true; shift ;;
         --swift)
             SWIFT_VERSION="${2:?'--swift requires a version (e.g. --swift 6.0)'}"
             shift 2
             ;;
-        *)
-            break
-            ;;
+        *) break ;;
     esac
 done
 
@@ -345,21 +889,37 @@ SWIFT_IMAGE_TAG="${SWIFT_VERSION:-latest}"
 IMAGE_NAME="augur:swift-${SWIFT_IMAGE_TAG}"
 CONTAINER_NAME="$(make_container_name)"
 
-case "$COMMAND" in
-    up)             cmd_up ;;
-    claude)         cmd_claude ;;
-    codex)          cmd_codex ;;
-    gemini)         cmd_gemini ;;
-    shell)          cmd_shell ;;
-    down)           cmd_down ;;
-    status)         cmd_status ;;
-    update)         cmd_update ;;
-    version)        cmd_version ;;
-    build)          cmd_build ;;
-    help|--help|-h) cmd_help ;;
-    *)
-        error "Unknown command: '$COMMAND'"
-        cmd_help
-        exit 1
-        ;;
-esac
+if $MACOS_MODE; then
+    case "$COMMAND" in
+        build)          cmd_build_macos "$@" ;;
+        up)             cmd_up_macos ;;
+        claude)         cmd_claude_macos ;;
+        shell)          cmd_shell_macos ;;
+        down)           cmd_down_macos ;;
+        destroy)        cmd_destroy_macos ;;
+        status)         cmd_status_macos ;;
+        update)         cmd_update_macos ;;
+        version)        cmd_version_macos ;;
+        help|--help|-h) cmd_help ;;
+        *) error "Unknown command: '$COMMAND'"; cmd_help; exit 1 ;;
+    esac
+else
+    case "$COMMAND" in
+        up)             cmd_up ;;
+        claude)         cmd_claude ;;
+        codex)          cmd_codex ;;
+        gemini)         cmd_gemini ;;
+        shell)          cmd_shell ;;
+        down)           cmd_down ;;
+        status)         cmd_status ;;
+        update)         cmd_update ;;
+        version)        cmd_version ;;
+        build)          cmd_build ;;
+        help|--help|-h) cmd_help ;;
+        *)
+            error "Unknown command: '$COMMAND'"
+            cmd_help
+            exit 1
+            ;;
+    esac
+fi
