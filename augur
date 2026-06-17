@@ -202,18 +202,12 @@ cmd_up() {
         -w /workspace
     )
 
-    local anthropic_key openai_key gemini_key
+    local anthropic_key
     anthropic_key="$(resolve_api_key "${ANTHROPIC_API_KEY:-}" "$HOME/.anthropic_api_key")"
-    openai_key="$(resolve_api_key "${OPENAI_API_KEY:-}" "$HOME/.openai_api_key")"
-    gemini_key="$(resolve_api_key "${GEMINI_API_KEY:-}" "$HOME/.gemini_api_key")"
     [[ -n "$anthropic_key" ]] && docker_args+=(-e "ANTHROPIC_API_KEY=${anthropic_key}")
-    [[ -n "$openai_key" ]]    && docker_args+=(-e "OPENAI_API_KEY=${openai_key}")
-    [[ -n "$gemini_key" ]]    && docker_args+=(-e "GEMINI_API_KEY=${gemini_key}")
 
-    mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.gemini"
+    mkdir -p "$HOME/.claude"
     docker_args+=(-v "${HOME}/.claude:/home/dev/.claude")
-    docker_args+=(-v "${HOME}/.codex:/home/dev/.codex")
-    docker_args+=(-v "${HOME}/.gemini:/home/dev/.gemini")
 
     # Claude Code stores config (oauthAccount, onboarding state) in ~/.claude.json
     # (separate from ~/.claude/ directory). Persist it so re-login isn't required.
@@ -236,8 +230,6 @@ cmd_up() {
     success "Container '${CONTAINER_NAME}' is up."
     echo ""
     echo -e "  ${BOLD}augur claude${RESET}  → Launch Claude Code"
-    echo -e "  ${BOLD}augur codex${RESET}   → Launch Codex"
-    echo -e "  ${BOLD}augur gemini${RESET}  → Launch Gemini CLI"
     echo -e "  ${BOLD}augur shell${RESET}   → Open bash shell"
     echo -e "  ${BOLD}augur down${RESET}    → Stop and remove"
 }
@@ -247,20 +239,6 @@ cmd_claude() {
     ensure_running
     info "Launching Claude Code in '${CONTAINER_NAME}'..."
     docker exec -it -e DISABLE_AUTOUPDATER=1 "$CONTAINER_NAME" claude
-}
-
-cmd_codex() {
-    require_docker
-    ensure_running
-    info "Launching Codex in '${CONTAINER_NAME}'..."
-    docker exec -it "$CONTAINER_NAME" codex
-}
-
-cmd_gemini() {
-    require_docker
-    ensure_running
-    info "Launching Gemini CLI in '${CONTAINER_NAME}'..."
-    docker exec -it "$CONTAINER_NAME" gemini
 }
 
 cmd_shell() {
@@ -305,20 +283,6 @@ cmd_status() {
     else
         echo -e "  ${RED}✗${RESET} Claude (not authenticated)"
     fi
-    if [[ -n "${OPENAI_API_KEY:-}" ]] || [[ -f "$HOME/.openai_api_key" ]]; then
-        echo -e "  ${GREEN}✓${RESET} Codex (API key)"
-    elif [[ -f "$HOME/.codex/auth.json" ]]; then
-        echo -e "  ${GREEN}✓${RESET} Codex (account auth)"
-    else
-        echo -e "  ${RED}✗${RESET} Codex (not authenticated)"
-    fi
-    if [[ -n "${GEMINI_API_KEY:-}" ]] || [[ -f "$HOME/.gemini_api_key" ]]; then
-        echo -e "  ${GREEN}✓${RESET} Gemini (API key)"
-    elif [[ -f "$HOME/.gemini/oauth_creds.json" ]]; then
-        echo -e "  ${GREEN}✓${RESET} Gemini (account auth)"
-    else
-        echo -e "  ${RED}✗${RESET} Gemini (not authenticated)"
-    fi
     if [[ -f "$HOME/.config/gh/hosts.yml" ]]; then
         echo -e "  ${GREEN}✓${RESET} GitHub CLI (gh) (authenticated)"
     else
@@ -344,7 +308,6 @@ cmd_version() {
     echo -e "  ${BOLD}Container tool versions:${RESET}"
     docker run --rm "$IMAGE_NAME" swift --version 2>/dev/null || echo "    swift:  (unable to fetch)"
     docker run --rm "$IMAGE_NAME" claude --version 2>/dev/null || echo "    claude: (unable to fetch)"
-    docker run --rm "$IMAGE_NAME" codex --version 2>/dev/null || echo "    codex:  (unable to fetch)"
     docker run --rm "$IMAGE_NAME" gh --version 2>/dev/null | head -1 || echo "    gh:     (unable to fetch)"
     echo ""
 }
@@ -848,8 +811,6 @@ cmd_help() {
     echo -e "  ${BOLD}DOCKER MODE (default)${RESET}"
     echo -e "    augur ${CYAN}up${RESET}       [--swift VERSION]  Start the container"
     echo -e "    augur ${CYAN}claude${RESET}                     Launch Claude Code"
-    echo -e "    augur ${CYAN}codex${RESET}                      Launch Codex"
-    echo -e "    augur ${CYAN}gemini${RESET}                     Launch Gemini CLI"
     echo -e "    augur ${CYAN}shell${RESET}                      Open a bash shell"
     echo -e "    augur ${CYAN}down${RESET}                       Stop and remove the container"
     echo -e "    augur ${CYAN}status${RESET}                     Check status and auth info"
@@ -879,7 +840,6 @@ cmd_help() {
     echo -e "  ${BOLD}ENVIRONMENT${RESET}"
     echo -e "    ANTHROPIC_API_KEY        Anthropic API key (or ~/.anthropic_api_key)"
     echo -e "    CLAUDE_CODE_OAUTH_TOKEN  Claude subscription token (or ~/.claude_code_oauth_token; run: claude setup-token)"
-    echo -e "    OPENAI_API_KEY           OpenAI API key (or ~/.openai_api_key) — Docker mode"
     echo -e "    SWIFT_VERSION            Default Swift version (default: latest)"
     echo ""
     echo -e "  ${BOLD}NOTES${RESET}"
@@ -933,8 +893,6 @@ else
     case "$COMMAND" in
         up)             cmd_up ;;
         claude)         cmd_claude ;;
-        codex)          cmd_codex ;;
-        gemini)         cmd_gemini ;;
         shell)          cmd_shell ;;
         down)           cmd_down ;;
         status)         cmd_status ;;

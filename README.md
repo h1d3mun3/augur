@@ -6,7 +6,7 @@
   <img src="resources/auger.png" alt="augur" width="320">
 </p>
 
-Run Claude Code, Codex CLI, and Gemini CLI in an isolated environment.
+Run Claude Code in an isolated environment.
 Works in any directory — only the current directory is exposed to the container or VM.
 
 Two modes are available:
@@ -48,8 +48,6 @@ cd ~/projects/my-app
 
 augur up        # start the container
 augur claude    # launch Claude Code
-augur codex     # launch Codex
-augur gemini    # launch Gemini CLI
 augur shell     # open a bash shell (for debugging)
 augur down      # stop and remove the container
 augur status    # show status and auth info
@@ -64,8 +62,6 @@ augur version   # show tool versions
 |------|-------------|
 | Current directory | mounted at `/workspace` (read/write) |
 | `~/.claude/` | shared (Claude auth and settings) |
-| `~/.codex/` | shared (Codex auth, settings, history) |
-| `~/.gemini/` | shared (Gemini auth and settings) |
 | `~/.config/gh/` | shared (GitHub CLI auth) |
 | `~/.gitconfig` | mounted read-only |
 | Everything else | **not visible to the container** |
@@ -191,20 +187,16 @@ If builds are flaky from the shared mount (virtiofs is not tuned for heavy I/O �
 
 ## API keys and authentication
 
-Set whichever keys you need. Add to `~/.zshrc`:
+Set the key you need. Add to `~/.zshrc`:
 
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."   # for Claude Code
-export OPENAI_API_KEY="sk-..."          # for Codex
-export GEMINI_API_KEY="..."             # for Gemini CLI
 ```
 
-Alternatively, place the key in a file (`~/.anthropic_api_key`, `~/.openai_api_key`, `~/.gemini_api_key`).
+Alternatively, place the key in a file (`~/.anthropic_api_key`).
 
 **Account-based auth** (no API key needed):
 - **Claude Code**: run `augur claude` — prompts for login on first use
-- **Gemini CLI**: run `augur gemini` — displays a URL for browser-based OAuth
-- **Codex**: run `augur codex` — prompts for login on first use
 
 **GitHub CLI:**
 

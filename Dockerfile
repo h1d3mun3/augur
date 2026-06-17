@@ -21,7 +21,7 @@ RUN useradd -m -u 1001 -s /bin/bash dev \
     && echo "dev ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 
 # Install CLI tools
-RUN npm install -g @anthropic-ai/claude-code @openai/codex @google/gemini-cli
+RUN npm install -g @anthropic-ai/claude-code
 
 WORKDIR /workspace
 USER dev
