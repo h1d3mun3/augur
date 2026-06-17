@@ -1,5 +1,9 @@
 # augur
 
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-0c90b4.svg" alt="License: MIT"></a>
+</p>
+
 Run Claude Code, Codex CLI, and Gemini CLI in an isolated environment.
 Works in any directory — only the current directory is exposed to the container or VM.
 
