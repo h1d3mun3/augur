@@ -1,9 +1,9 @@
-<p align="center">
-  <img src="resources/auger.png" alt="augur" width="320">
+<p align="left">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-0c90b4.svg" alt="License: MIT"></a>
 </p>
 
 <p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-0c90b4.svg" alt="License: MIT"></a>
+  <img src="resources/auger.png" alt="augur" width="320">
 </p>
 
 Run Claude Code, Codex CLI, and Gemini CLI in an isolated environment.
