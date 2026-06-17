@@ -1,4 +1,6 @@
-# augur
+<p align="center">
+  <img src="resources/auger.png" alt="augur" width="320">
+</p>
 
 Run Claude Code, Codex CLI, and Gemini CLI in an isolated environment.
 Works in any directory — only the current directory is exposed to the container or VM.
