@@ -354,11 +354,12 @@ cmd_version() {
 cmd_build_macos() {
     require_tart
 
-    local ipsw_path="" xcode_xip_path=""
+    local ipsw_path="" xcode_xip_path="" platforms="iOS"
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --ipsw)      ipsw_path="${2:?'--ipsw requires a file path'}";           shift 2 ;;
             --xcode-xip) xcode_xip_path="${2:?'--xcode-xip requires a file path'}"; shift 2 ;;
+            --platforms) platforms="${2:?'--platforms requires a value'}";          shift 2 ;;
             *) error "Unknown option: $1"; exit 1 ;;
         esac
     done
@@ -367,6 +368,15 @@ cmd_build_macos() {
     [[ -f "$ipsw_path" ]]      || { error "IPSW not found: ${ipsw_path}";    exit 1; }
     [[ -n "$xcode_xip_path" ]] || { error "--xcode-xip <path> is required."; exit 1; }
     [[ -f "$xcode_xip_path" ]] || { error "XIP not found: ${xcode_xip_path}"; exit 1; }
+
+    # Simulator runtimes to bake into the base VM. `all` pulls every platform Xcode offers;
+    # otherwise a comma-separated list (e.g. "iOS,watchOS"). Default: iOS only.
+    local -a platform_list=()
+    if [[ "$platforms" == "all" ]]; then
+        platform_list=(all)
+    else
+        IFS=',' read -ra platform_list <<< "$platforms"
+    fi
 
     # Step 1: Warn if base VM already exists
     if macos_vm_exists "$MACOS_BASE_VM"; then
@@ -490,6 +500,20 @@ cmd_build_macos() {
 
     info "Running Xcode first launch..."
     ssh_macos "$MACOS_BUILD_VM" "sudo xcodebuild -runFirstLaunch"
+
+    # Installing Xcode from a XIP does NOT bundle Simulator runtimes — Xcode 15+ ships them as
+    # separate downloadable components, so -runFirstLaunch alone leaves the VM without any
+    # simulator platform. Pull the requested platforms into the base VM so every clone has them
+    # (installing later into a clone would not persist and would re-download per project).
+    if [[ "${platform_list[0]}" == "all" ]]; then
+        info "Downloading all Simulator platforms — this takes a while (many GB)..."
+        ssh_macos "$MACOS_BUILD_VM" "sudo xcodebuild -downloadAllPlatforms"
+    else
+        for platform in "${platform_list[@]}"; do
+            info "Downloading ${platform} platform (Simulator runtime) — this takes a while (several GB)..."
+            ssh_macos "$MACOS_BUILD_VM" "sudo xcodebuild -downloadPlatform '${platform}'"
+        done
+    fi
 
     # Step 6: Install CLI tools (Homebrew + Claude Code)
     info "Installing Homebrew and CLI tools..."
@@ -834,7 +858,7 @@ cmd_help() {
     echo -e "    augur ${CYAN}version${RESET}                    Show version information"
     echo ""
     echo -e "  ${BOLD}MACOS VM MODE${RESET}  ${YELLOW}(macOS VM — full Xcode, xcodebuild, Simulator)${RESET}"
-    echo -e "    augur ${CYAN}build${RESET}  --macos --ipsw <path> --xcode-xip <path>  Build base VM (one-time)"
+    echo -e "    augur ${CYAN}build${RESET}  --macos --ipsw <path> --xcode-xip <path> [--platforms <list>]  Build base VM (one-time)"
     echo -e "    augur ${CYAN}up${RESET}     --macos                                   Start project VM"
     echo -e "    augur ${CYAN}claude${RESET} --macos                                   Launch Claude Code"
     echo -e "    augur ${CYAN}shell${RESET}  --macos                                   Open bash shell"
@@ -849,6 +873,8 @@ cmd_help() {
     echo -e "    --macos            Use macOS VM with Xcode instead of Docker"
     echo -e "    --ipsw <path>      macOS IPSW file  (for: augur build --macos)"
     echo -e "    --xcode-xip <path> Xcode XIP file   (for: augur build --macos)"
+    echo -e "    --platforms <list> Simulator platforms to bake into the base VM (for: augur build --macos)"
+    echo -e "                       default: ${CYAN}iOS${RESET} — comma-separated (e.g. ${CYAN}iOS,watchOS${RESET}) or ${CYAN}all${RESET}"
     echo ""
     echo -e "  ${BOLD}ENVIRONMENT${RESET}"
     echo -e "    ANTHROPIC_API_KEY        Anthropic API key (or ~/.anthropic_api_key)"
