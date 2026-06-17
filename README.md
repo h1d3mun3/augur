@@ -16,8 +16,8 @@ Two modes are available:
 | **Isolation** | Linux container | macOS VM (Apple Virtualization Framework) |
 | **Xcode / xcodebuild** | ✗ | ✓ |
 | **iOS Simulator** | ✗ | ✓ |
-| **Setup time** | ~5 min (image build) | ~60 min (VM build) |
-| **Disk usage** | ~2 GB | ~60 GB+ |
+| **Setup time** | ~5 min (image build) | ~75 min (VM build) |
+| **Disk usage** | ~2 GB | ~70 GB+ |
 | **Requires** | Docker | tart, IPSW, Xcode XIP |
 
 ---
@@ -95,7 +95,7 @@ brew install cirruslabs/cli/tart
 - **IPSW** — macOS restore image: https://ipsw.me or System Preferences > Software Update
 - **Xcode XIP** — Xcode installer: https://developer.apple.com/download/all/
 
-#### 3. Build the base VM (one-time, ~60 min)
+#### 3. Build the base VM (one-time, ~75 min)
 
 ```bash
 augur build --macos --ipsw ~/Downloads/macOS.ipsw --xcode-xip ~/Downloads/Xcode.xip
@@ -105,7 +105,19 @@ This will:
 1. Create a macOS VM from your IPSW (`tart create --from-ipsw`)
 2. Open the VM window for manual Setup Assistant completion (credentials: `admin` / `admin`, Remote Login enabled)
 3. Install Xcode, Homebrew, Node.js, and Claude Code
-4. Save the result as a reusable base VM (`augur-macos-base`)
+4. Download the iOS Simulator runtime (Xcode installed from a XIP does not bundle it)
+5. Save the result as a reusable base VM (`augur-macos-base`)
+
+By default only the **iOS** Simulator runtime is baked in. Use `--platforms` to bake in others —
+baking them into the base VM means every project clone gets them without re-downloading:
+
+```bash
+# iOS + watchOS
+augur build --macos --ipsw ... --xcode-xip ... --platforms iOS,watchOS
+
+# every platform Xcode offers (watchOS, tvOS, visionOS, …) — many extra GB
+augur build --macos --ipsw ... --xcode-xip ... --platforms all
+```
 
 > **Supply chain note:** The base VM is built entirely from Apple-signed assets (IPSW + Xcode XIP).
 > No third-party automation scripts are used.
