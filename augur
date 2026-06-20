@@ -26,6 +26,9 @@ MACOS_BUILD_VM="augur-macos-build"
 MACOS_SSH_USER="admin"
 MACOS_SSH_KEY="$HOME/.augur/vm_key"
 
+# macOS VM backend binary (augur-vm, built from ./augur-vm). Override with AUGUR_VM_BIN.
+AUGUR_VM_BIN="${AUGUR_VM_BIN:-}"
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 info()    { echo -e "${CYAN}[augur]${RESET} $*"; }
@@ -105,12 +108,29 @@ resolve_api_key() {
 
 # ── macOS VM mode helpers ─────────────────────────────────────────────────────
 
-require_tart() {
-    command -v tart &>/dev/null || {
-        error "Tart is not installed."
-        error "Install with: brew install cirruslabs/cli/tart"
+# Resolve the augur-vm binary (the macOS VM backend): an explicit override, then
+# PATH, then the install dir, then a local release build.
+resolve_vm_cli() {
+    if [[ -n "$AUGUR_VM_BIN" ]]; then echo "$AUGUR_VM_BIN"; return; fi
+    if command -v augur-vm &>/dev/null; then command -v augur-vm; return; fi
+    local c
+    for c in "$SCRIPT_DIR/augur-vm" "$SCRIPT_DIR/augur-vm/.build/release/augur-vm"; do
+        [[ -f "$c" && -x "$c" ]] && { echo "$c"; return; }
+    done
+    echo "augur-vm"
+}
+VM_CLI="$(resolve_vm_cli)"
+
+require_vz() {
+    if [[ "$(uname)" != "Darwin" ]]; then
+        error "macOS VM mode requires macOS (Apple Silicon)."
         exit 1
-    }
+    fi
+    if ! command -v "$VM_CLI" &>/dev/null && [[ ! -x "$VM_CLI" ]]; then
+        error "augur-vm (the macOS VM backend) was not found."
+        error "Build it on macOS: ${BOLD}bash install${RESET}  (or: cd augur-vm && scripts/build.sh)"
+        exit 1
+    fi
 }
 
 macos_project_vm() {
@@ -120,18 +140,18 @@ macos_project_vm() {
 }
 
 macos_vm_exists() {
-    tart list 2>/dev/null | awk 'NR>1 {print $2}' | grep -qx "$1"
+    "$VM_CLI" list 2>/dev/null | awk 'NR>1 {print $2}' | grep -qx "$1"
 }
 
 macos_vm_running() {
-    tart list 2>/dev/null | awk 'NR>1 {print $2, $NF}' | grep -qx "${1} running"
+    "$VM_CLI" list 2>/dev/null | awk 'NR>1 {print $2, $NF}' | grep -qx "${1} running"
 }
 
 # Poll until VM IP is available (boot takes ~30s); prints IP on success
 macos_vm_ip() {
     local vm="$1" ip
     for _ in {1..30}; do
-        ip=$(tart ip "$vm" 2>/dev/null) && [[ -n "$ip" ]] && { echo "$ip"; return 0; }
+        ip=$("$VM_CLI" ip "$vm" 2>/dev/null) && [[ -n "$ip" ]] && { echo "$ip"; return 0; }
         sleep 3
     done
     return 1
@@ -140,7 +160,7 @@ macos_vm_ip() {
 ssh_macos() {
     local vm="$1"; shift
     local ip
-    ip="$(tart ip "$vm" 2>/dev/null)" || { error "Cannot get IP for '${vm}'."; exit 1; }
+    ip="$("$VM_CLI" ip "$vm" 2>/dev/null)" || { error "Cannot get IP for '${vm}'."; exit 1; }
     local key_opts=()
     if [[ -f "$MACOS_SSH_KEY" ]]; then
         key_opts=(-i "$MACOS_SSH_KEY" -o PasswordAuthentication=no -o BatchMode=yes)
@@ -156,7 +176,7 @@ ssh_macos() {
 scp_to_macos() {
     local vm="$1" src="$2" dst="$3"
     local ip
-    ip="$(tart ip "$vm" 2>/dev/null)" || { error "Cannot get IP for '${vm}'."; exit 1; }
+    ip="$("$VM_CLI" ip "$vm" 2>/dev/null)" || { error "Cannot get IP for '${vm}'."; exit 1; }
     local key_opts=()
     if [[ -f "$MACOS_SSH_KEY" ]]; then
         key_opts=(-i "$MACOS_SSH_KEY" -o PasswordAuthentication=no -o BatchMode=yes)
@@ -315,7 +335,7 @@ cmd_version() {
 # ── macOS VM mode commands ────────────────────────────────────────────────────
 
 cmd_build_macos() {
-    require_tart
+    require_vz
 
     local ipsw_path="" xcode_xip_path="" platforms="iOS"
     while [[ $# -gt 0 ]]; do
@@ -346,25 +366,25 @@ cmd_build_macos() {
         warn "Existing base VM '${MACOS_BASE_VM}' will be replaced."
         read -rp "$(echo -e "${CYAN}[augur]${RESET} Continue? [y/N] ")" yn
         [[ "$yn" == [yY] ]] || { info "Aborted."; exit 0; }
-        macos_vm_running "$MACOS_BASE_VM" && tart stop "$MACOS_BASE_VM" 2>/dev/null || true
-        tart delete "$MACOS_BASE_VM"
+        macos_vm_running "$MACOS_BASE_VM" && "$VM_CLI" stop "$MACOS_BASE_VM" 2>/dev/null || true
+        "$VM_CLI" delete "$MACOS_BASE_VM"
     fi
     if macos_vm_exists "$MACOS_BUILD_VM"; then
-        macos_vm_running "$MACOS_BUILD_VM" && tart stop "$MACOS_BUILD_VM" 2>/dev/null || true
-        tart delete "$MACOS_BUILD_VM"
+        macos_vm_running "$MACOS_BUILD_VM" && "$VM_CLI" stop "$MACOS_BUILD_VM" 2>/dev/null || true
+        "$VM_CLI" delete "$MACOS_BUILD_VM"
     fi
 
     trap '
         if macos_vm_exists "$MACOS_BUILD_VM"; then
-            macos_vm_running "$MACOS_BUILD_VM" && tart stop "$MACOS_BUILD_VM" 2>/dev/null || true
-            tart delete "$MACOS_BUILD_VM" 2>/dev/null || true
+            macos_vm_running "$MACOS_BUILD_VM" && "$VM_CLI" stop "$MACOS_BUILD_VM" 2>/dev/null || true
+            "$VM_CLI" delete "$MACOS_BUILD_VM" 2>/dev/null || true
         fi
     ' EXIT
 
     # Step 2: Create VM from IPSW
     info "Creating VM from IPSW — this takes 15–30 minutes..."
-    tart create "$MACOS_BUILD_VM" --from-ipsw "$(realpath "$ipsw_path")" --disk-size 120
-    tart set "$MACOS_BUILD_VM" --cpu 4 --memory 8192
+    "$VM_CLI" create "$MACOS_BUILD_VM" --from-ipsw "$(realpath "$ipsw_path")" --disk-size 120
+    "$VM_CLI" set "$MACOS_BUILD_VM" --cpu 4 --memory 8192
 
     # Step 3: Run with GUI for manual Setup Assistant completion
     echo ""
@@ -382,20 +402,20 @@ cmd_build_macos() {
     echo -e "${BOLD}─────────────────────────────────────────────────────────────────────────────${RESET}"
     echo ""
     read -rp "$(echo -e "${CYAN}[augur]${RESET} Press Enter to open the VM window...")"
-    tart run "$MACOS_BUILD_VM"
+    "$VM_CLI" run "$MACOS_BUILD_VM"
 
     read -rp "$(echo -e "${CYAN}[augur]${RESET} Remote Login enabled? Ready to continue? [y/N] ")" yn
     [[ "$yn" == [yY] ]] || { info "Aborted."; exit 0; }
 
     # Step 4: Restart headlessly and wait for SSH
     info "Restarting VM headlessly..."
-    tart run --no-graphics "$MACOS_BUILD_VM" &>/dev/null &
-    local tart_pid=$!
+    "$VM_CLI" run --no-graphics "$MACOS_BUILD_VM" &>/dev/null &
+    local vm_pid=$!
 
     info "Waiting for SSH..."
     local vm_ip
     vm_ip="$(macos_vm_ip "$MACOS_BUILD_VM")" || {
-        kill "$tart_pid" 2>/dev/null; wait "$tart_pid" 2>/dev/null || true
+        kill "$vm_pid" 2>/dev/null; wait "$vm_pid" 2>/dev/null || true
         error "VM did not become reachable. Check that Remote Login is enabled."
         exit 1
     }
@@ -426,7 +446,7 @@ cmd_build_macos() {
          echo '$(cat "${MACOS_SSH_KEY}.pub")' >> ~/.ssh/authorized_keys && \
          chmod 600 ~/.ssh/authorized_keys"
 
-    # NOTE: the workspace is exposed at ~/workspace (a symlink to Tart's auto-mount under
+    # NOTE: the workspace is exposed at ~/workspace (a symlink to the virtiofs auto-mount under
     # "/Volumes/My Shared Files/"), created at runtime by ensure_macos_workspace — no
     # /etc/synthetic.conf / mount_virtiofs needed (the sealed root cannot host a runtime symlink).
 
@@ -502,11 +522,11 @@ cmd_build_macos() {
 
     # Step 7: Save as base VM
     info "Saving base VM '${MACOS_BASE_VM}'..."
-    tart stop "$MACOS_BUILD_VM" 2>/dev/null || true
-    wait "$tart_pid" 2>/dev/null || true
+    "$VM_CLI" stop "$MACOS_BUILD_VM" 2>/dev/null || true
+    wait "$vm_pid" 2>/dev/null || true
 
-    tart clone "$MACOS_BUILD_VM" "$MACOS_BASE_VM"
-    tart delete "$MACOS_BUILD_VM"
+    "$VM_CLI" clone "$MACOS_BUILD_VM" "$MACOS_BASE_VM"
+    "$VM_CLI" delete "$MACOS_BUILD_VM"
     trap - EXIT
 
     success "macOS base VM '${MACOS_BASE_VM}' is ready."
@@ -516,14 +536,14 @@ cmd_build_macos() {
     echo ""
 }
 
-# Poll until SSH is actually accepting connections (tart ip returning an IP does not guarantee
+# Poll until SSH is actually accepting connections (the VM having an IP does not guarantee
 # the SSH daemon is ready). Waits up to ~2 min (40 × 3s). Prints the IP on success.
 wait_for_macos_ssh() {
     local vm="$1"
     local ip retries=40 key_opts=()
     [[ -f "$MACOS_SSH_KEY" ]] && key_opts=(-i "$MACOS_SSH_KEY" -o PasswordAuthentication=no -o BatchMode=yes)
     while ((retries-- > 0)); do
-        ip="$(tart ip "$vm" 2>/dev/null)" && [[ -n "$ip" ]] && \
+        ip="$("$VM_CLI" ip "$vm" 2>/dev/null)" && [[ -n "$ip" ]] && \
             ssh -o StrictHostKeyChecking=no \
                 -o UserKnownHostsFile=/dev/null \
                 -o LogLevel=ERROR \
@@ -535,8 +555,8 @@ wait_for_macos_ssh() {
     return 1
 }
 
-# Expose the shared workspace inside the VM. Tart auto-mounts every --dir share (read-write,
-# owned by the guest user) under "/Volumes/My Shared Files/<name>". There is NO per-name virtiofs
+# Expose the shared workspace inside the VM. The virtiofs automount tag mounts every --dir share
+# (read-write, owned by the guest user) under "/Volumes/My Shared Files/<name>". There is NO per-name virtiofs
 # tag, so `mount_virtiofs workspace /workspace` silently fails — that was the "/workspace is empty"
 # bug. We just symlink the auto-mounted share to a stable path. The sealed system volume cannot
 # host a runtime symlink at /workspace (read-only), so we use ~/workspace. Idempotent.
@@ -578,7 +598,7 @@ ensure_macos_xcode_select() {
 }
 
 cmd_up_macos() {
-    require_tart
+    require_vz
     local project_vm
     project_vm="$(macos_project_vm)"
 
@@ -595,13 +615,13 @@ cmd_up_macos() {
 
     if ! macos_vm_exists "$project_vm"; then
         info "Cloning base VM to '${project_vm}'..."
-        tart clone "$MACOS_BASE_VM" "$project_vm"
+        "$VM_CLI" clone "$MACOS_BASE_VM" "$project_vm"
     fi
 
     mkdir -p "$HOME/.config/gh"
     info "Starting VM '${project_vm}'..."
     info "Mounting: ${BOLD}${WORKSPACE_DIR}${RESET} → ~/workspace"
-    tart run --no-graphics \
+    "$VM_CLI" run --no-graphics \
         --dir="workspace:${WORKSPACE_DIR}" \
         --dir="gh-config:${HOME}/.config/gh" \
         "$project_vm" &>/dev/null &
@@ -625,7 +645,7 @@ cmd_up_macos() {
         scp_to_macos "$project_vm" "$HOME/.gitconfig" "/Users/${MACOS_SSH_USER}/.gitconfig"
 
     # Write credentials to ~/.augur-env (sourced from ~/.zshenv for all zsh sessions). This is
-    # how Claude auth survives a fresh `tart clone` and works over SSH: the macOS Keychain is
+    # how Claude auth survives a fresh VM clone and works over SSH: the macOS Keychain is
     # unreadable over SSH, so we inject a token via the environment instead.
     # Precedence (official): ANTHROPIC_API_KEY > CLAUDE_CODE_OAUTH_TOKEN — if both are set the
     # API key wins. Provide either via env or a file (~/.anthropic_api_key / ~/.claude_code_oauth_token).
@@ -659,7 +679,7 @@ cmd_up_macos() {
 }
 
 cmd_claude_macos() {
-    require_tart
+    require_vz
     local project_vm
     project_vm="$(macos_project_vm)"
     macos_vm_running "$project_vm" || cmd_up_macos
@@ -671,7 +691,7 @@ cmd_claude_macos() {
 }
 
 cmd_shell_macos() {
-    require_tart
+    require_vz
     local project_vm
     project_vm="$(macos_project_vm)"
     macos_vm_running "$project_vm" || cmd_up_macos
@@ -682,7 +702,7 @@ cmd_shell_macos() {
 }
 
 cmd_down_macos() {
-    require_tart
+    require_vz
     local project_vm
     project_vm="$(macos_project_vm)"
     if ! macos_vm_exists "$project_vm"; then
@@ -690,14 +710,14 @@ cmd_down_macos() {
         return 0
     fi
     info "Stopping VM '${project_vm}'..."
-    tart stop "$project_vm" 2>/dev/null || true
+    "$VM_CLI" stop "$project_vm" 2>/dev/null || true
     success "VM '${project_vm}' stopped (clone kept; CoW so it costs ~0 on disk)."
     echo -e "  ${BOLD}augur up --macos${RESET}      → restart it (fast, no re-clone)"
     echo -e "  ${BOLD}augur destroy --macos${RESET} → remove the clone entirely"
 }
 
 cmd_destroy_macos() {
-    require_tart
+    require_vz
     local project_vm
     project_vm="$(macos_project_vm)"
     if ! macos_vm_exists "$project_vm"; then
@@ -705,13 +725,13 @@ cmd_destroy_macos() {
         return 0
     fi
     info "Stopping and removing VM '${project_vm}'..."
-    tart stop "$project_vm" 2>/dev/null || true
-    tart delete "$project_vm"
+    "$VM_CLI" stop "$project_vm" 2>/dev/null || true
+    "$VM_CLI" delete "$project_vm"
     success "VM '${project_vm}' has been removed."
 }
 
 cmd_status_macos() {
-    require_tart
+    require_vz
     local project_vm
     project_vm="$(macos_project_vm)"
 
@@ -721,7 +741,7 @@ cmd_status_macos() {
 
     if macos_vm_running "$project_vm"; then
         local ip
-        ip="$(tart ip "$project_vm" 2>/dev/null || echo '?')"
+        ip="$("$VM_CLI" ip "$project_vm" 2>/dev/null || echo '?')"
         echo -e "${BOLD}Status:${RESET}        ${GREEN}running${RESET}  (${ip})"
     elif macos_vm_exists "$project_vm"; then
         echo -e "${BOLD}Status:${RESET}        ${YELLOW}stopped${RESET}"
@@ -754,18 +774,43 @@ cmd_status_macos() {
     fi
 }
 
+cmd_list_macos() {
+    require_vz
+    local rows
+    rows="$("$VM_CLI" list 2>/dev/null | awk 'NR>1 {print $2, $NF}')"
+    if [[ -z "$rows" ]]; then
+        info "No macOS VMs found."
+        echo -e "  Create one with: ${BOLD}augur build --macos --ipsw <path> --xcode-xip <path>${RESET}"
+        return
+    fi
+
+    echo -e "  ${BOLD}$(printf '%-28s %-10s %s' NAME STATE IP)${RESET}"
+    local name state ip color
+    while read -r name state; do
+        [[ -z "$name" ]] && continue
+        if [[ "$state" == "running" ]]; then
+            ip="$("$VM_CLI" ip "$name" 2>/dev/null || echo '-')"
+            color="$GREEN"
+        else
+            ip="-"
+            color="$YELLOW"
+        fi
+        echo -e "  $(printf '%-28s' "$name") ${color}$(printf '%-10s' "$state")${RESET}${ip}"
+    done <<< "$rows"
+}
+
 cmd_update_macos() {
-    require_tart
+    require_vz
     macos_vm_exists "$MACOS_BASE_VM" || {
         error "Base VM '${MACOS_BASE_VM}' not found."
         error "Run: augur build --macos --ipsw <path> --xcode-xip <path>"
         exit 1
     }
     info "Updating CLI tools in base VM '${MACOS_BASE_VM}'..."
-    tart run --no-graphics "$MACOS_BASE_VM" &>/dev/null &
-    local tart_pid=$!
+    "$VM_CLI" run --no-graphics "$MACOS_BASE_VM" &>/dev/null &
+    local vm_pid=$!
     macos_vm_ip "$MACOS_BASE_VM" &>/dev/null || {
-        kill "$tart_pid" 2>/dev/null; wait "$tart_pid" 2>/dev/null || true
+        kill "$vm_pid" 2>/dev/null; wait "$vm_pid" 2>/dev/null || true
         error "VM did not become reachable in time."
         exit 1
     }
@@ -787,15 +832,15 @@ cmd_update_macos() {
         sudo systemsetup -setsleep Off 2>/dev/null || true
         [ -d /Applications/Xcode.app ] && sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
     "
-    tart stop "$MACOS_BASE_VM" 2>/dev/null || true
-    wait "$tart_pid" 2>/dev/null || true
+    "$VM_CLI" stop "$MACOS_BASE_VM" 2>/dev/null || true
+    wait "$vm_pid" 2>/dev/null || true
     success "CLI tools updated in '${MACOS_BASE_VM}'."
     warn "Project VMs cloned before this update will not be affected."
     warn "Run ${BOLD}augur down --macos && augur up --macos${RESET} to apply to the current project."
 }
 
 cmd_version_macos() {
-    require_tart
+    require_vz
     macos_vm_exists "$MACOS_BASE_VM" || {
         error "Base VM '${MACOS_BASE_VM}' not found."
         exit 1
@@ -804,8 +849,8 @@ cmd_version_macos() {
     echo -e "  ${BOLD}augur${RESET}  ${CYAN}1.2.0${RESET}  (macOS VM mode)"
     echo ""
     echo -e "  ${BOLD}Base VM tool versions:${RESET}"
-    tart run --no-graphics "$MACOS_BASE_VM" &>/dev/null &
-    local tart_pid=$!
+    "$VM_CLI" run --no-graphics "$MACOS_BASE_VM" &>/dev/null &
+    local vm_pid=$!
     if macos_vm_ip "$MACOS_BASE_VM" &>/dev/null; then
         ssh_macos "$MACOS_BASE_VM" '
             eval "$(/opt/homebrew/bin/brew shellenv)" 2>/dev/null
@@ -814,8 +859,8 @@ cmd_version_macos() {
             echo "    claude: $(claude --version 2>/dev/null || echo "(unable to fetch)")"
         ' || true
     fi
-    tart stop "$MACOS_BASE_VM" 2>/dev/null || true
-    wait "$tart_pid" 2>/dev/null || true
+    "$VM_CLI" stop "$MACOS_BASE_VM" 2>/dev/null || true
+    wait "$vm_pid" 2>/dev/null || true
     echo ""
 }
 
@@ -843,6 +888,7 @@ cmd_help() {
     echo -e "    augur ${CYAN}down${RESET}    --macos                                   Stop the VM (keep the clone)"
     echo -e "    augur ${CYAN}destroy${RESET} --macos                                   Stop and remove the VM clone"
     echo -e "    augur ${CYAN}status${RESET}  --macos                                   Check VM status"
+    echo -e "    augur ${CYAN}list${RESET}    --macos                                   List all VMs and their state"
     echo -e "    augur ${CYAN}update${RESET}  --macos                                   Update CLI tools in base VM"
     echo -e "    augur ${CYAN}version${RESET} --macos                                   Show tool versions in base VM"
     echo ""
@@ -862,8 +908,8 @@ cmd_help() {
     echo -e "  ${BOLD}NOTES${RESET}"
     echo -e "    • Docker mode:   current directory mounted at /workspace (Linux container)"
     echo -e "    • macOS VM mode: current directory exposed at ~/workspace (macOS VM)"
-    echo -e "    • macOS VM mode requires: tart"
-    echo -e "      brew install cirruslabs/cli/tart"
+    echo -e "    • macOS VM mode requires: augur-vm (the bundled Swift VM backend)"
+    echo -e "      build it on macOS with: bash install   (or augur-vm/scripts/build.sh)"
     echo -e "    • Docker mode shares ~/.claude, ~/.config/gh, ~/.gitconfig; macOS mode injects"
     echo -e "      Claude/GitHub credentials via env (see ENVIRONMENT) and copies ~/.gitconfig"
     echo -e "    • macOS VM mode IPSW + XIP must be downloaded from Apple directly:"
@@ -901,6 +947,7 @@ if $MACOS_MODE; then
         down)           cmd_down_macos ;;
         destroy)        cmd_destroy_macos ;;
         status)         cmd_status_macos ;;
+        list)           cmd_list_macos ;;
         update)         cmd_update_macos ;;
         version)        cmd_version_macos ;;
         help|--help|-h) cmd_help ;;

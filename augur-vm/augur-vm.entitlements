@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      Required to use Virtualization.framework. Without it the system terminates
+      the process the moment it touches VZ. NAT networking and virtiofs directory
+      sharing need no additional entitlement (bridged networking would require the
+      managed com.apple.vm.networking entitlement, which augur does not use).
+    -->
+    <key>com.apple.security.virtualization</key>
+    <true/>
+</dict>
+</plist>

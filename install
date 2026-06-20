@@ -35,6 +35,30 @@ cp "$SCRIPT_DIR/Dockerfile" "$INSTALL_DIR/Dockerfile"
 chmod +x "$INSTALL_DIR/augur"
 success "Files copied."
 
+# Build the macOS VM backend (augur-vm) when on macOS with a Swift toolchain.
+# Docker mode does not need this, so a failure here is only a warning.
+if [[ "$(uname)" == "Darwin" ]]; then
+    if command -v swift &>/dev/null && [[ -d "$SCRIPT_DIR/augur-vm" ]]; then
+        info "Building augur-vm (macOS VM backend)..."
+        if bash "$SCRIPT_DIR/augur-vm/scripts/build.sh" >/dev/null; then
+            vm_bin="$(cd "$SCRIPT_DIR/augur-vm" && swift build -c release --show-bin-path)/augur-vm"
+            cp "$vm_bin" "$INSTALL_DIR/augur-vm"
+            # Re-sign in place at the destination. Overwriting an existing, already
+            # validated binary on the same inode leaves a stale AMFI code-signing
+            # cache, so the copy is SIGKILLed ("Killed: 9") on launch even though its
+            # embedded signature looks intact. Re-signing the destination refreshes it.
+            codesign --force --sign - \
+                --entitlements "$SCRIPT_DIR/augur-vm/augur-vm.entitlements" \
+                "$INSTALL_DIR/augur-vm"
+            success "augur-vm installed to $INSTALL_DIR/augur-vm"
+        else
+            warn "augur-vm build failed — 'augur --macos' will be unavailable until it builds."
+        fi
+    else
+        warn "Skipping augur-vm build (needs Swift + ./augur-vm); required for 'augur --macos'."
+    fi
+fi
+
 # Add to PATH
 SHELL_CONFIG=""
 [[ -f "$HOME/.zshrc" ]]  && SHELL_CONFIG="$HOME/.zshrc"
