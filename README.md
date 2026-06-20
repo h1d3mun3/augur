@@ -18,7 +18,7 @@ Two modes are available:
 | **iOS Simulator** | ✗ | ✓ |
 | **Setup time** | ~5 min (image build) | ~75 min (VM build) |
 | **Disk usage** | ~2 GB | ~70 GB+ |
-| **Requires** | Docker | tart, IPSW, Xcode XIP |
+| **Requires** | Docker | augur-vm (bundled), IPSW, Xcode XIP |
 
 ---
 
@@ -80,10 +80,14 @@ The VM is isolated per project — each directory gets its own thin clone of the
 
 ### Setup
 
-#### 1. Install tools
+#### 1. Build the VM backend
+
+augur ships its own VM backend (`augur-vm`), a small Swift CLI built directly on
+Apple's Virtualization.framework — no third-party tools required.
 
 ```bash
-brew install cirruslabs/cli/tart
+# on the macOS host (needs the Xcode / Swift toolchain)
+bash install        # builds & installs augur-vm into ~/.augur
 ```
 
 #### 2. Download Apple-signed assets
@@ -98,7 +102,7 @@ augur build --macos --ipsw ~/Downloads/macOS.ipsw --xcode-xip ~/Downloads/Xcode.
 ```
 
 This will:
-1. Create a macOS VM from your IPSW (`tart create --from-ipsw`)
+1. Create a macOS VM from your IPSW (`augur-vm create --from-ipsw`)
 2. Open the VM window for manual Setup Assistant completion (credentials: `admin` / `admin`, Remote Login enabled)
 3. Install Xcode, Homebrew, Node.js, and Claude Code
 4. Download the iOS Simulator runtime (Xcode installed from a XIP does not bundle it)
@@ -152,7 +156,7 @@ every `up` (the same way it does for the GitHub token):
 | `~/.claude/` | **not** shared — local to the VM; auth is injected via env (see above) |
 | Everything else | **not visible to the VM** |
 
-> Tart auto-mounts the shared directory under `/Volumes/My Shared Files/workspace`; augur symlinks
+> The macOS guest auto-mounts the shared directory under `/Volumes/My Shared Files/workspace`; augur symlinks
 > it to `~/workspace`. The sealed system volume can't host a symlink at `/workspace`, so `~/workspace`
 > is used in the VM (Docker mode still uses `/workspace`).
 
@@ -179,7 +183,7 @@ If builds are flaky from the shared mount (virtiofs is not tuned for heavy I/O �
 ### Requirements
 
 - macOS (Apple Silicon)
-- [tart](https://github.com/cirruslabs/tart): `brew install cirruslabs/cli/tart`
+- Xcode / Swift toolchain (to build the bundled `augur-vm` backend via `bash install`)
 - macOS IPSW (Apple-signed)
 - Xcode XIP (Apple-signed, from developer.apple.com)
 
