@@ -774,6 +774,31 @@ cmd_status_macos() {
     fi
 }
 
+cmd_list_macos() {
+    require_vz
+    local rows
+    rows="$("$VM_CLI" list 2>/dev/null | awk 'NR>1 {print $2, $NF}')"
+    if [[ -z "$rows" ]]; then
+        info "No macOS VMs found."
+        echo -e "  Create one with: ${BOLD}augur build --macos --ipsw <path> --xcode-xip <path>${RESET}"
+        return
+    fi
+
+    echo -e "  ${BOLD}$(printf '%-28s %-10s %s' NAME STATE IP)${RESET}"
+    local name state ip color
+    while read -r name state; do
+        [[ -z "$name" ]] && continue
+        if [[ "$state" == "running" ]]; then
+            ip="$("$VM_CLI" ip "$name" 2>/dev/null || echo '-')"
+            color="$GREEN"
+        else
+            ip="-"
+            color="$YELLOW"
+        fi
+        echo -e "  $(printf '%-28s' "$name") ${color}$(printf '%-10s' "$state")${RESET}${ip}"
+    done <<< "$rows"
+}
+
 cmd_update_macos() {
     require_vz
     macos_vm_exists "$MACOS_BASE_VM" || {
@@ -863,6 +888,7 @@ cmd_help() {
     echo -e "    augur ${CYAN}down${RESET}    --macos                                   Stop the VM (keep the clone)"
     echo -e "    augur ${CYAN}destroy${RESET} --macos                                   Stop and remove the VM clone"
     echo -e "    augur ${CYAN}status${RESET}  --macos                                   Check VM status"
+    echo -e "    augur ${CYAN}list${RESET}    --macos                                   List all VMs and their state"
     echo -e "    augur ${CYAN}update${RESET}  --macos                                   Update CLI tools in base VM"
     echo -e "    augur ${CYAN}version${RESET} --macos                                   Show tool versions in base VM"
     echo ""
@@ -921,6 +947,7 @@ if $MACOS_MODE; then
         down)           cmd_down_macos ;;
         destroy)        cmd_destroy_macos ;;
         status)         cmd_status_macos ;;
+        list)           cmd_list_macos ;;
         update)         cmd_update_macos ;;
         version)        cmd_version_macos ;;
         help|--help|-h) cmd_help ;;
