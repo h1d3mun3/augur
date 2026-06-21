@@ -92,7 +92,7 @@ bash install        # builds & installs augur-vm into ~/.augur
 
 #### 2. Download Apple-signed assets
 
-- **IPSW** — macOS restore image: https://ipsw.me or System Preferences > Software Update
+- **IPSW** — macOS restore image: System Preferences > Software Update
 - **Xcode XIP** — Xcode installer: https://developer.apple.com/download/all/
 
 #### 3. Build the base VM (one-time, ~75 min)
