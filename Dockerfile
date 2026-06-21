@@ -20,9 +20,16 @@ RUN apt-get update \
 RUN useradd -m -u 1001 -s /bin/bash dev \
     && echo "dev ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 
-# Install CLI tools
-RUN npm install -g @anthropic-ai/claude-code
+# Install Claude Code via the official native installer so installMethod matches
+# the host's (the shared ~/.claude.json reports "native"). The AMFI code-signing
+# issue that forces native on macOS does not apply to Linux; native is used here
+# only to keep the install method consistent with the shared config and silence
+# the "claude command ... missing or broken · run claude install to repair" warning.
+# Must run as dev: the installer targets $HOME/.local, and PATH must expose it so
+# `docker exec ... claude` (a non-login shell) can find the binary.
+USER dev
+RUN curl -fsSL https://claude.ai/install.sh | bash -s stable
+ENV PATH=/home/dev/.local/bin:$PATH
 
 WORKDIR /workspace
-USER dev
 CMD ["bash"]
