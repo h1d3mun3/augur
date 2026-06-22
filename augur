@@ -456,7 +456,7 @@ cmd_build_macos() {
          echo '$(cat "${MACOS_SSH_KEY}.pub")' >> ~/.ssh/authorized_keys && \
          chmod 600 ~/.ssh/authorized_keys"
 
-    # NOTE: the workspace is exposed at ~/workspace (a symlink to the virtiofs auto-mount under
+    # NOTE: the workspace is exposed at ~/workspace-<slug> (a symlink to the virtiofs auto-mount under
     # "/Volumes/My Shared Files/"), created at runtime by ensure_macos_workspace — no
     # /etc/synthetic.conf / mount_virtiofs needed (the sealed root cannot host a runtime symlink).
 
@@ -568,15 +568,15 @@ wait_for_macos_ssh() {
 # Expose the shared workspace inside the VM. The virtiofs automount tag mounts every --dir share
 # (read-write, owned by the guest user) under "/Volumes/My Shared Files/<name>". There is NO per-name virtiofs
 # tag, so `mount_virtiofs workspace /workspace` silently fails — that was the "/workspace is empty"
-# bug. We just symlink the auto-mounted share to a stable path. The sealed system volume cannot
-# host a runtime symlink at /workspace (read-only), so we use ~/workspace. Idempotent.
+# bug. We just symlink the auto-mounted (per-project) share to a stable path. The sealed system
+# volume cannot host a runtime symlink at /workspace (read-only), so we use ~/workspace-<slug>. Idempotent.
 #
 # NOTE: ~/.claude is deliberately NOT shared — on macOS Claude's credential lives in the Keychain
 # (not ~/.claude), so sharing it persisted nothing; auth is injected via the environment instead
 # (see cmd_up_macos / ~/.augur-env). ~/.claude is a normal writable local dir in the VM.
 ensure_macos_workspace() {
     local vm="$1"
-    ssh_macos "$vm" 'ln -sfn "/Volumes/My Shared Files/workspace" "$HOME/workspace"'
+    ssh_macos "$vm" "ln -sfn '/Volumes/My Shared Files/${MACOS_SHARE}' \"\$HOME/${MACOS_SHARE}\""
 }
 
 ensure_macos_claude_bin() {
@@ -630,9 +630,9 @@ cmd_up_macos() {
 
     mkdir -p "$HOME/.config/gh"
     info "Starting VM '${project_vm}'..."
-    info "Mounting: ${BOLD}${WORKSPACE_DIR}${RESET} → ~/workspace"
+    info "Mounting: ${BOLD}${WORKSPACE_DIR}${RESET} → ~/${MACOS_SHARE}"
     "$VM_CLI" run --no-graphics \
-        --dir="workspace:${WORKSPACE_DIR}" \
+        --dir="${MACOS_SHARE}:${WORKSPACE_DIR}" \
         --dir="gh-config:${HOME}/.config/gh" \
         "$project_vm" &>/dev/null &
     disown
@@ -697,7 +697,7 @@ cmd_claude_macos() {
     ensure_macos_xcode_select "$project_vm"
     ensure_macos_claude_bin "$project_vm"
     info "Launching Claude Code in '${project_vm}'..."
-    ssh_macos "$project_vm" -t "zsh -l -c 'cd ~/workspace && DISABLE_AUTOUPDATER=1 claude'"
+    ssh_macos "$project_vm" -t "zsh -l -c 'cd ~/${MACOS_SHARE} && DISABLE_AUTOUPDATER=1 claude'"
 }
 
 cmd_shell_macos() {
@@ -708,7 +708,7 @@ cmd_shell_macos() {
     ensure_macos_workspace "$project_vm"
     ensure_macos_xcode_select "$project_vm"
     info "Opening shell in '${project_vm}'..."
-    ssh_macos "$project_vm" -t "cd ~/workspace && exec zsh -l"
+    ssh_macos "$project_vm" -t "cd ~/${MACOS_SHARE} && exec zsh -l"
 }
 
 cmd_down_macos() {
@@ -917,7 +917,7 @@ cmd_help() {
     echo ""
     echo -e "  ${BOLD}NOTES${RESET}"
     echo -e "    • Docker mode:   current directory mounted at /workspace-<project> (Linux container)"
-    echo -e "    • macOS VM mode: current directory exposed at ~/workspace (macOS VM)"
+    echo -e "    • macOS VM mode: current directory exposed at ~/workspace-<project> (macOS VM)"
     echo -e "    • macOS VM mode requires: augur-vm (the bundled Swift VM backend)"
     echo -e "      build it on macOS with: bash install   (or augur-vm/scripts/build.sh)"
     echo -e "    • Docker mode shares ~/.claude, ~/.config/gh, ~/.gitconfig; macOS mode injects"
@@ -948,6 +948,10 @@ SWIFT_IMAGE_TAG="${SWIFT_VERSION:-latest}"
 IMAGE_NAME="augur:swift-${SWIFT_IMAGE_TAG}"
 CONTAINER_NAME="$(make_container_name)"
 WORKSPACE_MOUNT="$(make_workspace_mount)"
+# Per-project virtiofs share name for macOS VM mode. The automount exposes it at
+# "/Volumes/My Shared Files/<name>", which is the path Claude actually records as cwd (it resolves
+# the ~/workspace-<slug> symlink), so a per-project name keeps each project's history under a distinct slug.
+MACOS_SHARE="workspace-$(workspace_slug)"
 
 if $MACOS_MODE; then
     case "$COMMAND" in
