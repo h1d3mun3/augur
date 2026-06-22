@@ -579,6 +579,24 @@ ensure_macos_workspace() {
     ssh_macos "$vm" "ln -sfn '/Volumes/My Shared Files/${MACOS_SHARE}' \"\$HOME/${MACOS_SHARE}\""
 }
 
+# Share the host's Claude conversation history (projects/ only) into the VM, so a session started in
+# Docker mode can be reopened from macOS mode and vice versa. We deliberately do NOT unify the
+# per-mode history slug or touch any workspace path: Docker records cwd /workspace-<slug> while macOS
+# records /Volumes/My Shared Files/<MACOS_SHARE>, so each mode keeps its own slug. Consequence: the
+# default (cwd-filtered) resume list won't show the other mode's sessions, but the picker's "show
+# all" (Ctrl+A) lists every project, so the cross-mode history is reachable. Auth is NOT shared (see
+# the ~/.claude note above). Idempotent.
+ensure_macos_claude_projects() {
+    local vm="$1"
+    ssh_macos "$vm" '
+        set -e
+        mkdir -p "$HOME/.claude"
+        # The VM-local projects dir is throwaway (lost on clone); replace a non-symlink with the share.
+        [ -L "$HOME/.claude/projects" ] || rm -rf "$HOME/.claude/projects"
+        ln -sfn "/Volumes/My Shared Files/claude-projects" "$HOME/.claude/projects"
+    '
+}
+
 ensure_macos_claude_bin() {
     local vm="$1"
     # Claude is installed via the official installer into ~/.local/bin (see cmd_build_macos).
@@ -629,11 +647,13 @@ cmd_up_macos() {
     fi
 
     mkdir -p "$HOME/.config/gh"
+    mkdir -p "$HOME/.claude/projects"
     info "Starting VM '${project_vm}'..."
     info "Mounting: ${BOLD}${WORKSPACE_DIR}${RESET} → ~/${MACOS_SHARE}"
     "$VM_CLI" run --no-graphics \
         --dir="${MACOS_SHARE}:${WORKSPACE_DIR}" \
         --dir="gh-config:${HOME}/.config/gh" \
+        --dir="claude-projects:${HOME}/.claude/projects" \
         "$project_vm" &>/dev/null &
     disown
 
@@ -644,6 +664,7 @@ cmd_up_macos() {
     }
 
     ensure_macos_workspace "$project_vm"
+    ensure_macos_claude_projects "$project_vm"
     ensure_macos_xcode_select "$project_vm"
     ensure_macos_claude_bin "$project_vm"
 
@@ -694,6 +715,7 @@ cmd_claude_macos() {
     project_vm="$(macos_project_vm)"
     macos_vm_running "$project_vm" || cmd_up_macos
     ensure_macos_workspace "$project_vm"
+    ensure_macos_claude_projects "$project_vm"
     ensure_macos_xcode_select "$project_vm"
     ensure_macos_claude_bin "$project_vm"
     info "Launching Claude Code in '${project_vm}'..."
@@ -706,6 +728,7 @@ cmd_shell_macos() {
     project_vm="$(macos_project_vm)"
     macos_vm_running "$project_vm" || cmd_up_macos
     ensure_macos_workspace "$project_vm"
+    ensure_macos_claude_projects "$project_vm"
     ensure_macos_xcode_select "$project_vm"
     info "Opening shell in '${project_vm}'..."
     ssh_macos "$project_vm" -t "cd ~/${MACOS_SHARE} && exec zsh -l"
