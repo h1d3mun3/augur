@@ -36,11 +36,21 @@ success() { echo -e "${GREEN}[augur]${RESET} $*"; }
 warn()    { echo -e "${YELLOW}[augur]${RESET} $*"; }
 error()   { echo -e "${RED}[augur]${RESET} $*" >&2; }
 
-make_container_name() {
+workspace_slug() {
     local dir_name
     dir_name="$(basename "$WORKSPACE_DIR")"
-    dir_name="$(echo "$dir_name" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]' '-' | sed 's/^-//;s/-$//')"
-    echo "augur-${dir_name}-swift-${SWIFT_IMAGE_TAG//./-}"
+    echo "$dir_name" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]' '-' | sed 's/^-//;s/-$//'
+}
+
+make_container_name() {
+    echo "augur-$(workspace_slug)-swift-${SWIFT_IMAGE_TAG//./-}"
+}
+
+# In-container mount/workdir, suffixed with the project slug so each project gets
+# a distinct path. Claude Code keys its per-directory memory off the cwd, so a
+# per-project path (e.g. /workspace-avow) keeps each project's memory isolated.
+make_workspace_mount() {
+    echo "/workspace-$(workspace_slug)"
 }
 
 container_running() {
@@ -213,13 +223,13 @@ cmd_up() {
     fi
 
     info "Starting container '${CONTAINER_NAME}'..."
-    info "Mounting: ${BOLD}${WORKSPACE_DIR}${RESET} → /workspace"
+    info "Mounting: ${BOLD}${WORKSPACE_DIR}${RESET} → ${WORKSPACE_MOUNT}"
 
     local docker_args=(
         run -dit
         --name "$CONTAINER_NAME"
-        -v "${WORKSPACE_DIR}:/workspace"
-        -w /workspace
+        -v "${WORKSPACE_DIR}:${WORKSPACE_MOUNT}"
+        -w "${WORKSPACE_MOUNT}"
     )
 
     local anthropic_key
@@ -906,7 +916,7 @@ cmd_help() {
     echo -e "    SWIFT_VERSION            Default Swift version (default: latest)"
     echo ""
     echo -e "  ${BOLD}NOTES${RESET}"
-    echo -e "    • Docker mode:   current directory mounted at /workspace (Linux container)"
+    echo -e "    • Docker mode:   current directory mounted at /workspace-<project> (Linux container)"
     echo -e "    • macOS VM mode: current directory exposed at ~/workspace (macOS VM)"
     echo -e "    • macOS VM mode requires: augur-vm (the bundled Swift VM backend)"
     echo -e "      build it on macOS with: bash install   (or augur-vm/scripts/build.sh)"
@@ -937,6 +947,7 @@ done
 SWIFT_IMAGE_TAG="${SWIFT_VERSION:-latest}"
 IMAGE_NAME="augur:swift-${SWIFT_IMAGE_TAG}"
 CONTAINER_NAME="$(make_container_name)"
+WORKSPACE_MOUNT="$(make_workspace_mount)"
 
 if $MACOS_MODE; then
     case "$COMMAND" in
