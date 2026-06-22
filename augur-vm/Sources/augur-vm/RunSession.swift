@@ -74,8 +74,9 @@ final class RunSession: NSObject, VZVirtualMachineDelegate {
         }
     }
 
-    /// Build the runtime configuration from the bundle. Adds graphics + input
-    /// devices when not headless (GUI mode).
+    /// Build the runtime configuration from the bundle. A graphics device (virtual
+    /// display) and input devices are attached in both modes; `headless` only governs
+    /// whether a host-side AppKit window is shown (see `run()`).
     func buildConfiguration() throws -> VZVirtualMachineConfiguration {
         let cfg = try VMConfig.load(name)
         loadedConfig = cfg
@@ -110,19 +111,23 @@ final class RunSession: NSObject, VZVirtualMachineDelegate {
         }
         config.networkDevices = [network]
 
-        if !headless {
-            let graphics = VZMacGraphicsDeviceConfiguration()
-            graphics.displays = [
-                VZMacGraphicsDisplayConfiguration(
-                    widthInPixels: cfg.display.width,
-                    heightInPixels: cfg.display.height,
-                    pixelsPerInch: cfg.display.pixelsPerInch
-                )
-            ]
-            config.graphicsDevices = [graphics]
-            config.keyboards = [VZUSBKeyboardConfiguration()]
-            config.pointingDevices = [VZUSBScreenCoordinatePointingDeviceConfiguration()]
-        }
+        // Attach a graphics device (virtual display) and input devices even when headless.
+        // macOS only brings up an Aqua (GUI) login session when a framebuffer exists, and
+        // `xcodebuild test` needs that Aqua session to reach testmanagerd — without a display
+        // device, auto-login never produces a console session and tests fail at launch with
+        // "com.apple.testmanagerd.control ... No such process". `headless` only suppresses the
+        // host-side AppKit window (see run()), not the display device the guest renders to.
+        let graphics = VZMacGraphicsDeviceConfiguration()
+        graphics.displays = [
+            VZMacGraphicsDisplayConfiguration(
+                widthInPixels: cfg.display.width,
+                heightInPixels: cfg.display.height,
+                pixelsPerInch: cfg.display.pixelsPerInch
+            )
+        ]
+        config.graphicsDevices = [graphics]
+        config.keyboards = [VZUSBKeyboardConfiguration()]
+        config.pointingDevices = [VZUSBScreenCoordinatePointingDeviceConfiguration()]
 
         let shares = try parseShares()
         if !shares.isEmpty {
