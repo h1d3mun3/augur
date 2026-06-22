@@ -163,9 +163,11 @@ every `up` (the same way it does for the GitHub token):
 ### Running `xcodebuild test`
 
 `xcodebuild test` needs an Aqua (GUI) login session to reach `testmanagerd`; a headless SSH login
-has none. The base VM is built with **auto-login** enabled so a GUI session exists at boot — once a
-user is logged in, `xcodebuild test` works over SSH for all test types. Recommended invocation
-(SwiftData's `@Model` macro needs `-skipMacroValidation` in a headless VM):
+has none. Two things make that session exist at boot: the base VM is built with **auto-login**
+enabled, and the VM is always run with a **virtual display device** (macOS only starts an Aqua
+session when a framebuffer exists — `--no-graphics` suppresses only the host-side window, not the
+display device). With both in place, `xcodebuild test` works over SSH for all test types. Recommended
+invocation (SwiftData's `@Model` macro needs `-skipMacroValidation` in a headless VM):
 
 ```bash
 NSUnbufferedIO=YES xcodebuild test \
