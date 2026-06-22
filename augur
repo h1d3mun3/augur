@@ -36,11 +36,21 @@ success() { echo -e "${GREEN}[augur]${RESET} $*"; }
 warn()    { echo -e "${YELLOW}[augur]${RESET} $*"; }
 error()   { echo -e "${RED}[augur]${RESET} $*" >&2; }
 
-make_container_name() {
+workspace_slug() {
     local dir_name
     dir_name="$(basename "$WORKSPACE_DIR")"
-    dir_name="$(echo "$dir_name" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]' '-' | sed 's/^-//;s/-$//')"
-    echo "augur-${dir_name}-swift-${SWIFT_IMAGE_TAG//./-}"
+    echo "$dir_name" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]' '-' | sed 's/^-//;s/-$//'
+}
+
+make_container_name() {
+    echo "augur-$(workspace_slug)-swift-${SWIFT_IMAGE_TAG//./-}"
+}
+
+# In-container mount/workdir, suffixed with the project slug so each project gets
+# a distinct path. Claude Code keys its per-directory memory off the cwd, so a
+# per-project path (e.g. /workspace-avow) keeps each project's memory isolated.
+make_workspace_mount() {
+    echo "/workspace-$(workspace_slug)"
 }
 
 container_running() {
@@ -213,13 +223,13 @@ cmd_up() {
     fi
 
     info "Starting container '${CONTAINER_NAME}'..."
-    info "Mounting: ${BOLD}${WORKSPACE_DIR}${RESET} → /workspace"
+    info "Mounting: ${BOLD}${WORKSPACE_DIR}${RESET} → ${WORKSPACE_MOUNT}"
 
     local docker_args=(
         run -dit
         --name "$CONTAINER_NAME"
-        -v "${WORKSPACE_DIR}:/workspace"
-        -w /workspace
+        -v "${WORKSPACE_DIR}:${WORKSPACE_MOUNT}"
+        -w "${WORKSPACE_MOUNT}"
     )
 
     local anthropic_key
@@ -446,7 +456,7 @@ cmd_build_macos() {
          echo '$(cat "${MACOS_SSH_KEY}.pub")' >> ~/.ssh/authorized_keys && \
          chmod 600 ~/.ssh/authorized_keys"
 
-    # NOTE: the workspace is exposed at ~/workspace (a symlink to the virtiofs auto-mount under
+    # NOTE: the workspace is exposed at ~/workspace-<slug> (a symlink to the virtiofs auto-mount under
     # "/Volumes/My Shared Files/"), created at runtime by ensure_macos_workspace — no
     # /etc/synthetic.conf / mount_virtiofs needed (the sealed root cannot host a runtime symlink).
 
@@ -558,15 +568,33 @@ wait_for_macos_ssh() {
 # Expose the shared workspace inside the VM. The virtiofs automount tag mounts every --dir share
 # (read-write, owned by the guest user) under "/Volumes/My Shared Files/<name>". There is NO per-name virtiofs
 # tag, so `mount_virtiofs workspace /workspace` silently fails — that was the "/workspace is empty"
-# bug. We just symlink the auto-mounted share to a stable path. The sealed system volume cannot
-# host a runtime symlink at /workspace (read-only), so we use ~/workspace. Idempotent.
+# bug. We just symlink the auto-mounted (per-project) share to a stable path. The sealed system
+# volume cannot host a runtime symlink at /workspace (read-only), so we use ~/workspace-<slug>. Idempotent.
 #
 # NOTE: ~/.claude is deliberately NOT shared — on macOS Claude's credential lives in the Keychain
 # (not ~/.claude), so sharing it persisted nothing; auth is injected via the environment instead
 # (see cmd_up_macos / ~/.augur-env). ~/.claude is a normal writable local dir in the VM.
 ensure_macos_workspace() {
     local vm="$1"
-    ssh_macos "$vm" 'ln -sfn "/Volumes/My Shared Files/workspace" "$HOME/workspace"'
+    ssh_macos "$vm" "ln -sfn '/Volumes/My Shared Files/${MACOS_SHARE}' \"\$HOME/${MACOS_SHARE}\""
+}
+
+# Share the host's Claude conversation history (projects/ only) into the VM, so a session started in
+# Docker mode can be reopened from macOS mode and vice versa. We deliberately do NOT unify the
+# per-mode history slug or touch any workspace path: Docker records cwd /workspace-<slug> while macOS
+# records /Volumes/My Shared Files/<MACOS_SHARE>, so each mode keeps its own slug. Consequence: the
+# default (cwd-filtered) resume list won't show the other mode's sessions, but the picker's "show
+# all" (Ctrl+A) lists every project, so the cross-mode history is reachable. Auth is NOT shared (see
+# the ~/.claude note above). Idempotent.
+ensure_macos_claude_projects() {
+    local vm="$1"
+    ssh_macos "$vm" '
+        set -e
+        mkdir -p "$HOME/.claude"
+        # The VM-local projects dir is throwaway (lost on clone); replace a non-symlink with the share.
+        [ -L "$HOME/.claude/projects" ] || rm -rf "$HOME/.claude/projects"
+        ln -sfn "/Volumes/My Shared Files/claude-projects" "$HOME/.claude/projects"
+    '
 }
 
 ensure_macos_claude_bin() {
@@ -619,11 +647,13 @@ cmd_up_macos() {
     fi
 
     mkdir -p "$HOME/.config/gh"
+    mkdir -p "$HOME/.claude/projects"
     info "Starting VM '${project_vm}'..."
-    info "Mounting: ${BOLD}${WORKSPACE_DIR}${RESET} → ~/workspace"
+    info "Mounting: ${BOLD}${WORKSPACE_DIR}${RESET} → ~/${MACOS_SHARE}"
     "$VM_CLI" run --no-graphics \
-        --dir="workspace:${WORKSPACE_DIR}" \
+        --dir="${MACOS_SHARE}:${WORKSPACE_DIR}" \
         --dir="gh-config:${HOME}/.config/gh" \
+        --dir="claude-projects:${HOME}/.claude/projects" \
         "$project_vm" &>/dev/null &
     disown
 
@@ -634,6 +664,7 @@ cmd_up_macos() {
     }
 
     ensure_macos_workspace "$project_vm"
+    ensure_macos_claude_projects "$project_vm"
     ensure_macos_xcode_select "$project_vm"
     ensure_macos_claude_bin "$project_vm"
 
@@ -684,10 +715,11 @@ cmd_claude_macos() {
     project_vm="$(macos_project_vm)"
     macos_vm_running "$project_vm" || cmd_up_macos
     ensure_macos_workspace "$project_vm"
+    ensure_macos_claude_projects "$project_vm"
     ensure_macos_xcode_select "$project_vm"
     ensure_macos_claude_bin "$project_vm"
     info "Launching Claude Code in '${project_vm}'..."
-    ssh_macos "$project_vm" -t "zsh -l -c 'cd ~/workspace && DISABLE_AUTOUPDATER=1 claude'"
+    ssh_macos "$project_vm" -t "zsh -l -c 'cd ~/${MACOS_SHARE} && DISABLE_AUTOUPDATER=1 claude'"
 }
 
 cmd_shell_macos() {
@@ -696,9 +728,10 @@ cmd_shell_macos() {
     project_vm="$(macos_project_vm)"
     macos_vm_running "$project_vm" || cmd_up_macos
     ensure_macos_workspace "$project_vm"
+    ensure_macos_claude_projects "$project_vm"
     ensure_macos_xcode_select "$project_vm"
     info "Opening shell in '${project_vm}'..."
-    ssh_macos "$project_vm" -t "cd ~/workspace && exec zsh -l"
+    ssh_macos "$project_vm" -t "cd ~/${MACOS_SHARE} && exec zsh -l"
 }
 
 cmd_down_macos() {
@@ -906,8 +939,8 @@ cmd_help() {
     echo -e "    SWIFT_VERSION            Default Swift version (default: latest)"
     echo ""
     echo -e "  ${BOLD}NOTES${RESET}"
-    echo -e "    • Docker mode:   current directory mounted at /workspace (Linux container)"
-    echo -e "    • macOS VM mode: current directory exposed at ~/workspace (macOS VM)"
+    echo -e "    • Docker mode:   current directory mounted at /workspace-<project> (Linux container)"
+    echo -e "    • macOS VM mode: current directory exposed at ~/workspace-<project> (macOS VM)"
     echo -e "    • macOS VM mode requires: augur-vm (the bundled Swift VM backend)"
     echo -e "      build it on macOS with: bash install   (or augur-vm/scripts/build.sh)"
     echo -e "    • Docker mode shares ~/.claude, ~/.config/gh, ~/.gitconfig; macOS mode injects"
@@ -937,6 +970,11 @@ done
 SWIFT_IMAGE_TAG="${SWIFT_VERSION:-latest}"
 IMAGE_NAME="augur:swift-${SWIFT_IMAGE_TAG}"
 CONTAINER_NAME="$(make_container_name)"
+WORKSPACE_MOUNT="$(make_workspace_mount)"
+# Per-project virtiofs share name for macOS VM mode. The automount exposes it at
+# "/Volumes/My Shared Files/<name>", which is the path Claude actually records as cwd (it resolves
+# the ~/workspace-<slug> symlink), so a per-project name keeps each project's history under a distinct slug.
+MACOS_SHARE="workspace-$(workspace_slug)"
 
 if $MACOS_MODE; then
     case "$COMMAND" in

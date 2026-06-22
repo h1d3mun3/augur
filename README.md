@@ -60,7 +60,7 @@ augur version   # show tool versions
 
 | Path | Description |
 |------|-------------|
-| Current directory | mounted at `/workspace` (read/write) |
+| Current directory | mounted at `/workspace-<project>` (read/write), named after the directory |
 | `~/.claude/` | shared (Claude auth and settings) |
 | `~/.config/gh/` | shared (GitHub CLI auth) |
 | `~/.gitconfig` | mounted read-only |
@@ -158,7 +158,7 @@ every `up` (the same way it does for the GitHub token):
 
 > The macOS guest auto-mounts the shared directory under `/Volumes/My Shared Files/workspace`; augur symlinks
 > it to `~/workspace`. The sealed system volume can't host a symlink at `/workspace`, so `~/workspace`
-> is used in the VM (Docker mode still uses `/workspace`).
+> is used in the VM (Docker mode uses a per-project `/workspace-<project>` path).
 
 ### Running `xcodebuild test`
 

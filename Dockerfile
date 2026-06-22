@@ -31,5 +31,7 @@ USER dev
 RUN curl -fsSL https://claude.ai/install.sh | bash -s stable
 ENV PATH=/home/dev/.local/bin:$PATH
 
-WORKDIR /workspace
+# No WORKDIR: the project is bind-mounted at /workspace-<slug> and the run command
+# sets the working directory via `-w` at runtime, so a baked-in WORKDIR would only
+# create a stray empty directory in the image.
 CMD ["bash"]
