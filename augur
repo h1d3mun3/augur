@@ -514,6 +514,10 @@ cmd_build_macos() {
         NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
         eval "$(/opt/homebrew/bin/brew shellenv)"
         echo '\''eval "$(/opt/homebrew/bin/brew shellenv)"'\'' >> ~/.zprofile
+        # GitHub CLI. augur injects the host gh token as GH_TOKEN into ~/.augur-env at VM startup,
+        # and gh respects GH_TOKEN automatically, so installing the binary is all that is needed for
+        # an authenticated gh (no hosts.yml / Keychain handling required). See cmd_up_macos.
+        brew install gh
         # Claude Code: do NOT use npm. The npm-distributed native binary arrives with a code
         # signature that gets corrupted during tar extraction, so Apple Silicon AMFI kills it
         # on launch (SIGKILL / "zsh: killed"). The official installer downloads a correctly
@@ -695,8 +699,9 @@ cmd_up_macos() {
     ssh_macos "$project_vm" \
         "grep -q '.augur-env' ~/.zshenv 2>/dev/null || echo '[[ -f ~/.augur-env ]] && source ~/.augur-env' >> ~/.zshenv"
 
-    # Enable HTTPS `git push` with GH_TOKEN (gh is not installed in the VM, so configure git's
-    # credential helper directly to read GH_TOKEN from the environment).
+    # Enable HTTPS `git push` with GH_TOKEN by configuring git's credential helper to read GH_TOKEN
+    # from the environment. This is independent of gh and keeps git auth working even in non-login
+    # shells where `gh auth setup-git` was never run.
     if [[ -n "$gh_token" ]]; then
         ssh_macos "$project_vm" \
             "git config --global 'credential.https://github.com.helper' '!f() { test \"\$1\" = get && echo username=x-access-token && echo password=\$GH_TOKEN; }; f'"
