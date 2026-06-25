@@ -40,12 +40,16 @@ AUGUR_GLOBAL_CONF="${AUGUR_GLOBAL_CONF:-$AUGUR_DIR/augur.conf}"
 AUGUR_PROJECT_CONF="$WORKSPACE_DIR/.augur.conf"
 AUGUR_PROXY_DIR="$AUGUR_DIR/proxy"
 # Ports the proxy listens on (host side). HTTP CONNECT is for Docker; SOCKS5 is for
-# the macOS file-handle datapath (gvproxy forwards guest TCP here by name).
-AUGUR_PROXY_HTTP_PORT="${AUGUR_PROXY_HTTP_PORT:-13128}"
-AUGUR_PROXY_SOCKS_PORT="${AUGUR_PROXY_SOCKS_PORT:-13129}"
+# the macOS file-handle datapath (gvproxy forwards guest TCP here by name). They are
+# derived per-project (a stable hash of the project dir name) so two egress-enabled
+# projects can run at once without colliding on a fixed port. Override any of them
+# with the matching env var. (Collisions are ~1/900 between distinct projects.)
+_augur_port_offset=$(( $(basename "$WORKSPACE_DIR" | tr '[:upper:]' '[:lower:]' | cksum | cut -d' ' -f1) % 900 ))
+AUGUR_PROXY_HTTP_PORT="${AUGUR_PROXY_HTTP_PORT:-$((13000 + _augur_port_offset))}"
+AUGUR_PROXY_SOCKS_PORT="${AUGUR_PROXY_SOCKS_PORT:-$((14000 + _augur_port_offset))}"
 # In egress mode the guest has no host-routable IP (gvproxy user-space network);
 # SSH reaches it via gvproxy's host-side forward 127.0.0.1:<this port> → guest:22.
-AUGUR_SSH_FWD_PORT="${AUGUR_SSH_FWD_PORT:-2222}"
+AUGUR_SSH_FWD_PORT="${AUGUR_SSH_FWD_PORT:-$((20000 + _augur_port_offset))}"
 # Egress filtering is opt-in: ON when a project ./.augur.conf exists, or AUGUR_EGRESS=1,
 # or --egress. --no-egress / AUGUR_EGRESS=0 forces it off. Default off keeps existing
 # behavior byte-for-byte for users who never create a .augur.conf.
@@ -523,7 +527,15 @@ cmd_up() {
 
     docker_args+=("$IMAGE_NAME" bash)
 
-    docker "${docker_args[@]}" &>/dev/null
+    if ! docker "${docker_args[@]}" &>/dev/null; then
+        error "Failed to start the container."
+        # Don't leave a started proxy / internal network orphaned.
+        if egress_enabled; then
+            stop_proxy
+            docker network rm "$(egress_network_name)" &>/dev/null || true
+        fi
+        exit 1
+    fi
 
     if egress_enabled; then verify_egress_locked; fi
 
@@ -550,16 +562,17 @@ cmd_shell() {
 
 cmd_down() {
     require_docker
-    if ! container_exists; then
+    if container_exists; then
+        info "Stopping and removing container '${CONTAINER_NAME}'..."
+        docker rm -f "$CONTAINER_NAME" &>/dev/null
+        success "Container '${CONTAINER_NAME}' has been stopped and removed."
+    else
         warn "No container found for this directory (${CONTAINER_NAME})."
-        return 0
     fi
-    info "Stopping and removing container '${CONTAINER_NAME}'..."
-    docker rm -f "$CONTAINER_NAME" &>/dev/null
-    # Tear down egress filtering (safe no-ops if it was never enabled).
+    # Always tear down egress (safe no-ops if it was never enabled) so a stranded
+    # proxy/network from a crashed or out-of-band-removed container is cleaned up.
     stop_proxy
     docker network rm "$(egress_network_name)" &>/dev/null || true
-    success "Container '${CONTAINER_NAME}' has been stopped and removed."
 }
 
 cmd_status() {
@@ -968,6 +981,10 @@ cmd_up_macos() {
     info "Waiting for VM to boot and SSH to be ready..."
     wait_for_macos_ssh "$project_vm" &>/dev/null || {
         error "VM SSH did not become available in time."
+        # Tear down what we started so a stranded VM/gvproxy/proxy isn't left behind.
+        "$VM_CLI" stop "$project_vm" 2>/dev/null || true
+        stop_gvproxy
+        stop_proxy
         exit 1
     }
 
@@ -1047,14 +1064,16 @@ cmd_down_macos() {
     require_vz
     local project_vm
     project_vm="$(macos_project_vm)"
+    # Always tear down the host-side egress (gvproxy/proxy) so a stranded one from a
+    # crashed VM is cleaned up, even if the VM clone itself is already gone.
+    stop_gvproxy
+    stop_proxy
     if ! macos_vm_exists "$project_vm"; then
         warn "No VM found for this directory (${project_vm})."
         return 0
     fi
     info "Stopping VM '${project_vm}'..."
     "$VM_CLI" stop "$project_vm" 2>/dev/null || true
-    stop_gvproxy
-    stop_proxy
     success "VM '${project_vm}' stopped (clone kept; CoW so it costs ~0 on disk)."
     echo -e "  ${BOLD}augur up --macos${RESET}      → restart it (fast, no re-clone)"
     echo -e "  ${BOLD}augur destroy --macos${RESET} → remove the clone entirely"
@@ -1064,14 +1083,14 @@ cmd_destroy_macos() {
     require_vz
     local project_vm
     project_vm="$(macos_project_vm)"
+    stop_gvproxy
+    stop_proxy
     if ! macos_vm_exists "$project_vm"; then
         warn "No VM found for this directory (${project_vm})."
         return 0
     fi
     info "Stopping and removing VM '${project_vm}'..."
     "$VM_CLI" stop "$project_vm" 2>/dev/null || true
-    stop_gvproxy
-    stop_proxy
     "$VM_CLI" delete "$project_vm"
     success "VM '${project_vm}' has been removed."
 }
@@ -1087,12 +1106,24 @@ cmd_status_macos() {
 
     if macos_vm_running "$project_vm"; then
         local ip
-        ip="$("$VM_CLI" ip "$project_vm" 2>/dev/null || echo '?')"
+        if macos_via_gvproxy "$project_vm"; then
+            ip="127.0.0.1:${AUGUR_SSH_FWD_PORT} (gvproxy fwd)"
+        else
+            ip="$("$VM_CLI" ip "$project_vm" 2>/dev/null || echo '?')"
+        fi
         echo -e "${BOLD}Status:${RESET}        ${GREEN}running${RESET}  (${ip})"
     elif macos_vm_exists "$project_vm"; then
         echo -e "${BOLD}Status:${RESET}        ${YELLOW}stopped${RESET}"
     else
         echo -e "${BOLD}Status:${RESET}        ${RED}not created${RESET}"
+    fi
+    if egress_enabled; then
+        local estate="${RED}stopped${RESET}"; proxy_running && estate="${GREEN}running${RESET}"
+        local gstate="${RED}stopped${RESET}"; gvproxy_running && gstate="${GREEN}running${RESET}"
+        echo -e "${BOLD}Egress:${RESET}        ${GREEN}on${RESET} (proxy ${estate}, gvproxy ${gstate})"
+        echo -e "${BOLD}Allowlist:${RESET}     ${AUGUR_GLOBAL_CONF}$( [[ -f "$AUGUR_PROJECT_CONF" ]] && echo " + .augur.conf" )"
+    else
+        echo -e "${BOLD}Egress:${RESET}        ${YELLOW}off${RESET} (no .augur.conf; add one or pass --egress)"
     fi
     echo ""
 
@@ -1242,6 +1273,8 @@ cmd_help() {
     echo -e "    --swift VERSION    Swift version for Docker mode (default: ${CYAN}latest${RESET})"
     echo -e "    --macos            Use macOS VM with Xcode instead of Docker"
     echo -e "    --gui              Open a VM window in macOS VM mode (for: augur up --macos)"
+    echo -e "    --egress           Force the egress allowlist on (default: on iff ./.augur.conf exists)"
+    echo -e "    --no-egress        Force the egress allowlist off for this run"
     echo -e "    --ipsw <path>      macOS IPSW file  (for: augur build --macos)"
     echo -e "    --xcode-xip <path> Xcode XIP file   (for: augur build --macos)"
     echo -e "    --platforms <list> Simulator platforms to bake into the base VM (for: augur build --macos)"
@@ -1251,8 +1284,12 @@ cmd_help() {
     echo -e "    ANTHROPIC_API_KEY        Anthropic API key (or ~/.anthropic_api_key)"
     echo -e "    CLAUDE_CODE_OAUTH_TOKEN  Claude subscription token (or ~/.claude_code_oauth_token; run: claude setup-token)"
     echo -e "    SWIFT_VERSION            Default Swift version (default: latest)"
+    echo -e "    AUGUR_EGRESS             Force egress on/off (1/0); overrides .augur.conf detection"
     echo ""
     echo -e "  ${BOLD}NOTES${RESET}"
+    echo -e "    • Egress allowlist: add a ${CYAN}.augur.conf${RESET} (one domain per line, ${CYAN}*.example.com${RESET} for"
+    echo -e "      subdomains) to restrict the container/VM to those domains. Works in both modes,"
+    echo -e "      needs no sudo. See ${CYAN}augur status${RESET} and README. macOS egress also needs Go (augur-gvproxy)."
     echo -e "    • Docker mode:   current directory mounted at /workspace-<project> (Linux container)"
     echo -e "    • macOS VM mode: current directory exposed at ~/workspace-<project> (macOS VM)"
     echo -e "    • macOS VM mode requires: augur-vm (the bundled Swift VM backend)"

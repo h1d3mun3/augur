@@ -76,19 +76,20 @@ swift build          # cross-platform
 swift test           # unit tests (Allowlist matching, SNI, CONNECT/SOCKS parsing)
 ```
 
-## Remaining work (macOS airtight datapath)
+## macOS datapath
 
-The macOS file-handle datapath needs a small **fork of `gvproxy`
-(gvisor-tap-vsock, Go)** installed as `augur-gvproxy`, started by `augur` with:
+On macOS the guest reaches this proxy through a small **fork of `gvproxy`
+(gvisor-tap-vsock)** in `../gvproxy/` (a patch + `build.sh`, built by `install`),
+which runs the guest's network on the host and forwards every guest TCP connection
+to this proxy's SOCKS5 by destination IP. This proxy then peeks the TLS SNI / HTTP
+Host on the SOCKS-by-IP stream, applies the allowlist by name, and dials out by
+name. `augur` starts it as:
 
 ```
 augur-gvproxy --listen-vfkit unixgram://<sock> \
               --socks-upstream 127.0.0.1:<socks-port> \
-              --deny-direct
+              --ssh-port <fwd-port> --deny-direct
 ```
 
-The fork adds an egress hook so the netstack forwards guest TCP to this proxy's
-SOCKS5 (by name) instead of dialing directly. It also requires reworking augur-vm's
-IP discovery (`DHCPLeases`/`IPCommand`) to gvproxy's fixed gateway addressing and
-SSH-over-forward. The Docker datapath and this proxy core are complete and tested;
-the gvproxy fork is the one external piece still to build (needs Go + a macOS host).
+The Docker datapath and this proxy core are verified on Linux; the macOS datapath
+is verified end-to-end on Apple Silicon. See `../gvproxy/README.md` for the fork.

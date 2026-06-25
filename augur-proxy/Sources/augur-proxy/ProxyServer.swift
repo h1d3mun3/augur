@@ -44,7 +44,7 @@ final class ProxyServer {
     func handleHTTP(_ cfd: Int32, client: String) {
         defer { close(cfd) }
         Sock.setReadTimeout(cfd, seconds: 15)   // a silent client can't pin a thread
-        guard let head = readHTTPHead(cfd) else { return }
+        guard let (head, leftover) = readHTTPHead(cfd) else { return }
         guard let req = HTTPProxyRequest.parse(head: head) else {
             try? Sock.writeAll(cfd, Array("HTTP/1.1 400 Bad Request\r\n\r\n".utf8)); return
         }
@@ -66,10 +66,13 @@ final class ProxyServer {
         switch req.kind {
         case .connect:
             try? Sock.writeAll(cfd, Array("HTTP/1.1 200 Connection Established\r\n\r\n".utf8))
+            if !leftover.isEmpty { try? Sock.writeAll(upstream, leftover) }  // rare: data before 200
         case .absolute(let method, let target):
-            // Rewrite absolute-URI request line to origin-form and replay the head.
+            // Rewrite absolute-URI request line to origin-form, then replay the head
+            // and any coalesced body bytes upstream.
             let originHead = rewriteToOriginForm(head: head, method: method, target: target)
             try? Sock.writeAll(upstream, Array(originHead.utf8))
+            if !leftover.isEmpty { try? Sock.writeAll(upstream, leftover) }
         }
         spliceBoth(cfd, upstream)
     }
@@ -172,17 +175,20 @@ final class ProxyServer {
 
     // MARK: - Helpers
 
-    /// Read an HTTP request head: bytes up to and including the blank line.
-    private func readHTTPHead(_ fd: Int32, limit: Int = 64 * 1024) -> String? {
+    /// Read an HTTP request head (up to and including the blank line) plus any
+    /// bytes that arrived in the same read AFTER it — a request body (POST/PUT) is
+    /// often coalesced with the head, and the caller must forward those leftover
+    /// bytes upstream too or the request hangs / loses its body.
+    private func readHTTPHead(_ fd: Int32, limit: Int = 64 * 1024) -> (head: String, leftover: [UInt8])? {
         var data = [UInt8]()
         while data.count < limit {
             guard let chunk = try? Sock.read(fd), !chunk.isEmpty else { break }
             data += chunk
             if let r = findHeaderEnd(data) {
-                return String(decoding: data[0..<r], as: UTF8.self)
+                return (String(decoding: data[0..<r], as: UTF8.self), Array(data[r...]))
             }
         }
-        return data.isEmpty ? nil : String(decoding: data, as: UTF8.self)
+        return data.isEmpty ? nil : (String(decoding: data, as: UTF8.self), [])
     }
 
     private func findHeaderEnd(_ b: [UInt8]) -> Int? {

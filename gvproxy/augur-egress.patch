@@ -166,7 +166,7 @@ index 0000000..139a641
 +	return c, nil
 +}
 diff --git a/pkg/services/forwarder/tcp.go b/pkg/services/forwarder/tcp.go
-index ae18ada..d425b97 100644
+index ae18ada..2dd2f5a 100644
 --- a/pkg/services/forwarder/tcp.go
 +++ b/pkg/services/forwarder/tcp.go
 @@ -17,7 +17,12 @@ import (
@@ -202,6 +202,14 @@ index ae18ada..d425b97 100644
  			r.Complete(true)
  			return
  		}
+@@ -48,6 +60,7 @@ func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
+ 			} else {
+ 				log.Errorf("r.CreateEndpoint() = %v", tcpErr)
+ 			}
++			_ = outbound.Close() // don't leak the dialed upstream/SOCKS conn
+ 			return
+ 		}
+ 
 diff --git a/pkg/types/configuration.go b/pkg/types/configuration.go
 index 0e6a051..71f88b0 100644
 --- a/pkg/types/configuration.go

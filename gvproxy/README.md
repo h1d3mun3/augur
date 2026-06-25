@@ -71,5 +71,6 @@ The patch builds (`go build ./cmd/gvproxy`) and `go vet` is clean. The SOCKS-by-
 → SNI-peek protocol it relies on is verified end-to-end against `augur-proxy` (see
 the augur-proxy tests / `--socks5` live checks, including a NUL-injection exploit
 attempt that is correctly blocked). The full VM integration (VZFileHandle + gvproxy
-+ a booted macOS guest) must be validated on an Apple Silicon host — it cannot run
-in a Linux CI sandbox.
++ a booted macOS guest) has been **validated end-to-end on Apple Silicon**: an
+allowlisted host is reachable, a non-allowlisted host is blocked, and SSH reaches
+the VM through gvproxy's forward. (It cannot run in a Linux CI sandbox.)
