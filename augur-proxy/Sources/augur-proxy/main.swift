@@ -122,10 +122,21 @@ signal(SIGPIPE, SIG_IGN)
 // empty/garbage policy still applies (fail-closed); an unreadable file keeps the
 // previous policy so we never fall open.
 DispatchQueue.global().async {
-    var last = mtime(opts.allowlist)
+    // Local (not a global func) so Swift's concurrency checker doesn't flag it as a
+    // "concurrently-executed global function".
+    func fileMtime(_ path: String) -> Double {
+        var st = stat()
+        guard stat(path, &st) == 0 else { return -1 }
+        #if canImport(Darwin)
+        return Double(st.st_mtimespec.tv_sec) + Double(st.st_mtimespec.tv_nsec) / 1e9
+        #else
+        return Double(st.st_mtim.tv_sec) + Double(st.st_mtim.tv_nsec) / 1e9
+        #endif
+    }
+    var last = fileMtime(opts.allowlist)
     while true {
-        sleepSeconds(2)
-        let now = mtime(opts.allowlist)
+        _ = sleep(2)
+        let now = fileMtime(opts.allowlist)
         if now != last {
             last = now
             if let fresh = loadAllowlist(opts.allowlist) {
@@ -156,17 +167,3 @@ do {
 
 log.info("augur-proxy ready (pid \(getpid()))")
 dispatchMain()
-
-// ── small platform helpers ──────────────────────────────────────────────────
-
-func mtime(_ path: String) -> Double {
-    var st = stat()
-    guard stat(path, &st) == 0 else { return -1 }
-    #if canImport(Darwin)
-    return Double(st.st_mtimespec.tv_sec) + Double(st.st_mtimespec.tv_nsec) / 1e9
-    #else
-    return Double(st.st_mtim.tv_sec) + Double(st.st_mtim.tv_nsec) / 1e9
-    #endif
-}
-
-func sleepSeconds(_ s: UInt32) { _ = sleep(s) }
