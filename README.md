@@ -231,7 +231,7 @@ The effective list is a **global baseline** (`~/.augur/augur.conf`, installed wi
 
 | Mode | Enforcement |
 |------|-------------|
-| **Docker** | Container runs on an internal network (no route out) with `NET_ADMIN` dropped, so a root agent can't re-route; all egress goes to the host proxy via `host.docker.internal`. A boot self-test fails closed if direct egress is ever reachable. |
+| **Docker** | The agent runs on an internal network (no route to the host or the internet) with `NET_ADMIN` dropped, so a root agent can't re-route. A proxy **sidecar** container joins that internal network (to receive the agent's traffic) and a normal bridge (to egress) — making it the agent's only way out. A boot self-test fails closed if direct egress is ever reachable. |
 | **macOS VM** | The guest's only NIC is a host-owned socket (`VZFileHandleNetworkDeviceAttachment`); a bundled `gvproxy` runs the guest's network on the host and funnels every connection to the proxy. Needs no special entitlement. |
 
 In both modes the proxy decides by domain (the CONNECT host, or the TLS SNI / HTTP Host) and connects out by name.

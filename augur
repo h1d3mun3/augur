@@ -39,6 +39,14 @@ AUGUR_DIR="$HOME/.augur"
 AUGUR_GLOBAL_CONF="${AUGUR_GLOBAL_CONF:-$AUGUR_DIR/augur.conf}"
 AUGUR_PROJECT_CONF="$WORKSPACE_DIR/.augur.conf"
 AUGUR_PROXY_DIR="$AUGUR_DIR/proxy"
+# Docker mode runs the proxy as a SIDECAR container, not on the host: on Docker
+# Desktop a `--internal` network severs the route to the host, so a host proxy is
+# unreachable. The sidecar joins the agent's internal network (to receive its
+# traffic) AND a normal bridge (to egress) — making it the agent's only way out.
+AUGUR_PROXY_SRC="$AUGUR_DIR/augur-proxy-src"        # Swift source (copied by install)
+AUGUR_PROXY_LINUX="$AUGUR_DIR/augur-proxy-linux"    # Linux build, run in the sidecar
+AUGUR_INTERNAL_SUBNET="${AUGUR_INTERNAL_SUBNET:-172.31.255.0/28}"
+AUGUR_SIDECAR_IP="${AUGUR_SIDECAR_IP:-172.31.255.2}"
 # Ports the proxy listens on (host side). HTTP CONNECT is for Docker; SOCKS5 is for
 # the macOS file-handle datapath (gvproxy forwards guest TCP here by name). They are
 # derived per-project (a stable hash of the project dir name) so two egress-enabled
@@ -345,68 +353,106 @@ stop_proxy() {
 # ── Docker egress topology (no host sudo; enforced by Docker's network layer) ──
 
 egress_network_name() { echo "augur-$(workspace_slug)-net"; }
+egress_sidecar_name() { echo "augur-$(workspace_slug)-proxy"; }
 
-# An --internal network has no route to the public internet (Docker installs no
-# MASQUERADE/forward rules for it). The container's only reachable egress is the
-# host proxy via host.docker.internal — and with --cap-drop=NET_ADMIN the root
-# agent inside cannot add a route or touch iptables. That is the boundary.
+# The agent's --internal network: no route to the host or the internet (Docker
+# installs no MASQUERADE/forward rules). A fixed subnet gives the sidecar a stable
+# IP the agent points HTTPS_PROXY at.
 ensure_egress_network() {
     local net; net="$(egress_network_name)"
     if ! docker network inspect "$net" &>/dev/null; then
         info "Creating internal egress network '${net}'..."
-        docker network create --internal "$net" &>/dev/null
+        docker network create --internal --subnet "$AUGUR_INTERNAL_SUBNET" "$net" &>/dev/null
     fi
 }
 
-# Boot self-test: prove the container CANNOT reach the internet except via the
-# proxy. If a direct (proxy-less) request succeeds, the airtight assumption is
-# broken (e.g. a Docker Desktop regression) — fail closed rather than run unfiltered.
+# Build the Linux augur-proxy the sidecar runs (the host binary is for macOS and is
+# the wrong architecture/OS for a container). Built once via the augur image (which
+# carries the Swift toolchain); the .build dir is a host mount so the binary lands
+# on the host fs. Idempotent.
+ensure_linux_proxy() {
+    [[ -x "$AUGUR_PROXY_LINUX" ]] && return 0
+    [[ -d "$AUGUR_PROXY_SRC" ]] || {
+        error "augur-proxy source not found at ${AUGUR_PROXY_SRC}."
+        error "Re-run ${BOLD}bash install${RESET} to install it."
+        exit 1
+    }
+    ensure_image
+    info "Building the Linux egress proxy for the Docker sidecar (one-time, ~1 min)..."
+    # Copy the (read-only mounted) source to a writable tmp dir inside the container,
+    # build there, send build chatter to stderr, and stream ONLY the binary to stdout
+    # → the host file. Avoids host-mount write/permission issues. augur-proxy has no
+    # dependencies, so the build needs no network.
+    mkdir -p "$AUGUR_DIR"
+    docker run --rm -v "${AUGUR_PROXY_SRC}:/src:ro" "$IMAGE_NAME" \
+        sh -c 'cp -a /src /tmp/aps && cd /tmp/aps && swift build -c release 1>&2 && cat .build/release/augur-proxy' \
+        > "$AUGUR_PROXY_LINUX"
+    if [[ ! -s "$AUGUR_PROXY_LINUX" ]]; then
+        rm -f "$AUGUR_PROXY_LINUX"
+        error "Failed to build the Linux egress proxy."; exit 1
+    fi
+    chmod +x "$AUGUR_PROXY_LINUX"
+}
+
+# Start the proxy sidecar: dual-homed on the agent's internal network (fixed IP) and
+# a normal bridge for egress. Runs the Linux augur-proxy (mounted) with the merged
+# allowlist (mounted read-only). The agent reaches it at AUGUR_SIDECAR_IP.
+start_sidecar() {
+    local name; name="$(egress_sidecar_name)"
+    local allowlist; allowlist="$(write_merged_allowlist)"
+    docker rm -f "$name" &>/dev/null || true
+    info "Starting egress proxy sidecar '${name}'..."
+    docker run -d --name "$name" \
+        --network "$(egress_network_name)" --ip "$AUGUR_SIDECAR_IP" \
+        --cap-drop NET_ADMIN \
+        -v "${allowlist}:/allowlist:ro" \
+        -v "${AUGUR_PROXY_LINUX}:/usr/local/bin/augur-proxy:ro" \
+        "$IMAGE_NAME" \
+        augur-proxy --allowlist /allowlist --listen 0.0.0.0 --http-port "$AUGUR_PROXY_HTTP_PORT" &>/dev/null
+    # Give the sidecar an egress path (the default bridge reaches the internet); the
+    # sidecar itself only connects to allowlisted domains, so this is not a hole.
+    docker network connect bridge "$name" &>/dev/null || true
+}
+
+stop_sidecar() {
+    docker rm -f "$(egress_sidecar_name)" &>/dev/null || true
+}
+
+# Boot self-test: prove the agent can ONLY egress via the sidecar. Direct (proxy-less)
+# requests must fail; a request THROUGH the sidecar must get an HTTP response.
 verify_egress_locked() {
-    info "Running egress self-test (direct egress must be blocked)..."
+    info "Running egress self-test..."
     local leaked=false
-    # Empty the proxy env so curl attempts a DIRECT connection; on the internal
-    # network this must fail. Test both a hostname and a public IP literal.
+    # Direct egress (no proxy) on the internal network must fail — hostname and IP.
     if docker exec -e HTTP_PROXY= -e HTTPS_PROXY= -e http_proxy= -e https_proxy= -e NO_PROXY="*" \
         "$CONTAINER_NAME" sh -c 'curl -s --max-time 6 -o /dev/null https://example.com' 2>/dev/null; then
-        leaked=true
+        leaked=true; error "Self-test: the container reached the internet directly (not isolated)."
     fi
     if docker exec -e HTTP_PROXY= -e HTTPS_PROXY= -e http_proxy= -e https_proxy= -e NO_PROXY="*" \
         "$CONTAINER_NAME" sh -c 'curl -s --max-time 6 -o /dev/null https://1.1.1.1' 2>/dev/null; then
-        leaked=true
+        leaked=true; error "Self-test: the container reached a public IP directly (not isolated)."
     fi
-    # DNS-exfil probe: resolving an arbitrary external name must FAIL (the resolver
-    # points at an unreachable address on the no-egress internal network).
+    # External DNS must fail closed (resolver points at an unreachable address).
     if docker exec "$CONTAINER_NAME" sh -c 'getent hosts dns-leak-probe.example' &>/dev/null; then
-        leaked=true
-        error "Egress self-test: the container resolved an external name (DNS not fail-closed)."
+        leaked=true; error "Self-test: the container resolved an external name (DNS not fail-closed)."
     fi
-    # Sanity: the proxy path's host.docker.internal (a static --add-host entry) must
-    # still resolve, else the --dns change broke legitimate egress.
-    if ! docker exec "$CONTAINER_NAME" sh -c 'getent hosts host.docker.internal' &>/dev/null; then
-        error "Egress self-test FAILED: host.docker.internal no longer resolves (broke the proxy path)."
-        leaked=true
-    fi
-    # The proxy must actually be REACHABLE from the container: a request through it
-    # (even to a denied host, which returns 403) must get an HTTP response, not a
-    # connection failure. Catches host.docker.internal resolving to an address the
-    # proxy isn't listening on (e.g. an IPv6 host-gateway vs an IPv4-only bind).
+    # The sidecar proxy MUST be reachable: a request through it (even a 403 deny) must
+    # return an HTTP status, not a connection failure. curl prints 000 on failure.
     local pcode
     pcode="$(docker exec "$CONTAINER_NAME" sh -c \
-        "curl -s -o /dev/null -w '%{http_code}' --max-time 8 -x 'http://host.docker.internal:${AUGUR_PROXY_HTTP_PORT}' http://egress-proxy-probe.invalid/" 2>/dev/null || echo 000)"
-    if [[ "$pcode" == "000" ]]; then
-        error "Egress self-test FAILED: the host proxy is not reachable from the container."
-        error "host.docker.internal:${AUGUR_PROXY_HTTP_PORT} did not respond — nothing would work."
+        "curl -s -o /dev/null -w '%{http_code}' --max-time 8 -x 'http://${AUGUR_SIDECAR_IP}:${AUGUR_PROXY_HTTP_PORT}' http://egress-proxy-probe.invalid/" 2>/dev/null)"
+    if [[ -z "$pcode" || "$pcode" == "000" ]]; then
         leaked=true
+        error "Self-test: the egress proxy sidecar (${AUGUR_SIDECAR_IP}:${AUGUR_PROXY_HTTP_PORT}) is not reachable."
     fi
     if $leaked; then
-        error "Egress self-test FAILED: the container reached the internet WITHOUT the proxy."
-        error "The proxy is not the only egress path — refusing to continue (would run unfiltered)."
+        error "Egress self-test FAILED — refusing to continue. Tearing down."
         docker rm -f "$CONTAINER_NAME" &>/dev/null || true
-        stop_proxy
+        stop_sidecar
         docker network rm "$(egress_network_name)" &>/dev/null || true
         exit 1
     fi
-    success "Egress self-test passed: only allowlisted domains are reachable (via the proxy)."
+    success "Egress self-test passed: the sidecar is the agent's only egress; only allowlisted domains are reachable."
 }
 
 # ── macOS egress datapath (VZFileHandle + gvproxy) ────────────────────────────
@@ -512,31 +558,28 @@ cmd_up() {
         -w "${WORKSPACE_MOUNT}"
     )
 
-    # Egress allowlist: put the container on an internal network with no route to
-    # the internet, drop NET_ADMIN so the root agent can't re-route, and point all
-    # egress at the host proxy via host.docker.internal. No host sudo required.
+    # Egress allowlist: put the agent on an internal network (no route to the host
+    # or the internet) with NET_ADMIN dropped so the root agent can't re-route, and
+    # point all egress at the proxy SIDECAR (the agent's only reachable peer). No
+    # host sudo required. The sidecar enforces the allowlist and egresses for it.
     if egress_enabled; then
         ensure_egress_network
-        # Bind dual-stack (::) so the container can reach the proxy whether
-        # host.docker.internal resolves to an IPv4 or IPv6 host-gateway.
-        start_proxy "::"
-        local proxy_url="http://host.docker.internal:${AUGUR_PROXY_HTTP_PORT}"
+        ensure_linux_proxy
+        start_sidecar
+        local proxy_url="http://${AUGUR_SIDECAR_IP}:${AUGUR_PROXY_HTTP_PORT}"
         docker_args+=(
             --network "$(egress_network_name)"
             --cap-drop NET_ADMIN
-            --add-host "host.docker.internal:host-gateway"
             -e "HTTP_PROXY=${proxy_url}"  -e "http_proxy=${proxy_url}"
             -e "HTTPS_PROXY=${proxy_url}" -e "https_proxy=${proxy_url}"
             -e "NO_PROXY=localhost,127.0.0.1" -e "no_proxy=localhost,127.0.0.1"
-            # Point the container's resolver at an unreachable address (RFC 5737
-            # TEST-NET-1). On the --internal network this has no egress, so external
-            # name resolution fails closed — closing the DNS-exfil channel. Proxied
-            # tools are unaffected: they resolve host-side via *_PROXY, and
-            # host.docker.internal is a static --add-host entry, not a DNS lookup.
+            # Resolver points at an unreachable address (RFC 5737 TEST-NET-1):
+            # external DNS fails closed (the agent reaches the sidecar by IP and
+            # proxies by name, so it needs no working external DNS). Closes DNS-exfil.
             --dns 192.0.2.1
             --dns-search .
         )
-        info "Egress restricted to allowlisted domains (proxy: ${BOLD}${proxy_url}${RESET})."
+        info "Egress restricted to allowlisted domains (sidecar: ${BOLD}${proxy_url}${RESET})."
     fi
 
     local anthropic_key
@@ -565,9 +608,9 @@ cmd_up() {
 
     if ! docker "${docker_args[@]}" &>/dev/null; then
         error "Failed to start the container."
-        # Don't leave a started proxy / internal network orphaned.
+        # Don't leave a started sidecar / internal network orphaned.
         if egress_enabled; then
-            stop_proxy
+            stop_sidecar
             docker network rm "$(egress_network_name)" &>/dev/null || true
         fi
         exit 1
@@ -606,8 +649,8 @@ cmd_down() {
         warn "No container found for this directory (${CONTAINER_NAME})."
     fi
     # Always tear down egress (safe no-ops if it was never enabled) so a stranded
-    # proxy/network from a crashed or out-of-band-removed container is cleaned up.
-    stop_proxy
+    # sidecar/network from a crashed or out-of-band-removed container is cleaned up.
+    stop_sidecar
     docker network rm "$(egress_network_name)" &>/dev/null || true
 }
 
@@ -617,8 +660,9 @@ cmd_status() {
     echo -e "${BOLD}Directory:${RESET}  ${WORKSPACE_DIR}"
     echo -e "${BOLD}Image:${RESET}      ${IMAGE_NAME}"
     if egress_enabled; then
-        local estate="${RED}stopped${RESET}"; proxy_running && estate="${GREEN}running${RESET}"
-        echo -e "${BOLD}Egress:${RESET}     ${GREEN}on${RESET} (allowlist; proxy ${estate})"
+        local estate="${RED}stopped${RESET}"
+        docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$(egress_sidecar_name)" && estate="${GREEN}running${RESET}"
+        echo -e "${BOLD}Egress:${RESET}     ${GREEN}on${RESET} (allowlist; sidecar ${estate})"
         echo -e "${BOLD}Allowlist:${RESET}  ${AUGUR_GLOBAL_CONF}$( [[ -f "$AUGUR_PROJECT_CONF" ]] && echo " + .augur.conf" )"
     else
         echo -e "${BOLD}Egress:${RESET}     ${YELLOW}off${RESET} (no .augur.conf; add one or pass --egress)"
