@@ -33,6 +33,39 @@ index 8fe3154..da1009f 100644
  	if args.vpnkitSocket != "" {
  		config.Interfaces.VPNKit = args.vpnkitSocket
  	}
+diff --git a/cmd/gvproxy/main.go b/cmd/gvproxy/main.go
+index 2588f02..eaa0bb9 100644
+--- a/cmd/gvproxy/main.go
++++ b/cmd/gvproxy/main.go
+@@ -157,15 +157,20 @@ func run(ctx context.Context, g *errgroup.Group, config *GvproxyConfig) error {
+ 		httpServe(ctx, g, ln, vn.ServicesMux())
+ 	}
+ 
+-	ln, err := vn.Listen("tcp", fmt.Sprintf("%s:80", config.Stack.GatewayIP))
+-	if err != nil {
+-		return err
++	// augur: the gateway:80 mux is a GUEST-reachable forward-management API. In
++	// egress mode (--deny-direct) augur uses only static forwards, so do not expose
++	// it — it would be unnecessary management surface for a root guest.
++	if !config.Stack.DenyDirectEgress {
++		ln, err := vn.Listen("tcp", fmt.Sprintf("%s:80", config.Stack.GatewayIP))
++		if err != nil {
++			return err
++		}
++		mux := http.NewServeMux()
++		mux.Handle("/services/forwarder/all", vn.Mux())
++		mux.Handle("/services/forwarder/expose", vn.Mux())
++		mux.Handle("/services/forwarder/unexpose", vn.Mux())
++		httpServe(ctx, g, ln, mux)
+ 	}
+-	mux := http.NewServeMux()
+-	mux.Handle("/services/forwarder/all", vn.Mux())
+-	mux.Handle("/services/forwarder/expose", vn.Mux())
+-	mux.Handle("/services/forwarder/unexpose", vn.Mux())
+-	httpServe(ctx, g, ln, mux)
+ 
+ 	if InDebugMode() {
+ 		g.Go(func() error {
 diff --git a/pkg/services/forwarder/socks_client.go b/pkg/services/forwarder/socks_client.go
 new file mode 100644
 index 0000000..139a641

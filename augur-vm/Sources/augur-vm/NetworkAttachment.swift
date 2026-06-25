@@ -72,6 +72,8 @@ enum NetworkAttachment {
                                        _ body: (UnsafePointer<sockaddr>, socklen_t) throws -> Void) throws {
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
+        // macOS/BSD sockaddr_un carries sun_len; set it so bind/connect are happy.
+        addr.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
         let cap = MemoryLayout.size(ofValue: addr.sun_path)
         let bytes = Array(path.utf8)
         guard bytes.count < cap else { throw CLIError("vfkit: socket path too long: \(path)") }

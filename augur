@@ -43,6 +43,9 @@ AUGUR_PROXY_DIR="$AUGUR_DIR/proxy"
 # the macOS file-handle datapath (gvproxy forwards guest TCP here by name).
 AUGUR_PROXY_HTTP_PORT="${AUGUR_PROXY_HTTP_PORT:-13128}"
 AUGUR_PROXY_SOCKS_PORT="${AUGUR_PROXY_SOCKS_PORT:-13129}"
+# In egress mode the guest has no host-routable IP (gvproxy user-space network);
+# SSH reaches it via gvproxy's host-side forward 127.0.0.1:<this port> → guest:22.
+AUGUR_SSH_FWD_PORT="${AUGUR_SSH_FWD_PORT:-2222}"
 # Egress filtering is opt-in: ON when a project ./.augur.conf exists, or AUGUR_EGRESS=1,
 # or --egress. --no-egress / AUGUR_EGRESS=0 forces it off. Default off keeps existing
 # behavior byte-for-byte for users who never create a .augur.conf.
@@ -187,35 +190,52 @@ macos_vm_ip() {
     return 1
 }
 
+# SSH target for a VM. The project VM in egress mode lives behind gvproxy's
+# user-space network (no host-routable IP); SSH reaches it via gvproxy's host-side
+# forward at 127.0.0.1:<AUGUR_SSH_FWD_PORT>. Every other case (build/base VM, or a
+# project VM without egress) uses the DHCP-leased guest IP on port 22. Keyed on the
+# project VM having a *running* gvproxy, so build/base flows are never affected.
+macos_via_gvproxy() { [[ "$1" == "$(macos_project_vm)" ]] && gvproxy_running; }
+macos_ssh_host() {
+    if macos_via_gvproxy "$1"; then echo "127.0.0.1"; else "$VM_CLI" ip "$1" 2>/dev/null; fi
+}
+macos_ssh_port() {
+    if macos_via_gvproxy "$1"; then echo "$AUGUR_SSH_FWD_PORT"; else echo "22"; fi
+}
+
 ssh_macos() {
     local vm="$1"; shift
-    local ip
-    ip="$("$VM_CLI" ip "$vm" 2>/dev/null)" || { error "Cannot get IP for '${vm}'."; exit 1; }
+    local host port
+    host="$(macos_ssh_host "$vm")"; port="$(macos_ssh_port "$vm")"
+    [[ -n "$host" ]] || { error "Cannot resolve SSH host for '${vm}'."; exit 1; }
     local key_opts=()
     if [[ -f "$MACOS_SSH_KEY" ]]; then
         key_opts=(-i "$MACOS_SSH_KEY" -o PasswordAuthentication=no -o BatchMode=yes)
     fi
-    ssh -o StrictHostKeyChecking=no \
+    ssh -p "$port" \
+        -o StrictHostKeyChecking=no \
         -o UserKnownHostsFile=/dev/null \
         -o LogLevel=ERROR \
         -o ConnectTimeout=10 \
         "${key_opts[@]}" \
-        "${MACOS_SSH_USER}@${ip}" "$@"
+        "${MACOS_SSH_USER}@${host}" "$@"
 }
 
 scp_to_macos() {
     local vm="$1" src="$2" dst="$3"
-    local ip
-    ip="$("$VM_CLI" ip "$vm" 2>/dev/null)" || { error "Cannot get IP for '${vm}'."; exit 1; }
+    local host port
+    host="$(macos_ssh_host "$vm")"; port="$(macos_ssh_port "$vm")"
+    [[ -n "$host" ]] || { error "Cannot resolve SSH host for '${vm}'."; exit 1; }
     local key_opts=()
     if [[ -f "$MACOS_SSH_KEY" ]]; then
         key_opts=(-i "$MACOS_SSH_KEY" -o PasswordAuthentication=no -o BatchMode=yes)
     fi
-    scp -o StrictHostKeyChecking=no \
+    scp -P "$port" \
+        -o StrictHostKeyChecking=no \
         -o UserKnownHostsFile=/dev/null \
         -o LogLevel=ERROR \
         "${key_opts[@]}" \
-        "$src" "${MACOS_SSH_USER}@${ip}:${dst}"
+        "$src" "${MACOS_SSH_USER}@${host}:${dst}"
 }
 
 # ── Egress proxy helpers (shared by Docker and macOS modes) ───────────────────
@@ -407,8 +427,11 @@ start_gvproxy() {
     # --listen-vfkit: the socket the VM's NIC attaches to (one datagram = one frame).
     # --socks-upstream: send all guest TCP to augur-proxy by name for the allowlist
     #   decision. --deny-direct: never net.Dial directly (the fork's egress hook).
+    # --ssh-port: gvproxy forwards host 127.0.0.1:<port> → guest :22 so augur can
+    #   reach the VM (it has no host-routable IP behind gvproxy's user-space net).
     "$gvp" --listen-vfkit "unixgram://${sock}" \
            --socks-upstream "127.0.0.1:${AUGUR_PROXY_SOCKS_PORT}" \
+           --ssh-port "$AUGUR_SSH_FWD_PORT" \
            --deny-direct &>/dev/null &
     echo $! > "$pidfile"
     disown
@@ -811,16 +834,19 @@ cmd_build_macos() {
 # the SSH daemon is ready). Waits up to ~2 min (40 × 3s). Prints the IP on success.
 wait_for_macos_ssh() {
     local vm="$1"
-    local ip retries=40 key_opts=()
+    local host port retries=40 key_opts=()
+    port="$(macos_ssh_port "$vm")"
     [[ -f "$MACOS_SSH_KEY" ]] && key_opts=(-i "$MACOS_SSH_KEY" -o PasswordAuthentication=no -o BatchMode=yes)
     while ((retries-- > 0)); do
-        ip="$("$VM_CLI" ip "$vm" 2>/dev/null)" && [[ -n "$ip" ]] && \
-            ssh -o StrictHostKeyChecking=no \
+        host="$(macos_ssh_host "$vm")"
+        [[ -n "$host" ]] && \
+            ssh -p "$port" \
+                -o StrictHostKeyChecking=no \
                 -o UserKnownHostsFile=/dev/null \
                 -o LogLevel=ERROR \
                 -o ConnectTimeout=5 \
                 "${key_opts[@]}" \
-                "${MACOS_SSH_USER}@${ip}" true 2>/dev/null && { echo "$ip"; return 0; }
+                "${MACOS_SSH_USER}@${host}" true 2>/dev/null && { echo "$host"; return 0; }
         sleep 3
     done
     return 1
