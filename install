@@ -33,7 +33,35 @@ mkdir -p "$INSTALL_DIR"
 cp "$SCRIPT_DIR/augur" "$INSTALL_DIR/augur"
 cp "$SCRIPT_DIR/Dockerfile" "$INSTALL_DIR/Dockerfile"
 chmod +x "$INSTALL_DIR/augur"
+
+# Install the egress allowlist baseline — but never clobber a user's edited copy.
+if [[ -f "$SCRIPT_DIR/augur.conf" ]]; then
+    if [[ -f "$INSTALL_DIR/augur.conf" ]]; then
+        info "Keeping existing $INSTALL_DIR/augur.conf (baseline updated at augur.conf.default)."
+        cp "$SCRIPT_DIR/augur.conf" "$INSTALL_DIR/augur.conf.default"
+    else
+        cp "$SCRIPT_DIR/augur.conf" "$INSTALL_DIR/augur.conf"
+    fi
+fi
 success "Files copied."
+
+# Build the egress proxy (augur-proxy). Cross-platform (Linux + macOS); needed for
+# egress filtering in both modes. A failure here is a warning — filtering is opt-in.
+if command -v swift &>/dev/null && [[ -d "$SCRIPT_DIR/augur-proxy" ]]; then
+    info "Building augur-proxy (egress filter)..."
+    if (cd "$SCRIPT_DIR/augur-proxy" && swift build -c release) >/dev/null 2>&1; then
+        proxy_bin="$(cd "$SCRIPT_DIR/augur-proxy" && swift build -c release --show-bin-path)/augur-proxy"
+        cp "$proxy_bin" "$INSTALL_DIR/augur-proxy"
+        # macOS: ad-hoc re-sign in place so an overwrite doesn't trip a stale AMFI cache
+        # (no entitlements needed — augur-proxy does not touch Virtualization.framework).
+        [[ "$(uname)" == "Darwin" ]] && codesign --force --sign - "$INSTALL_DIR/augur-proxy" 2>/dev/null || true
+        success "augur-proxy installed to $INSTALL_DIR/augur-proxy"
+    else
+        warn "augur-proxy build failed — egress filtering will be unavailable until it builds."
+    fi
+else
+    warn "Skipping augur-proxy build (needs Swift); egress filtering will be unavailable."
+fi
 
 # Build the macOS VM backend (augur-vm) when on macOS with a Swift toolchain.
 # Docker mode does not need this, so a failure here is only a warning.

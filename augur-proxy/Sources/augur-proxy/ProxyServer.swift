@@ -1,0 +1,170 @@
+import Foundation
+import AugurProxyCore
+#if canImport(Glibc)
+import Glibc
+#elseif canImport(Darwin)
+import Darwin
+#endif
+
+/// Runs the listening sockets and brokers each connection through `Filter`. A
+/// thread per connection keeps the implementation dependency-free; augur is a
+/// single-developer tool, so concurrency is modest and this is plenty.
+final class ProxyServer {
+    let filter: Filter
+    let log: DecisionLog
+    let publicOnly: Bool
+
+    init(filter: Filter, log: DecisionLog, publicOnly: Bool) {
+        self.filter = filter
+        self.log = log
+        self.publicOnly = publicOnly
+    }
+
+    /// Start a listener and dispatch accepted connections to `handler` on threads.
+    func serve(addr: String, port: UInt16, name: String, handler: @escaping (Int32, String) -> Void) throws {
+        let listenFD = try Sock.listen(addr: addr, port: port)
+        log.info("\(name) listening on \(addr):\(port)")
+        Thread.detachNewThread { [weak self] in
+            while true {
+                var ss = sockaddr_storage()
+                var len = socklen_t(MemoryLayout<sockaddr_storage>.size)
+                let cfd = withUnsafeMutablePointer(to: &ss) {
+                    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { accept(listenFD, $0, &len) }
+                }
+                if cfd < 0 { continue }
+                let client = Self.peerIP(&ss)
+                guard self != nil else { close(cfd); return }
+                Thread.detachNewThread { handler(cfd, client) }
+            }
+        }
+    }
+
+    // MARK: - HTTP CONNECT / forward proxy (Docker datapath)
+
+    func handleHTTP(_ cfd: Int32, client: String) {
+        defer { close(cfd) }
+        guard let head = readHTTPHead(cfd) else { return }
+        guard let req = HTTPProxyRequest.parse(head: head) else {
+            try? Sock.writeAll(cfd, Array("HTTP/1.1 400 Bad Request\r\n\r\n".utf8)); return
+        }
+        let dest = req.destination
+        let verdict = filter.decide(dest, client: client)
+        guard verdict.allowed else {
+            log.deny(client: client, host: dest.host, port: dest.port, reason: verdict.reason)
+            try? Sock.writeAll(cfd, Array("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n".utf8))
+            return
+        }
+        guard let upstream = try? Sock.connect(host: dest.host, port: dest.port, publicOnly: publicOnly) else {
+            log.deny(client: client, host: dest.host, port: dest.port, reason: "upstream-unreachable")
+            try? Sock.writeAll(cfd, Array("HTTP/1.1 502 Bad Gateway\r\n\r\n".utf8))
+            return
+        }
+        defer { close(upstream) }
+        log.allow(client: client, host: dest.host, port: dest.port, via: "http")
+
+        switch req.kind {
+        case .connect:
+            try? Sock.writeAll(cfd, Array("HTTP/1.1 200 Connection Established\r\n\r\n".utf8))
+        case .absolute(let method, let target):
+            // Rewrite absolute-URI request line to origin-form and replay the head.
+            let originHead = rewriteToOriginForm(head: head, method: method, target: target)
+            try? Sock.writeAll(upstream, Array(originHead.utf8))
+        }
+        spliceBoth(cfd, upstream)
+    }
+
+    // MARK: - SOCKS5 (macOS datapath: gvproxy forwards guest TCP here, by name)
+
+    func handleSocks(_ cfd: Int32, client: String) {
+        defer { close(cfd) }
+        // Greeting: VER NMETHODS METHODS...
+        guard let greeting = try? Sock.read(cfd), greeting.count >= 2, greeting[0] == Socks5.version else { return }
+        try? Sock.writeAll(cfd, [Socks5.version, Socks5.noAuth])
+
+        // Request — accumulate until parseable.
+        var buf = [UInt8]()
+        var parsed: Destination?
+        for _ in 0..<8 {
+            guard let chunk = try? Sock.read(cfd), !chunk.isEmpty else { break }
+            buf += chunk
+            if let (dest, _) = Socks5.parseRequest(buf) { parsed = dest; break }
+        }
+        guard let dest = parsed else {
+            try? Sock.writeAll(cfd, Socks5.reply(.generalFailure)); return
+        }
+        let verdict = filter.decide(dest, client: client)
+        guard verdict.allowed else {
+            log.deny(client: client, host: dest.host, port: dest.port, reason: verdict.reason)
+            try? Sock.writeAll(cfd, Socks5.reply(.notAllowed)); return
+        }
+        guard let upstream = try? Sock.connect(host: dest.host, port: dest.port, publicOnly: publicOnly) else {
+            log.deny(client: client, host: dest.host, port: dest.port, reason: "upstream-unreachable")
+            try? Sock.writeAll(cfd, Socks5.reply(.hostUnreachable)); return
+        }
+        defer { close(upstream) }
+        log.allow(client: client, host: dest.host, port: dest.port, via: "socks")
+        try? Sock.writeAll(cfd, Socks5.reply(.succeeded))
+        spliceBoth(cfd, upstream)
+    }
+
+    // MARK: - Helpers
+
+    /// Read an HTTP request head: bytes up to and including the blank line.
+    private func readHTTPHead(_ fd: Int32, limit: Int = 64 * 1024) -> String? {
+        var data = [UInt8]()
+        while data.count < limit {
+            guard let chunk = try? Sock.read(fd), !chunk.isEmpty else { break }
+            data += chunk
+            if let r = findHeaderEnd(data) {
+                return String(decoding: data[0..<r], as: UTF8.self)
+            }
+        }
+        return data.isEmpty ? nil : String(decoding: data, as: UTF8.self)
+    }
+
+    private func findHeaderEnd(_ b: [UInt8]) -> Int? {
+        guard b.count >= 4 else { return nil }
+        for i in 0...(b.count - 4) where b[i]==13 && b[i+1]==10 && b[i+2]==13 && b[i+3]==10 {
+            return i + 4
+        }
+        return nil
+    }
+
+    private func rewriteToOriginForm(head: String, method: String, target: String) -> String {
+        // Replace the absolute target with the origin-form path in the request line.
+        guard let schemeRange = target.range(of: "://") else { return head }
+        let afterScheme = target[schemeRange.upperBound...]
+        let path = afterScheme.firstIndex(of: "/").map { String(afterScheme[$0...]) } ?? "/"
+        guard let firstLineEnd = head.range(of: "\r\n") else { return head }
+        let rest = head[firstLineEnd.upperBound...]
+        return "\(method) \(path) HTTP/1.1\r\n\(rest)"
+    }
+
+    /// Bidirectional copy: one direction on this thread, the other on a new one.
+    private func spliceBoth(_ a: Int32, _ b: Int32) {
+        let done = DispatchSemaphore(value: 0)
+        Thread.detachNewThread { Sock.splice(from: a, to: b); done.signal() }
+        Sock.splice(from: b, to: a)
+        done.wait()
+    }
+
+    static func peerIP(_ ss: inout sockaddr_storage) -> String {
+        var buf = [CChar](repeating: 0, count: 64)
+        if Int32(ss.ss_family) == AF_INET {
+            withUnsafePointer(to: &ss) {
+                $0.withMemoryRebound(to: sockaddr_in.self, capacity: 1) {
+                    var a = $0.pointee.sin_addr
+                    inet_ntop(AF_INET, &a, &buf, socklen_t(buf.count))
+                }
+            }
+        } else if Int32(ss.ss_family) == AF_INET6 {
+            withUnsafePointer(to: &ss) {
+                $0.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) {
+                    var a = $0.pointee.sin6_addr
+                    inet_ntop(AF_INET6, &a, &buf, socklen_t(buf.count))
+                }
+            }
+        }
+        return String(cString: buf)
+    }
+}
