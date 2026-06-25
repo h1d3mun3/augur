@@ -58,4 +58,24 @@ final class ProxyRequestsTests: XCTestCase {
         let req: [UInt8] = [0x05, 0x02, 0x00, 0x01, 1, 2, 3, 4, 0x00, 0x50]  // cmd=BIND
         XCTAssertNil(Socks5.parseRequest(req))
     }
+
+    // MARK: origin-form Host (transparent SOCKS peek, plaintext port 80)
+    func testHostFromOriginForm() {
+        let req = Array("GET /repo/file HTTP/1.1\r\nHost: raw.githubusercontent.com\r\nUser-Agent: x\r\n\r\n".utf8)
+        XCTAssertEqual(HTTPProxyRequest.hostFromOriginForm(req), "raw.githubusercontent.com")
+    }
+
+    func testHostFromOriginFormStripsPort() {
+        let req = Array("GET / HTTP/1.1\r\nHost: example.com:8080\r\n\r\n".utf8)
+        XCTAssertEqual(HTTPProxyRequest.hostFromOriginForm(req), "example.com")
+    }
+
+    func testHostFromOriginFormRejectsTLS() {
+        // A TLS record (starts 0x16) must not be parsed as HTTP.
+        XCTAssertNil(HTTPProxyRequest.hostFromOriginForm([0x16, 0x03, 0x01, 0x00, 0x05]))
+    }
+
+    func testHostFromOriginFormNoHostYet() {
+        XCTAssertNil(HTTPProxyRequest.hostFromOriginForm(Array("GET / HTTP/1.1\r\n".utf8)))
+    }
 }

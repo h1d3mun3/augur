@@ -54,7 +54,8 @@ public enum TLSClientHello {
         guard let nameType = r.u8(), nameType == 0x00 else { return nil }  // host_name
         guard let nameLen = r.u16(), let name = r.bytes(nameLen) else { return nil }
         let host = String(decoding: name, as: UTF8.self)
-        return host.isEmpty ? nil : host
+        // Reject NUL/illegal bytes so the decision and the dial can't disagree.
+        return isValidHostname(host) ? host : nil
     }
 }
 

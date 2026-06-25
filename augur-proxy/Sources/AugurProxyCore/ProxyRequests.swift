@@ -56,6 +56,25 @@ public enum HTTPProxyRequest {
         return Parsed(kind: .absolute(method: method, target: target), destination: dest)
     }
 
+    /// Extract the host from an *origin-form* HTTP request's `Host:` header
+    /// (`GET /path HTTP/1.1\r\nHost: example.com\r\n…`). Used by the transparent
+    /// SOCKS peek path for plaintext port 80. Returns nil if no Host header is
+    /// present yet. Scans on bytes (CRLF is one Swift grapheme — see parse()).
+    public static func hostFromOriginForm(_ bytes: [UInt8]) -> String? {
+        // Must look like an HTTP request method line, not a TLS record.
+        guard let first = bytes.first, first != 0x16 else { return nil }
+        let text = String(decoding: bytes, as: UTF8.self)
+        for rawLine in text.split(whereSeparator: \.isNewline) {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            if line.lowercased().hasPrefix("host:") {
+                let value = line.dropFirst("host:".count).trimmingCharacters(in: .whitespaces)
+                let hostOnly = value.split(separator: ":").first.map(String.init) ?? value
+                return isValidHostname(hostOnly) ? hostOnly : nil
+            }
+        }
+        return nil
+    }
+
     /// Split `host:port` (or `[v6]:port`, or bare host) into a Destination.
     static func parseAuthority(_ authority: String, defaultPort: UInt16) -> Destination? {
         guard !authority.isEmpty else { return nil }

@@ -62,6 +62,13 @@ enum Sock {
         throw SockError("connect \(host):\(port) failed: \(lastErr)")
     }
 
+    /// Apply a receive timeout (seconds) so a peer that connects but never sends
+    /// can't pin a handler thread forever (used while peeking SNI/Host).
+    static func setReadTimeout(_ fd: Int32, seconds: Int) {
+        var tv = timeval(tv_sec: seconds, tv_usec: 0)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+    }
+
     /// Read up to `max` bytes. Returns [] on clean EOF, throws on error.
     static func read(_ fd: Int32, max: Int = 65536) throws -> [UInt8] {
         var buf = [UInt8](repeating: 0, count: max)
@@ -102,32 +109,53 @@ enum Sock {
         shutdown(dst, shutWrite)
     }
 
+    /// True for any destination that is NOT a globally-routable public address, so
+    /// the proxy refuses to be tricked into reaching host-local / LAN / internal
+    /// services (SSRF) — even via an allowlisted name that resolves to such an IP.
     static func isPrivate(_ sa: UnsafePointer<sockaddr>) -> Bool {
         switch Int32(sa.pointee.sa_family) {
         case AF_INET:
             let v = sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) {
                 UInt32(bigEndian: $0.pointee.sin_addr.s_addr)
             }
-            let a = (v >> 24) & 0xff, b = (v >> 16) & 0xff
-            if a == 127 { return true }                 // loopback
-            if a == 10 { return true }                  // 10/8
-            if a == 172 && (b >= 16 && b <= 31) { return true } // 172.16/12
-            if a == 192 && b == 168 { return true }     // 192.168/16
-            if a == 169 && b == 254 { return true }     // link-local
-            if a == 0 { return true }
-            return false
+            return isPrivateV4(UInt8(v >> 24), UInt8((v >> 16) & 0xff),
+                               UInt8((v >> 8) & 0xff), UInt8(v & 0xff))
         case AF_INET6:
             return sa.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { p in
                 var addr = p.pointee.sin6_addr
-                let bytes = withUnsafeBytes(of: &addr) { Array($0) }
-                if bytes == [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1] { return true } // ::1
-                if bytes[0] == 0xfe && (bytes[1] & 0xc0) == 0x80 { return true } // fe80::/10
-                if (bytes[0] & 0xfe) == 0xfc { return true } // fc00::/7 ULA
-                if bytes[0] == 0xff { return true } // multicast
+                let b = withUnsafeBytes(of: &addr) { Array($0) }
+                // First 10 bytes zero: ::, ::1 (loopback), IPv4-mapped (::ffff:0:0/96)
+                // and IPv4-compatible (deprecated) — classify the embedded v4 so a
+                // mapped 127.0.0.1 / 10.x can't slip past as "public IPv6".
+                if b[0...9].allSatisfy({ $0 == 0 }) {
+                    if b[10] == 0xff && b[11] == 0xff { return isPrivateV4(b[12], b[13], b[14], b[15]) }
+                    return true   // ::, ::1, v4-compat — never public
+                }
+                if b[0] == 0x00 && b[1] == 0x64 && b[2] == 0xff && b[3] == 0x9b { return true } // 64:ff9b::/96 NAT64
+                if b[0] == 0xfe && (b[1] & 0xc0) == 0x80 { return true } // fe80::/10 link-local
+                if (b[0] & 0xfe) == 0xfc { return true } // fc00::/7 ULA
+                if b[0] == 0xff { return true } // multicast
                 return false
             }
         default:
             return true   // unknown family: refuse
+        }
+    }
+
+    /// IPv4 non-public classification, shared by the AF_INET and IPv4-mapped paths.
+    static func isPrivateV4(_ a: UInt8, _ b: UInt8, _ c: UInt8, _ d: UInt8) -> Bool {
+        switch a {
+        case 0:          return true               // 0.0.0.0/8
+        case 10:         return true               // 10/8 private
+        case 127:        return true               // loopback
+        case 100:        return b >= 64 && b <= 127 // 100.64/10 CGNAT (Tailscale etc.)
+        case 169:        return b == 254           // 169.254/16 link-local
+        case 172:        return b >= 16 && b <= 31  // 172.16/12 private
+        case 192:        return (b == 168)          // 192.168/16 private
+                              || (b == 0 && c == 0)  // 192.0.0/24 IETF protocol
+        case 198:        return b == 18 || b == 19   // 198.18/15 benchmark
+        case 255:        return b == 255 && c == 255 && d == 255 // broadcast
+        default:         return a >= 240            // 240/4 reserved (incl. 255/8)
         }
     }
 }

@@ -43,6 +43,7 @@ final class ProxyServer {
 
     func handleHTTP(_ cfd: Int32, client: String) {
         defer { close(cfd) }
+        Sock.setReadTimeout(cfd, seconds: 15)   // a silent client can't pin a thread
         guard let head = readHTTPHead(cfd) else { return }
         guard let req = HTTPProxyRequest.parse(head: head) else {
             try? Sock.writeAll(cfd, Array("HTTP/1.1 400 Bad Request\r\n\r\n".utf8)); return
@@ -77,6 +78,7 @@ final class ProxyServer {
 
     func handleSocks(_ cfd: Int32, client: String) {
         defer { close(cfd) }
+        Sock.setReadTimeout(cfd, seconds: 15)   // bound the handshake/peek wait
         // Greeting: VER NMETHODS METHODS...
         guard let greeting = try? Sock.read(cfd), greeting.count >= 2, greeting[0] == Socks5.version else { return }
         try? Sock.writeAll(cfd, [Socks5.version, Socks5.noAuth])
@@ -92,6 +94,36 @@ final class ProxyServer {
         guard let dest = parsed else {
             try? Sock.writeAll(cfd, Socks5.reply(.generalFailure)); return
         }
+
+        // The macOS datapath (gvproxy) only knows the destination IP, so it hands us
+        // an IP-literal SOCKS request. We can't allowlist an IP by name, so we accept
+        // the SOCKS connection, peek the first segment for a TLS SNI / HTTP Host,
+        // allowlist by that domain, and dial UPSTREAM BY NAME (re-resolving) — so a
+        // spoofed SNI just reaches the real allowed host and cannot exfil elsewhere.
+        if dest.isIPLiteral {
+            try? Sock.writeAll(cfd, Socks5.reply(.succeeded))   // client now sends ClientHello
+            let (peekedHost, buffered) = peekHostname(cfd)
+            guard let host = peekedHost else {
+                log.deny(client: client, host: dest.host, port: dest.port, reason: "no-sni")
+                return   // close → client sees a reset (effective deny)
+            }
+            let verdict = filter.decide(Destination(host: host, port: dest.port, isIPLiteral: false), client: client)
+            guard verdict.allowed else {
+                log.deny(client: client, host: host, port: dest.port, reason: verdict.reason)
+                return
+            }
+            guard let upstream = try? Sock.connect(host: host, port: dest.port, publicOnly: publicOnly) else {
+                log.deny(client: client, host: host, port: dest.port, reason: "upstream-unreachable")
+                return
+            }
+            defer { close(upstream) }
+            log.allow(client: client, host: host, port: dest.port, via: "socks-sni")
+            try? Sock.writeAll(upstream, buffered)   // replay the peeked bytes
+            spliceBoth(cfd, upstream)
+            return
+        }
+
+        // Named destination (SOCKS atyp=domain, e.g. a future by-name caller).
         let verdict = filter.decide(dest, client: client)
         guard verdict.allowed else {
             log.deny(client: client, host: dest.host, port: dest.port, reason: verdict.reason)
@@ -105,6 +137,37 @@ final class ProxyServer {
         log.allow(client: client, host: dest.host, port: dest.port, via: "socks")
         try? Sock.writeAll(cfd, Socks5.reply(.succeeded))
         spliceBoth(cfd, upstream)
+    }
+
+    /// Read the first request segment and recover the destination domain from a TLS
+    /// ClientHello SNI (443) or an HTTP `Host:` header (80). Returns the host (nil if
+    /// none — fail closed) and ALL bytes read, so the caller can replay them upstream.
+    /// Accumulates across reads in case the ClientHello spans segments.
+    func peekHostname(_ cfd: Int32, limit: Int = 16 * 1024) -> (String?, [UInt8]) {
+        // Bound the wait: a guest that connects but never sends a ClientHello must
+        // not pin this thread. After the timeout we fall through and deny.
+        Sock.setReadTimeout(cfd, seconds: 10)
+        defer { Sock.setReadTimeout(cfd, seconds: 0) }   // clear for the splice phase
+        var buf = [UInt8]()
+        while buf.count < limit {
+            guard let chunk = try? Sock.read(cfd), !chunk.isEmpty else { break }
+            buf += chunk
+            if let sni = TLSClientHello.serverName(fromRecord: buf) { return (sni, buf) }
+            if let host = HTTPProxyRequest.hostFromOriginForm(buf) { return (host, buf) }
+            // Heuristics to stop early: a TLS record that isn't a handshake, or a
+            // complete HTTP head with no Host — both unrecoverable.
+            if buf.first.map({ $0 != 0x16 }) == true, buf.contains(0x0A),
+               HTTPProxyRequest.hostFromOriginForm(buf) == nil, looksLikeCompleteHTTPHead(buf) {
+                break
+            }
+        }
+        return (nil, buf)
+    }
+
+    private func looksLikeCompleteHTTPHead(_ b: [UInt8]) -> Bool {
+        guard b.count >= 4 else { return false }
+        for i in 0...(b.count - 4) where b[i]==13 && b[i+1]==10 && b[i+2]==13 && b[i+3]==10 { return true }
+        return false
     }
 
     // MARK: - Helpers
@@ -142,6 +205,7 @@ final class ProxyServer {
 
     /// Bidirectional copy: one direction on this thread, the other on a new one.
     private func spliceBoth(_ a: Int32, _ b: Int32) {
+        Sock.setReadTimeout(a, seconds: 0)   // established tunnel: no read timeout
         let done = DispatchSemaphore(value: 0)
         Thread.detachNewThread { Sock.splice(from: a, to: b); done.signal() }
         Sock.splice(from: b, to: a)

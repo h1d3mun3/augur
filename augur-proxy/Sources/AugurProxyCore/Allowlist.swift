@@ -54,6 +54,10 @@ public struct Allowlist {
         // An IP literal is never a domain match — it can only be allowed by the pin
         // table (handled by the caller), never by the allowlist.
         if isIPLiteral(h) { return false }
+        // Decision chokepoint: never match a host that isn't a clean LDH hostname.
+        // The dial uses this same string via getaddrinfo (which truncates at NUL),
+        // so a malformed host must fail closed here too. See isValidHostname.
+        guard isValidHostname(h) else { return false }
         if exact.contains(h) { return true }
         for base in suffixes where Allowlist.isSubdomain(h, of: base) {
             return true

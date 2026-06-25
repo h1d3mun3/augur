@@ -63,6 +63,21 @@ else
     warn "Skipping augur-proxy build (needs Swift); egress filtering will be unavailable."
 fi
 
+# Build augur-gvproxy (the gvisor-tap-vsock fork) — only needed for the macOS VM
+# egress datapath, and only buildable with a Go toolchain. A failure is a warning.
+if [[ "$(uname)" == "Darwin" ]] && [[ -f "$SCRIPT_DIR/gvproxy/build.sh" ]]; then
+    if command -v go &>/dev/null; then
+        info "Building augur-gvproxy (macOS egress netstack)..."
+        if bash "$SCRIPT_DIR/gvproxy/build.sh" "$INSTALL_DIR/augur-gvproxy" >/dev/null 2>&1; then
+            success "augur-gvproxy installed to $INSTALL_DIR/augur-gvproxy"
+        else
+            warn "augur-gvproxy build failed — macOS egress filtering will be unavailable until it builds."
+        fi
+    else
+        warn "Skipping augur-gvproxy build (needs Go); required for macOS egress filtering."
+    fi
+fi
+
 # Build the macOS VM backend (augur-vm) when on macOS with a Swift toolchain.
 # Docker mode does not need this, so a failure here is only a warning.
 if [[ "$(uname)" == "Darwin" ]]; then
