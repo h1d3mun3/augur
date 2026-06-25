@@ -386,6 +386,18 @@ verify_egress_locked() {
         error "Egress self-test FAILED: host.docker.internal no longer resolves (broke the proxy path)."
         leaked=true
     fi
+    # The proxy must actually be REACHABLE from the container: a request through it
+    # (even to a denied host, which returns 403) must get an HTTP response, not a
+    # connection failure. Catches host.docker.internal resolving to an address the
+    # proxy isn't listening on (e.g. an IPv6 host-gateway vs an IPv4-only bind).
+    local pcode
+    pcode="$(docker exec "$CONTAINER_NAME" sh -c \
+        "curl -s -o /dev/null -w '%{http_code}' --max-time 8 -x 'http://host.docker.internal:${AUGUR_PROXY_HTTP_PORT}' http://egress-proxy-probe.invalid/" 2>/dev/null || echo 000)"
+    if [[ "$pcode" == "000" ]]; then
+        error "Egress self-test FAILED: the host proxy is not reachable from the container."
+        error "host.docker.internal:${AUGUR_PROXY_HTTP_PORT} did not respond — nothing would work."
+        leaked=true
+    fi
     if $leaked; then
         error "Egress self-test FAILED: the container reached the internet WITHOUT the proxy."
         error "The proxy is not the only egress path — refusing to continue (would run unfiltered)."
@@ -505,7 +517,9 @@ cmd_up() {
     # egress at the host proxy via host.docker.internal. No host sudo required.
     if egress_enabled; then
         ensure_egress_network
-        start_proxy "0.0.0.0"   # reachable from the container as host.docker.internal
+        # Bind dual-stack (::) so the container can reach the proxy whether
+        # host.docker.internal resolves to an IPv4 or IPv6 host-gateway.
+        start_proxy "::"
         local proxy_url="http://host.docker.internal:${AUGUR_PROXY_HTTP_PORT}"
         docker_args+=(
             --network "$(egress_network_name)"
