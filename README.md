@@ -128,6 +128,7 @@ augur build --macos --ipsw ... --xcode-xip ... --platforms all
 cd ~/projects/my-app
 
 augur up --macos        # clone base VM and start (first run clones automatically)
+augur up --macos --gui  # same, but also open a VM window (display + keyboard + pointer)
 augur claude --macos    # launch Claude Code  (starts VM if not running)
 augur shell --macos     # open a bash shell   (starts VM if not running)
 augur down --macos      # stop the VM (keeps the clone — next up is fast)

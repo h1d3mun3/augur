@@ -11,6 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="$(pwd)"
 SWIFT_VERSION="${SWIFT_VERSION:-}"
 MACOS_MODE=false
+MACOS_GUI=false
 
 # ANSI colors
 RED='\033[0;31m'
@@ -654,7 +655,15 @@ cmd_up_macos() {
     mkdir -p "$HOME/.claude/projects"
     info "Starting VM '${project_vm}'..."
     info "Mounting: ${BOLD}${WORKSPACE_DIR}${RESET} → ~/${MACOS_SHARE}"
-    "$VM_CLI" run --no-graphics \
+    # A GUI window (--gui) and headless mode build the same VM (same NAT networking and
+    # directory shares); --gui only adds the host-side display window. SSH-based setup
+    # below still runs because the VM is backgrounded either way.
+    local graphics_flag="--no-graphics"
+    if $MACOS_GUI; then
+        graphics_flag=""
+        info "Opening a GUI window for '${project_vm}'..."
+    fi
+    "$VM_CLI" run $graphics_flag \
         --dir="${MACOS_SHARE}:${WORKSPACE_DIR}" \
         --dir="gh-config:${HOME}/.config/gh" \
         --dir="claude-projects:${HOME}/.claude/projects" \
@@ -920,7 +929,7 @@ cmd_help() {
     echo ""
     echo -e "  ${BOLD}MACOS VM MODE${RESET}  ${YELLOW}(macOS VM — full Xcode, xcodebuild, Simulator)${RESET}"
     echo -e "    augur ${CYAN}build${RESET}  --macos --ipsw <path> --xcode-xip <path> [--platforms <list>]  Build base VM (one-time)"
-    echo -e "    augur ${CYAN}up${RESET}     --macos                                   Start project VM"
+    echo -e "    augur ${CYAN}up${RESET}     --macos [--gui]                           Start project VM (--gui opens a window)"
     echo -e "    augur ${CYAN}claude${RESET} --macos                                   Launch Claude Code"
     echo -e "    augur ${CYAN}shell${RESET}  --macos                                   Open bash shell"
     echo -e "    augur ${CYAN}down${RESET}    --macos                                   Stop the VM (keep the clone)"
@@ -933,6 +942,7 @@ cmd_help() {
     echo -e "  ${BOLD}OPTIONS${RESET}"
     echo -e "    --swift VERSION    Swift version for Docker mode (default: ${CYAN}latest${RESET})"
     echo -e "    --macos            Use macOS VM with Xcode instead of Docker"
+    echo -e "    --gui              Open a VM window in macOS VM mode (for: augur up --macos)"
     echo -e "    --ipsw <path>      macOS IPSW file  (for: augur build --macos)"
     echo -e "    --xcode-xip <path> Xcode XIP file   (for: augur build --macos)"
     echo -e "    --platforms <list> Simulator platforms to bake into the base VM (for: augur build --macos)"
@@ -964,6 +974,7 @@ shift || true
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --macos) MACOS_MODE=true; shift ;;
+        --gui)   MACOS_GUI=true; shift ;;
         --swift)
             SWIFT_VERSION="${2:?'--swift requires a version (e.g. --swift 6.0)'}"
             shift 2
