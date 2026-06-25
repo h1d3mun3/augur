@@ -374,6 +374,18 @@ verify_egress_locked() {
         "$CONTAINER_NAME" sh -c 'curl -s --max-time 6 -o /dev/null https://1.1.1.1' 2>/dev/null; then
         leaked=true
     fi
+    # DNS-exfil probe: resolving an arbitrary external name must FAIL (the resolver
+    # points at an unreachable address on the no-egress internal network).
+    if docker exec "$CONTAINER_NAME" sh -c 'getent hosts dns-leak-probe.example' &>/dev/null; then
+        leaked=true
+        error "Egress self-test: the container resolved an external name (DNS not fail-closed)."
+    fi
+    # Sanity: the proxy path's host.docker.internal (a static --add-host entry) must
+    # still resolve, else the --dns change broke legitimate egress.
+    if ! docker exec "$CONTAINER_NAME" sh -c 'getent hosts host.docker.internal' &>/dev/null; then
+        error "Egress self-test FAILED: host.docker.internal no longer resolves (broke the proxy path)."
+        leaked=true
+    fi
     if $leaked; then
         error "Egress self-test FAILED: the container reached the internet WITHOUT the proxy."
         error "The proxy is not the only egress path — refusing to continue (would run unfiltered)."
@@ -433,8 +445,11 @@ start_gvproxy() {
     #   decision. --deny-direct: never net.Dial directly (the fork's egress hook).
     # --ssh-port: gvproxy forwards host 127.0.0.1:<port> → guest :22 so augur can
     #   reach the VM (it has no host-routable IP behind gvproxy's user-space net).
+    # --dns-allowlist: only resolve names in the same merged allowlist used for
+    #   connections, so DNS-resolvable == connection-allowed (closes DNS-exfil).
     "$gvp" --listen-vfkit "unixgram://${sock}" \
            --socks-upstream "127.0.0.1:${AUGUR_PROXY_SOCKS_PORT}" \
+           --dns-allowlist "$(proxy_allowlist)" \
            --ssh-port "$AUGUR_SSH_FWD_PORT" \
            --deny-direct &>/dev/null &
     echo $! > "$pidfile"
@@ -499,6 +514,13 @@ cmd_up() {
             -e "HTTP_PROXY=${proxy_url}"  -e "http_proxy=${proxy_url}"
             -e "HTTPS_PROXY=${proxy_url}" -e "https_proxy=${proxy_url}"
             -e "NO_PROXY=localhost,127.0.0.1" -e "no_proxy=localhost,127.0.0.1"
+            # Point the container's resolver at an unreachable address (RFC 5737
+            # TEST-NET-1). On the --internal network this has no egress, so external
+            # name resolution fails closed — closing the DNS-exfil channel. Proxied
+            # tools are unaffected: they resolve host-side via *_PROXY, and
+            # host.docker.internal is a static --add-host entry, not a DNS lookup.
+            --dns 192.0.2.1
+            --dns-search .
         )
         info "Egress restricted to allowlisted domains (proxy: ${BOLD}${proxy_url}${RESET})."
     fi

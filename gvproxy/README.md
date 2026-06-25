@@ -8,8 +8,7 @@ egress is forced through `augur-proxy`'s allowlist**.
 
 ## What the fork changes
 
-`augur-egress.patch` (5 files, ~140 lines against pinned commit `af3ea886`) adds two
-flags to `gvproxy`:
+`augur-egress.patch` (pinned commit `af3ea886`) adds three flags to `gvproxy`:
 
 - `--socks-upstream host:port` — the TCP forwarder dials every guest connection
   through this SOCKS5 proxy (the host-side `augur-proxy`) by destination IP,
@@ -17,9 +16,13 @@ flags to `gvproxy`:
   HTTP Host and applies the domain allowlist.
 - `--deny-direct` — does not register the UDP and ICMP forwarders at all. They
   `net.Dial` directly and would otherwise be egress holes (QUIC/HTTP3 exfil, ICMP
-  tunneling). The gateway DNS server is a separate listener and keeps working, so
-  name resolution is unaffected. With this flag, **SOCKS-filtered TCP is the only
-  way out** — a root agent in the guest cannot bypass it.
+  tunneling). With this flag, **SOCKS-filtered TCP is the only way out** — a root
+  agent in the guest cannot bypass it.
+- `--dns-allowlist <file>` — the gateway DNS server only resolves names matching
+  this allowlist (same `.augur.conf` grammar) and returns NXDOMAIN otherwise;
+  non-address record types are refused. Makes DNS-resolvable == connection-allowed,
+  closing DNS-exfil. The matcher (`pkg/services/dns/dns_allowlist.go`) is a 1:1 port
+  of `augur-proxy`'s Swift `Allowlist`.
 
 The hook is `pkg/services/forwarder/tcp.go` (the single point all guest TCP egress
 funnels through); the SOCKS5 client is dependency-free (`socks_client.go`).
@@ -29,7 +32,8 @@ funnels through); the SOCKS5 client is dependency-free (`socks_client.go`).
 ```
 augur-gvproxy --listen-vfkit unixgram://<sock> \
               --socks-upstream 127.0.0.1:<augur-proxy-socks-port> \
-              --deny-direct
+              --dns-allowlist ~/.augur/proxy/<slug>.allowlist \
+              --ssh-port <fwd-port> --deny-direct
 ```
 
 `augur` starts this automatically in `cmd_up_macos` when egress filtering is on;
@@ -54,12 +58,16 @@ the SOCKS proxy and fail closed without a recoverable SNI/Host). An adversarial
 review of the datapath found and fixed two would-be bypasses in `augur-proxy`
 (NUL-byte SNI truncation; IPv4-mapped-IPv6 SSRF) — see `augur-proxy` `SecurityTests`.
 
-**Accepted residual — DNS:** the gvproxy gateway DNS server (`192.168.127.1:53`)
-survives `--deny-direct` (it is a separate listener, not the UDP forwarder) and
-resolves arbitrary names via the host resolver with no allowlist. That is a
-**low-bandwidth exfil/C2 channel** (base32-in-QNAME to an attacker NS) — it cannot
-move a TCP/TLS tunnel. It is accepted for now; the fast-follow is to gate
-`addAnswers` on the allowlist and restrict RR types to A/AAAA/CNAME.
+**DNS is gated (`--dns-allowlist`):** the gateway DNS server (`192.168.127.1:53`)
+only resolves names that match the allowlist — the SAME merged `.augur.conf` used
+for connections — and returns NXDOMAIN otherwise; non-address record types
+(TXT/MX/NS/SRV) are refused. A disallowed query is answered locally and never
+leaves the host, so the QNAME-based DNS-exfil/C2 channel is closed. The matcher is
+a 1:1 port of `augur-proxy`'s Swift `Allowlist`/`Hostname` (see
+`pkg/services/dns/dns_allowlist_test.go` for the parity tests). Residual: a guest
+can still resolve `<data>.<allowlisted-wildcard-domain>` if the allowlist contains
+a broad third-party wildcard the guest doesn't control — identical to the
+connection-side exposure; mitigation is allowlist policy, not the matcher.
 
 **Compatibility limit:** connections with no recoverable SNI/Host (ECH/ESNI,
 non-TLS/non-HTTP protocols) fail closed (denied). augur's egress needs are all
