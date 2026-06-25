@@ -22,6 +22,12 @@ import Darwin
 /// The frame transport matches the "vfkit" convention gvproxy speaks
 /// (`gvproxy --listen-vfkit unixgram://<path>`): one datagram == one L2 frame.
 enum NetworkAttachment {
+    /// MAC the guest must present in vfkit/egress mode. gvproxy ships a default
+    /// static DHCP lease mapping its deviceIP (192.168.127.2 — the host's
+    /// SSH-forward target) to this MAC, so the guest receives that fixed IP and is
+    /// reachable. This is the same MAC podman/vfkit guests use with gvproxy.
+    static let vfkitGuestMAC = "5a:94:ef:e4:0c:ee"
+
     /// Connect to gvproxy's unixgram socket at `socketPath` and wrap the fd for VZ.
     /// The returned attachment retains ownership of the socket via the FileHandle.
     static func vfkit(socketPath: String) throws -> VZNetworkDeviceAttachment {

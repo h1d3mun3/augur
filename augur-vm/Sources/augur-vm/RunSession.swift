@@ -115,11 +115,17 @@ final class RunSession: NSObject, VZVirtualMachineDelegate {
         if let socketPath = netVfkitSocket {
             FileHandle.standardError.write(Data("[augur-vm] egress-filtered networking via \(socketPath)\n".utf8))
             network.attachment = try NetworkAttachment.vfkit(socketPath: socketPath)
+            // gvproxy reserves the deviceIP (192.168.127.2 — the SSH-forward target)
+            // for this exact MAC via a default static DHCP lease, so the guest must
+            // use it to receive that IP and be reachable. (Same MAC podman/vfkit use.)
+            if let mac = VZMACAddress(string: NetworkAttachment.vfkitGuestMAC) {
+                network.macAddress = mac
+            }
         } else {
             network.attachment = NetworkAttachment.nat()
-        }
-        if let mac = VZMACAddress(string: cfg.macAddress) {
-            network.macAddress = mac
+            if let mac = VZMACAddress(string: cfg.macAddress) {
+                network.macAddress = mac
+            }
         }
         config.networkDevices = [network]
 
