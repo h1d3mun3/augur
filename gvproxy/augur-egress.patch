@@ -1,0 +1,259 @@
+diff --git a/cmd/gvproxy/config.go b/cmd/gvproxy/config.go
+index 8fe3154..da1009f 100644
+--- a/cmd/gvproxy/config.go
++++ b/cmd/gvproxy/config.go
+@@ -47,6 +47,8 @@ type GvproxyArgs struct {
+ 	logFile            string
+ 	servicesEndpoint   string
+ 	ec2MetadataAccess  bool
++	socksUpstream      string
++	denyDirect         bool
+ }
+ 
+ type GvproxyConfig struct {
+@@ -138,6 +140,8 @@ func GvproxyArgParse(flagSet *flag.FlagSet, args *GvproxyArgs, argv []string) (*
+ 	flagSet.StringVar(&args.servicesEndpoint, "services", "", "Exposes the same HTTP API as the --listen flag, without the /connect endpoint")
+ 	flagSet.BoolVar(&args.ec2MetadataAccess, "ec2-metadata-access", false, "Permits access to EC2 Metadata Service and Amazon Time Sync Service")
+ 	flagSet.StringVar(&args.notificationSocket, "notification", "", "Socket to be used to send network-ready notifications")
++	flagSet.StringVar(&args.socksUpstream, "socks-upstream", "", "augur: dial all guest TCP through this SOCKS5 proxy (host:port) for allowlist enforcement")
++	flagSet.BoolVar(&args.denyDirect, "deny-direct", false, "augur: disable UDP/ICMP forwarders so SOCKS-filtered TCP is the only egress")
+ 	if err := flagSet.Parse(argv); err != nil {
+ 		return nil, err
+ 	}
+@@ -274,6 +278,12 @@ func GvproxyConfigure(config *GvproxyConfig, args *GvproxyArgs, version string)
+ 	if args.vfkitSocket != "" {
+ 		config.Interfaces.Vfkit = args.vfkitSocket
+ 	}
++	if args.socksUpstream != "" {
++		config.Stack.SocksUpstream = args.socksUpstream
++	}
++	if args.denyDirect {
++		config.Stack.DenyDirectEgress = true
++	}
+ 	if args.vpnkitSocket != "" {
+ 		config.Interfaces.VPNKit = args.vpnkitSocket
+ 	}
+diff --git a/cmd/gvproxy/main.go b/cmd/gvproxy/main.go
+index 2588f02..eaa0bb9 100644
+--- a/cmd/gvproxy/main.go
++++ b/cmd/gvproxy/main.go
+@@ -157,15 +157,20 @@ func run(ctx context.Context, g *errgroup.Group, config *GvproxyConfig) error {
+ 		httpServe(ctx, g, ln, vn.ServicesMux())
+ 	}
+ 
+-	ln, err := vn.Listen("tcp", fmt.Sprintf("%s:80", config.Stack.GatewayIP))
+-	if err != nil {
+-		return err
++	// augur: the gateway:80 mux is a GUEST-reachable forward-management API. In
++	// egress mode (--deny-direct) augur uses only static forwards, so do not expose
++	// it — it would be unnecessary management surface for a root guest.
++	if !config.Stack.DenyDirectEgress {
++		ln, err := vn.Listen("tcp", fmt.Sprintf("%s:80", config.Stack.GatewayIP))
++		if err != nil {
++			return err
++		}
++		mux := http.NewServeMux()
++		mux.Handle("/services/forwarder/all", vn.Mux())
++		mux.Handle("/services/forwarder/expose", vn.Mux())
++		mux.Handle("/services/forwarder/unexpose", vn.Mux())
++		httpServe(ctx, g, ln, mux)
+ 	}
+-	mux := http.NewServeMux()
+-	mux.Handle("/services/forwarder/all", vn.Mux())
+-	mux.Handle("/services/forwarder/expose", vn.Mux())
+-	mux.Handle("/services/forwarder/unexpose", vn.Mux())
+-	httpServe(ctx, g, ln, mux)
+ 
+ 	if InDebugMode() {
+ 		g.Go(func() error {
+diff --git a/pkg/services/forwarder/socks_client.go b/pkg/services/forwarder/socks_client.go
+new file mode 100644
+index 0000000..139a641
+--- /dev/null
++++ b/pkg/services/forwarder/socks_client.go
+@@ -0,0 +1,93 @@
++package forwarder
++
++// Minimal SOCKS5 client (RFC 1928, no auth) used by augur's egress mode to hand
++// every guest TCP connection to the host-side augur-proxy, which makes the
++// allow/deny decision. Kept dependency-free (no golang.org/x/net/proxy) so the
++// augur fork of gvproxy adds no new module requirements.
++
++import (
++	"encoding/binary"
++	"fmt"
++	"io"
++	"net"
++
++	"gvisor.dev/gvisor/pkg/tcpip"
++)
++
++// socksDial connects to the SOCKS5 proxy at socksAddr and issues a CONNECT to the
++// guest's intended destination (dst:port). The destination is passed as an IP
++// literal (ATYP 1/4); augur-proxy peeks the TLS SNI / HTTP Host on the stream to
++// recover the domain and applies its allowlist.
++func socksDial(socksAddr string, dst tcpip.Address, port uint16) (net.Conn, error) {
++	c, err := net.Dial("tcp", socksAddr)
++	if err != nil {
++		return nil, err
++	}
++	ok := false
++	defer func() {
++		if !ok {
++			_ = c.Close()
++		}
++	}()
++
++	// Greeting: VER=5, NMETHODS=1, METHOD=0 (no auth).
++	if _, err := c.Write([]byte{0x05, 0x01, 0x00}); err != nil {
++		return nil, err
++	}
++	reply := make([]byte, 2)
++	if _, err := io.ReadFull(c, reply); err != nil {
++		return nil, err
++	}
++	if reply[0] != 0x05 || reply[1] != 0x00 {
++		return nil, fmt.Errorf("socks: no acceptable auth method (%v)", reply)
++	}
++
++	// Request: VER=5, CMD=1 (connect), RSV=0, ATYP, ADDR, PORT.
++	req := []byte{0x05, 0x01, 0x00}
++	raw := dst.AsSlice()
++	switch len(raw) {
++	case 4:
++		req = append(req, 0x01) // IPv4
++		req = append(req, raw...)
++	case 16:
++		req = append(req, 0x04) // IPv6
++		req = append(req, raw...)
++	default:
++		return nil, fmt.Errorf("socks: unsupported address length %d", len(raw))
++	}
++	req = binary.BigEndian.AppendUint16(req, port)
++	if _, err := c.Write(req); err != nil {
++		return nil, err
++	}
++
++	// Reply: VER, REP, RSV, ATYP, BND.ADDR, BND.PORT. Read the fixed head, then
++	// the variable bound address (which we discard).
++	head := make([]byte, 4)
++	if _, err := io.ReadFull(c, head); err != nil {
++		return nil, err
++	}
++	if head[1] != 0x00 {
++		return nil, fmt.Errorf("socks: connect refused (rep=%d)", head[1])
++	}
++	var addrLen int
++	switch head[3] {
++	case 0x01:
++		addrLen = 4
++	case 0x04:
++		addrLen = 16
++	case 0x03:
++		l := make([]byte, 1)
++		if _, err := io.ReadFull(c, l); err != nil {
++			return nil, err
++		}
++		addrLen = int(l[0])
++	default:
++		return nil, fmt.Errorf("socks: bad reply ATYP %d", head[3])
++	}
++	if _, err := io.ReadFull(c, make([]byte, addrLen+2)); err != nil { // addr + port
++		return nil, err
++	}
++
++	ok = true
++	return c, nil
++}
+diff --git a/pkg/services/forwarder/tcp.go b/pkg/services/forwarder/tcp.go
+index ae18ada..2dd2f5a 100644
+--- a/pkg/services/forwarder/tcp.go
++++ b/pkg/services/forwarder/tcp.go
+@@ -17,7 +17,12 @@ import (
+ 
+ const linkLocalSubnet = "169.254.0.0/16"
+ 
+-func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mutex, ec2MetadataAccess bool) *tcp.Forwarder {
++// TCP forwards guest TCP connections. When socksUpstream is non-empty (augur
++// egress mode), every connection is dialed through that SOCKS5 proxy
++// (augur-proxy) by destination IP instead of directly — so the proxy, not
++// gvproxy, decides whether the connection is allowed. When empty, behavior is
++// upstream's: a direct net.Dial.
++func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mutex, ec2MetadataAccess bool, socksUpstream string) *tcp.Forwarder {
+ 	return tcp.NewForwarder(s, 0, 10, func(r *tcp.ForwarderRequest) {
+ 		localAddress := r.ID().LocalAddress
+ 
+@@ -31,9 +36,16 @@ func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
+ 			localAddress = replaced
+ 		}
+ 		natLock.Unlock()
+-		outbound, err := net.Dial("tcp", net.JoinHostPort(localAddress.String(), fmt.Sprint(r.ID().LocalPort)))
++		target := net.JoinHostPort(localAddress.String(), fmt.Sprint(r.ID().LocalPort))
++		var outbound net.Conn
++		var err error
++		if socksUpstream != "" {
++			outbound, err = socksDial(socksUpstream, localAddress, r.ID().LocalPort)
++		} else {
++			outbound, err = net.Dial("tcp", target)
++		}
+ 		if err != nil {
+-			log.Tracef("net.Dial() = %v", err)
++			log.Tracef("egress dial(%s) = %v", target, err)
+ 			r.Complete(true)
+ 			return
+ 		}
+@@ -48,6 +60,7 @@ func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
+ 			} else {
+ 				log.Errorf("r.CreateEndpoint() = %v", tcpErr)
+ 			}
++			_ = outbound.Close() // don't leak the dialed upstream/SOCKS conn
+ 			return
+ 		}
+ 
+diff --git a/pkg/types/configuration.go b/pkg/types/configuration.go
+index 0e6a051..71f88b0 100644
+--- a/pkg/types/configuration.go
++++ b/pkg/types/configuration.go
+@@ -59,6 +59,14 @@ type Configuration struct {
+ 
+ 	// EC2 Metadata Service Access
+ 	Ec2MetadataAccess bool `yaml:"ec2MetadataAccess,omitempty"`
++
++	// augur egress mode. When SocksUpstream is set, all guest TCP is dialed
++	// through that SOCKS5 proxy (the host-side augur-proxy) instead of directly,
++	// so the proxy enforces the domain allowlist. DenyDirectEgress additionally
++	// disables the UDP and ICMP forwarders, leaving SOCKS-filtered TCP (and the
++	// gateway DNS server) as the only egress — so a root guest cannot bypass it.
++	SocksUpstream    string `yaml:"socksUpstream,omitempty"`
++	DenyDirectEgress bool   `yaml:"denyDirectEgress,omitempty"`
+ }
+ 
+ type Protocol string
+diff --git a/pkg/virtualnetwork/services.go b/pkg/virtualnetwork/services.go
+index c7bc35c..f216fb1 100644
+--- a/pkg/virtualnetwork/services.go
++++ b/pkg/virtualnetwork/services.go
+@@ -25,12 +25,18 @@ func addServices(configuration *types.Configuration, s *stack.Stack, ipPool *tap
+ 	var natLock sync.Mutex
+ 	translation := parseNATTable(configuration)
+ 
+-	tcpForwarder := forwarder.TCP(s, translation, &natLock, configuration.Ec2MetadataAccess)
++	tcpForwarder := forwarder.TCP(s, translation, &natLock, configuration.Ec2MetadataAccess, configuration.SocksUpstream)
+ 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpForwarder.HandlePacket)
+-	udpForwarder := forwarder.UDP(s, translation, &natLock, configuration.Ec2MetadataAccess)
+-	s.SetTransportProtocolHandler(udp.ProtocolNumber, udpForwarder.HandlePacket)
+-	icmpForwarder := forwarder.ICMP(s, translation, &natLock)
+-	s.SetTransportProtocolHandler(icmp.ProtocolNumber4, icmpForwarder.HandlePacket)
++	// augur egress mode: with DenyDirectEgress, do not register the UDP and ICMP
++	// forwarders at all. They net.Dial directly (bypassing the SOCKS allowlist), so
++	// leaving them registered would be an egress hole (e.g. QUIC/HTTP3 exfil, ICMP
++	// tunneling). The gateway DNS server is a separate listener and still works.
++	if !configuration.DenyDirectEgress {
++		udpForwarder := forwarder.UDP(s, translation, &natLock, configuration.Ec2MetadataAccess)
++		s.SetTransportProtocolHandler(udp.ProtocolNumber, udpForwarder.HandlePacket)
++		icmpForwarder := forwarder.ICMP(s, translation, &natLock)
++		s.SetTransportProtocolHandler(icmp.ProtocolNumber4, icmpForwarder.HandlePacket)
++	}
+ 
+ 	dnsMux, err := dnsServer(configuration, s)
+ 	if err != nil {

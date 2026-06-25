@@ -30,6 +30,40 @@ MACOS_SSH_KEY="$HOME/.augur/vm_key"
 # macOS VM backend binary (augur-vm, built from ./augur-vm). Override with AUGUR_VM_BIN.
 AUGUR_VM_BIN="${AUGUR_VM_BIN:-}"
 
+# ── Egress allowlist (augur-proxy) ────────────────────────────────────────────
+# When enabled, all guest egress is funneled through a host-side, host-user
+# transparent proxy that only permits the domains in the merged allowlist
+# (global ~/.augur/augur.conf + project ./.augur.conf). Everything else is blocked.
+# No host sudo is ever required. See augur-proxy/.
+AUGUR_DIR="$HOME/.augur"
+AUGUR_GLOBAL_CONF="${AUGUR_GLOBAL_CONF:-$AUGUR_DIR/augur.conf}"
+AUGUR_PROJECT_CONF="$WORKSPACE_DIR/.augur.conf"
+AUGUR_PROXY_DIR="$AUGUR_DIR/proxy"
+# Docker mode runs the proxy as a SIDECAR container, not on the host: on Docker
+# Desktop a `--internal` network severs the route to the host, so a host proxy is
+# unreachable. The sidecar joins the agent's internal network (to receive its
+# traffic) AND a normal bridge (to egress) — making it the agent's only way out.
+AUGUR_PROXY_SRC="$AUGUR_DIR/augur-proxy-src"        # Swift source (copied by install)
+AUGUR_PROXY_LINUX="$AUGUR_DIR/augur-proxy-linux"    # Linux build, run in the sidecar
+AUGUR_INTERNAL_SUBNET="${AUGUR_INTERNAL_SUBNET:-172.31.255.0/28}"
+AUGUR_SIDECAR_IP="${AUGUR_SIDECAR_IP:-172.31.255.2}"
+# Ports the proxy listens on (host side). HTTP CONNECT is for Docker; SOCKS5 is for
+# the macOS file-handle datapath (gvproxy forwards guest TCP here by name). They are
+# derived per-project (a stable hash of the project dir name) so two egress-enabled
+# projects can run at once without colliding on a fixed port. Override any of them
+# with the matching env var. (Collisions are ~1/900 between distinct projects.)
+_augur_port_offset=$(( $(basename "$WORKSPACE_DIR" | tr '[:upper:]' '[:lower:]' | cksum | cut -d' ' -f1) % 900 ))
+AUGUR_PROXY_HTTP_PORT="${AUGUR_PROXY_HTTP_PORT:-$((13000 + _augur_port_offset))}"
+AUGUR_PROXY_SOCKS_PORT="${AUGUR_PROXY_SOCKS_PORT:-$((14000 + _augur_port_offset))}"
+# In egress mode the guest has no host-routable IP (gvproxy user-space network);
+# SSH reaches it via gvproxy's host-side forward 127.0.0.1:<this port> → guest:22.
+AUGUR_SSH_FWD_PORT="${AUGUR_SSH_FWD_PORT:-$((20000 + _augur_port_offset))}"
+# Egress filtering is opt-in: ON when a project ./.augur.conf exists, or AUGUR_EGRESS=1,
+# or --egress. --no-egress / AUGUR_EGRESS=0 forces it off. Default off keeps existing
+# behavior byte-for-byte for users who never create a .augur.conf.
+AUGUR_EGRESS="${AUGUR_EGRESS:-auto}"
+AUGUR_PROXY_BIN="${AUGUR_PROXY_BIN:-}"
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 info()    { echo -e "${CYAN}[augur]${RESET} $*"; }
@@ -168,35 +202,323 @@ macos_vm_ip() {
     return 1
 }
 
+# SSH target for a VM. The project VM in egress mode lives behind gvproxy's
+# user-space network (no host-routable IP); SSH reaches it via gvproxy's host-side
+# forward at 127.0.0.1:<AUGUR_SSH_FWD_PORT>. Every other case (build/base VM, or a
+# project VM without egress) uses the DHCP-leased guest IP on port 22. Keyed on the
+# project VM having a *running* gvproxy, so build/base flows are never affected.
+macos_via_gvproxy() { [[ "$1" == "$(macos_project_vm)" ]] && gvproxy_running; }
+macos_ssh_host() {
+    if macos_via_gvproxy "$1"; then echo "127.0.0.1"; else "$VM_CLI" ip "$1" 2>/dev/null; fi
+}
+macos_ssh_port() {
+    if macos_via_gvproxy "$1"; then echo "$AUGUR_SSH_FWD_PORT"; else echo "22"; fi
+}
+
 ssh_macos() {
     local vm="$1"; shift
-    local ip
-    ip="$("$VM_CLI" ip "$vm" 2>/dev/null)" || { error "Cannot get IP for '${vm}'."; exit 1; }
+    local host port
+    host="$(macos_ssh_host "$vm")"; port="$(macos_ssh_port "$vm")"
+    [[ -n "$host" ]] || { error "Cannot resolve SSH host for '${vm}'."; exit 1; }
     local key_opts=()
     if [[ -f "$MACOS_SSH_KEY" ]]; then
         key_opts=(-i "$MACOS_SSH_KEY" -o PasswordAuthentication=no -o BatchMode=yes)
     fi
-    ssh -o StrictHostKeyChecking=no \
+    ssh -p "$port" \
+        -o StrictHostKeyChecking=no \
         -o UserKnownHostsFile=/dev/null \
         -o LogLevel=ERROR \
         -o ConnectTimeout=10 \
         "${key_opts[@]}" \
-        "${MACOS_SSH_USER}@${ip}" "$@"
+        "${MACOS_SSH_USER}@${host}" "$@"
 }
 
 scp_to_macos() {
     local vm="$1" src="$2" dst="$3"
-    local ip
-    ip="$("$VM_CLI" ip "$vm" 2>/dev/null)" || { error "Cannot get IP for '${vm}'."; exit 1; }
+    local host port
+    host="$(macos_ssh_host "$vm")"; port="$(macos_ssh_port "$vm")"
+    [[ -n "$host" ]] || { error "Cannot resolve SSH host for '${vm}'."; exit 1; }
     local key_opts=()
     if [[ -f "$MACOS_SSH_KEY" ]]; then
         key_opts=(-i "$MACOS_SSH_KEY" -o PasswordAuthentication=no -o BatchMode=yes)
     fi
-    scp -o StrictHostKeyChecking=no \
+    scp -P "$port" \
+        -o StrictHostKeyChecking=no \
         -o UserKnownHostsFile=/dev/null \
         -o LogLevel=ERROR \
         "${key_opts[@]}" \
-        "$src" "${MACOS_SSH_USER}@${ip}:${dst}"
+        "$src" "${MACOS_SSH_USER}@${host}:${dst}"
+}
+
+# ── Egress proxy helpers (shared by Docker and macOS modes) ───────────────────
+
+# Resolve the augur-proxy binary: explicit override, PATH, install dir, local build.
+resolve_proxy_cli() {
+    if [[ -n "$AUGUR_PROXY_BIN" ]]; then echo "$AUGUR_PROXY_BIN"; return; fi
+    if command -v augur-proxy &>/dev/null; then command -v augur-proxy; return; fi
+    local c
+    for c in "$AUGUR_DIR/augur-proxy" \
+             "$SCRIPT_DIR/augur-proxy/.build/release/augur-proxy" \
+             "$SCRIPT_DIR/augur-proxy/.build/debug/augur-proxy"; do
+        [[ -f "$c" && -x "$c" ]] && { echo "$c"; return; }
+    done
+    echo "augur-proxy"
+}
+
+# Is egress filtering active for this invocation?
+egress_enabled() {
+    case "$AUGUR_EGRESS" in
+        1|on|true)   return 0 ;;
+        0|off|false|no) return 1 ;;
+        *) [[ -f "$AUGUR_PROJECT_CONF" ]] && return 0 || return 1 ;;  # auto
+    esac
+}
+
+proxy_pidfile() { echo "$AUGUR_PROXY_DIR/$(workspace_slug).pid"; }
+proxy_logfile() { echo "$AUGUR_PROXY_DIR/$(workspace_slug).log"; }
+proxy_allowlist() { echo "$AUGUR_PROXY_DIR/$(workspace_slug).allowlist"; }
+
+proxy_running() {
+    local pf; pf="$(proxy_pidfile)"
+    [[ -f "$pf" ]] || return 1
+    local pid; pid="$(cat "$pf" 2>/dev/null)"
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+# Merge global baseline + project conf into a host-side runtime allowlist the proxy
+# reads. Deliberately written under ~/.augur (NOT the project tree) so the guest —
+# which can write the mounted ./.augur.conf — cannot widen its own policy mid-session.
+write_merged_allowlist() {
+    mkdir -p "$AUGUR_PROXY_DIR"
+    local out; out="$(proxy_allowlist)"
+    {
+        echo "# generated by augur at $(date) — do not edit (regenerated on 'augur up')"
+        [[ -f "$AUGUR_GLOBAL_CONF" ]]  && { echo "# --- global: $AUGUR_GLOBAL_CONF"; cat "$AUGUR_GLOBAL_CONF"; }
+        [[ -f "$AUGUR_PROJECT_CONF" ]] && { echo "# --- project: $AUGUR_PROJECT_CONF"; cat "$AUGUR_PROJECT_CONF"; }
+    } > "$out"
+    echo "$out"
+}
+
+require_proxy_bin() {
+    local bin; bin="$(resolve_proxy_cli)"
+    if ! command -v "$bin" &>/dev/null && [[ ! -x "$bin" ]]; then
+        error "Egress filtering is enabled but augur-proxy was not found."
+        error "Build it: ${BOLD}cd augur-proxy && swift build -c release${RESET}  (or run: bash install)"
+        exit 1
+    fi
+    echo "$bin"
+}
+
+# Start the host-side proxy for this project (idempotent). $1 = listen address.
+start_proxy() {
+    local listen="$1"
+    local bin allowlist pidfile logfile
+    bin="$(require_proxy_bin)"
+    allowlist="$(write_merged_allowlist)"
+    pidfile="$(proxy_pidfile)"
+    logfile="$(proxy_logfile)"
+
+    if proxy_running; then
+        info "Egress proxy already running (pid $(cat "$pidfile"))."
+        return 0
+    fi
+    mkdir -p "$AUGUR_PROXY_DIR"
+    info "Starting egress proxy (allowlist: ${BOLD}${allowlist}${RESET})..."
+    "$bin" --allowlist "$allowlist" \
+           --listen "$listen" \
+           --http-port "$AUGUR_PROXY_HTTP_PORT" \
+           --socks-port "$AUGUR_PROXY_SOCKS_PORT" \
+           --log "$logfile" \
+           --pidfile "$pidfile" &>/dev/null &
+    disown
+    # Give it a moment to bind / fail closed.
+    local tries=20
+    while ((tries-- > 0)); do
+        proxy_running && return 0
+        sleep 0.1
+    done
+    error "Egress proxy failed to start. See ${logfile}."
+    exit 1
+}
+
+stop_proxy() {
+    local pidfile; pidfile="$(proxy_pidfile)"
+    if proxy_running; then
+        info "Stopping egress proxy..."
+        kill "$(cat "$pidfile")" 2>/dev/null || true
+    fi
+    rm -f "$pidfile" 2>/dev/null || true
+}
+
+# ── Docker egress topology (no host sudo; enforced by Docker's network layer) ──
+
+egress_network_name() { echo "augur-$(workspace_slug)-net"; }
+egress_sidecar_name() { echo "augur-$(workspace_slug)-proxy"; }
+
+# The agent's --internal network: no route to the host or the internet (Docker
+# installs no MASQUERADE/forward rules). A fixed subnet gives the sidecar a stable
+# IP the agent points HTTPS_PROXY at.
+ensure_egress_network() {
+    local net; net="$(egress_network_name)"
+    if ! docker network inspect "$net" &>/dev/null; then
+        info "Creating internal egress network '${net}'..."
+        docker network create --internal --subnet "$AUGUR_INTERNAL_SUBNET" "$net" &>/dev/null
+    fi
+}
+
+# Build the Linux augur-proxy the sidecar runs (the host binary is for macOS and is
+# the wrong architecture/OS for a container). Built once via the augur image (which
+# carries the Swift toolchain); the .build dir is a host mount so the binary lands
+# on the host fs. Idempotent.
+ensure_linux_proxy() {
+    [[ -x "$AUGUR_PROXY_LINUX" ]] && return 0
+    [[ -d "$AUGUR_PROXY_SRC" ]] || {
+        error "augur-proxy source not found at ${AUGUR_PROXY_SRC}."
+        error "Re-run ${BOLD}bash install${RESET} to install it."
+        exit 1
+    }
+    ensure_image
+    info "Building the Linux egress proxy for the Docker sidecar (one-time, ~1 min)..."
+    # Copy the (read-only mounted) source to a writable tmp dir inside the container,
+    # build there, send build chatter to stderr, and stream ONLY the binary to stdout
+    # → the host file. Avoids host-mount write/permission issues. augur-proxy has no
+    # dependencies, so the build needs no network.
+    mkdir -p "$AUGUR_DIR"
+    docker run --rm -v "${AUGUR_PROXY_SRC}:/src:ro" "$IMAGE_NAME" \
+        sh -c 'cp -a /src /tmp/aps && cd /tmp/aps && swift build -c release 1>&2 && cat .build/release/augur-proxy' \
+        > "$AUGUR_PROXY_LINUX"
+    if [[ ! -s "$AUGUR_PROXY_LINUX" ]]; then
+        rm -f "$AUGUR_PROXY_LINUX"
+        error "Failed to build the Linux egress proxy."; exit 1
+    fi
+    chmod +x "$AUGUR_PROXY_LINUX"
+}
+
+# Start the proxy sidecar: dual-homed on the agent's internal network (fixed IP) and
+# a normal bridge for egress. Runs the Linux augur-proxy (mounted) with the merged
+# allowlist (mounted read-only). The agent reaches it at AUGUR_SIDECAR_IP.
+start_sidecar() {
+    local name; name="$(egress_sidecar_name)"
+    local allowlist; allowlist="$(write_merged_allowlist)"
+    docker rm -f "$name" &>/dev/null || true
+    info "Starting egress proxy sidecar '${name}'..."
+    docker run -d --name "$name" \
+        --network "$(egress_network_name)" --ip "$AUGUR_SIDECAR_IP" \
+        --cap-drop NET_ADMIN \
+        -v "${allowlist}:/allowlist:ro" \
+        -v "${AUGUR_PROXY_LINUX}:/usr/local/bin/augur-proxy:ro" \
+        "$IMAGE_NAME" \
+        augur-proxy --allowlist /allowlist --listen 0.0.0.0 --http-port "$AUGUR_PROXY_HTTP_PORT" &>/dev/null
+    # Give the sidecar an egress path (the default bridge reaches the internet); the
+    # sidecar itself only connects to allowlisted domains, so this is not a hole.
+    docker network connect bridge "$name" &>/dev/null || true
+}
+
+stop_sidecar() {
+    docker rm -f "$(egress_sidecar_name)" &>/dev/null || true
+}
+
+# Boot self-test: prove the agent can ONLY egress via the sidecar. Direct (proxy-less)
+# requests must fail; a request THROUGH the sidecar must get an HTTP response.
+verify_egress_locked() {
+    info "Running egress self-test..."
+    local leaked=false
+    # Direct egress (no proxy) on the internal network must fail — hostname and IP.
+    if docker exec -e HTTP_PROXY= -e HTTPS_PROXY= -e http_proxy= -e https_proxy= -e NO_PROXY="*" \
+        "$CONTAINER_NAME" sh -c 'curl -s --max-time 6 -o /dev/null https://example.com' 2>/dev/null; then
+        leaked=true; error "Self-test: the container reached the internet directly (not isolated)."
+    fi
+    if docker exec -e HTTP_PROXY= -e HTTPS_PROXY= -e http_proxy= -e https_proxy= -e NO_PROXY="*" \
+        "$CONTAINER_NAME" sh -c 'curl -s --max-time 6 -o /dev/null https://1.1.1.1' 2>/dev/null; then
+        leaked=true; error "Self-test: the container reached a public IP directly (not isolated)."
+    fi
+    # External DNS must fail closed (resolver points at an unreachable address).
+    if docker exec "$CONTAINER_NAME" sh -c 'getent hosts dns-leak-probe.example' &>/dev/null; then
+        leaked=true; error "Self-test: the container resolved an external name (DNS not fail-closed)."
+    fi
+    # The sidecar proxy MUST be reachable: a request through it (even a 403 deny) must
+    # return an HTTP status, not a connection failure. curl prints 000 on failure.
+    local pcode
+    pcode="$(docker exec "$CONTAINER_NAME" sh -c \
+        "curl -s -o /dev/null -w '%{http_code}' --max-time 8 -x 'http://${AUGUR_SIDECAR_IP}:${AUGUR_PROXY_HTTP_PORT}' http://egress-proxy-probe.invalid/" 2>/dev/null)"
+    if [[ -z "$pcode" || "$pcode" == "000" ]]; then
+        leaked=true
+        error "Self-test: the egress proxy sidecar (${AUGUR_SIDECAR_IP}:${AUGUR_PROXY_HTTP_PORT}) is not reachable."
+    fi
+    if $leaked; then
+        error "Egress self-test FAILED — refusing to continue. Tearing down."
+        docker rm -f "$CONTAINER_NAME" &>/dev/null || true
+        stop_sidecar
+        docker network rm "$(egress_network_name)" &>/dev/null || true
+        exit 1
+    fi
+    success "Egress self-test passed: the sidecar is the agent's only egress; only allowlisted domains are reachable."
+}
+
+# ── macOS egress datapath (VZFileHandle + gvproxy) ────────────────────────────
+# The guest's only NIC is a host-owned unixgram socket; gvproxy runs the guest's
+# userspace network stack on the host and forwards all guest TCP to augur-proxy's
+# SOCKS5 listener (the allowlist decision point). Because that socket is the sole
+# egress, a root agent in the VM cannot bypass it — and nothing here needs host
+# sudo or the Apple-gated vmnet entitlement. Requires the augur gvproxy fork.
+AUGUR_GVPROXY_BIN="${AUGUR_GVPROXY_BIN:-}"
+
+resolve_gvproxy() {
+    if [[ -n "$AUGUR_GVPROXY_BIN" ]]; then echo "$AUGUR_GVPROXY_BIN"; return; fi
+    command -v augur-gvproxy &>/dev/null && { command -v augur-gvproxy; return; }
+    local c
+    for c in "$AUGUR_DIR/augur-gvproxy" "$SCRIPT_DIR/gvproxy/augur-gvproxy"; do
+        [[ -x "$c" ]] && { echo "$c"; return; }
+    done
+    echo ""   # not found
+}
+
+gvproxy_socket()  { echo "$AUGUR_PROXY_DIR/$(workspace_slug).vfkit.sock"; }
+gvproxy_pidfile() { echo "$AUGUR_PROXY_DIR/$(workspace_slug).gvproxy.pid"; }
+
+gvproxy_running() {
+    local pf; pf="$(gvproxy_pidfile)"
+    [[ -f "$pf" ]] || return 1
+    local pid; pid="$(cat "$pf" 2>/dev/null)"
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+# Start gvproxy: creates the vfkit unixgram socket the VM attaches to, and routes
+# guest egress to augur-proxy's SOCKS5. Fail closed if the fork isn't installed.
+start_gvproxy() {
+    local gvp sock pidfile
+    gvp="$(resolve_gvproxy)"
+    if [[ -z "$gvp" ]]; then
+        error "macOS egress filtering needs the augur gvproxy fork (augur-gvproxy), which was not found."
+        error "Build/install it (see gvproxy/README), or run with ${BOLD}--no-egress${RESET} to disable filtering."
+        stop_proxy
+        exit 1
+    fi
+    sock="$(gvproxy_socket)"; pidfile="$(gvproxy_pidfile)"
+    rm -f "$sock"
+    gvproxy_running && return 0
+    info "Starting gvproxy (guest netstack → SOCKS5 allowlist)..."
+    # --listen-vfkit: the socket the VM's NIC attaches to (one datagram = one frame).
+    # --socks-upstream: send all guest TCP to augur-proxy by name for the allowlist
+    #   decision. --deny-direct: never net.Dial directly (the fork's egress hook).
+    # --ssh-port: gvproxy forwards host 127.0.0.1:<port> → guest :22 so augur can
+    #   reach the VM (it has no host-routable IP behind gvproxy's user-space net).
+    "$gvp" --listen-vfkit "unixgram://${sock}" \
+           --socks-upstream "127.0.0.1:${AUGUR_PROXY_SOCKS_PORT}" \
+           --ssh-port "$AUGUR_SSH_FWD_PORT" \
+           --deny-direct &>/dev/null &
+    echo $! > "$pidfile"
+    disown
+    local tries=30
+    while ((tries-- > 0)); do [[ -S "$sock" ]] && return 0; sleep 0.1; done
+    error "gvproxy did not create its socket in time."
+    exit 1
+}
+
+stop_gvproxy() {
+    local pidfile; pidfile="$(gvproxy_pidfile)"
+    gvproxy_running && kill "$(cat "$pidfile")" 2>/dev/null || true
+    rm -f "$pidfile" "$(gvproxy_socket)" 2>/dev/null || true
 }
 
 # ── Docker mode commands ──────────────────────────────────────────────────────
@@ -233,6 +555,30 @@ cmd_up() {
         -w "${WORKSPACE_MOUNT}"
     )
 
+    # Egress allowlist: put the agent on an internal network (no route to the host
+    # or the internet) with NET_ADMIN dropped so the root agent can't re-route, and
+    # point all egress at the proxy SIDECAR (the agent's only reachable peer). No
+    # host sudo required. The sidecar enforces the allowlist and egresses for it.
+    if egress_enabled; then
+        ensure_egress_network
+        ensure_linux_proxy
+        start_sidecar
+        local proxy_url="http://${AUGUR_SIDECAR_IP}:${AUGUR_PROXY_HTTP_PORT}"
+        docker_args+=(
+            --network "$(egress_network_name)"
+            --cap-drop NET_ADMIN
+            -e "HTTP_PROXY=${proxy_url}"  -e "http_proxy=${proxy_url}"
+            -e "HTTPS_PROXY=${proxy_url}" -e "https_proxy=${proxy_url}"
+            -e "NO_PROXY=localhost,127.0.0.1" -e "no_proxy=localhost,127.0.0.1"
+            # Resolver points at an unreachable address: external DNS fails closed
+            # (the agent reaches the sidecar by IP and proxies by name, so it needs
+            # no working external DNS). Closes the DNS-exfil channel.
+            --dns 192.0.2.1
+            --dns-search .
+        )
+        info "Egress restricted to allowlisted domains (sidecar: ${BOLD}${proxy_url}${RESET})."
+    fi
+
     local anthropic_key
     anthropic_key="$(resolve_api_key "${ANTHROPIC_API_KEY:-}" "$HOME/.anthropic_api_key")"
     [[ -n "$anthropic_key" ]] && docker_args+=(-e "ANTHROPIC_API_KEY=${anthropic_key}")
@@ -257,7 +603,18 @@ cmd_up() {
 
     docker_args+=("$IMAGE_NAME" bash)
 
-    docker "${docker_args[@]}" &>/dev/null
+    if ! docker "${docker_args[@]}" &>/dev/null; then
+        error "Failed to start the container."
+        # Don't leave a started sidecar / internal network orphaned.
+        if egress_enabled; then
+            stop_sidecar
+            docker network rm "$(egress_network_name)" &>/dev/null || true
+        fi
+        exit 1
+    fi
+
+    if egress_enabled; then verify_egress_locked; fi
+
     success "Container '${CONTAINER_NAME}' is up."
     echo ""
     echo -e "  ${BOLD}augur claude${RESET}  → Launch Claude Code"
@@ -281,13 +638,17 @@ cmd_shell() {
 
 cmd_down() {
     require_docker
-    if ! container_exists; then
+    if container_exists; then
+        info "Stopping and removing container '${CONTAINER_NAME}'..."
+        docker rm -f "$CONTAINER_NAME" &>/dev/null
+        success "Container '${CONTAINER_NAME}' has been stopped and removed."
+    else
         warn "No container found for this directory (${CONTAINER_NAME})."
-        return 0
     fi
-    info "Stopping and removing container '${CONTAINER_NAME}'..."
-    docker rm -f "$CONTAINER_NAME" &>/dev/null
-    success "Container '${CONTAINER_NAME}' has been stopped and removed."
+    # Always tear down egress (safe no-ops if it was never enabled) so a stranded
+    # sidecar/network from a crashed or out-of-band-removed container is cleaned up.
+    stop_sidecar
+    docker network rm "$(egress_network_name)" &>/dev/null || true
 }
 
 cmd_status() {
@@ -295,6 +656,14 @@ cmd_status() {
     echo -e "${BOLD}Container:${RESET}  ${CONTAINER_NAME}"
     echo -e "${BOLD}Directory:${RESET}  ${WORKSPACE_DIR}"
     echo -e "${BOLD}Image:${RESET}      ${IMAGE_NAME}"
+    if egress_enabled; then
+        local estate="${RED}stopped${RESET}"
+        docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$(egress_sidecar_name)" && estate="${GREEN}running${RESET}"
+        echo -e "${BOLD}Egress:${RESET}     ${GREEN}on${RESET} (allowlist; sidecar ${estate})"
+        echo -e "${BOLD}Allowlist:${RESET}  ${AUGUR_GLOBAL_CONF}$( [[ -f "$AUGUR_PROJECT_CONF" ]] && echo " + .augur.conf" )"
+    else
+        echo -e "${BOLD}Egress:${RESET}     ${YELLOW}off${RESET} (no .augur.conf; add one or pass --egress)"
+    fi
 
     if container_running; then
         echo -e "${BOLD}Status:${RESET}     ${GREEN}running${RESET}"
@@ -555,16 +924,19 @@ cmd_build_macos() {
 # the SSH daemon is ready). Waits up to ~2 min (40 × 3s). Prints the IP on success.
 wait_for_macos_ssh() {
     local vm="$1"
-    local ip retries=40 key_opts=()
+    local host port retries=40 key_opts=()
+    port="$(macos_ssh_port "$vm")"
     [[ -f "$MACOS_SSH_KEY" ]] && key_opts=(-i "$MACOS_SSH_KEY" -o PasswordAuthentication=no -o BatchMode=yes)
     while ((retries-- > 0)); do
-        ip="$("$VM_CLI" ip "$vm" 2>/dev/null)" && [[ -n "$ip" ]] && \
-            ssh -o StrictHostKeyChecking=no \
+        host="$(macos_ssh_host "$vm")"
+        [[ -n "$host" ]] && \
+            ssh -p "$port" \
+                -o StrictHostKeyChecking=no \
                 -o UserKnownHostsFile=/dev/null \
                 -o LogLevel=ERROR \
                 -o ConnectTimeout=5 \
                 "${key_opts[@]}" \
-                "${MACOS_SSH_USER}@${ip}" true 2>/dev/null && { echo "$ip"; return 0; }
+                "${MACOS_SSH_USER}@${host}" true 2>/dev/null && { echo "$host"; return 0; }
         sleep 3
     done
     return 1
@@ -663,7 +1035,20 @@ cmd_up_macos() {
         graphics_flag=""
         info "Opening a GUI window for '${project_vm}'..."
     fi
+
+    # Egress allowlist: replace NAT with the vfkit/file-handle datapath so all guest
+    # traffic flows through the host proxy. The proxy's SOCKS5 is the decision point;
+    # gvproxy provides the guest netstack and forwards to it. No host sudo required.
+    local net_args=()
+    if egress_enabled; then
+        start_proxy "127.0.0.1"          # SOCKS5 reachable locally by gvproxy
+        start_gvproxy
+        net_args=(--net-vfkit="$(gvproxy_socket)")
+        info "Egress restricted to allowlisted domains (file-handle datapath)."
+    fi
+
     "$VM_CLI" run $graphics_flag \
+        "${net_args[@]}" \
         --dir="${MACOS_SHARE}:${WORKSPACE_DIR}" \
         --dir="gh-config:${HOME}/.config/gh" \
         --dir="claude-projects:${HOME}/.claude/projects" \
@@ -673,6 +1058,10 @@ cmd_up_macos() {
     info "Waiting for VM to boot and SSH to be ready..."
     wait_for_macos_ssh "$project_vm" &>/dev/null || {
         error "VM SSH did not become available in time."
+        # Tear down what we started so a stranded VM/gvproxy/proxy isn't left behind.
+        "$VM_CLI" stop "$project_vm" 2>/dev/null || true
+        stop_gvproxy
+        stop_proxy
         exit 1
     }
 
@@ -752,6 +1141,10 @@ cmd_down_macos() {
     require_vz
     local project_vm
     project_vm="$(macos_project_vm)"
+    # Always tear down the host-side egress (gvproxy/proxy) so a stranded one from a
+    # crashed VM is cleaned up, even if the VM clone itself is already gone.
+    stop_gvproxy
+    stop_proxy
     if ! macos_vm_exists "$project_vm"; then
         warn "No VM found for this directory (${project_vm})."
         return 0
@@ -767,6 +1160,8 @@ cmd_destroy_macos() {
     require_vz
     local project_vm
     project_vm="$(macos_project_vm)"
+    stop_gvproxy
+    stop_proxy
     if ! macos_vm_exists "$project_vm"; then
         warn "No VM found for this directory (${project_vm})."
         return 0
@@ -788,12 +1183,24 @@ cmd_status_macos() {
 
     if macos_vm_running "$project_vm"; then
         local ip
-        ip="$("$VM_CLI" ip "$project_vm" 2>/dev/null || echo '?')"
+        if macos_via_gvproxy "$project_vm"; then
+            ip="127.0.0.1:${AUGUR_SSH_FWD_PORT} (gvproxy fwd)"
+        else
+            ip="$("$VM_CLI" ip "$project_vm" 2>/dev/null || echo '?')"
+        fi
         echo -e "${BOLD}Status:${RESET}        ${GREEN}running${RESET}  (${ip})"
     elif macos_vm_exists "$project_vm"; then
         echo -e "${BOLD}Status:${RESET}        ${YELLOW}stopped${RESET}"
     else
         echo -e "${BOLD}Status:${RESET}        ${RED}not created${RESET}"
+    fi
+    if egress_enabled; then
+        local estate="${RED}stopped${RESET}"; proxy_running && estate="${GREEN}running${RESET}"
+        local gstate="${RED}stopped${RESET}"; gvproxy_running && gstate="${GREEN}running${RESET}"
+        echo -e "${BOLD}Egress:${RESET}        ${GREEN}on${RESET} (proxy ${estate}, gvproxy ${gstate})"
+        echo -e "${BOLD}Allowlist:${RESET}     ${AUGUR_GLOBAL_CONF}$( [[ -f "$AUGUR_PROJECT_CONF" ]] && echo " + .augur.conf" )"
+    else
+        echo -e "${BOLD}Egress:${RESET}        ${YELLOW}off${RESET} (no .augur.conf; add one or pass --egress)"
     fi
     echo ""
 
@@ -943,6 +1350,8 @@ cmd_help() {
     echo -e "    --swift VERSION    Swift version for Docker mode (default: ${CYAN}latest${RESET})"
     echo -e "    --macos            Use macOS VM with Xcode instead of Docker"
     echo -e "    --gui              Open a VM window in macOS VM mode (for: augur up --macos)"
+    echo -e "    --egress           Force the egress allowlist on (default: on iff ./.augur.conf exists)"
+    echo -e "    --no-egress        Force the egress allowlist off for this run"
     echo -e "    --ipsw <path>      macOS IPSW file  (for: augur build --macos)"
     echo -e "    --xcode-xip <path> Xcode XIP file   (for: augur build --macos)"
     echo -e "    --platforms <list> Simulator platforms to bake into the base VM (for: augur build --macos)"
@@ -952,8 +1361,12 @@ cmd_help() {
     echo -e "    ANTHROPIC_API_KEY        Anthropic API key (or ~/.anthropic_api_key)"
     echo -e "    CLAUDE_CODE_OAUTH_TOKEN  Claude subscription token (or ~/.claude_code_oauth_token; run: claude setup-token)"
     echo -e "    SWIFT_VERSION            Default Swift version (default: latest)"
+    echo -e "    AUGUR_EGRESS             Force egress on/off (1/0); overrides .augur.conf detection"
     echo ""
     echo -e "  ${BOLD}NOTES${RESET}"
+    echo -e "    • Egress allowlist: add a ${CYAN}.augur.conf${RESET} (one domain per line, ${CYAN}*.example.com${RESET} for"
+    echo -e "      subdomains) to restrict the container/VM to those domains. Works in both modes,"
+    echo -e "      needs no sudo. See ${CYAN}augur status${RESET} and README. macOS egress also needs Go (augur-gvproxy)."
     echo -e "    • Docker mode:   current directory mounted at /workspace-<project> (Linux container)"
     echo -e "    • macOS VM mode: current directory exposed at ~/workspace-<project> (macOS VM)"
     echo -e "    • macOS VM mode requires: augur-vm (the bundled Swift VM backend)"
@@ -975,6 +1388,8 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --macos) MACOS_MODE=true; shift ;;
         --gui)   MACOS_GUI=true; shift ;;
+        --egress)    AUGUR_EGRESS=1; shift ;;
+        --no-egress) AUGUR_EGRESS=0; shift ;;
         --swift)
             SWIFT_VERSION="${2:?'--swift requires a version (e.g. --swift 6.0)'}"
             shift 2

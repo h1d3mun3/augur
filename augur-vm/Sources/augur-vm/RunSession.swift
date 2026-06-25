@@ -12,6 +12,9 @@ final class RunSession: NSObject, VZVirtualMachineDelegate {
     let name: String
     let headless: Bool
     private let dirs: [String]
+    /// When set, the guest NIC is bound to this vfkit unixgram socket (gvproxy) so
+    /// all egress is filtered by the host; nil means plain NAT (no filtering).
+    private let netVfkitSocket: String?
 
     var vm: VZVirtualMachine?
     var loadedConfig: VMConfig?
@@ -24,10 +27,11 @@ final class RunSession: NSObject, VZVirtualMachineDelegate {
     var isTerminating = false
     var terminateReply: (() -> Void)?
 
-    init(name: String, headless: Bool, dirs: [String]) {
+    init(name: String, headless: Bool, dirs: [String], netVfkitSocket: String? = nil) {
         self.name = name
         self.headless = headless
         self.dirs = dirs
+        self.netVfkitSocket = netVfkitSocket
     }
 
     /// Entry point: prepare, then either park headless or run the GUI app.
@@ -105,9 +109,23 @@ final class RunSession: NSObject, VZVirtualMachineDelegate {
         ]
 
         let network = VZVirtioNetworkDeviceConfiguration()
-        network.attachment = VZNATNetworkDeviceAttachment()
-        if let mac = VZMACAddress(string: cfg.macAddress) {
-            network.macAddress = mac
+        // Egress-filtered (vfkit/file-handle) when a socket is given, else plain NAT.
+        // The persisted bundle (config.json) has no network field, so this choice is
+        // purely runtime — base VMs and clones stay byte-compatible either way.
+        if let socketPath = netVfkitSocket {
+            FileHandle.standardError.write(Data("[augur-vm] egress-filtered networking via \(socketPath)\n".utf8))
+            network.attachment = try NetworkAttachment.vfkit(socketPath: socketPath)
+            // gvproxy reserves the deviceIP (192.168.127.2 — the SSH-forward target)
+            // for this exact MAC via a default static DHCP lease, so the guest must
+            // use it to receive that IP and be reachable. (Same MAC podman/vfkit use.)
+            if let mac = VZMACAddress(string: NetworkAttachment.vfkitGuestMAC) {
+                network.macAddress = mac
+            }
+        } else {
+            network.attachment = NetworkAttachment.nat()
+            if let mac = VZMACAddress(string: cfg.macAddress) {
+                network.macAddress = mac
+            }
         }
         config.networkDevices = [network]
 

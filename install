@@ -33,7 +33,62 @@ mkdir -p "$INSTALL_DIR"
 cp "$SCRIPT_DIR/augur" "$INSTALL_DIR/augur"
 cp "$SCRIPT_DIR/Dockerfile" "$INSTALL_DIR/Dockerfile"
 chmod +x "$INSTALL_DIR/augur"
+
+# Install the egress allowlist baseline — but never clobber a user's edited copy.
+if [[ -f "$SCRIPT_DIR/augur.conf" ]]; then
+    if [[ -f "$INSTALL_DIR/augur.conf" ]]; then
+        info "Keeping existing $INSTALL_DIR/augur.conf (baseline updated at augur.conf.default)."
+        cp "$SCRIPT_DIR/augur.conf" "$INSTALL_DIR/augur.conf.default"
+    else
+        cp "$SCRIPT_DIR/augur.conf" "$INSTALL_DIR/augur.conf"
+    fi
+fi
 success "Files copied."
+
+# Build the egress proxy (augur-proxy). Cross-platform (Linux + macOS); needed for
+# egress filtering in both modes. A failure here is a warning — filtering is opt-in.
+if command -v swift &>/dev/null && [[ -d "$SCRIPT_DIR/augur-proxy" ]]; then
+    info "Building augur-proxy (egress filter)..."
+    if (cd "$SCRIPT_DIR/augur-proxy" && swift build -c release) >/dev/null 2>&1; then
+        proxy_bin="$(cd "$SCRIPT_DIR/augur-proxy" && swift build -c release --show-bin-path)/augur-proxy"
+        cp "$proxy_bin" "$INSTALL_DIR/augur-proxy"
+        # macOS: ad-hoc re-sign in place so an overwrite doesn't trip a stale AMFI cache
+        # (no entitlements needed — augur-proxy does not touch Virtualization.framework).
+        [[ "$(uname)" == "Darwin" ]] && codesign --force --sign - "$INSTALL_DIR/augur-proxy" 2>/dev/null || true
+        success "augur-proxy installed to $INSTALL_DIR/augur-proxy"
+    else
+        warn "augur-proxy build failed — egress filtering will be unavailable until it builds."
+    fi
+else
+    warn "Skipping augur-proxy build (needs Swift); egress filtering will be unavailable."
+fi
+
+# Ship the augur-proxy SOURCE too: Docker egress runs the proxy as a sidecar
+# CONTAINER, so it needs a Linux build of augur-proxy. augur builds that on first
+# `augur up` (egress) using the Docker image's Swift toolchain — but it needs the
+# source here. Exclude the local .build dir (host-arch artifacts).
+if [[ -d "$SCRIPT_DIR/augur-proxy" ]]; then
+    rm -rf "$INSTALL_DIR/augur-proxy-src"
+    mkdir -p "$INSTALL_DIR/augur-proxy-src"
+    (cd "$SCRIPT_DIR/augur-proxy" && \
+     tar --exclude=.build --exclude='.git' -cf - . ) | tar -xf - -C "$INSTALL_DIR/augur-proxy-src"
+    success "augur-proxy source staged for the Docker sidecar build."
+fi
+
+# Build augur-gvproxy (the gvisor-tap-vsock fork) — only needed for the macOS VM
+# egress datapath, and only buildable with a Go toolchain. A failure is a warning.
+if [[ "$(uname)" == "Darwin" ]] && [[ -f "$SCRIPT_DIR/gvproxy/build.sh" ]]; then
+    if command -v go &>/dev/null; then
+        info "Building augur-gvproxy (macOS egress netstack)..."
+        if bash "$SCRIPT_DIR/gvproxy/build.sh" "$INSTALL_DIR/augur-gvproxy" >/dev/null 2>&1; then
+            success "augur-gvproxy installed to $INSTALL_DIR/augur-gvproxy"
+        else
+            warn "augur-gvproxy build failed — macOS egress filtering will be unavailable until it builds."
+        fi
+    else
+        warn "Skipping augur-gvproxy build (needs Go); required for macOS egress filtering."
+    fi
+fi
 
 # Build the macOS VM backend (augur-vm) when on macOS with a Swift toolchain.
 # Docker mode does not need this, so a failure here is only a warning.

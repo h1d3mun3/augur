@@ -152,14 +152,14 @@ every `up` (the same way it does for the GitHub token):
 
 | Path | Description |
 |------|-------------|
-| Current directory | exposed at `~/workspace` in the VM (read/write, virtiofs auto-mount) |
+| Current directory | exposed at `~/workspace-<project>` in the VM (read/write, virtiofs auto-mount) |
 | `~/.gitconfig` | copied on VM start (HTTPS `git push` uses `GH_TOKEN`) |
 | `~/.claude/` | **not** shared — local to the VM; auth is injected via env (see above) |
 | Everything else | **not visible to the VM** |
 
-> The macOS guest auto-mounts the shared directory under `/Volumes/My Shared Files/workspace`; augur symlinks
-> it to `~/workspace`. The sealed system volume can't host a symlink at `/workspace`, so `~/workspace`
-> is used in the VM (Docker mode uses a per-project `/workspace-<project>` path).
+> The macOS guest auto-mounts the shared directory under `/Volumes/My Shared Files/workspace-<project>`; augur
+> symlinks it to `~/workspace-<project>`. The sealed system volume can't host a symlink at `/workspace`, so the
+> per-project `~/workspace-<project>` path is used in the VM (Docker mode uses `/workspace-<project>`).
 
 ### Running `xcodebuild test`
 
@@ -181,7 +181,7 @@ NSUnbufferedIO=YES xcodebuild test \
 ```
 
 If builds are flaky from the shared mount (virtiofs is not tuned for heavy I/O — occasional
-"project is damaged" errors), copy the project to local disk first: `rsync -a ~/workspace/ ~/Developer/<app>/`.
+"project is damaged" errors), copy the project to local disk first: `rsync -a ~/workspace-<project>/ ~/Developer/<app>/`.
 
 ### Requirements
 
@@ -189,6 +189,60 @@ If builds are flaky from the shared mount (virtiofs is not tuned for heavy I/O �
 - Xcode / Swift toolchain (to build the bundled `augur-vm` backend via `bash install`)
 - macOS IPSW (Apple-signed)
 - Xcode XIP (Apple-signed, from developer.apple.com)
+
+---
+
+## Egress allowlist (`.augur.conf`)
+
+Restrict the container/VM to a set of domains — everything else is blocked. Enforcement runs in a small proxy on the **host, as your user — it never needs `sudo`**. Useful for sandboxing an agent so it can only reach the services it should.
+
+**Opt-in.** Filtering turns on when the project has a `./.augur.conf` (or you pass `--egress`); otherwise augur behaves exactly as before. To disable for one run, pass `--no-egress`.
+
+```bash
+cd ~/projects/my-app
+
+cat > .augur.conf <<'EOF'
+api.anthropic.com
+claude.ai
+github.com
+api.github.com
+*.githubusercontent.com
+registry.npmjs.org
+EOF
+
+augur up            # Docker, egress restricted to the list above
+augur up --macos    # macOS VM, same restriction
+augur status        # shows: Egress on/off + the active allowlist
+```
+
+### `.augur.conf` format
+
+One pattern per line, `#` for comments:
+
+| Pattern | Matches |
+|---|---|
+| `example.com` | that exact host (the apex) only |
+| `*.example.com` | subdomains only (`api.example.com`, not `example.com`) |
+| `.example.com` | the apex **and** all subdomains |
+
+The effective list is a **global baseline** (`~/.augur/augur.conf`, installed with sensible defaults for Claude Code / GitHub / npm / Homebrew) merged with the project's `./.augur.conf`. The merge happens on the host, so the guest can't widen its own policy by editing the mounted file. Edits take effect on the next `augur up`.
+
+### How it works
+
+| Mode | Enforcement |
+|------|-------------|
+| **Docker** | The agent runs on an internal network (no route to the host or the internet) with `NET_ADMIN` dropped, so a root agent can't re-route. A proxy **sidecar** container joins that internal network (to receive the agent's traffic) and a normal bridge (to egress) — making it the agent's only way out. A boot self-test fails closed if direct egress is ever reachable. |
+| **macOS VM** | The guest's only NIC is a host-owned socket (`VZFileHandleNetworkDeviceAttachment`); a bundled `gvproxy` runs the guest's network on the host and funnels every connection to the proxy. Needs no special entitlement. |
+
+In both modes the proxy decides by domain (the CONNECT host, or the TLS SNI / HTTP Host) and connects out by name.
+
+### Requirements
+
+`install` builds the proxy (`augur-proxy`, Swift) automatically. **macOS egress also needs Go** (for `augur-gvproxy`) — `brew install go`, then re-run `bash install`. Without it, macOS egress is unavailable but everything else works.
+
+The host ports the proxy uses are derived per-project so two egress-enabled projects can run at once; override with `AUGUR_PROXY_HTTP_PORT` / `AUGUR_PROXY_SOCKS_PORT` / `AUGUR_SSH_FWD_PORT` if needed.
+
+> **Scope.** This guarantees *"the guest can only reach allowlisted domains."* It is **not** exfiltration-proof: an allowlisted, writable host (e.g. `github.com` with your `GH_TOKEN`) and the shared workspace are intentional channels. DNS resolution itself is not filtered (a documented low-bandwidth residual). See `augur-proxy/README.md` and `gvproxy/README.md`.
 
 ---
 
