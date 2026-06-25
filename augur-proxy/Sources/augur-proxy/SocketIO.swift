@@ -9,22 +9,43 @@ import Darwin
 /// third-party networking dependency — the proxy stays a single lightweight
 /// static binary that builds on both Linux (Docker host) and macOS (VM host).
 enum Sock {
-    /// Create, bind, and listen on `addr:port` (IPv4). Returns the listening fd.
+    /// Create, bind, and listen on `addr:port`. An IPv6 `addr` (e.g. "::") binds a
+    /// DUAL-STACK socket (IPV6_V6ONLY off) so the proxy is reachable whether the
+    /// client connects over IPv4 or IPv6 — needed because Docker Desktop may resolve
+    /// host.docker.internal to an IPv6 host-gateway. Returns the listening fd.
     static func listen(addr: String, port: UInt16, backlog: Int32 = 128) throws -> Int32 {
-        let fd = socket(AF_INET, sockStreamType, 0)
+        let isV6 = addr.contains(":")
+        let fd = socket(isV6 ? AF_INET6 : AF_INET, sockStreamType, 0)
         guard fd >= 0 else { throw SockError("socket() failed: \(errnoString())") }
         var yes: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
 
-        var sa = sockaddr_in()
-        sa.sin_family = sa_family_t(AF_INET)
-        sa.sin_port = port.bigEndian
-        guard inet_pton(AF_INET, addr, &sa.sin_addr) == 1 else {
-            close(fd); throw SockError("bad listen address: \(addr)")
-        }
-        let bindRet = withUnsafePointer(to: &sa) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+        let bindRet: Int32
+        if isV6 {
+            var off: Int32 = 0  // dual-stack: also accept IPv4 (as v4-mapped)
+            setsockopt(fd, ipprotoIPV6, ipv6V6Only, &off, socklen_t(MemoryLayout<Int32>.size))
+            var sa6 = sockaddr_in6()
+            sa6.sin6_family = sa_family_t(AF_INET6)
+            sa6.sin6_port = port.bigEndian
+            guard inet_pton(AF_INET6, addr, &sa6.sin6_addr) == 1 else {
+                close(fd); throw SockError("bad listen address: \(addr)")
+            }
+            bindRet = withUnsafePointer(to: &sa6) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
+                }
+            }
+        } else {
+            var sa = sockaddr_in()
+            sa.sin_family = sa_family_t(AF_INET)
+            sa.sin_port = port.bigEndian
+            guard inet_pton(AF_INET, addr, &sa.sin_addr) == 1 else {
+                close(fd); throw SockError("bad listen address: \(addr)")
+            }
+            bindRet = withUnsafePointer(to: &sa) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
             }
         }
         guard bindRet == 0 else { close(fd); throw SockError("bind(\(addr):\(port)) failed: \(errnoString())") }
@@ -172,6 +193,8 @@ func errnoString() -> String { String(cString: strerror(errno)) }
 #if canImport(Glibc)
 let sockStreamType = Int32(SOCK_STREAM.rawValue)
 let shutWrite = Int32(SHUT_WR)
+let ipprotoIPV6 = Int32(IPPROTO_IPV6)
+let ipv6V6Only = Int32(IPV6_V6ONLY)
 let Glibc_listen = Glibc.listen
 let Glibc_connect = Glibc.connect
 let Glibc_read = Glibc.read
@@ -179,6 +202,8 @@ let Glibc_write = Glibc.write
 #elseif canImport(Darwin)
 let sockStreamType = SOCK_STREAM
 let shutWrite = SHUT_WR
+let ipprotoIPV6 = Int32(IPPROTO_IPV6)
+let ipv6V6Only = Int32(IPV6_V6ONLY)
 let Glibc_listen = Darwin.listen
 let Glibc_connect = Darwin.connect
 let Glibc_read = Darwin.read
