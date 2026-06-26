@@ -229,7 +229,7 @@ ssh_macos() {
         -o UserKnownHostsFile=/dev/null \
         -o LogLevel=ERROR \
         -o ConnectTimeout=10 \
-        "${key_opts[@]}" \
+        ${key_opts[@]+"${key_opts[@]}"} \
         "${MACOS_SSH_USER}@${host}" "$@"
 }
 
@@ -246,7 +246,7 @@ scp_to_macos() {
         -o StrictHostKeyChecking=no \
         -o UserKnownHostsFile=/dev/null \
         -o LogLevel=ERROR \
-        "${key_opts[@]}" \
+        ${key_opts[@]+"${key_opts[@]}"} \
         "$src" "${MACOS_SSH_USER}@${host}:${dst}"
 }
 
@@ -938,7 +938,7 @@ wait_for_macos_ssh() {
                 -o UserKnownHostsFile=/dev/null \
                 -o LogLevel=ERROR \
                 -o ConnectTimeout=5 \
-                "${key_opts[@]}" \
+                ${key_opts[@]+"${key_opts[@]}"} \
                 "${MACOS_SSH_USER}@${host}" true 2>/dev/null && { echo "$host"; return 0; }
         sleep 3
     done
@@ -1051,7 +1051,7 @@ cmd_up_macos() {
     fi
 
     "$VM_CLI" run $graphics_flag \
-        "${net_args[@]}" \
+        ${net_args[@]+"${net_args[@]}"} \
         --dir="${MACOS_SHARE}:${WORKSPACE_DIR}" \
         --dir="gh-config:${HOME}/.config/gh" \
         --dir="claude-projects:${HOME}/.claude/projects" \
