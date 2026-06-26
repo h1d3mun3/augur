@@ -1321,6 +1321,35 @@ cmd_version_macos() {
     echo ""
 }
 
+# ── Config scaffolding ────────────────────────────────────────────────────────
+
+# Write a starter ./.augur.conf in the project root. Never overwrites an existing
+# file (the project conf is hand-maintained); we only report that one was found.
+cmd_init_conf() {
+    local out="$AUGUR_PROJECT_CONF"
+    if [[ -f "$out" ]]; then
+        warn "A project config already exists: ${BOLD}${out}${RESET}"
+        warn "Leaving it untouched. Edit it directly to change this project's egress allowlist."
+        return 0
+    fi
+    cat > "$out" <<'EOF'
+# augur project egress allowlist
+#
+# Domains listed here (merged with the global ~/.augur/augur.conf) are reachable
+# from this project's container/VM. Everything else is blocked by the host-side
+# augur-proxy. Creating this file also turns egress filtering on for the project.
+#
+# Syntax (one pattern per line, '#' starts a comment):
+#   example.com     exact host only (the apex). Does NOT match subdomains.
+#   *.example.com   subdomains only (api.example.com yes; example.com no).
+#   .example.com    the apex AND every subdomain.
+
+# Add this project's endpoints below:
+EOF
+    success "Created ${BOLD}${out}${RESET}"
+    info "Edit it to list this project's endpoints, then run ${BOLD}augur up${RESET}."
+}
+
 # ── Help ──────────────────────────────────────────────────────────────────────
 
 cmd_help() {
@@ -1336,6 +1365,7 @@ cmd_help() {
     echo -e "    augur ${CYAN}build${RESET}   [--swift VERSION]  Build the Docker image"
     echo -e "    augur ${CYAN}update${RESET}  [--swift VERSION]  Rebuild image with latest versions"
     echo -e "    augur ${CYAN}version${RESET}                    Show version information"
+    echo -e "    augur ${CYAN}init-conf${RESET}                  Scaffold a ./.augur.conf egress allowlist"
     echo ""
     echo -e "  ${BOLD}MACOS VM MODE${RESET}  ${YELLOW}(macOS VM — full Xcode, xcodebuild, Simulator)${RESET}"
     echo -e "    augur ${CYAN}build${RESET}  --macos --ipsw <path> --xcode-xip <path> [--platforms <list>]  Build base VM (one-time)"
@@ -1419,6 +1449,7 @@ if $MACOS_MODE; then
         down)           cmd_down_macos ;;
         destroy)        cmd_destroy_macos ;;
         status)         cmd_status_macos ;;
+        init-conf)      cmd_init_conf ;;
         list)           cmd_list_macos ;;
         update)         cmd_update_macos ;;
         version)        cmd_version_macos ;;
@@ -1432,6 +1463,7 @@ else
         shell)          cmd_shell ;;
         down)           cmd_down ;;
         status)         cmd_status ;;
+        init-conf)      cmd_init_conf ;;
         update)         cmd_update ;;
         version)        cmd_version ;;
         build)          cmd_build ;;
