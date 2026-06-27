@@ -4,7 +4,7 @@ FROM swift:${SWIFT_VERSION}
 # System dependencies + Node.js 22 + GitHub CLI
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-       curl ca-certificates gnupg sudo procps findutils jq wget git \
+       curl ca-certificates gnupg procps findutils jq wget git \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
@@ -16,9 +16,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
-# Create non-root user
-RUN useradd -m -u 1001 -s /bin/bash dev \
-    && echo "dev ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+# Create non-root user (no sudo — the agent runs as dev with no elevated privileges)
+RUN useradd -m -u 1001 -s /bin/bash dev
 
 # Install Claude Code via the official native installer so installMethod matches
 # the host's (the shared ~/.claude.json reports "native"). The AMFI code-signing

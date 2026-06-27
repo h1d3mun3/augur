@@ -915,16 +915,20 @@ cmd_build_macos() {
         bash "$_claude_installer" -s stable
         rm -f "$_claude_installer"
         echo '\''export PATH="$HOME/.local/bin:$PATH"'\'' >> ~/.zprofile
+        # Pin the Xcode developer directory via DEVELOPER_DIR so xcodebuild/xcrun always
+        # use the full Xcode installation even if Homebrew later resets xcode-select to CLT.
+        # This avoids needing sudo xcode-select at project VM startup.
+        echo '\''export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer'\'' >> ~/.zprofile
         codesign -dvv "$HOME/.local/bin/claude" 2>&1 | grep -qi "Anthropic" \
             || { echo "augur: ERROR claude binary is not signed by Anthropic — aborting build" >&2; exit 1; }
     '
 
-    # Re-assert Xcode as the active developer dir: installing Homebrew also installs the Command
-    # Line Tools and switches xcode-select to them, which breaks `xcodebuild` ("requires Xcode").
-    info "Selecting full Xcode as the active developer directory..."
-    ssh_macos "$MACOS_BUILD_VM" "sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"
-
     # Step 7: Save as base VM
+    # Revoke the build-time NOPASSWD sudo grant before saving. Project VMs are cloned from
+    # this base, so leaving the grant in place would give the AI agent root access.
+    info "Revoking build-time sudo grant..."
+    ssh_macos "$MACOS_BUILD_VM" "sudo rm -f /etc/sudoers.d/augur"
+
     info "Saving base VM '${MACOS_BASE_VM}'..."
     "$VM_CLI" stop "$MACOS_BUILD_VM" 2>/dev/null || true
     wait "$vm_pid" 2>/dev/null || true
@@ -1011,19 +1015,6 @@ ensure_macos_claude_bin() {
     '"
 }
 
-ensure_macos_xcode_select() {
-    local vm="$1"
-    # Point the active developer dir at full Xcode so xcodebuild/simctl work. build/update already
-    # set this, but it can drift back to /Library/Developer/CommandLineTools (e.g. Homebrew installs
-    # Command Line Tools and switches xcode-select to them) — and that drift is baked into clones.
-    # Without this, xcodebuild fails with "requires Xcode" unless the caller sets DEVELOPER_DIR by
-    # hand. Re-assert on every up so each clone is correct without a rebuild. Fast no-op if already set.
-    ssh_macos "$vm" '
-        [ -d /Applications/Xcode.app ] || exit 0
-        [ "$(xcode-select -p 2>/dev/null)" = /Applications/Xcode.app/Contents/Developer ] && exit 0
-        sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
-    '
-}
 
 cmd_up_macos() {
     require_vz
@@ -1090,7 +1081,6 @@ cmd_up_macos() {
 
     ensure_macos_workspace "$project_vm"
     ensure_macos_claude_projects "$project_vm"
-    ensure_macos_xcode_select "$project_vm"
     ensure_macos_claude_bin "$project_vm"
 
     # Copy git config, and copy .claude.json one-way for onboarding state only (NOT auth — on
@@ -1142,7 +1132,6 @@ cmd_claude_macos() {
     macos_vm_running "$project_vm" || cmd_up_macos
     ensure_macos_workspace "$project_vm"
     ensure_macos_claude_projects "$project_vm"
-    ensure_macos_xcode_select "$project_vm"
     ensure_macos_claude_bin "$project_vm"
     info "Launching Claude Code in '${project_vm}'..."
     ssh_macos "$project_vm" -t "zsh -l -c 'cd ~/${MACOS_SHARE} && DISABLE_AUTOUPDATER=1 claude'"
@@ -1155,7 +1144,6 @@ cmd_shell_macos() {
     macos_vm_running "$project_vm" || cmd_up_macos
     ensure_macos_workspace "$project_vm"
     ensure_macos_claude_projects "$project_vm"
-    ensure_macos_xcode_select "$project_vm"
     info "Opening shell in '${project_vm}'..."
     ssh_macos "$project_vm" -t "cd ~/${MACOS_SHARE} && exec zsh -l"
 }
@@ -1303,16 +1291,6 @@ cmd_update_macos() {
         codesign -dvv "$HOME/.local/bin/claude" 2>&1 | grep -qi "Anthropic" \
             || echo "augur: WARNING claude binary is not signed by Anthropic" >&2
     '
-    # Ensure auto-login is set (so `xcodebuild test` can reach testmanagerd) and that full Xcode is
-    # the active developer dir (Homebrew's Command Line Tools can hijack xcode-select). Both let an
-    # existing base VM be fixed without a full rebuild — see cmd_build_macos.
-    ssh_macos "$MACOS_BASE_VM" "
-        echo '00000000: 1ced 3f4a bcbc ba2c caca 4e82' | sudo xxd -r - /etc/kcpassword
-        sudo chmod 600 /etc/kcpassword
-        sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser ${MACOS_SSH_USER}
-        sudo systemsetup -setsleep Off 2>/dev/null || true
-        [ -d /Applications/Xcode.app ] && sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
-    "
     "$VM_CLI" stop "$MACOS_BASE_VM" 2>/dev/null || true
     wait "$vm_pid" 2>/dev/null || true
     success "CLI tools updated in '${MACOS_BASE_VM}'."
