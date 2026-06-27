@@ -215,6 +215,13 @@ macos_ssh_port() {
     if macos_via_gvproxy "$1"; then echo "$AUGUR_SSH_FWD_PORT"; else echo "22"; fi
 }
 
+# Per-VM host key store (TOFU): accept a new key on first connect, reject changes thereafter.
+# Stored under ~/.augur/known_hosts/<vm-name> — one file per VM so keys don't cross-pollinate.
+vm_known_hosts_file() {
+    mkdir -p "$AUGUR_DIR/known_hosts"
+    echo "$AUGUR_DIR/known_hosts/${1}"
+}
+
 ssh_macos() {
     local vm="$1"; shift
     local host port
@@ -225,8 +232,8 @@ ssh_macos() {
         key_opts=(-i "$MACOS_SSH_KEY" -o PasswordAuthentication=no -o BatchMode=yes)
     fi
     ssh -p "$port" \
-        -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
+        -o StrictHostKeyChecking=accept-new \
+        -o UserKnownHostsFile="$(vm_known_hosts_file "$vm")" \
         -o LogLevel=ERROR \
         -o ConnectTimeout=10 \
         ${key_opts[@]+"${key_opts[@]}"} \
@@ -243,8 +250,8 @@ scp_to_macos() {
         key_opts=(-i "$MACOS_SSH_KEY" -o PasswordAuthentication=no -o BatchMode=yes)
     fi
     scp -P "$port" \
-        -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
+        -o StrictHostKeyChecking=accept-new \
+        -o UserKnownHostsFile="$(vm_known_hosts_file "$vm")" \
         -o LogLevel=ERROR \
         ${key_opts[@]+"${key_opts[@]}"} \
         "$src" "${MACOS_SSH_USER}@${host}:${dst}"
@@ -802,10 +809,14 @@ cmd_build_macos() {
         exit 1
     }
 
+    # A fresh build always produces a new VM with a new SSH host key. Discard any stale
+    # entry so the TOFU check below stores the new key cleanly.
+    rm -f "$(vm_known_hosts_file "$MACOS_BUILD_VM")"
+
     # Configure passwordless sudo so subsequent ssh_macos calls don't need a TTY
     info "Configuring passwordless sudo..."
-    ssh -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
+    ssh -o StrictHostKeyChecking=accept-new \
+        -o UserKnownHostsFile="$(vm_known_hosts_file "$MACOS_BUILD_VM")" \
         -o LogLevel=ERROR \
         -o ConnectTimeout=10 \
         "${MACOS_SSH_USER}@${vm_ip}" \
@@ -819,8 +830,8 @@ cmd_build_macos() {
         mkdir -p "$(dirname "$MACOS_SSH_KEY")"
         ssh-keygen -t ed25519 -f "$MACOS_SSH_KEY" -N "" -C "augur-vm"
     fi
-    ssh -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
+    ssh -o StrictHostKeyChecking=accept-new \
+        -o UserKnownHostsFile="$(vm_known_hosts_file "$MACOS_BUILD_VM")" \
         -o LogLevel=ERROR \
         -o ConnectTimeout=10 \
         "${MACOS_SSH_USER}@${vm_ip}" \
@@ -847,14 +858,12 @@ cmd_build_macos() {
     "
 
     # Step 5: Install Xcode via SSH
-    local xip_name
-    xip_name="$(basename "$xcode_xip_path")"
-
+    # Use a fixed safe remote filename to avoid shell injection via the source path's basename.
     info "Copying Xcode XIP to VM ($(du -sh "$xcode_xip_path" | cut -f1))..."
-    scp_to_macos "$MACOS_BUILD_VM" "$xcode_xip_path" "/tmp/${xip_name}"
+    scp_to_macos "$MACOS_BUILD_VM" "$xcode_xip_path" "/tmp/Xcode.xip"
 
     info "Expanding Xcode XIP — this takes ~20 minutes..."
-    ssh_macos "$MACOS_BUILD_VM" "cd /tmp && xip --expand '${xip_name}' && rm '${xip_name}'"
+    ssh_macos "$MACOS_BUILD_VM" "cd /tmp && xip --expand Xcode.xip && rm Xcode.xip"
 
     info "Installing Xcode..."
     ssh_macos "$MACOS_BUILD_VM" "sudo mv /tmp/Xcode.app /Applications/Xcode.app && \
@@ -875,15 +884,21 @@ cmd_build_macos() {
         ssh_macos "$MACOS_BUILD_VM" "sudo xcodebuild -downloadAllPlatforms"
     else
         for platform in "${platform_list[@]}"; do
+            [[ "$platform" =~ ^[a-zA-Z]+$ ]] || { error "Invalid platform name: '${platform}' (letters only, e.g. iOS, watchOS)"; exit 1; }
             info "Downloading ${platform} platform (Simulator runtime) — this takes a while (several GB)..."
-            ssh_macos "$MACOS_BUILD_VM" "sudo xcodebuild -downloadPlatform '${platform}'"
+            ssh_macos "$MACOS_BUILD_VM" "sudo xcodebuild -downloadPlatform ${platform}"
         done
     fi
 
     # Step 6: Install CLI tools (Homebrew + Claude Code)
     info "Installing Homebrew and CLI tools..."
     ssh_macos "$MACOS_BUILD_VM" '
-        NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+        # Download installers to temp files before executing — separates network fetch from execution
+        # so the scripts can be inspected and avoids piping untrusted content directly to a shell.
+        _brew_installer=$(mktemp)
+        curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh -o "$_brew_installer"
+        NONINTERACTIVE=1 /bin/bash "$_brew_installer"
+        rm -f "$_brew_installer"
         eval "$(/opt/homebrew/bin/brew shellenv)"
         echo '\''eval "$(/opt/homebrew/bin/brew shellenv)"'\'' >> ~/.zprofile
         # GitHub CLI. augur injects the host gh token as GH_TOKEN into ~/.augur-env at VM startup,
@@ -895,7 +910,10 @@ cmd_build_macos() {
         # on launch (SIGKILL / "zsh: killed"). The official installer downloads a correctly
         # Developer-ID-signed + notarized binary straight from Anthropic, which passes AMFI.
         # Pin to the stable channel and verify the signer to fail closed on a tampered binary.
-        curl -fsSL https://claude.ai/install.sh | bash -s stable
+        _claude_installer=$(mktemp)
+        curl -fsSL https://claude.ai/install.sh -o "$_claude_installer"
+        bash "$_claude_installer" -s stable
+        rm -f "$_claude_installer"
         echo '\''export PATH="$HOME/.local/bin:$PATH"'\'' >> ~/.zprofile
         codesign -dvv "$HOME/.local/bin/claude" 2>&1 | grep -qi "Anthropic" \
             || { echo "augur: ERROR claude binary is not signed by Anthropic — aborting build" >&2; exit 1; }
@@ -933,8 +951,8 @@ wait_for_macos_ssh() {
         host="$(macos_ssh_host "$vm")"
         [[ -n "$host" ]] && \
             ssh -p "$port" \
-                -o StrictHostKeyChecking=no \
-                -o UserKnownHostsFile=/dev/null \
+                -o StrictHostKeyChecking=accept-new \
+                -o UserKnownHostsFile="$(vm_known_hosts_file "$vm")" \
                 -o LogLevel=ERROR \
                 -o ConnectTimeout=5 \
                 ${key_opts[@]+"${key_opts[@]}"} \
@@ -985,8 +1003,11 @@ ensure_macos_claude_bin() {
     ssh_macos "$vm" "zsh -l -c '
         \"\$HOME/.local/bin/claude\" --version &>/dev/null && exit 0
         echo \"augur: claude not found in VM — installing via official installer...\" >&2
-        curl -fsSL https://claude.ai/install.sh | bash -s stable || \
-            echo \"augur: install failed. Run: augur update --macos (patches the base VM).\" >&2
+        _installer=\$(mktemp)
+        curl -fsSL https://claude.ai/install.sh -o \"\$_installer\"
+        bash \"\$_installer\" -s stable || \\
+            { rm -f \"\$_installer\"; echo \"augur: install failed. Run: augur update --macos (patches the base VM).\" >&2; exit 0; }
+        rm -f \"\$_installer\"
     '"
 }
 
@@ -1273,7 +1294,11 @@ cmd_update_macos() {
     ssh_macos "$MACOS_BASE_VM" '
         # Claude Code via the official installer (see cmd_build_macos for why npm is avoided).
         # The base VM has no virtiofs mounts here, so ~/.claude is local and writable.
-        curl -fsSL https://claude.ai/install.sh | bash -s stable
+        # Download to a temp file before executing — avoids piping untrusted content to a shell.
+        _installer=$(mktemp)
+        curl -fsSL https://claude.ai/install.sh -o "$_installer"
+        bash "$_installer" -s stable
+        rm -f "$_installer"
         grep -q ".local/bin" ~/.zprofile 2>/dev/null || echo '\''export PATH="$HOME/.local/bin:$PATH"'\'' >> ~/.zprofile
         codesign -dvv "$HOME/.local/bin/claude" 2>&1 | grep -qi "Anthropic" \
             || echo "augur: WARNING claude binary is not signed by Anthropic" >&2
