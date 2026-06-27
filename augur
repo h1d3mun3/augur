@@ -729,10 +729,24 @@ cmd_update() {
     warn "Existing containers use the old image. Run ${BOLD}augur down && augur up${RESET} to apply."
 }
 
+# Report the installed version: the commit augur was installed from, stamped into
+# ~/.augur/VERSION by `install` (`git describe` — a tag-relative name if tags exist,
+# else the short commit, with -dirty for a modified tree). Falls back to a live
+# describe when run straight from a checkout (uninstalled), then to "unknown".
+augur_version() {
+    if [[ -f "$AUGUR_DIR/VERSION" ]]; then
+        cat "$AUGUR_DIR/VERSION"
+    elif _v="$(git -C "$SCRIPT_DIR" describe --tags --always --dirty 2>/dev/null)" && [[ -n "$_v" ]]; then
+        echo "$_v (uninstalled)"
+    else
+        echo "unknown"
+    fi
+}
+
 cmd_version() {
     require_docker
     echo ""
-    echo -e "  ${BOLD}augur${RESET}  ${CYAN}1.2.0${RESET}"
+    echo -e "  ${BOLD}augur${RESET}  ${CYAN}$(augur_version)${RESET}"
     echo -e "  ${BOLD}Swift${RESET}       ${CYAN}${SWIFT_IMAGE_TAG}${RESET}  (image: ${IMAGE_NAME})"
     echo ""
     ensure_image
@@ -1327,7 +1341,7 @@ cmd_version_macos() {
         exit 1
     }
     echo ""
-    echo -e "  ${BOLD}augur${RESET}  ${CYAN}1.2.0${RESET}  (macOS VM mode)"
+    echo -e "  ${BOLD}augur${RESET}  ${CYAN}$(augur_version)${RESET}  (macOS VM mode)"
     echo ""
     echo -e "  ${BOLD}Base VM tool versions:${RESET}"
     "$VM_CLI" run --no-graphics "$MACOS_BASE_VM" &>/dev/null &

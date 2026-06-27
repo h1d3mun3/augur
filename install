@@ -34,6 +34,16 @@ cp "$SCRIPT_DIR/augur" "$INSTALL_DIR/augur"
 cp "$SCRIPT_DIR/Dockerfile" "$INSTALL_DIR/Dockerfile"
 chmod +x "$INSTALL_DIR/augur"
 
+# Stamp the installed version. The running ~/.augur/augur has no git context, so record
+# what we built from here: `git describe` gives a tag-relative name when tags exist, else
+# the short commit; --dirty flags an install from a modified working tree. Falls back to
+# "unknown" when installing outside a git checkout (e.g. an extracted tarball).
+if _ver="$(git -C "$SCRIPT_DIR" describe --tags --always --dirty 2>/dev/null)" && [[ -n "$_ver" ]]; then
+    printf '%s (installed %s)\n' "$_ver" "$(date +%F)" > "$INSTALL_DIR/VERSION"
+else
+    printf 'unknown (installed %s)\n' "$(date +%F)" > "$INSTALL_DIR/VERSION"
+fi
+
 # Egress allowlist (three layers):
 #   - augur.conf.default : augur-managed baseline. ALWAYS refreshed, so shipped domain
 #                          updates (e.g. new Anthropic endpoints) reach every install.
