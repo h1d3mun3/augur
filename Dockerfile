@@ -17,6 +17,18 @@ RUN apt-get update \
 # Create non-root user (no sudo — the agent runs as dev with no elevated privileges)
 RUN useradd -m -u 1001 -s /bin/bash dev
 
+# Aider — bundled as a Claude-Code-independent fallback agent (see docs/). Installed
+# into an isolated venv so it can't perturb the image's system Python, with the `aider`
+# entrypoint symlinked onto PATH for all users. This is the only second agent augur
+# ships; anything else is bring-your-own via `augur shell` or a fork.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 python3-venv \
+    && python3 -m venv /opt/aider \
+    && /opt/aider/bin/pip install --no-cache-dir --upgrade pip \
+    && /opt/aider/bin/pip install --no-cache-dir aider-chat \
+    && ln -s /opt/aider/bin/aider /usr/local/bin/aider \
+    && rm -rf /var/lib/apt/lists/*
+
 # Install Claude Code via the official native installer so installMethod matches
 # the host's (the shared ~/.claude.json reports "native"). The AMFI code-signing
 # issue that forces native on macOS does not apply to Linux; native is used here

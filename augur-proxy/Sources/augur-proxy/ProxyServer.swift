@@ -49,13 +49,16 @@ final class ProxyServer {
             try? Sock.writeAll(cfd, Array("HTTP/1.1 400 Bad Request\r\n\r\n".utf8)); return
         }
         let dest = req.destination
-        let verdict = filter.decide(dest, client: client)
-        guard verdict.allowed else {
-            log.deny(client: client, host: dest.host, port: dest.port, reason: verdict.reason)
+        let decision = filter.decideDial(dest, client: client)
+        guard decision.verdict.allowed else {
+            log.deny(client: client, host: dest.host, port: dest.port, reason: decision.verdict.reason)
             try? Sock.writeAll(cfd, Array("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n".utf8))
             return
         }
-        guard let upstream = try? Sock.connect(host: dest.host, port: dest.port, publicOnly: publicOnly) else {
+        // An explicitly-listed IP endpoint may be a LAN/Tailscale address (e.g. a local
+        // Ollama); permit the reachable-private dial for it while keeping the SSRF guard
+        // for everything else.
+        guard let upstream = try? Sock.connect(host: dest.host, port: dest.port, publicOnly: publicOnly, lanException: decision.explicitIP) else {
             log.deny(client: client, host: dest.host, port: dest.port, reason: "upstream-unreachable")
             try? Sock.writeAll(cfd, Array("HTTP/1.1 502 Bad Gateway\r\n\r\n".utf8))
             return
@@ -104,6 +107,21 @@ final class ProxyServer {
         // allowlist by that domain, and dial UPSTREAM BY NAME (re-resolving) — so a
         // spoofed SNI just reaches the real allowed host and cannot exfil elsewhere.
         if dest.isIPLiteral {
+            let decision = filter.decideDial(dest, client: client)
+            // An explicitly-listed IP endpoint (e.g. a LAN/Tailscale Ollama from an
+            // augur profile): honor the IP rule directly — there is no name to recover —
+            // and permit the reachable-private dial. No SNI/Host peek, so plain-HTTP-to-IP works.
+            if decision.explicitIP && decision.verdict.allowed {
+                guard let upstream = try? Sock.connect(host: dest.host, port: dest.port, publicOnly: publicOnly, lanException: true) else {
+                    log.deny(client: client, host: dest.host, port: dest.port, reason: "upstream-unreachable")
+                    try? Sock.writeAll(cfd, Socks5.reply(.hostUnreachable)); return
+                }
+                defer { close(upstream) }
+                try? Sock.writeAll(cfd, Socks5.reply(.succeeded))
+                log.allow(client: client, host: dest.host, port: dest.port, via: "socks-ip")
+                spliceBoth(cfd, upstream)
+                return
+            }
             try? Sock.writeAll(cfd, Socks5.reply(.succeeded))   // client now sends ClientHello
             let (peekedHost, buffered) = peekHostname(cfd)
             guard let host = peekedHost else {

@@ -10,23 +10,42 @@ import Foundation
 ///   - `example.com`    exact host only (the apex). Does NOT match subdomains.
 ///   - `*.example.com`  subdomains only (`api.example.com` yes; `example.com` no).
 ///   - `.example.com`   the apex AND every subdomain (a convenience for both).
+///   - `1.2.3.4:11434`  an IPv4 literal WITH a port: allow ONLY that IP on that port.
+///                      A bare IP (no port) and IPv6 literals are NOT accepted (v1).
+///
+/// IP-literal rules are matched by `allowsIP`, NEVER by `allows` (a domain decision
+/// must never resolve to an IP). They exist so an augur profile can permit a direct
+/// host endpoint such as a LAN/Tailscale Ollama server (`192.168.1.50:11434`). A port
+/// is mandatory so a rule can't silently open every port on a host; only IPv4 is
+/// supported for now (the SOCKS atyp=4 IPv6 form needs canonicalization first).
 ///
 /// Matching is case-insensitive and ignores a single trailing dot (FQDN form).
 public struct Allowlist {
+    /// A permitted IPv4 endpoint: this exact IP on this exact port.
+    struct IPRule: Equatable { let ip: String; let port: UInt16 }
+
     /// Exact hosts that are allowed (from bare-host patterns and from the apex of
     /// a `.example.com` pattern).
     private let exact: Set<String>
     /// Suffix patterns. Each entry is a domain whose *subdomains* are allowed,
     /// e.g. `github.com` here allows `api.github.com`, `a.b.github.com`, …
     private let suffixes: [String]
+    /// IP-literal allow rules. Consulted only by `allowsIP`, kept apart from the
+    /// domain sets so a host that isn't a clean LDH name can never match a domain.
+    private let ipRules: [IPRule]
 
     public init(patterns: [String]) {
         var exact = Set<String>()
         var suffixes = [String]()
+        var ipRules = [IPRule]()
         for raw in patterns {
             let p = Allowlist.normalize(raw)
             guard !p.isEmpty else { continue }
-            if let rest = p.dropPrefixIfPresent("*.") {
+            // An IP literal (optionally with a port) is not a domain pattern, so it
+            // must be recognized before the `*.`/`.` domain branches.
+            if let rule = Allowlist.parseIPRule(p) {
+                ipRules.append(rule)
+            } else if let rest = p.dropPrefixIfPresent("*.") {
                 // subdomains only
                 if !rest.isEmpty { suffixes.append(rest) }
             } else if let rest = p.dropPrefixIfPresent(".") {
@@ -38,6 +57,7 @@ public struct Allowlist {
         }
         self.exact = exact
         self.suffixes = suffixes
+        self.ipRules = ipRules
     }
 
     /// Parse raw `.augur.conf` text (comments, blank lines, one pattern per line).
@@ -45,7 +65,7 @@ public struct Allowlist {
         self.init(patterns: Allowlist.patterns(fromConf: confText))
     }
 
-    public var isEmpty: Bool { exact.isEmpty && suffixes.isEmpty }
+    public var isEmpty: Bool { exact.isEmpty && suffixes.isEmpty && ipRules.isEmpty }
 
     /// The decision. `host` may carry a port (`example.com:443`) or a trailing dot.
     public func allows(_ host: String) -> Bool {
@@ -65,7 +85,38 @@ public struct Allowlist {
         return false
     }
 
+    /// The IP-literal decision, kept separate from `allows`: the Filter calls this
+    /// for IP-literal destinations. An IP rule with a port allows only that port;
+    /// a portless rule allows any port on that IP. A non-IP host never matches.
+    public func allowsIP(_ host: String, port: UInt16) -> Bool {
+        let h = Allowlist.normalize(host)
+        guard !h.isEmpty, isIPLiteral(h) else { return false }
+        for r in ipRules where r.ip == h && r.port == port {
+            return true
+        }
+        return false
+    }
+
     // MARK: - Matching helpers
+
+    /// Parse an IP allow rule. v1 accepts ONLY `IPv4:port` (e.g. `192.168.1.50:11434`).
+    /// Returns nil — so the pattern falls through to domain handling (where an IP can
+    /// never match) — for anything else: a bare IP with no port (which would otherwise
+    /// open every port on a host), and any IPv6 literal (bracketed or bare, whose
+    /// textual SOCKS atyp=4 form is not yet canonicalized for safe matching).
+    static func parseIPRule(_ pattern: String) -> IPRule? {
+        guard !pattern.hasPrefix("[") else { return nil }   // no [IPv6]:port
+        // Exactly one colon ⇒ host:port. (0 colons = bare IP → rejected; 2+ = IPv6.)
+        let colonCount = pattern.reduce(0) { $1 == ":" ? $0 + 1 : $0 }
+        guard colonCount == 1 else { return nil }
+        let colon = pattern.firstIndex(of: ":")!
+        let host = String(pattern[..<colon])
+        let portPart = pattern[pattern.index(after: colon)...]
+        // `host` has no colon here, so isIPLiteral is true only for an IPv4 literal.
+        guard isIPLiteral(host), !portPart.isEmpty, portPart.allSatisfy(\.isNumber),
+              let port = UInt16(portPart) else { return nil }
+        return IPRule(ip: host, port: port)
+    }
 
     /// True iff `host` is a strict subdomain of `base` on a label boundary.
     /// `api.github.com` is a subdomain of `github.com`; `evilgithub.com` is NOT

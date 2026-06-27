@@ -37,11 +37,37 @@ public final class Filter {
 
     /// Decide whether `client` may reach `dest`.
     public func decide(_ dest: Destination, client: String) -> Verdict {
+        evaluate(dest, client: client, list: currentList())
+    }
+
+    /// A decision plus whether it was reached via an EXPLICIT IP rule. Both are
+    /// computed from the SAME allowlist snapshot, so a hot-reload landing between the
+    /// two can't mix policies (the server needs both to gate the private-dial
+    /// exception, and must not read the allowlist twice).
+    public struct DialDecision: Equatable {
+        public let verdict: Verdict
+        /// `dest` is an IP literal an IP rule permits → eligible for the private-dial
+        /// exception (NOT merely allowed via a DNS pin, which keeps the full guard).
+        public let explicitIP: Bool
+    }
+
+    /// The decision the datapaths use: verdict + explicit-IP flag under one lock.
+    public func decideDial(_ dest: Destination, client: String) -> DialDecision {
         let list = currentList()
+        let explicitIP = dest.isIPLiteral && list.allowsIP(dest.host, port: dest.port)
+        return DialDecision(verdict: evaluate(dest, client: client, list: list), explicitIP: explicitIP)
+    }
+
+    /// The pure decision over a fixed allowlist snapshot (pins are independently
+    /// thread-safe). Shared by `decide` and `decideDial`.
+    private func evaluate(_ dest: Destination, client: String, list: Allowlist) -> Verdict {
         if dest.isIPLiteral {
-            // An IP-literal connect is only allowed if the filtering DNS recently
-            // handed this client that exact IP for an allowed name (pin). Otherwise
-            // deny — this blocks IP-literal exfil and ECH-hidden direct connects.
+            // Allow an IP-literal connect when the policy explicitly lists this IP:port
+            // (e.g. a LAN/Tailscale LLM endpoint added by an augur profile)…
+            if list.allowsIP(dest.host, port: dest.port) { return .allow() }
+            // …or when the filtering DNS recently handed this client that exact IP for
+            // an allowed name (pin). Failing both, deny — this blocks IP-literal exfil
+            // and ECH-hidden direct connects.
             if let domain = pins.domain(forIP: dest.host, client: client), list.allows(domain) {
                 return .allow()
             }

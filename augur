@@ -77,6 +77,23 @@ AUGUR_SSH_FWD_PORT="${AUGUR_SSH_FWD_PORT:-$((20000 + _augur_port_offset))}"
 AUGUR_EGRESS="${AUGUR_EGRESS:-auto}"
 AUGUR_PROXY_BIN="${AUGUR_PROXY_BIN:-}"
 
+# ── LLM endpoint profiles (Ollama / custom backends) ──────────────────────────
+# Point Claude Code at a non-Anthropic endpoint (e.g. a LAN Ollama server) for a
+# single run, selected with `--profile <name>` (or `--local` for the [local]
+# profile). Profiles live in an INI-style file: project ./.augur.llm (preferred)
+# or global ~/.augur/augur.llm. Selecting one (a) injects ANTHROPIC_BASE_URL/MODEL/…
+# into the guest and (b) adds the endpoint's host:port to the egress allowlist for
+# that run only — so the path to the endpoint is open only while the profile is
+# active (a plain `augur claude` regenerates the allowlist without it).
+AUGUR_LLM_PROFILE="${AUGUR_LLM_PROFILE:-}"
+AUGUR_LLM_PROJECT="$WORKSPACE_DIR/.augur.llm"
+AUGUR_LLM_GLOBAL="${AUGUR_LLM_GLOBAL:-$AUGUR_DIR/augur.llm}"
+# Filled in by resolve_llm_profile when a profile is selected.
+LLM_ENV_ARGS=()             # KEY=VALUE env entries injected into the guest
+LLM_LAUNCH="claude"         # the command the active profile launches (default: claude)
+AUGUR_LLM_ALLOW_ENTRIES=""  # space-separated trusted egress entries from the profile
+LLM_PROFILE_SOURCE=""       # path of the file the active profile was resolved from
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 info()    { echo -e "${CYAN}[augur]${RESET} $*"; }
@@ -162,6 +179,259 @@ resolve_api_key() {
     elif [[ -f "$file_path" ]]; then
         cat "$file_path"
     fi
+}
+
+# ── LLM endpoint profiles ─────────────────────────────────────────────────────
+
+# True if $1 (the host part of an authority) is an IPv4/IPv6 literal, not a hostname.
+llm_is_ip() {
+    local h="$1"
+    [[ "$h" == *:* ]] && return 0                                  # IPv6 (has a colon)
+    [[ "$h" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && return 0     # IPv4
+    return 1
+}
+
+# Extract the authority (host[:port]) from a base URL: strip scheme, path, userinfo.
+#   http://user@192.168.1.50:11434/v1  →  192.168.1.50:11434
+llm_authority() {
+    local u="$1"
+    u="${u#*://}"   # drop scheme://
+    u="${u%%/*}"    # drop /path
+    u="${u##*@}"    # drop userinfo@
+    printf '%s' "$u"
+}
+
+# True if INI file $1 defines a [$2] section.
+llm_profile_has_section() {
+    [[ -f "$1" ]] || return 1
+    awk -v section="$2" '
+        function trim(s){ sub(/^[ \t\r]+/,"",s); sub(/[ \t\r]+$/,"",s); return s }
+        /^[ \t]*\[/ { h=$0; sub(/^[ \t]*\[/,"",h); sub(/\][ \t]*.*$/,"",h);
+                      if (trim(h)==section){found=1; exit} }
+        END { exit(found?0:1) }
+    ' "$1"
+}
+
+# Print the value of key $3 in section [$2] of INI file $1 (empty if absent).
+llm_profile_get() {
+    awk -v section="$2" -v key="$3" '
+        function trim(s){ sub(/^[ \t\r]+/,"",s); sub(/[ \t\r]+$/,"",s); return s }
+        /^[ \t]*#/ { next }
+        /^[ \t]*\[/ { h=$0; sub(/^[ \t]*\[/,"",h); sub(/\][ \t]*.*$/,"",h); cur=trim(h); next }
+        {
+            line=$0; sub(/#.*/,"",line)
+            eq=index(line,"=")
+            if (eq>0 && cur==section) {
+                k=trim(substr(line,1,eq-1)); v=trim(substr(line,eq+1))
+                if (k==key) { print v; exit }
+            }
+        }
+    ' "$1" 2>/dev/null
+}
+
+# Emit "SUFFIX<TAB>VALUE" for every `prefix.SUFFIX = value` key in section [$2] of $1.
+llm_profile_kv() {
+    awk -v section="$2" -v prefix="$3" '
+        function trim(s){ sub(/^[ \t\r]+/,"",s); sub(/[ \t\r]+$/,"",s); return s }
+        /^[ \t]*#/ { next }
+        /^[ \t]*\[/ { h=$0; sub(/^[ \t]*\[/,"",h); sub(/\][ \t]*.*$/,"",h); cur=trim(h); next }
+        {
+            line=$0; sub(/#.*/,"",line); eq=index(line,"=")
+            if (eq>0 && cur==section) {
+                k=trim(substr(line,1,eq-1)); v=trim(substr(line,eq+1))
+                if (index(k,prefix)==1) print substr(k,length(prefix)+1) "\t" v
+            }
+        }
+    ' "$1" 2>/dev/null
+}
+
+# Print every value of key $3 in section [$2] of $1 (one per line; supports repeats).
+llm_profile_get_all() {
+    awk -v section="$2" -v key="$3" '
+        function trim(s){ sub(/^[ \t\r]+/,"",s); sub(/[ \t\r]+$/,"",s); return s }
+        /^[ \t]*#/ { next }
+        /^[ \t]*\[/ { h=$0; sub(/^[ \t]*\[/,"",h); sub(/\][ \t]*.*$/,"",h); cur=trim(h); next }
+        {
+            line=$0; sub(/#.*/,"",line); eq=index(line,"=")
+            if (eq>0 && cur==section) {
+                k=trim(substr(line,1,eq-1)); v=trim(substr(line,eq+1))
+                if (k==key) print v
+            }
+        }
+    ' "$1" 2>/dev/null
+}
+
+# Normalize one `allow` value to the proxy's expected form: an IP keeps its port (the
+# proxy makes an IP:port rule); a hostname drops any port (the proxy matches the bare
+# host). A scheme/path/userinfo, if a URL was given, is stripped first.
+llm_allow_entry() {
+    local authority host
+    authority="$(llm_authority "$1")"
+    [[ -n "$authority" ]] || return 0
+    if [[ "$authority" == \[* ]]; then            # [IPv6]:port — pass through verbatim
+        printf '%s' "$authority"
+    else
+        host="${authority%%:*}"
+        if llm_is_ip "$host"; then printf '%s' "$authority"; else printf '%s' "$host"; fi
+    fi
+}
+
+# Drop IP-literal rules from the PROJECT layer on stdin. ./.augur.conf is writable by
+# the guest and ships in cloned repos, so an IP rule there must NOT receive the proxy's
+# private-dial exception — only host-side layers (baseline/global) and the explicit
+# --profile path may open an IP. An honored IP rule always contains an IPv4 dotted-quad
+# (or is an IPv6 literal); we match that ANYWHERE in the line, BEFORE the proxy's own
+# trim/lowercase/trailing-dot canonicalization, so no wrapping (trailing dots, NBSP /
+# Unicode padding, case) can sneak a rule past us that the proxy then normalizes and
+# honors. Over-stripping a domain that embeds a dotted-quad (e.g. nip.io style, which
+# resolves to a private IP anyway) is intentional and safe. Domains are otherwise kept.
+strip_project_ip_rules() {
+    awk '
+        { probe=$0; sub(/#.*/,"",probe) }                        # ignore an inline comment
+        probe ~ /[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/ ||              # any IPv4 dotted-quad
+        probe ~ /\[/ || probe ~ /:.*:/ {                         # IPv6 (bracketed or 2+ colons)
+            line=$0; gsub(/^[ \t\r]+|[ \t\r]+$/,"",line)
+            print "augur: ignoring untrusted IP rule in ./.augur.conf: " line > "/dev/stderr"
+            next
+        }
+        { print }
+    '
+}
+
+# Reject shell metacharacters in a workspace-controlled value (a profile's launch or an
+# env.* literal). These strings are embedded into the macOS remote command, so a quote /
+# $ / ; / backtick etc. could break out and run on the guest. Endpoint URLs, model names
+# and launch args never need them. (Docker passes argv directly, so it is safe regardless;
+# this hardens the macOS datapath and fails closed on anything suspicious.)
+llm_assert_safe() {
+    local label="$1" val="$2" forbidden="'\"\`\$;|&<>()" c i
+    [[ "$val" == *$'\n'* ]] && { error "Profile '${AUGUR_LLM_PROFILE}' ${label} contains a newline."; exit 1; }
+    for (( i=0; i<${#forbidden}; i++ )); do
+        c="${forbidden:i:1}"
+        [[ "$val" == *"$c"* ]] && { error "Profile '${AUGUR_LLM_PROFILE}' ${label} contains unsafe character '${c}': ${val}"; exit 1; }
+    done
+    return 0   # the loop's last [[ ]] is falsy on a safe value; don't leak that under set -e
+}
+
+# An env var NAME (the <NAME> in env.<NAME> / secret.<NAME> / secretfile.<NAME>) is
+# workspace-controlled and also lands in the macOS remote command, so it must be a
+# plain identifier — never a quote-breaking string. Enforce the POSIX env-name shape.
+llm_assert_name() {
+    [[ "$2" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || {
+        error "Profile '${AUGUR_LLM_PROFILE}' has an invalid ${1} name: '${2}'"; exit 1
+    }
+}
+
+# Resolve AUGUR_LLM_PROFILE into LLM_LAUNCH (guest command), LLM_ENV_ARGS (guest env),
+# AUGUR_LLM_ALLOW_ENTRIES (trusted egress), and LLM_PROFILE_SOURCE (the file it came
+# from). No-op when no profile was selected. Exits on a bad/unsafe profile. This must
+# stay SIDE-EFFECT-FREE (no host command execution / file reads driven by untrusted
+# input), since it runs before confirm_llm_profile.
+resolve_llm_profile() {
+    LLM_ENV_ARGS=()
+    LLM_LAUNCH="claude"
+    AUGUR_LLM_ALLOW_ENTRIES=""
+    LLM_PROFILE_SOURCE=""
+    [[ -n "$AUGUR_LLM_PROFILE" ]] || return 0
+
+    local name="$AUGUR_LLM_PROFILE" file=""
+    if llm_profile_has_section "$AUGUR_LLM_PROJECT" "$name"; then
+        file="$AUGUR_LLM_PROJECT"
+    elif llm_profile_has_section "$AUGUR_LLM_GLOBAL" "$name"; then
+        file="$AUGUR_LLM_GLOBAL"
+    else
+        error "LLM profile '[${name}]' not found in ${AUGUR_LLM_PROJECT} or ${AUGUR_LLM_GLOBAL}."
+        error "Scaffold one with: ${BOLD}augur init-llm${RESET}"
+        exit 1
+    fi
+    LLM_PROFILE_SOURCE="$file"
+    local is_project="false"; [[ "$file" == "$AUGUR_LLM_PROJECT" ]] && is_project="true"
+
+    # Launch command (default: claude).
+    local launch; launch="$(llm_profile_get "$file" "$name" launch)"
+    [[ -n "$launch" ]] && LLM_LAUNCH="$launch"
+    llm_assert_safe "launch" "$LLM_LAUNCH"
+
+    local n v sv
+    # Literal env: env.<NAME> = value (name + value validated; injected into the guest).
+    while IFS=$'\t' read -r n v; do
+        [[ -n "$n" ]] || continue
+        llm_assert_name "env" "$n"
+        llm_assert_safe "env.${n}" "$v"
+        LLM_ENV_ARGS+=("${n}=${v}")
+    done < <(llm_profile_kv "$file" "$name" "env.")
+
+    # Host secrets — honored ONLY from the host-side global profile, never a workspace
+    # one: a cloned repo must not be able to make augur read host env vars or host files.
+    if [[ "$is_project" == "true" ]]; then
+        [[ -n "$(llm_profile_kv "$file" "$name" "secret."; llm_profile_kv "$file" "$name" "secretfile.")" ]] && \
+            warn "Ignoring secret.*/secretfile.* in a workspace profile (host-side ~/.augur/augur.llm only)."
+    else
+        # secret.<NAME> = HOST_ENV_VAR — validate the NAME, then look it up. Never feed a
+        # raw value to indirect expansion (bash evaluates `name[subscript]` arithmetically,
+        # which would run $(...) — host RCE).
+        while IFS=$'\t' read -r n v; do
+            [[ -n "$n" ]] || continue
+            llm_assert_name "secret" "$n"
+            if [[ ! "$v" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+                error "secret.${n}: '${v}' is not a valid environment variable name."; exit 1
+            fi
+            sv=""; set +u; sv="${!v}"; set -u
+            [[ -z "$sv" ]] && warn "secret.${n}: host env '${v}' is empty."
+            LLM_ENV_ARGS+=("${n}=${sv}")
+        done < <(llm_profile_kv "$file" "$name" "secret.")
+        # secretfile.<NAME> = path (host-side profile, so the path is trusted).
+        while IFS=$'\t' read -r n v; do
+            [[ -n "$n" ]] || continue
+            llm_assert_name "secretfile" "$n"
+            v="${v/#\~/$HOME}"; sv=""; [[ -f "$v" ]] && sv="$(cat "$v")"
+            LLM_ENV_ARGS+=("${n}=${sv}")
+        done < <(llm_profile_kv "$file" "$name" "secretfile.")
+    fi
+
+    # Egress this profile may open: allow = entry [entry...] (space/comma sep; repeatable).
+    local allow_raw entry derived
+    allow_raw="$(llm_profile_get_all "$file" "$name" allow | tr ',\n' '  ')"
+    for entry in $allow_raw; do
+        derived="$(llm_allow_entry "$entry")"
+        [[ -n "$derived" ]] && AUGUR_LLM_ALLOW_ENTRIES+="${AUGUR_LLM_ALLOW_ENTRIES:+ }${derived}"
+    done
+
+    info "LLM profile ${BOLD}${name}${RESET} → launch: ${BOLD}${LLM_LAUNCH}${RESET}${AUGUR_LLM_ALLOW_ENTRIES:+  (egress: ${AUGUR_LLM_ALLOW_ENTRIES})}"
+}
+
+# Before activating a profile, show its full effect (source, command, env var NAMES,
+# egress) and confirm. .augur.llm is repo-located, so the user vouches for it here.
+# AUGUR_ASSUME_YES=1 skips. Runs AFTER resolve, which is side-effect-free.
+confirm_llm_profile() {
+    [[ -n "$AUGUR_LLM_PROFILE" ]] || return 0
+    [[ "${AUGUR_ASSUME_YES:-0}" == "1" ]] && return 0
+    echo ""
+    warn "Profile '${AUGUR_LLM_PROFILE}' (${LLM_PROFILE_SOURCE}) will:"
+    echo -e "    • run:            ${BOLD}${LLM_LAUNCH}${RESET}"
+    if [[ ${#LLM_ENV_ARGS[@]} -gt 0 ]]; then
+        local names="" kv
+        for kv in "${LLM_ENV_ARGS[@]}"; do names+="${names:+, }${kv%%=*}"; done
+        echo -e "    • set guest env:  ${BOLD}${names}${RESET}"
+    fi
+    [[ -n "$AUGUR_LLM_ALLOW_ENTRIES" ]] && \
+        echo -e "    • open egress to: ${BOLD}${AUGUR_LLM_ALLOW_ENTRIES}${RESET}"
+    [[ "$LLM_PROFILE_SOURCE" == "$AUGUR_LLM_PROJECT" ]] && \
+        echo -e "    ${YELLOW}This profile comes from the workspace — review it if the repo is untrusted.${RESET}"
+    if [[ ! -t 0 ]]; then
+        error "Refusing to activate a profile non-interactively. Set AUGUR_ASSUME_YES=1 to allow."
+        exit 1
+    fi
+    local ans; read -r -p "Continue? [y/N] " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || { info "Aborted."; exit 0; }
+}
+
+# Rewrite the merged allowlist so it reflects the active profile (or its absence).
+# The running proxy hot-reloads the file, so this opens the endpoint path for a
+# local run and closes it again on the next plain `augur claude`.
+refresh_egress_allowlist() {
+    egress_enabled || return 0
+    write_merged_allowlist >/dev/null
 }
 
 # ── macOS VM mode helpers ─────────────────────────────────────────────────────
@@ -315,7 +585,13 @@ write_merged_allowlist() {
         echo "# generated by augur at $(date) — do not edit (regenerated on 'augur up')"
         [[ -f "$AUGUR_BASELINE_CONF" ]] && { echo "# --- baseline: $AUGUR_BASELINE_CONF"; cat "$AUGUR_BASELINE_CONF"; }
         [[ -f "$AUGUR_GLOBAL_CONF" ]]   && { echo "# --- global: $AUGUR_GLOBAL_CONF"; cat "$AUGUR_GLOBAL_CONF"; }
-        [[ -f "$AUGUR_PROJECT_CONF" ]]  && { echo "# --- project: $AUGUR_PROJECT_CONF"; cat "$AUGUR_PROJECT_CONF"; }
+        # Project layer is workspace-writable: keep its domains but strip IP rules, which
+        # must not gain the private-dial exception from an untrusted source.
+        [[ -f "$AUGUR_PROJECT_CONF" ]]  && { echo "# --- project (IP rules stripped): $AUGUR_PROJECT_CONF"; strip_project_ip_rules < "$AUGUR_PROJECT_CONF"; }
+        if [[ -n "$AUGUR_LLM_ALLOW_ENTRIES" ]]; then
+            echo "# --- llm-profile: ${AUGUR_LLM_PROFILE}"
+            local e; for e in $AUGUR_LLM_ALLOW_ENTRIES; do echo "$e"; done
+        fi
     } > "$out"
     echo "$out"
 }
@@ -656,8 +932,18 @@ cmd_up() {
 cmd_claude() {
     require_docker
     ensure_running
-    info "Launching Claude Code in '${CONTAINER_NAME}'..."
-    docker exec -it -e DISABLE_AUTOUPDATER=1 "$CONTAINER_NAME" claude
+    resolve_llm_profile
+    confirm_llm_profile
+    refresh_egress_allowlist
+    info "Launching ${BOLD}${LLM_LAUNCH}${RESET} in '${CONTAINER_NAME}'..."
+    local exec_args=(exec -it -e DISABLE_AUTOUPDATER=1)
+    if [[ ${#LLM_ENV_ARGS[@]} -gt 0 ]]; then
+        local kv
+        for kv in "${LLM_ENV_ARGS[@]}"; do exec_args+=(-e "$kv"); done
+    fi
+    # Split the launch command into words (simple args only; no quoted spaces).
+    local -a launch_words; read -ra launch_words <<< "$LLM_LAUNCH"
+    docker "${exec_args[@]}" "$CONTAINER_NAME" "${launch_words[@]}"
 }
 
 cmd_shell() {
@@ -937,6 +1223,14 @@ cmd_build_macos() {
         bash "$_claude_installer" stable
         rm -f "$_claude_installer"
         echo '\''export PATH="$HOME/.local/bin:$PATH"'\'' >> ~/.zprofile
+        # Aider — bundled as a Claude-Code-independent fallback agent (see docs/), in an
+        # isolated venv with `aider` symlinked onto PATH (~/.local/bin), mirroring the
+        # Docker image so a profile `launch = aider ...` works in both modes.
+        command -v python3 >/dev/null 2>&1 || brew install python
+        python3 -m venv "$HOME/.aider-venv"
+        "$HOME/.aider-venv/bin/pip" install --no-cache-dir --upgrade pip aider-chat
+        mkdir -p "$HOME/.local/bin"
+        ln -sf "$HOME/.aider-venv/bin/aider" "$HOME/.local/bin/aider"
         # Pin the Xcode developer directory via DEVELOPER_DIR so xcodebuild/xcrun always
         # use the full Xcode installation even if Homebrew later resets xcode-select to CLT.
         # This avoids needing sudo xcode-select at project VM startup.
@@ -1155,8 +1449,15 @@ cmd_claude_macos() {
     ensure_macos_workspace "$project_vm"
     ensure_macos_claude_projects "$project_vm"
     ensure_macos_claude_bin "$project_vm"
-    info "Launching Claude Code in '${project_vm}'..."
-    ssh_macos "$project_vm" -t "zsh -l -c 'cd ~/${MACOS_SHARE} && DISABLE_AUTOUPDATER=1 claude'"
+    resolve_llm_profile
+    confirm_llm_profile
+    refresh_egress_allowlist
+    info "Launching ${BOLD}${LLM_LAUNCH}${RESET} in '${project_vm}'..."
+    # Inject the profile env inline on the remote command (per-invocation; ~/.augur-env
+    # is left untouched). Values (URL / model name) carry no spaces or quotes.
+    local env_prefix=""
+    [[ ${#LLM_ENV_ARGS[@]} -gt 0 ]] && env_prefix="${LLM_ENV_ARGS[*]} "
+    ssh_macos "$project_vm" -t "zsh -l -c 'cd ~/${MACOS_SHARE} && ${env_prefix}DISABLE_AUTOUPDATER=1 ${LLM_LAUNCH}'"
 }
 
 cmd_shell_macos() {
@@ -1312,6 +1613,12 @@ cmd_update_macos() {
         grep -q ".local/bin" ~/.zprofile 2>/dev/null || echo '\''export PATH="$HOME/.local/bin:$PATH"'\'' >> ~/.zprofile
         codesign -dvv "$HOME/.local/bin/claude" 2>&1 | grep -qi "Anthropic" \
             || echo "augur: WARNING claude binary is not signed by Anthropic" >&2
+        # Aider — install or upgrade the bundled fallback agent (isolated venv on PATH).
+        command -v python3 >/dev/null 2>&1 || brew install python
+        python3 -m venv "$HOME/.aider-venv"
+        "$HOME/.aider-venv/bin/pip" install --no-cache-dir --upgrade pip aider-chat
+        mkdir -p "$HOME/.local/bin"
+        ln -sf "$HOME/.aider-venv/bin/aider" "$HOME/.local/bin/aider"
     '
     "$VM_CLI" stop "$MACOS_BASE_VM" 2>/dev/null || true
     wait "$vm_pid" 2>/dev/null || true
@@ -1374,6 +1681,69 @@ EOF
     info "Edit it to list this project's endpoints, then run ${BOLD}augur up${RESET}."
 }
 
+# Write a starter ./.augur.llm with an example local Ollama profile. Never
+# overwrites an existing file.
+cmd_init_llm() {
+    local out="$AUGUR_LLM_PROJECT"
+    if [[ -f "$out" ]]; then
+        warn "An LLM profile file already exists: ${BOLD}${out}${RESET}"
+        warn "Leaving it untouched. Edit it directly to change this project's profiles."
+        return 0
+    fi
+    cat > "$out" <<'EOF'
+# augur LLM endpoint / agent profiles
+#
+# Run a coding agent against a chosen backend for a single invocation:
+#   augur claude --profile <name>      (or --local for [local])
+# A plain `augur claude` runs Claude Code against Anthropic; nothing here is used.
+#
+# Each profile is generic:
+#   launch       = <command>            the agent to run in the sandbox (default: claude)
+#   env.<NAME>   = <value>              a literal env var for the guest process
+#   secret.<NAME> = <HOST_ENV_VAR>      a secret resolved from the HOST env (never inline one)
+#   secretfile.<NAME> = <path>          a secret read from a file on the host
+#   allow        = <host:port> [...]    egress this profile may open, for THIS run only
+#
+# Trust model: this file lives in the workspace (it can ship in a cloned repo), so
+# augur shows the launch command + egress and asks you to confirm before activating a
+# profile (set AUGUR_ASSUME_YES=1 to skip). IP rules in ./.augur.conf are ignored for
+# safety; only a profile's `allow` (or your host-side ~/.augur config) may open an IP.
+# An `allow` IP must be private (LAN / RFC1918 / Tailscale CGNAT) — public IPs are
+# refused; reach a public endpoint by hostname instead.
+#
+# Caveat: a local model is for ordinary single-agent editing. Cloud-only features
+# (e.g. /code-review ultra) are unavailable, and heavy multi-agent orchestration is
+# slow/unreliable locally.
+
+# Claude Code pointed at a LAN/Tailscale Ollama (Anthropic-compatible /v1/messages):
+[local]
+launch  = claude
+env.ANTHROPIC_BASE_URL        = http://192.168.1.50:11434
+env.ANTHROPIC_MODEL           = qwen2.5-coder:32b
+env.ANTHROPIC_SMALL_FAST_MODEL = qwen2.5-coder:7b
+env.ANTHROPIC_AUTH_TOKEN      = ollama
+allow   = 192.168.1.50:11434
+
+# Aider (bundled) pointed at the same Ollama, as a Claude-Code-independent fallback:
+# (If aider crashes on startup reading the git index — seen with newer git on the
+# macOS VM — add --no-git to launch; it skips git integration but still uses the model.)
+# [aider-local]
+# launch = aider --model ollama/qwen2.5-coder:32b --no-auto-commits
+# env.OLLAMA_API_BASE = http://192.168.1.50:11434
+# allow  = 192.168.1.50:11434
+
+# Authenticated endpoint: reference a secret, never inline it:
+# [remote]
+# launch = claude
+# env.ANTHROPIC_BASE_URL = https://ollama.example.com
+# env.ANTHROPIC_MODEL    = qwen2.5-coder:32b
+# secret.ANTHROPIC_AUTH_TOKEN = MY_OLLAMA_TOKEN   # from the host env (never committed)
+# allow  = ollama.example.com
+EOF
+    success "Created ${BOLD}${out}${RESET}"
+    info "Edit the IP/model, then run ${BOLD}augur claude --local${RESET}."
+}
+
 # ── Help ──────────────────────────────────────────────────────────────────────
 
 cmd_help() {
@@ -1390,6 +1760,7 @@ cmd_help() {
     echo -e "    augur ${CYAN}update${RESET}  [--swift VERSION]  Rebuild image with latest versions"
     echo -e "    augur ${CYAN}version${RESET}                    Show version information"
     echo -e "    augur ${CYAN}init-conf${RESET}                  Scaffold a ./.augur.conf egress allowlist"
+    echo -e "    augur ${CYAN}init-llm${RESET}                   Scaffold a ./.augur.llm LLM endpoint profile"
     echo ""
     echo -e "  ${BOLD}MACOS VM MODE${RESET}  ${YELLOW}(macOS VM — full Xcode, xcodebuild, Simulator)${RESET}"
     echo -e "    augur ${CYAN}build${RESET}  --macos --ipsw <path> --xcode-xip <path> [--platforms <list>]  Build base VM (one-time)"
@@ -1409,6 +1780,8 @@ cmd_help() {
     echo -e "    --gui              Open a VM window in macOS VM mode (for: augur up --macos)"
     echo -e "    --egress           Force the egress allowlist on (re-enables if AUGUR_EGRESS=0)"
     echo -e "    --no-egress        Disable the egress allowlist for this run"
+    echo -e "    --profile NAME     Use LLM endpoint profile NAME from .augur.llm (for: augur claude)"
+    echo -e "    --local            Shorthand for --profile local"
     echo -e "    --ipsw <path>      macOS IPSW file  (for: augur build --macos)"
     echo -e "    --xcode-xip <path> Xcode XIP file   (for: augur build --macos)"
     echo -e "    --platforms <list> Simulator platforms to bake into the base VM (for: augur build --macos)"
@@ -1419,11 +1792,16 @@ cmd_help() {
     echo -e "    CLAUDE_CODE_OAUTH_TOKEN  Claude subscription token (or ~/.claude_code_oauth_token; run: claude setup-token)"
     echo -e "    SWIFT_VERSION            Default Swift version (default: latest)"
     echo -e "    AUGUR_EGRESS             Disable (0) or force-enable (1) egress filtering; default is always on"
+    echo -e "    AUGUR_ASSUME_YES         Skip the profile activation confirmation prompt (1 = yes)"
     echo ""
     echo -e "  ${BOLD}NOTES${RESET}"
     echo -e "    • Egress allowlist: on by default (global ${CYAN}~/.augur/augur.conf${RESET}). Add a ${CYAN}.augur.conf${RESET}"
     echo -e "      in the project root to extend it with project-specific domains. Use ${CYAN}--no-egress${RESET} to"
     echo -e "      disable for one run. Works in both modes, needs no sudo. macOS egress also needs Go (augur-gvproxy)."
+    echo -e "    • LLM profiles:  run an agent against a local/LAN endpoint (e.g. Ollama) for one run"
+    echo -e "      with ${CYAN}augur claude --local${RESET}. Define profiles in ${CYAN}.augur.llm${RESET} (${CYAN}augur init-llm${RESET}); each sets a"
+    echo -e "      launch command + env + the egress it may open. Aider is bundled as a fallback agent."
+    echo -e "      Private-IP endpoints only (RFC1918/Tailscale); a workspace profile asks to confirm."
     echo -e "    • Docker mode:   current directory mounted at /workspace-<project> (Linux container)"
     echo -e "    • macOS VM mode: current directory exposed at ~/workspace-<project> (macOS VM)"
     echo -e "    • macOS VM mode requires: augur-vm (the bundled Swift VM backend)"
@@ -1447,6 +1825,11 @@ while [[ $# -gt 0 ]]; do
         --gui)   MACOS_GUI=true; shift ;;
         --egress)    AUGUR_EGRESS=1; shift ;;
         --no-egress) AUGUR_EGRESS=0; shift ;;
+        --profile)
+            AUGUR_LLM_PROFILE="${2:?'--profile requires a name (e.g. --profile local)'}"
+            shift 2
+            ;;
+        --local) AUGUR_LLM_PROFILE="local"; shift ;;
         --swift)
             SWIFT_VERSION="${2:?'--swift requires a version (e.g. --swift 6.0)'}"
             shift 2
@@ -1474,6 +1857,7 @@ if $MACOS_MODE; then
         destroy)        cmd_destroy_macos ;;
         status)         cmd_status_macos ;;
         init-conf)      cmd_init_conf ;;
+        init-llm)       cmd_init_llm ;;
         list)           cmd_list_macos ;;
         update)         cmd_update_macos ;;
         version)        cmd_version_macos ;;
@@ -1488,6 +1872,7 @@ else
         down)           cmd_down ;;
         status)         cmd_status ;;
         init-conf)      cmd_init_conf ;;
+        init-llm)       cmd_init_llm ;;
         update)         cmd_update ;;
         version)        cmd_version ;;
         build)          cmd_build ;;

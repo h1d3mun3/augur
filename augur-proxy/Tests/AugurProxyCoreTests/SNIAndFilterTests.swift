@@ -61,12 +61,40 @@ final class SNIAndFilterTests: XCTestCase {
         XCTAssertFalse(f.decide(Destination(host: "9.9.9.9", port: 443, isIPLiteral: true), client: "c").allowed)
     }
 
+    func testFilterAllowsIPRuleWithPort() {
+        let f = Filter(allowlist: Allowlist(patterns: ["192.168.1.50:11434"]))
+        XCTAssertTrue(f.decide(Destination(host: "192.168.1.50", port: 11434, isIPLiteral: true), client: "c").allowed)
+        // Same IP, wrong port → denied.
+        XCTAssertFalse(f.decide(Destination(host: "192.168.1.50", port: 22, isIPLiteral: true), client: "c").allowed)
+        // Different IP → denied.
+        XCTAssertFalse(f.decide(Destination(host: "192.168.1.60", port: 11434, isIPLiteral: true), client: "c").allowed)
+    }
+
+    func testDecideDialScopesTheExplicitIPException() {
+        let pins = PinTable()
+        let f = Filter(allowlist: Allowlist(patterns: ["192.168.1.50:11434", "github.com"]), pins: pins)
+        // Explicitly-listed IP:port → allowed AND eligible for the dial exception.
+        let ok = f.decideDial(Destination(host: "192.168.1.50", port: 11434, isIPLiteral: true), client: "c")
+        XCTAssertTrue(ok.verdict.allowed); XCTAssertTrue(ok.explicitIP)
+        // Wrong port / wrong IP → not allowed, not eligible.
+        XCTAssertFalse(f.decideDial(Destination(host: "192.168.1.50", port: 22, isIPLiteral: true), client: "c").explicitIP)
+        XCTAssertFalse(f.decideDial(Destination(host: "10.0.0.1", port: 11434, isIPLiteral: true), client: "c").explicitIP)
+        // A domain is allowed by name but is never an explicit IP.
+        let dom = f.decideDial(Destination(host: "github.com", port: 443, isIPLiteral: false), client: "c")
+        XCTAssertTrue(dom.verdict.allowed); XCTAssertFalse(dom.explicitIP)
+        // Allowed via a DNS pin (not an explicit IP rule) → allowed but NOT eligible:
+        // the private-dial guard must stay on for the rebinding case.
+        pins.pin(ip: "10.9.9.9", forClient: "c", domain: "github.com", ttl: 60)
+        let pinned = f.decideDial(Destination(host: "10.9.9.9", port: 443, isIPLiteral: true), client: "c")
+        XCTAssertTrue(pinned.verdict.allowed); XCTAssertFalse(pinned.explicitIP)
+    }
+
     func testPinExpiry() {
         var now = Date(timeIntervalSince1970: 1000)
         let pins = PinTable(clock: { now })
         pins.pin(ip: "1.1.1.1", forClient: "c", domain: "github.com", ttl: 10)
         XCTAssertEqual(pins.domain(forIP: "1.1.1.1", client: "c"), "github.com")
-        now = Date(timeIntervalSince1970: 1000 + 10 + 5 + 1)  // past ttl+floor+grace
+        now = Date(timeIntervalSince1970: 1000 + 30 + 5 + 1)  // past max(ttl,30)+grace
         XCTAssertNil(pins.domain(forIP: "1.1.1.1", client: "c"))
     }
 

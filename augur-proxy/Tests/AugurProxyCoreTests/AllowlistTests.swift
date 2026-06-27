@@ -46,6 +46,44 @@ final class AllowlistTests: XCTestCase {
         XCTAssertFalse(a.allows("::1"))
     }
 
+    func testIPRuleWithPortAllowsOnlyThatPort() {
+        let a = Allowlist(patterns: ["192.168.1.50:11434"])
+        XCTAssertTrue(a.allowsIP("192.168.1.50", port: 11434))
+        XCTAssertFalse(a.allowsIP("192.168.1.50", port: 22), "a pinned-port rule must not open other ports")
+        XCTAssertFalse(a.allowsIP("192.168.1.51", port: 11434), "must not open a different IP")
+        XCTAssertFalse(a.allows("192.168.1.50"), "an IP rule must never become a domain match")
+        XCTAssertFalse(a.isEmpty)
+    }
+
+    func testPortlessIPRuleIsNotHonored() {
+        // A bare IP (no port) must NOT become an IP rule — it would otherwise open
+        // every port on a host. It is simply inert (never matches anything).
+        let a = Allowlist(patterns: ["10.0.0.5"])
+        XCTAssertFalse(a.allowsIP("10.0.0.5", port: 11434))
+        XCTAssertFalse(a.allowsIP("10.0.0.5", port: 443))
+        XCTAssertFalse(a.allows("10.0.0.5"))
+    }
+
+    func testIPv6RuleIsNotHonored() {
+        // IPv6 literals (bracketed or bare) are not accepted as IP rules in v1.
+        let a = Allowlist(patterns: ["[fd00::1]:11434", "fd00::2"])
+        XCTAssertFalse(a.allowsIP("fd00::1", port: 11434))
+        XCTAssertFalse(a.allowsIP("fd00::2", port: 11434))
+    }
+
+    func testDomainRuleNeverAllowsIP() {
+        let a = Allowlist(patterns: ["api.anthropic.com"])
+        XCTAssertFalse(a.allowsIP("1.2.3.4", port: 443))
+    }
+
+    func testHostnameWithPortIsADomainNotAnIPRule() {
+        // A hostname authority stays a domain (port stripped by `allows`), and is
+        // never mistaken for an IP rule.
+        let a = Allowlist(patterns: ["ollama.local"])
+        XCTAssertTrue(a.allows("ollama.local:11434"))
+        XCTAssertFalse(a.allowsIP("ollama.local", port: 11434))
+    }
+
     func testConfParsingStripsCommentsAndBlanks() {
         let conf = """
         # comment line

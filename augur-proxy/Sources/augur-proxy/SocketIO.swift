@@ -1,4 +1,5 @@
 import Foundation
+import AugurProxyCore
 #if canImport(Glibc)
 import Glibc
 #elseif canImport(Darwin)
@@ -55,7 +56,16 @@ enum Sock {
 
     /// Connect to `host:port`, refusing non-public destinations when `publicOnly`.
     /// Resolves via getaddrinfo and tries addresses in order. Returns a connected fd.
-    static func connect(host: String, port: UInt16, publicOnly: Bool) throws -> Int32 {
+    ///
+    /// `lanException` carves a NARROW hole in the private-address guard: when set (the
+    /// caller has confirmed `host` is an IP literal an allowlist IP rule explicitly
+    /// permits), a destination in a reachable-private range (RFC1918 + CGNAT/Tailscale)
+    /// is permitted; loopback, link-local/metadata, and PUBLIC addresses stay blocked
+    /// even then — see `isReachablePrivate`. Containment does NOT rest on getaddrinfo
+    /// returning the literal: `dialBlocked` re-vets EVERY resolved sockaddr below, so
+    /// even if `host` somehow resolved elsewhere, a non-reachable-private result is
+    /// still blocked.
+    static func connect(host: String, port: UInt16, publicOnly: Bool, lanException: Bool = false) throws -> Int32 {
         var hints = addrinfo()
         hints.ai_family = AF_UNSPEC
         hints.ai_socktype = sockStreamType
@@ -68,7 +78,7 @@ enum Sock {
         var ai: UnsafeMutablePointer<addrinfo>? = head
         while let cur = ai {
             defer { ai = cur.pointee.ai_next }
-            if publicOnly, let sa = cur.pointee.ai_addr, isPrivate(sa) {
+            if let sa = cur.pointee.ai_addr, dialBlocked(sa, publicOnly: publicOnly, lanException: lanException) {
                 lastErr = "destination resolves to a non-public address (blocked)"
                 continue
             }
@@ -128,6 +138,50 @@ enum Sock {
             if failed { break }
         }
         shutdown(dst, shutWrite)
+    }
+
+    /// The single dial gate, as a pure decision over a resolved `sockaddr` (so the
+    /// tests exercise it directly):
+    ///   - `--allow-private` (publicOnly == false): nothing is blocked.
+    ///   - `lanException` (the destination is an IP literal an IP rule explicitly
+    ///     permits): allow ONLY a reachable-private address (RFC1918 / CGNAT). A
+    ///     PUBLIC IP is blocked here too — an IP rule is for a vetted private/tailnet
+    ///     endpoint, not an arbitrary public exfil target (use a domain for those) —
+    ///     and so are loopback / link-local / metadata.
+    ///   - otherwise (domains, DNS-pinned IPs): the standard guard blocks all private.
+    static func dialBlocked(_ sa: UnsafePointer<sockaddr>, publicOnly: Bool, lanException: Bool) -> Bool {
+        guard publicOnly else { return false }            // --allow-private: nothing blocked
+        if lanException { return !isReachablePrivate(sa) } // explicit IP rule: reachable-private only
+        return isPrivate(sa)                               // normal path: block all non-public
+    }
+
+    /// True for the private ranges augur will dial under an explicit-IP `lanException`:
+    /// RFC1918 + CGNAT/Tailscale IPv4, including the IPv4-mapped IPv6 form. Native IPv6
+    /// literals are unsupported as IP rules in v1 (see `Allowlist.parseIPRule`), so the
+    /// non-mapped AF_INET6 case returns false. Strictly narrower than `isPrivate` — see
+    /// `isReachablePrivateIPv4` for why loopback/link-local/metadata are excluded.
+    static func isReachablePrivate(_ sa: UnsafePointer<sockaddr>) -> Bool {
+        switch Int32(sa.pointee.sa_family) {
+        case AF_INET:
+            let v = sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) {
+                UInt32(bigEndian: $0.pointee.sin_addr.s_addr)
+            }
+            return isReachablePrivateIPv4(UInt8(v >> 24), UInt8((v >> 16) & 0xff),
+                                          UInt8((v >> 8) & 0xff), UInt8(v & 0xff))
+        case AF_INET6:
+            return sa.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { p in
+                var addr = p.pointee.sin6_addr
+                let b = withUnsafeBytes(of: &addr) { Array($0) }
+                // Only IPv4-mapped (::ffff:a.b.c.d) is classified; native IPv6 is not a
+                // valid IP rule in v1, so anything else is not reachable-private.
+                if b[0...9].allSatisfy({ $0 == 0 }), b[10] == 0xff, b[11] == 0xff {
+                    return isReachablePrivateIPv4(b[12], b[13], b[14], b[15])
+                }
+                return false
+            }
+        default:
+            return false
+        }
     }
 
     /// True for any destination that is NOT a globally-routable public address, so

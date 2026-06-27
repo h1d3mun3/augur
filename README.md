@@ -6,7 +6,7 @@
   <img src="resources/auger.png" alt="augur" width="320">
 </p>
 
-Run Claude Code in an isolated environment.
+Run a coding agent in an isolated environment — Claude Code by default, or another agent (e.g. a local-model fallback) when you need one.
 Works in any directory — only the current directory is exposed to the container or VM.
 
 Two modes are available:
@@ -248,6 +248,37 @@ In both modes the proxy decides by domain (the CONNECT host, or the TLS SNI / HT
 The host ports the proxy uses are derived per-project so two egress-enabled projects can run at once; override with `AUGUR_PROXY_HTTP_PORT` / `AUGUR_PROXY_SOCKS_PORT` / `AUGUR_SSH_FWD_PORT` if needed.
 
 > **Scope.** This guarantees *"the guest can only reach allowlisted domains."* DNS is gated on the same allowlist (a name resolves only if it's connectable), so the guest can't tunnel data out via DNS queries either. It is still **not** exfiltration-proof: an allowlisted, writable host (e.g. `github.com` with your `GH_TOKEN`) and the shared workspace are intentional channels. See `augur-proxy/README.md` and `gvproxy/README.md`.
+
+---
+
+## Local & alternate model backends (`.augur.llm`)
+
+Point a coding agent at a non-Anthropic endpoint — e.g. a LAN or [Tailscale](https://tailscale.com) [Ollama](https://ollama.com) server — for a **single run**, selected at launch. Useful as an availability fallback ("Anthropic is down, use local") or for keeping sensitive work off the cloud. The default `augur claude` is unchanged; this is opt-in per invocation.
+
+```bash
+augur init-llm                 # scaffold ./.augur.llm, then edit the IP / model
+augur claude --local           # run the [local] profile (or --profile <name>)
+augur claude                   # back to Anthropic (the endpoint path is closed again)
+```
+
+A profile is generic — `launch` (the agent, default `claude`), `env.*` (literal env vars), `secret.*` / `secretfile.*` (referenced host secrets, never inlined), and `allow` (the egress it may open):
+
+```ini
+[local]
+launch  = claude
+env.ANTHROPIC_BASE_URL = http://192.168.1.50:11434   # Ollama speaks Anthropic /v1/messages (v0.14+)
+env.ANTHROPIC_MODEL    = qwen2.5-coder:32b
+allow   = 192.168.1.50:11434
+```
+
+**Agents.** Claude Code is the default; **[Aider](https://aider.chat) is bundled in both modes** (Docker image and macOS base VM) as a Claude-Code-independent fallback (`launch = aider …`). A macOS base VM built before this picks it up with `augur update --macos`. Anything else is bring-your-own via `augur shell` or a fork.
+
+**Security model.** The endpoint is reached through the same proxy — the only new hole is the one `IP:port` you list, open only while the profile is active. To keep a cloned/hostile repo from abusing this:
+- IP rules in a workspace `./.augur.conf` are **ignored** — only your host-side `~/.augur` config or a confirmed profile may open an IP.
+- Activating a workspace profile **prints the endpoint + command and asks to confirm** (`AUGUR_ASSUME_YES=1` skips).
+- An `allow` IP must be **private** (RFC1918 LAN or Tailscale CGNAT); public IPs are refused (reach a public endpoint by hostname). Loopback / link-local / cloud-metadata stay blocked.
+
+**Caveat.** A local model is for ordinary single-agent editing; cloud-only features (e.g. `/code-review ultra`) are unavailable and heavy multi-agent orchestration is slow/unreliable locally. See [`docs/ollama-llm-endpoint-design.md`](docs/ollama-llm-endpoint-design.md).
 
 ---
 

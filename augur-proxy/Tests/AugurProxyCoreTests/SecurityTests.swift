@@ -36,6 +36,35 @@ final class SecurityTests: XCTestCase {
         XCTAssertEqual(TLSClientHello.parseServerNameExtension(good), "example.com")
     }
 
+    // The explicit-IP dial exception admits RFC1918 + CGNAT (Tailscale), and NOTHING
+    // else — loopback, link-local/metadata, and public addresses stay blocked even
+    // when explicitly listed, so a guest-writable allowlist can't pivot via SSRF.
+    func testReachablePrivateAdmitsRFC1918AndCGNAT() {
+        // Admitted: the three RFC1918 blocks (incl. their edges).
+        XCTAssertTrue(isReachablePrivateIPv4(10, 0, 0, 1))
+        XCTAssertTrue(isReachablePrivateIPv4(10, 255, 255, 255))
+        XCTAssertTrue(isReachablePrivateIPv4(172, 16, 0, 1))
+        XCTAssertTrue(isReachablePrivateIPv4(172, 31, 255, 255))
+        XCTAssertTrue(isReachablePrivateIPv4(192, 168, 1, 50))
+        // Admitted: CGNAT 100.64/10 (Tailscale), incl. its edges.
+        XCTAssertTrue(isReachablePrivateIPv4(100, 64, 0, 1))
+        XCTAssertTrue(isReachablePrivateIPv4(100, 127, 255, 255))
+        // Rejected: just outside CGNAT and just outside 172.16/12.
+        XCTAssertFalse(isReachablePrivateIPv4(100, 63, 255, 255))
+        XCTAssertFalse(isReachablePrivateIPv4(100, 128, 0, 1))
+        XCTAssertFalse(isReachablePrivateIPv4(172, 15, 0, 1))
+        XCTAssertFalse(isReachablePrivateIPv4(172, 32, 0, 1))
+        // Rejected: loopback, link-local (incl. cloud metadata), 0/8.
+        XCTAssertFalse(isReachablePrivateIPv4(127, 0, 0, 1))
+        XCTAssertFalse(isReachablePrivateIPv4(169, 254, 169, 254), "cloud metadata must never be reachable")
+        XCTAssertFalse(isReachablePrivateIPv4(169, 254, 0, 1))
+        XCTAssertFalse(isReachablePrivateIPv4(0, 0, 0, 0))
+        XCTAssertFalse(isReachablePrivateIPv4(192, 0, 0, 1), "192.0.0/24 is not 192.168/16")
+        // Rejected: ordinary public addresses.
+        XCTAssertFalse(isReachablePrivateIPv4(8, 8, 8, 8))
+        XCTAssertFalse(isReachablePrivateIPv4(1, 1, 1, 1))
+    }
+
     private func sniExtension(name: [UInt8]) -> [UInt8] {
         // server_name extension body: list_len(2) type(1)=host_name name_len(2) name
         let entry: [UInt8] = [0x00] + u16(name.count) + name
