@@ -196,19 +196,19 @@ If builds are flaky from the shared mount (virtiofs is not tuned for heavy I/O �
 
 Restrict the container/VM to a set of domains — everything else is blocked. Enforcement runs in a small proxy on the **host, as your user — it never needs `sudo`**. Useful for sandboxing an agent so it can only reach the services it should.
 
-**On by default.** Filtering is always active using the global baseline (`~/.augur/augur.conf`, installed with sensible defaults). Add a `./.augur.conf` in the project root to extend it with project-specific domains. To disable for one run, pass `--no-egress`.
+**On by default.** Filtering is always active using a **managed baseline** (`~/.augur/augur.conf.default`, shipped with sensible defaults and refreshed on every install). Add your own always-on domains to `~/.augur/augur.conf`, or per-project ones to a `./.augur.conf` in the project root. To disable for one run, pass `--no-egress`.
 
 ```bash
 cd ~/projects/my-app
 
-# Optional: extend the global baseline with project-specific domains
+# Optional: extend the baseline with project-specific domains
 cat > .augur.conf <<'EOF'
-# project-specific domains (merged on top of ~/.augur/augur.conf)
+# project-specific domains (merged on top of the managed baseline)
 registry.example.com
 api.myservice.com
 EOF
 
-augur up            # Docker, egress on (global baseline + .augur.conf if present)
+augur up            # Docker, egress on (baseline + augur.conf + .augur.conf if present)
 augur up --macos    # macOS VM, same
 augur up --no-egress  # disable egress filtering for this run
 augur status        # shows: Egress on/off + the active allowlist
@@ -224,7 +224,13 @@ One pattern per line, `#` for comments:
 | `*.example.com` | subdomains only (`api.example.com`, not `example.com`) |
 | `.example.com` | the apex **and** all subdomains |
 
-The effective list is the **global baseline** (`~/.augur/augur.conf`, installed with sensible defaults for Claude Code / GitHub / npm / Homebrew) merged with the project's `./.augur.conf` if present. The merge happens on the host, so the guest can't widen its own policy by editing the mounted file. Edits take effect on the next `augur up`.
+The effective list is three layers merged (union — a layer can only widen, never narrow):
+
+1. **Managed baseline** (`~/.augur/augur.conf.default`) — shipped defaults for Claude Code / GitHub / npm / Homebrew. augur owns this file and **refreshes it on every install**, so shipped domain updates reach you automatically. Don't edit it; your changes are overwritten.
+2. **Your global additions** (`~/.augur/augur.conf`) — always-on domains you add. **Never overwritten** by install.
+3. **Project** (`./.augur.conf`) — per-project domains.
+
+The merge happens on the host, so the guest can't widen its own policy by editing the mounted file. Edits take effect on the next `augur up`.
 
 ### How it works
 

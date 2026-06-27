@@ -34,13 +34,28 @@ cp "$SCRIPT_DIR/augur" "$INSTALL_DIR/augur"
 cp "$SCRIPT_DIR/Dockerfile" "$INSTALL_DIR/Dockerfile"
 chmod +x "$INSTALL_DIR/augur"
 
-# Install the egress allowlist baseline — but never clobber a user's edited copy.
+# Egress allowlist (three layers):
+#   - augur.conf.default : augur-managed baseline. ALWAYS refreshed, so shipped domain
+#                          updates (e.g. new Anthropic endpoints) reach every install.
+#   - augur.conf         : the user's own global domains. NEVER clobbered; scaffolded once.
+# Per-project domains live in each project's ./.augur.conf.
 if [[ -f "$SCRIPT_DIR/augur.conf" ]]; then
-    if [[ -f "$INSTALL_DIR/augur.conf" ]]; then
-        info "Keeping existing $INSTALL_DIR/augur.conf (baseline updated at augur.conf.default)."
-        cp "$SCRIPT_DIR/augur.conf" "$INSTALL_DIR/augur.conf.default"
-    else
-        cp "$SCRIPT_DIR/augur.conf" "$INSTALL_DIR/augur.conf"
+    cp "$SCRIPT_DIR/augur.conf" "$INSTALL_DIR/augur.conf.default"
+    info "Refreshed managed baseline $INSTALL_DIR/augur.conf.default."
+    if [[ ! -f "$INSTALL_DIR/augur.conf" ]]; then
+        cat > "$INSTALL_DIR/augur.conf" <<'CONF'
+# augur egress allowlist — your global additions
+#
+# augur ships a managed baseline (Anthropic, GitHub, npm, Homebrew, …) in
+# augur.conf.default, refreshed on every install. Add YOUR own always-on domains
+# here; this file is never overwritten. Per-project domains go in ./.augur.conf.
+#
+# Syntax (one pattern per line, '#' starts a comment):
+#   example.com     exact host only (the apex). Does NOT match subdomains.
+#   *.example.com   subdomains only (api.example.com yes; example.com no).
+#   .example.com    the apex AND every subdomain.
+CONF
+        info "Scaffolded $INSTALL_DIR/augur.conf (add your own global domains here)."
     fi
 fi
 success "Files copied."
