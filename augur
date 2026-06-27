@@ -912,7 +912,7 @@ cmd_build_macos() {
         # Pin to the stable channel and verify the signer to fail closed on a tampered binary.
         _claude_installer=$(mktemp)
         curl -fsSL https://claude.ai/install.sh -o "$_claude_installer"
-        bash "$_claude_installer" -s stable
+        bash "$_claude_installer" stable
         rm -f "$_claude_installer"
         echo '\''export PATH="$HOME/.local/bin:$PATH"'\'' >> ~/.zprofile
         # Pin the Xcode developer directory via DEVELOPER_DIR so xcodebuild/xcrun always
@@ -1009,7 +1009,7 @@ ensure_macos_claude_bin() {
         echo \"augur: claude not found in VM — installing via official installer...\" >&2
         _installer=\$(mktemp)
         curl -fsSL https://claude.ai/install.sh -o \"\$_installer\"
-        bash \"\$_installer\" -s stable || \\
+        bash \"\$_installer\" stable || \\
             { rm -f \"\$_installer\"; echo \"augur: install failed. Run: augur update --macos (patches the base VM).\" >&2; exit 0; }
         rm -f \"\$_installer\"
     '"
@@ -1285,7 +1285,7 @@ cmd_update_macos() {
         # Download to a temp file before executing — avoids piping untrusted content to a shell.
         _installer=$(mktemp)
         curl -fsSL https://claude.ai/install.sh -o "$_installer"
-        bash "$_installer" -s stable
+        bash "$_installer" stable
         rm -f "$_installer"
         grep -q ".local/bin" ~/.zprofile 2>/dev/null || echo '\''export PATH="$HOME/.local/bin:$PATH"'\'' >> ~/.zprofile
         codesign -dvv "$HOME/.local/bin/claude" 2>&1 | grep -qi "Anthropic" \
