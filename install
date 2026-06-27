@@ -87,6 +87,10 @@ if [[ -d "$SCRIPT_DIR/augur-proxy" ]]; then
     mkdir -p "$INSTALL_DIR/augur-proxy-src"
     (cd "$SCRIPT_DIR/augur-proxy" && \
      tar --exclude=.build --exclude='.git' -cf - . ) | tar -xf - -C "$INSTALL_DIR/augur-proxy-src"
+    # Drop the cached Linux build so the freshly-staged source actually takes effect:
+    # ensure_linux_proxy() skips rebuilding when the binary exists, so without this a
+    # reinstall would keep running the old sidecar proxy. Rebuilt on the next `augur up`.
+    rm -f "$INSTALL_DIR/augur-proxy-linux"
     success "augur-proxy source staged for the Docker sidecar build."
 fi
 
