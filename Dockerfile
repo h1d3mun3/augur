@@ -1,12 +1,10 @@
 ARG SWIFT_VERSION=latest
 FROM swift:${SWIFT_VERSION}
 
-# System dependencies + Node.js 22 + GitHub CLI
+# System dependencies + GitHub CLI
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        curl ca-certificates gnupg procps findutils jq wget git \
-    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
     && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
        | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
     && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
