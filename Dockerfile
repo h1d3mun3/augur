@@ -28,7 +28,12 @@ RUN useradd -m -u 1001 -s /bin/bash dev \
 # Must run as dev: the installer targets $HOME/.local, and PATH must expose it so
 # `docker exec ... claude` (a non-login shell) can find the binary.
 USER dev
-RUN curl -fsSL https://claude.ai/install.sh | bash -s stable
+# Download the installer to a temp file before executing — separates the network fetch
+# from execution so the script can be inspected and avoids piping untrusted content to bash.
+RUN _installer=$(mktemp) \
+    && curl -fsSL https://claude.ai/install.sh -o "$_installer" \
+    && bash "$_installer" -s stable \
+    && rm -f "$_installer"
 ENV PATH=/home/dev/.local/bin:$PATH
 
 # No WORKDIR: the project is bind-mounted at /workspace-<slug> and the run command
