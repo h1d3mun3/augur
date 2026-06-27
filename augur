@@ -52,14 +52,20 @@ AUGUR_PROXY_DIR="$AUGUR_DIR/proxy"
 # traffic) AND a normal bridge (to egress) — making it the agent's only way out.
 AUGUR_PROXY_SRC="$AUGUR_DIR/augur-proxy-src"        # Swift source (copied by install)
 AUGUR_PROXY_LINUX="$AUGUR_DIR/augur-proxy-linux"    # Linux build, run in the sidecar
-AUGUR_INTERNAL_SUBNET="${AUGUR_INTERNAL_SUBNET:-172.31.255.0/28}"
-AUGUR_SIDECAR_IP="${AUGUR_SIDECAR_IP:-172.31.255.2}"
-# Ports the proxy listens on (host side). HTTP CONNECT is for Docker; SOCKS5 is for
-# the macOS file-handle datapath (gvproxy forwards guest TCP here by name). They are
-# derived per-project (a stable hash of the project dir name) so two egress-enabled
-# projects can run at once without colliding on a fixed port. Override any of them
-# with the matching env var. (Collisions are ~1/900 between distinct projects.)
+# Per-project derivation: a stable hash of the project dir name yields an offset used
+# for both the proxy ports AND the internal subnet, so two egress-enabled projects can
+# run at once without colliding. Override any value below with its matching env var.
+# (Collisions are ~1/900 between distinct projects.)
 _augur_port_offset=$(( $(basename "$WORKSPACE_DIR" | tr '[:upper:]' '[:lower:]' | cksum | cut -d' ' -f1) % 900 ))
+# Carve a per-project /28 out of 172.31.0.0/16: third octet = offset/16, fourth octet =
+# (offset%16)*16 (a /28 boundary). The sidecar takes the network address + 2. The network
+# is --internal, so it has no route to the host or the internet regardless of the subnet.
+_augur_subnet_third=$(( _augur_port_offset / 16 ))
+_augur_subnet_fourth=$(( (_augur_port_offset % 16) * 16 ))
+AUGUR_INTERNAL_SUBNET="${AUGUR_INTERNAL_SUBNET:-172.31.${_augur_subnet_third}.${_augur_subnet_fourth}/28}"
+AUGUR_SIDECAR_IP="${AUGUR_SIDECAR_IP:-172.31.${_augur_subnet_third}.$(( _augur_subnet_fourth + 2 ))}"
+# Ports the proxy listens on (host side). HTTP CONNECT is for Docker; SOCKS5 is for
+# the macOS file-handle datapath (gvproxy forwards guest TCP here by name).
 AUGUR_PROXY_HTTP_PORT="${AUGUR_PROXY_HTTP_PORT:-$((13000 + _augur_port_offset))}"
 AUGUR_PROXY_SOCKS_PORT="${AUGUR_PROXY_SOCKS_PORT:-$((14000 + _augur_port_offset))}"
 # In egress mode the guest has no host-routable IP (gvproxy user-space network);
@@ -371,13 +377,20 @@ egress_network_name() { echo "augur-$(workspace_slug)-net"; }
 egress_sidecar_name() { echo "augur-$(workspace_slug)-proxy"; }
 
 # The agent's --internal network: no route to the host or the internet (Docker
-# installs no MASQUERADE/forward rules). A fixed subnet gives the sidecar a stable
+# installs no MASQUERADE/forward rules). A per-project subnet gives the sidecar a stable
 # IP the agent points HTTPS_PROXY at.
 ensure_egress_network() {
     local net; net="$(egress_network_name)"
     if ! docker network inspect "$net" &>/dev/null; then
-        info "Creating internal egress network '${net}'..."
-        docker network create --internal --subnet "$AUGUR_INTERNAL_SUBNET" "$net" &>/dev/null
+        info "Creating internal egress network '${net}' (${AUGUR_INTERNAL_SUBNET})..."
+        local err
+        if ! err="$(docker network create --internal --subnet "$AUGUR_INTERNAL_SUBNET" "$net" 2>&1)"; then
+            error "Failed to create egress network '${net}': ${err}"
+            # The subnet is derived per-project, but a hash collision (or a leftover
+            # network from another project) can still overlap. Override with a free one:
+            error "Retry with a different subnet, e.g. ${BOLD}AUGUR_INTERNAL_SUBNET=172.31.42.0/28 AUGUR_SIDECAR_IP=172.31.42.2 augur up${RESET}"
+            exit 1
+        fi
     fi
 }
 
