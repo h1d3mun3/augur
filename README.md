@@ -196,22 +196,21 @@ If builds are flaky from the shared mount (virtiofs is not tuned for heavy I/O �
 
 Restrict the container/VM to a set of domains — everything else is blocked. Enforcement runs in a small proxy on the **host, as your user — it never needs `sudo`**. Useful for sandboxing an agent so it can only reach the services it should.
 
-**Opt-in.** Filtering turns on when the project has a `./.augur.conf` (or you pass `--egress`); otherwise augur behaves exactly as before. To disable for one run, pass `--no-egress`.
+**On by default.** Filtering is always active using the global baseline (`~/.augur/augur.conf`, installed with sensible defaults). Add a `./.augur.conf` in the project root to extend it with project-specific domains. To disable for one run, pass `--no-egress`.
 
 ```bash
 cd ~/projects/my-app
 
+# Optional: extend the global baseline with project-specific domains
 cat > .augur.conf <<'EOF'
-api.anthropic.com
-claude.ai
-github.com
-api.github.com
-*.githubusercontent.com
-registry.npmjs.org
+# project-specific domains (merged on top of ~/.augur/augur.conf)
+registry.example.com
+api.myservice.com
 EOF
 
-augur up            # Docker, egress restricted to the list above
-augur up --macos    # macOS VM, same restriction
+augur up            # Docker, egress on (global baseline + .augur.conf if present)
+augur up --macos    # macOS VM, same
+augur up --no-egress  # disable egress filtering for this run
 augur status        # shows: Egress on/off + the active allowlist
 ```
 
@@ -225,7 +224,7 @@ One pattern per line, `#` for comments:
 | `*.example.com` | subdomains only (`api.example.com`, not `example.com`) |
 | `.example.com` | the apex **and** all subdomains |
 
-The effective list is a **global baseline** (`~/.augur/augur.conf`, installed with sensible defaults for Claude Code / GitHub / npm / Homebrew) merged with the project's `./.augur.conf`. The merge happens on the host, so the guest can't widen its own policy by editing the mounted file. Edits take effect on the next `augur up`.
+The effective list is the **global baseline** (`~/.augur/augur.conf`, installed with sensible defaults for Claude Code / GitHub / npm / Homebrew) merged with the project's `./.augur.conf` if present. The merge happens on the host, so the guest can't widen its own policy by editing the mounted file. Edits take effect on the next `augur up`.
 
 ### How it works
 
