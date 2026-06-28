@@ -320,6 +320,83 @@ write_merged_allowlist() {
     echo "$out"
 }
 
+# Effective domain patterns a project ./.augur.conf contributes (comments stripped,
+# whitespace trimmed, blanks dropped) — one per line. Mirrors the proxy's own parser.
+project_conf_domains() {
+    [[ -f "$AUGUR_PROJECT_CONF" ]] || return 0
+    sed 's/#.*//' "$AUGUR_PROJECT_CONF" | awk '{ gsub(/^[ \t]+|[ \t]+$/, "") } $0 != ""'
+}
+
+# Host-side record of approved project-conf fingerprints (TOFU). Under ~/.augur — NEVER
+# the project tree or a mounted share — so the guest cannot forge its own approval.
+project_conf_hash_file() {
+    mkdir -p "$AUGUR_DIR/project-hashes"
+    echo "$AUGUR_DIR/project-hashes/$(workspace_slug)"
+}
+
+project_conf_hash() {
+    if command -v sha256sum &>/dev/null; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        shasum -a 256 "$1" | awk '{print $1}'
+    fi
+}
+
+# L1 (trust-on-first-use): a project's ./.augur.conf widens the egress allowlist, so
+# treat it as untrusted input (a hostile repo, or an agent that wrote it). Require the
+# operator to approve it on first sight and again whenever it changes — the same TOFU
+# model as the SSH host keys above. Approved fingerprints live host-side under
+# ~/.augur/project-hashes, so a guest that edits the mounted ./.augur.conf cannot get
+# the change honored without a fresh host-side approval. Non-interactive runs fail
+# closed unless AUGUR_ACCEPT_PROJECT_CONF=1 (kept for CI / disposable flows). Only the
+# egress-enabled paths call this — with filtering off, ./.augur.conf has no effect.
+check_project_conf_approved() {
+    [[ -f "$AUGUR_PROJECT_CONF" ]] || return 0
+
+    local hash_file cur recorded
+    hash_file="$(project_conf_hash_file)"
+    cur="$(project_conf_hash "$AUGUR_PROJECT_CONF")"
+    # Fail closed if the conf could not be fingerprinted (no sha256 tool): a security
+    # gate must never silently approve. project_conf_hash runs in a $(...) subshell, so
+    # an `exit` there wouldn't abort us — guard here in the caller instead.
+    if [[ -z "$cur" ]]; then
+        error "Could not fingerprint ./.augur.conf (no sha256sum/shasum?). Refusing to continue (fail closed)."
+        exit 1
+    fi
+    recorded=""
+    [[ -f "$hash_file" ]] && recorded="$(cat "$hash_file" 2>/dev/null || true)"
+    [[ "$cur" == "$recorded" ]] && return 0
+
+    warn "This project's ${BOLD}.augur.conf${RESET} widens the egress allowlist with:"
+    local d had=0
+    while IFS= read -r d; do
+        echo -e "    ${YELLOW}+ ${d}${RESET}"; had=1
+    done < <(project_conf_domains)
+    [[ "$had" == 1 ]] || echo -e "    (no domains — comments only)"
+
+    if [[ "${AUGUR_ACCEPT_PROJECT_CONF:-}" == "1" ]]; then
+        echo "$cur" > "$hash_file"
+        info "Accepted via AUGUR_ACCEPT_PROJECT_CONF=1."
+        return 0
+    fi
+
+    if [[ -t 0 && -t 1 ]]; then
+        local yn=""
+        read -rp "$(echo -e "${CYAN}[augur]${RESET} Accept these domains for this project? [y/N] ")" yn || true
+        if [[ "$yn" == [yY] ]]; then
+            echo "$cur" > "$hash_file"
+            success "Approved — won't ask again until .augur.conf changes."
+            return 0
+        fi
+        error "Declined. Edit ./.augur.conf or approve it to continue."
+        exit 1
+    fi
+
+    error "Project ./.augur.conf is unapproved and augur is non-interactive."
+    error "Re-run in a terminal to review it, or set AUGUR_ACCEPT_PROJECT_CONF=1 to accept."
+    exit 1
+}
+
 require_proxy_bin() {
     local bin; bin="$(resolve_proxy_cli)"
     if ! command -v "$bin" &>/dev/null && [[ ! -x "$bin" ]]; then
@@ -571,6 +648,10 @@ cmd_up() {
         return 0
     fi
 
+    # Gate the untrusted project ./.augur.conf before tearing anything down or
+    # starting the proxy (only relevant when egress filtering is on).
+    if egress_enabled; then check_project_conf_approved; fi
+
     if container_exists; then
         info "Removing stale container '${CONTAINER_NAME}'..."
         docker rm -f "$CONTAINER_NAME" &>/dev/null
@@ -610,27 +691,51 @@ cmd_up() {
         info "Egress restricted to allowlisted domains (sidecar: ${BOLD}${proxy_url}${RESET})."
     fi
 
-    local anthropic_key
+    # Claude auth via env only — the host's credential store is never mounted into
+    # the guest. ANTHROPIC_API_KEY wins if both are set (official precedence);
+    # otherwise the subscription token (run `claude setup-token` once on the host,
+    # or place it in ~/.claude_code_oauth_token). Mirrors macOS VM mode and keeps
+    # the guest off the host's ~/.claude entirely.
+    local anthropic_key claude_oauth_token
     anthropic_key="$(resolve_api_key "${ANTHROPIC_API_KEY:-}" "$HOME/.anthropic_api_key")"
-    [[ -n "$anthropic_key" ]] && docker_args+=(-e "ANTHROPIC_API_KEY=${anthropic_key}")
+    claude_oauth_token="$(resolve_api_key "${CLAUDE_CODE_OAUTH_TOKEN:-}" "$HOME/.claude_code_oauth_token")"
+    [[ -n "$anthropic_key" ]]      && docker_args+=(-e "ANTHROPIC_API_KEY=${anthropic_key}")
+    [[ -n "$claude_oauth_token" ]] && docker_args+=(-e "CLAUDE_CODE_OAUTH_TOKEN=${claude_oauth_token}")
 
-    mkdir -p "$HOME/.claude"
-    docker_args+=(-v "${HOME}/.claude:/home/dev/.claude")
-
-    # Claude Code stores config (oauthAccount, onboarding state) in ~/.claude.json
-    # (separate from ~/.claude/ directory). Persist it so re-login isn't required.
-    touch "$HOME/.claude.json"
-    docker_args+=(-v "${HOME}/.claude.json:/home/dev/.claude.json")
+    # Persist ONLY this project's Claude history, not the whole ~/.claude. Claude
+    # keys history by cwd (the container runs in /workspace-<slug>, which Claude
+    # encodes as projects/-workspace-<slug>), so we bind just that leaf dir. The
+    # guest can therefore neither read other projects' transcripts nor tamper with
+    # host auth/settings. The container-side parent (~/.claude/projects) and a
+    # minimal ~/.claude.json are baked dev-owned into the image (see Dockerfile),
+    # so onboarding is skipped without exposing the host's config.
+    local claude_proj_dir="-workspace-$(workspace_slug)"
+    mkdir -p "$HOME/.claude/projects/${claude_proj_dir}"
+    docker_args+=(-v "${HOME}/.claude/projects/${claude_proj_dir}:/home/dev/.claude/projects/${claude_proj_dir}")
 
     [[ -f "$HOME/.gitconfig" ]] && docker_args+=(-v "${HOME}/.gitconfig:/home/dev/.gitconfig:ro")
 
+    # gh config is mounted READ-ONLY: the guest may read it but cannot rewrite the
+    # host's hosts.yml/config (tamper). The token itself is supplied via GH_TOKEN
+    # (gh respects it automatically; on macOS hosts gh keeps the token in Keychain,
+    # not hosts.yml, so the env var is the real auth path either way).
     mkdir -p "$HOME/.config/gh"
-    docker_args+=(-v "${HOME}/.config/gh:/home/dev/.config/gh")
-    # On macOS, gh stores OAuth tokens in Keychain (not in hosts.yml), so the
-    # mounted config alone is not enough. Pass the token explicitly via GH_TOKEN.
+    docker_args+=(-v "${HOME}/.config/gh:/home/dev/.config/gh:ro")
     local gh_token
     gh_token="$(gh auth token 2>/dev/null || true)"
-    [[ -n "$gh_token" ]] && docker_args+=(-e "GH_TOKEN=${gh_token}")
+    if [[ -n "$gh_token" ]]; then
+        # GH_TOKEN authenticates gh; the GIT_CONFIG_* env vars add a self-contained
+        # git credential helper so HTTPS `git push` works off GH_TOKEN alone — without
+        # writing to the read-only ~/.gitconfig and without depending on the host's
+        # credential helper being executable inside the Linux container (a macOS host's
+        # osxkeychain/gh helper is not). $GH_TOKEN expands in the container at push time.
+        docker_args+=(
+            -e "GH_TOKEN=${gh_token}"
+            -e "GIT_CONFIG_COUNT=1"
+            -e "GIT_CONFIG_KEY_0=credential.https://github.com.helper"
+            -e 'GIT_CONFIG_VALUE_0=!f() { test "$1" = get && echo username=x-access-token && echo "password=$GH_TOKEN"; }; f'
+        )
+    fi
 
     docker_args+=("$IMAGE_NAME" bash)
 
@@ -710,6 +815,11 @@ cmd_status() {
         docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$(egress_sidecar_name)" && estate="${GREEN}running${RESET}"
         echo -e "${BOLD}Egress:${RESET}     ${GREEN}on${RESET} (allowlist; sidecar ${estate})"
         echo -e "${BOLD}Allowlist:${RESET}  baseline$( [[ -f "$AUGUR_GLOBAL_CONF" ]] && echo " + augur.conf" )$( [[ -f "$AUGUR_PROJECT_CONF" ]] && echo " + .augur.conf" )"
+        if [[ -f "$AUGUR_PROJECT_CONF" ]]; then
+            local _st="${YELLOW}unapproved (prompts on next up)${RESET}"
+            [[ "$(project_conf_hash "$AUGUR_PROJECT_CONF")" == "$(cat "$(project_conf_hash_file)" 2>/dev/null || true)" ]] && _st="${GREEN}approved${RESET}"
+            echo -e "${BOLD}.augur.conf:${RESET} [${_st}] $(project_conf_domains | tr '\n' ' ')"
+        fi
     else
         echo -e "${BOLD}Egress:${RESET}     ${YELLOW}off${RESET} (disabled via --no-egress or AUGUR_EGRESS=0)"
     fi
@@ -829,14 +939,16 @@ cmd_build_macos() {
     echo -e "${BOLD}─────────────────────────────────────────────────────────────────────────────${RESET}"
     echo ""
     read -rp "$(echo -e "${CYAN}[augur]${RESET} Press Enter to open the VM window...")"
-    "$VM_CLI" run "$MACOS_BUILD_VM"
+    # Build/setup phases use plain NAT (gvproxy isn't running and no agent is present);
+    # --net-nat is required now that egress-filtered networking is the fail-closed default.
+    "$VM_CLI" run --net-nat "$MACOS_BUILD_VM"
 
     read -rp "$(echo -e "${CYAN}[augur]${RESET} Remote Login enabled? Ready to continue? [y/N] ")" yn
     [[ "$yn" == [yY] ]] || { info "Aborted."; exit 0; }
 
     # Step 4: Restart headlessly and wait for SSH
     info "Restarting VM headlessly..."
-    "$VM_CLI" run --no-graphics "$MACOS_BUILD_VM" &>/dev/null &
+    "$VM_CLI" run --no-graphics --net-nat "$MACOS_BUILD_VM" &>/dev/null &
     local vm_pid=$!
 
     info "Waiting for SSH..."
@@ -1018,13 +1130,14 @@ ensure_macos_workspace() {
     ssh_macos "$vm" "ln -sfn '/Volumes/My Shared Files/${MACOS_SHARE}' \"\$HOME/${MACOS_SHARE}\""
 }
 
-# Share the host's Claude conversation history (projects/ only) into the VM, so a session started in
-# Docker mode can be reopened from macOS mode and vice versa. We deliberately do NOT unify the
-# per-mode history slug or touch any workspace path: Docker records cwd /workspace-<slug> while macOS
-# records /Volumes/My Shared Files/<MACOS_SHARE>, so each mode keeps its own slug. Consequence: the
-# default (cwd-filtered) resume list won't show the other mode's sessions, but the picker's "show
-# all" (Ctrl+A) lists every project, so the cross-mode history is reachable. Auth is NOT shared (see
-# the ~/.claude note above). Idempotent.
+# Point the guest's Claude history (projects/ only) at the per-VM isolated share so this project's
+# conversation history persists on the host across clones. For isolation (fix M2) the host side is a
+# per-VM directory (~/.augur/claude-projects/<vm>), NOT the host's shared ~/.claude/projects — the
+# guest can therefore neither read other projects' transcripts nor write into them. Consequence:
+# cross-mode (Docker<->macOS) resume is no longer shared and pre-existing sessions under the host's
+# ~/.claude/projects aren't auto-listed (they are not destroyed, just not surfaced here). Whatever
+# subdir name Claude derives from the guest cwd lands inside the shared parent, so no path-encoding
+# assumption is needed. Auth is NOT shared (see the ~/.claude note above). Idempotent.
 ensure_macos_claude_projects() {
     local vm="$1"
     ssh_macos "$vm" '
@@ -1070,13 +1183,19 @@ cmd_up_macos() {
         return 0
     fi
 
+    # Gate the untrusted project ./.augur.conf before cloning or starting the proxy
+    # (only relevant when egress filtering is on).
+    if egress_enabled; then check_project_conf_approved; fi
+
     if ! macos_vm_exists "$project_vm"; then
         info "Cloning base VM to '${project_vm}'..."
         "$VM_CLI" clone "$MACOS_BASE_VM" "$project_vm"
     fi
 
     mkdir -p "$HOME/.config/gh"
-    mkdir -p "$HOME/.claude/projects"
+    # Per-VM isolated history parent (NOT the host's shared ~/.claude/projects): the
+    # guest only ever sees its own project's transcripts, never other projects'.
+    mkdir -p "$AUGUR_DIR/claude-projects/$project_vm"
     info "Starting VM '${project_vm}'..."
     info "Mounting: ${BOLD}${WORKSPACE_DIR}${RESET} → ~/${MACOS_SHARE}"
     # A GUI window (--gui) and headless mode build the same VM (same NAT networking and
@@ -1097,13 +1216,19 @@ cmd_up_macos() {
         start_gvproxy
         net_args=(--net-vfkit="$(gvproxy_socket)")
         info "Egress restricted to allowlisted domains (file-handle datapath)."
+    else
+        # Egress filtering off (AUGUR_EGRESS=0 / --no-egress): opt into unfiltered NAT
+        # explicitly. augur-vm now fails closed without a net flag, so this branch is
+        # required to keep the --no-egress path booting.
+        net_args=(--net-nat)
+        warn "Egress filtering OFF — guest has unrestricted network access (NAT)."
     fi
 
     "$VM_CLI" run $graphics_flag \
         ${net_args[@]+"${net_args[@]}"} \
         --dir="${MACOS_SHARE}:${WORKSPACE_DIR}" \
-        --dir="gh-config:${HOME}/.config/gh" \
-        --dir="claude-projects:${HOME}/.claude/projects" \
+        --dir="gh-config:${HOME}/.config/gh:ro" \
+        --dir="claude-projects:${AUGUR_DIR}/claude-projects/${project_vm}" \
         "$project_vm" &>/dev/null &
     disown
 
@@ -1248,6 +1373,11 @@ cmd_status_macos() {
         local gstate="${RED}stopped${RESET}"; gvproxy_running && gstate="${GREEN}running${RESET}"
         echo -e "${BOLD}Egress:${RESET}        ${GREEN}on${RESET} (proxy ${estate}, gvproxy ${gstate})"
         echo -e "${BOLD}Allowlist:${RESET}     baseline$( [[ -f "$AUGUR_GLOBAL_CONF" ]] && echo " + augur.conf" )$( [[ -f "$AUGUR_PROJECT_CONF" ]] && echo " + .augur.conf" )"
+        if [[ -f "$AUGUR_PROJECT_CONF" ]]; then
+            local _st="${YELLOW}unapproved (prompts on next up)${RESET}"
+            [[ "$(project_conf_hash "$AUGUR_PROJECT_CONF")" == "$(cat "$(project_conf_hash_file)" 2>/dev/null || true)" ]] && _st="${GREEN}approved${RESET}"
+            echo -e "${BOLD}.augur.conf:${RESET}    [${_st}] $(project_conf_domains | tr '\n' ' ')"
+        fi
     else
         echo -e "${BOLD}Egress:${RESET}        ${YELLOW}off${RESET} (disabled via --no-egress or AUGUR_EGRESS=0)"
     fi
@@ -1314,7 +1444,9 @@ cmd_update_macos() {
         exit 1
     }
     info "Updating CLI tools in base VM '${MACOS_BASE_VM}'..."
-    "$VM_CLI" run --no-graphics "$MACOS_BASE_VM" &>/dev/null &
+    # Base-VM maintenance runs over NAT (no gvproxy/agent); opt into it explicitly
+    # now that egress-filtered networking is the fail-closed default.
+    "$VM_CLI" run --no-graphics --net-nat "$MACOS_BASE_VM" &>/dev/null &
     local vm_pid=$!
     macos_vm_ip "$MACOS_BASE_VM" &>/dev/null || {
         kill "$vm_pid" 2>/dev/null; wait "$vm_pid" 2>/dev/null || true

@@ -13,8 +13,12 @@ final class RunSession: NSObject, VZVirtualMachineDelegate {
     let headless: Bool
     private let dirs: [String]
     /// When set, the guest NIC is bound to this vfkit unixgram socket (gvproxy) so
-    /// all egress is filtered by the host; nil means plain NAT (no filtering).
+    /// all egress is filtered by the host. This is the default datapath: if it is
+    /// nil and NAT was not explicitly requested, the boot fails closed.
     private let netVfkitSocket: String?
+    /// Opt-in to unfiltered NAT. Without it (and without a vfkit socket) the VM
+    /// refuses to boot rather than silently granting the guest full network access.
+    private let netAllowNAT: Bool
 
     var vm: VZVirtualMachine?
     var loadedConfig: VMConfig?
@@ -27,11 +31,12 @@ final class RunSession: NSObject, VZVirtualMachineDelegate {
     var isTerminating = false
     var terminateReply: (() -> Void)?
 
-    init(name: String, headless: Bool, dirs: [String], netVfkitSocket: String? = nil) {
+    init(name: String, headless: Bool, dirs: [String], netVfkitSocket: String? = nil, netAllowNAT: Bool = false) {
         self.name = name
         self.headless = headless
         self.dirs = dirs
         self.netVfkitSocket = netVfkitSocket
+        self.netAllowNAT = netAllowNAT
     }
 
     /// Entry point: prepare, then either park headless or run the GUI app.
@@ -109,21 +114,28 @@ final class RunSession: NSObject, VZVirtualMachineDelegate {
         ]
 
         let network = VZVirtioNetworkDeviceConfiguration()
-        // Egress-filtered (vfkit/file-handle) when a socket is given, else plain NAT.
-        // The persisted bundle (config.json) has no network field, so this choice is
-        // purely runtime — base VMs and clones stay byte-compatible either way.
-        if let socketPath = netVfkitSocket {
+        // Networking is fail-closed: the egress-filtered (vfkit/file-handle) datapath
+        // is the default, and unfiltered NAT must be opted into with --net-nat. A run
+        // with neither a vfkit socket nor --net-nat refuses to boot, so a forgotten
+        // flag never silently grants the guest full internet (and the persisted disk
+        // may carry injected ~/.augur-env secrets). The persisted bundle (config.json)
+        // has no network field, so this choice is purely runtime — base VMs and clones
+        // stay byte-compatible either way.
+        if netAllowNAT {
+            network.attachment = NetworkAttachment.nat()
+            if let mac = VZMACAddress(string: cfg.macAddress) {
+                network.macAddress = mac
+            }
+        } else {
+            guard let socketPath = netVfkitSocket else {
+                throw CLIError("egress-filtered networking requires --net-vfkit <socket>; pass --net-nat to opt into unfiltered NAT")
+            }
             FileHandle.standardError.write(Data("[augur-vm] egress-filtered networking via \(socketPath)\n".utf8))
             network.attachment = try NetworkAttachment.vfkit(socketPath: socketPath)
             // gvproxy reserves the deviceIP (192.168.127.2 — the SSH-forward target)
             // for this exact MAC via a default static DHCP lease, so the guest must
             // use it to receive that IP and be reachable. (Same MAC podman/vfkit use.)
             if let mac = VZMACAddress(string: NetworkAttachment.vfkitGuestMAC) {
-                network.macAddress = mac
-            }
-        } else {
-            network.attachment = NetworkAttachment.nat()
-            if let mac = VZMACAddress(string: cfg.macAddress) {
                 network.macAddress = mac
             }
         }
@@ -161,20 +173,29 @@ final class RunSession: NSObject, VZVirtualMachineDelegate {
         return config
     }
 
-    /// Parse `--dir name:path` specs into virtiofs shares (split on the first colon).
+    /// Parse `--dir name:path[:ro]` specs into virtiofs shares. The name is split
+    /// off the first colon (so the path may itself contain colons); an optional
+    /// trailing `:ro` marks the share read-only. Shares are read-write by default,
+    /// so existing `name:path` specs are unaffected. Read-only shares let augur
+    /// expose host config (e.g. gh-config) the guest may read but must not tamper.
     private func parseShares() throws -> [String: VZSharedDirectory] {
         var shares: [String: VZSharedDirectory] = [:]
         for spec in dirs {
             guard let colon = spec.firstIndex(of: ":") else {
-                throw CLIError("--dir must be in name:path form: '\(spec)'")
+                throw CLIError("--dir must be in name:path[:ro] form: '\(spec)'")
             }
             let shareName = String(spec[..<colon])
-            let path = String(spec[spec.index(after: colon)...])
+            var path = String(spec[spec.index(after: colon)...])
+            var readOnly = false
+            if path.hasSuffix(":ro") {
+                readOnly = true
+                path = String(path.dropLast(3))
+            }
             guard !shareName.isEmpty, !path.isEmpty else {
-                throw CLIError("--dir must be in name:path form: '\(spec)'")
+                throw CLIError("--dir must be in name:path[:ro] form: '\(spec)'")
             }
             shares[shareName] = VZSharedDirectory(
-                url: URL(fileURLWithPath: path), readOnly: false)
+                url: URL(fileURLWithPath: path), readOnly: readOnly)
         }
         return shares
     }

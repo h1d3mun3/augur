@@ -61,10 +61,13 @@ augur version   # show tool versions
 | Path | Description |
 |------|-------------|
 | Current directory | mounted at `/workspace-<project>` (read/write), named after the directory |
-| `~/.claude/` | shared (Claude auth and settings) |
-| `~/.config/gh/` | shared (GitHub CLI auth) |
+| `~/.claude/projects/-workspace-<project>` | **only this project's** Claude history is shared (read/write) — not the rest of `~/.claude`, so other projects' transcripts and host auth/settings stay invisible |
+| `~/.config/gh/` | mounted **read-only** (the container can read but not rewrite it; the token is injected via `GH_TOKEN`) |
 | `~/.gitconfig` | mounted read-only |
+| Claude auth | injected via env (`CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY`) — the host's credential store is never mounted |
 | Everything else | **not visible to the container** |
+
+> Auth is env-based in both modes now. If you only ever logged in via the browser, run `claude setup-token` once on the host (or set `ANTHROPIC_API_KEY`); see [API keys and authentication](#api-keys-and-authentication). Upgrading from an older augur requires a one-time `augur build` (the image now pre-creates the scoped history dir).
 
 ### Requirements
 
@@ -154,7 +157,9 @@ every `up` (the same way it does for the GitHub token):
 |------|-------------|
 | Current directory | exposed at `~/workspace-<project>` in the VM (read/write, virtiofs auto-mount) |
 | `~/.gitconfig` | copied on VM start (HTTPS `git push` uses `GH_TOKEN`) |
-| `~/.claude/` | **not** shared — local to the VM; auth is injected via env (see above) |
+| `~/.config/gh/` | shared **read-only** (token also injected via `GH_TOKEN`) |
+| Claude history | **only this project's** history is shared, in a per-VM isolated dir (`~/.augur/claude-projects/<vm>`), so other projects' transcripts stay invisible. Cross-mode (Docker↔macOS) resume is no longer shared. |
+| Claude auth | **not** shared — injected via env (the macOS Keychain is unreadable over SSH; see above) |
 | Everything else | **not visible to the VM** |
 
 > The macOS guest auto-mounts the shared directory under `/Volumes/My Shared Files/workspace-<project>`; augur
@@ -232,6 +237,8 @@ The effective list is three layers merged (union — a layer can only widen, nev
 
 The merge happens on the host, so the guest can't widen its own policy by editing the mounted file. Edits take effect on the next `augur up`.
 
+**Project domains require approval (trust-on-first-use).** Because `./.augur.conf` ships inside a repository you may not fully trust, augur shows the domains it adds and asks you to approve them on first sight and again whenever the file changes — the same model as SSH host keys. The approval fingerprint is stored host-side under `~/.augur/project-hashes/` (never in the project tree or a mounted share), so a compromised guest that rewrites `./.augur.conf` cannot get the change honored without a fresh host-side approval. `augur status` shows the project's domains and whether they're approved. For non-interactive / disposable runs (CI), set `AUGUR_ACCEPT_PROJECT_CONF=1` to accept automatically; without a TTY and without that variable, an unapproved/changed conf fails closed.
+
 ### How it works
 
 | Mode | Enforcement |
@@ -261,8 +268,17 @@ export ANTHROPIC_API_KEY="sk-ant-..."   # for Claude Code
 
 Alternatively, place the key in a file (`~/.anthropic_api_key`).
 
-**Account-based auth** (no API key needed):
-- **Claude Code**: run `augur claude` — prompts for login on first use
+**Account-based auth** (subscription, no API key needed): augur never mounts the host's
+Claude credential store into the guest — auth is injected via the environment in both
+modes. Generate a long-lived subscription token once on the host:
+
+```bash
+claude setup-token            # prints a token for CLAUDE_CODE_OAUTH_TOKEN
+export CLAUDE_CODE_OAUTH_TOKEN="..."   # or save it to ~/.claude_code_oauth_token
+```
+
+augur reads `CLAUDE_CODE_OAUTH_TOKEN` (env or `~/.claude_code_oauth_token`) and injects it
+into the container/VM. `ANTHROPIC_API_KEY` takes priority if both are set.
 
 **GitHub CLI:**
 
@@ -271,4 +287,5 @@ brew install gh
 gh auth login
 ```
 
-`gh` credentials are shared automatically in both modes.
+`gh` credentials are shared automatically in both modes (token injected via `GH_TOKEN`;
+the host's `~/.config/gh` is mounted read-only so the guest can't rewrite it).
