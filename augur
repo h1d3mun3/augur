@@ -164,6 +164,23 @@ resolve_api_key() {
     fi
 }
 
+# Persist a captured Claude subscription token to the host token file augur reads on
+# every `up` (resolve_api_key picks it up as CLAUDE_CODE_OAUTH_TOKEN). Validates the
+# shape and writes it 0600. The host never needs claude installed for this.
+save_oauth_token() {
+    local token="$1" dest="$HOME/.claude_code_oauth_token"
+    if [[ -z "$token" || "$token" != sk-ant-* ]]; then
+        error "No valid token saved (expected a value starting with sk-ant-…)."
+        error "If 'claude setup-token' printed one, save it manually:"
+        error "  echo '<token>' > ${dest} && chmod 600 ${dest}"
+        return 1
+    fi
+    ( umask 077; printf '%s\n' "$token" > "$dest" )
+    chmod 600 "$dest"
+    success "Saved subscription token to ${BOLD}${dest}${RESET} (chmod 600)."
+    info "augur injects it as CLAUDE_CODE_OAUTH_TOKEN on every 'up' — no host claude needed."
+}
+
 # ── macOS VM mode helpers ─────────────────────────────────────────────────────
 
 # Resolve the augur-vm binary (the macOS VM backend): an explicit override, then
@@ -665,6 +682,26 @@ cmd_shell() {
     ensure_running
     info "Opening bash shell in '${CONTAINER_NAME}'..."
     docker exec -it "$CONTAINER_NAME" bash
+}
+
+# Generate a long-lived Claude subscription token by running `claude setup-token`
+# INSIDE the guest (so the host never needs claude installed), then save it on the
+# host for augur to inject. setup-token uses a copy-the-code OAuth flow that works
+# headless: it prints a URL to open in any browser; paste the code back here.
+cmd_setup_token() {
+    require_docker
+    ensure_running
+    info "Running 'claude setup-token' in '${CONTAINER_NAME}'..."
+    info "Complete the browser sign-in; when it prints the token, copy it."
+    # Run attached straight to the terminal (no pipe). `claude setup-token` is a
+    # full-screen TUI; capturing its stdout forces a non-TTY and garbles the redraw,
+    # so we don't capture it — the token is pasted back here instead.
+    docker exec -it -e DISABLE_AUTOUPDATER=1 "$CONTAINER_NAME" claude setup-token || true
+    stty sane 2>/dev/null || true   # restore cooked mode if the TUI left the tty raw
+    echo ""
+    local token=""
+    read -rp "$(echo -e "${CYAN}[augur]${RESET} Paste the token (sk-ant-…) here to save it on the host: ")" token || true
+    save_oauth_token "$token"
 }
 
 cmd_down() {
@@ -1186,6 +1223,26 @@ cmd_shell_macos() {
     ssh_macos "$project_vm" -t "cd ~/${MACOS_SHARE} && exec zsh -l"
 }
 
+# macOS counterpart of cmd_setup_token: run `claude setup-token` in the VM and save
+# the resulting token on the host. Same copy-the-code flow (no host claude needed).
+cmd_setup_token_macos() {
+    require_vz
+    local project_vm
+    project_vm="$(macos_project_vm)"
+    macos_vm_running "$project_vm" || cmd_up_macos
+    ensure_macos_claude_bin "$project_vm"
+    info "Running 'claude setup-token' in '${project_vm}'..."
+    info "Complete the browser sign-in; when it prints the token, copy it."
+    # Run attached to the terminal (no pipe) so the full-screen TUI renders cleanly;
+    # the token is pasted back here instead of being captured.
+    ssh_macos "$project_vm" -t "zsh -l -c 'claude setup-token'" || true
+    stty sane 2>/dev/null || true   # restore cooked mode if the TUI left the tty raw
+    echo ""
+    local token=""
+    read -rp "$(echo -e "${CYAN}[augur]${RESET} Paste the token (sk-ant-…) here to save it on the host: ")" token || true
+    save_oauth_token "$token"
+}
+
 cmd_down_macos() {
     require_vz
     local project_vm
@@ -1388,6 +1445,7 @@ cmd_help() {
     echo -e "    augur ${CYAN}up${RESET}       [--swift VERSION]  Start the container"
     echo -e "    augur ${CYAN}claude${RESET}                     Launch Claude Code"
     echo -e "    augur ${CYAN}shell${RESET}                      Open a bash shell"
+    echo -e "    augur ${CYAN}setup-token${RESET}                Get a Claude token in the guest, save it on the host"
     echo -e "    augur ${CYAN}down${RESET}                       Stop and remove the container"
     echo -e "    augur ${CYAN}status${RESET}                     Check status and toolchain"
     echo -e "    augur ${CYAN}build${RESET}   [--swift VERSION]  Build the Docker image"
@@ -1400,6 +1458,7 @@ cmd_help() {
     echo -e "    augur ${CYAN}up${RESET}     --macos [--gui]                           Start project VM (--gui opens a window)"
     echo -e "    augur ${CYAN}claude${RESET} --macos                                   Launch Claude Code"
     echo -e "    augur ${CYAN}shell${RESET}  --macos                                   Open bash shell"
+    echo -e "    augur ${CYAN}setup-token${RESET} --macos                              Get a Claude token in the VM, save it on the host"
     echo -e "    augur ${CYAN}down${RESET}    --macos                                   Stop the VM (keep the clone)"
     echo -e "    augur ${CYAN}destroy${RESET} --macos                                   Stop and remove the VM clone"
     echo -e "    augur ${CYAN}status${RESET}  --macos                                   Check VM status and toolchain"
@@ -1420,7 +1479,7 @@ cmd_help() {
     echo ""
     echo -e "  ${BOLD}ENVIRONMENT${RESET}"
     echo -e "    ANTHROPIC_API_KEY        Anthropic API key (or ~/.anthropic_api_key)"
-    echo -e "    CLAUDE_CODE_OAUTH_TOKEN  Claude subscription token (or ~/.claude_code_oauth_token; run: claude setup-token)"
+    echo -e "    CLAUDE_CODE_OAUTH_TOKEN  Claude subscription token (or ~/.claude_code_oauth_token; run: augur setup-token)"
     echo -e "    SWIFT_VERSION            Default Swift version (default: latest)"
     echo -e "    AUGUR_EGRESS             Disable (0) or force-enable (1) egress filtering; default is always on"
     echo ""
@@ -1474,6 +1533,7 @@ if $MACOS_MODE; then
         up)             cmd_up_macos ;;
         claude)         cmd_claude_macos ;;
         shell)          cmd_shell_macos ;;
+        setup-token)    cmd_setup_token_macos ;;
         down)           cmd_down_macos ;;
         destroy)        cmd_destroy_macos ;;
         status)         cmd_status_macos ;;
@@ -1489,6 +1549,7 @@ else
         up)             cmd_up ;;
         claude)         cmd_claude ;;
         shell)          cmd_shell ;;
+        setup-token)    cmd_setup_token ;;
         down)           cmd_down ;;
         status)         cmd_status ;;
         init-conf)      cmd_init_conf ;;
