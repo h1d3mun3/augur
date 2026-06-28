@@ -1265,9 +1265,13 @@ cmd_status_macos() {
     # When the VM is stopped we just point at `augur up --macos` instead.
     echo -e "${BOLD}Toolchain:${RESET}"
     if macos_vm_running "$project_vm" && macos_vm_ip "$project_vm" &>/dev/null; then
+        # SSH runs a non-login shell, so ~/.zprofile (where the build pins DEVELOPER_DIR)
+        # is not sourced. Pin it here too so xcodebuild uses the full Xcode install instead
+        # of the CLT, which would otherwise fail and show "(unable to fetch)".
         ssh_macos "$project_vm" '
             eval "$(/opt/homebrew/bin/brew shellenv)" 2>/dev/null
             export PATH="$HOME/.local/bin:$PATH"
+            export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
             echo "    xcode:  $(xcodebuild -version 2>/dev/null | head -1 || echo "(unable to fetch)")"
             echo "    claude: $(claude --version 2>/dev/null || echo "(unable to fetch)")"
         ' || true
