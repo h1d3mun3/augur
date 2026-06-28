@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Test shim for `gh`: report no token so cmd_up's GH_TOKEN injection block is skipped,
+# keeping the constructed `docker run` deterministic. (Real `gh auth token` would make
+# the argv depend on the host's GitHub login.)
+exit 0
