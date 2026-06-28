@@ -20,7 +20,7 @@ warn()    { echo -e "${YELLOW}[install]${RESET} $*"; }
 error()   { echo -e "${RED}[install]${RESET} $*" >&2; }
 
 # Validate source files exist
-for f in augur Dockerfile; do
+for f in augur Dockerfile .dockerignore; do
     if [[ ! -f "$SCRIPT_DIR/$f" ]]; then
         error "$f not found in $SCRIPT_DIR"
         exit 1
@@ -32,6 +32,9 @@ info "Installing to $INSTALL_DIR..."
 mkdir -p "$INSTALL_DIR"
 cp "$SCRIPT_DIR/augur" "$INSTALL_DIR/augur"
 cp "$SCRIPT_DIR/Dockerfile" "$INSTALL_DIR/Dockerfile"
+# Ship the .dockerignore alongside the Dockerfile so the build context (~/.augur) stays
+# tiny — otherwise the multi-GB VM images under ~/.augur/vms get swept into `augur build`.
+cp "$SCRIPT_DIR/.dockerignore" "$INSTALL_DIR/.dockerignore"
 chmod +x "$INSTALL_DIR/augur"
 
 # Stamp the installed version. The running ~/.augur/augur has no git context, so record
