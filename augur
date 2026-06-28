@@ -520,6 +520,11 @@ resolve_gvproxy() {
 
 gvproxy_socket()  { echo "$AUGUR_PROXY_DIR/$(workspace_slug).vfkit.sock"; }
 gvproxy_pidfile() { echo "$AUGUR_PROXY_DIR/$(workspace_slug).gvproxy.pid"; }
+# Diagnostic logs for the macOS egress datapath. gvproxy and the VM run are otherwise
+# launched with output discarded, which makes an "SSH did not come up" failure opaque;
+# these capture their stderr so the failure path can surface the real cause.
+gvproxy_log()     { echo "$AUGUR_PROXY_DIR/$(workspace_slug).gvproxy.log"; }
+macos_vm_log()    { echo "$AUGUR_PROXY_DIR/$(workspace_slug).vm.log"; }
 
 gvproxy_running() {
     local pf; pf="$(gvproxy_pidfile)"
@@ -554,7 +559,7 @@ start_gvproxy() {
            --socks-upstream "127.0.0.1:${AUGUR_PROXY_SOCKS_PORT}" \
            --dns-allowlist "$(proxy_allowlist)" \
            --ssh-port "$AUGUR_SSH_FWD_PORT" \
-           --deny-direct &>/dev/null &
+           --deny-direct &>"$(gvproxy_log)" &
     echo $! > "$pidfile"
     disown
     local tries=30
@@ -1141,12 +1146,28 @@ cmd_up_macos() {
         --dir="${MACOS_SHARE}:${WORKSPACE_DIR}" \
         --dir="gh-config:${HOME}/.config/gh" \
         --dir="claude-projects:${HOME}/.claude/projects" \
-        "$project_vm" &>/dev/null &
+        "$project_vm" &>"$(macos_vm_log)" &
     disown
 
     info "Waiting for VM to boot and SSH to be ready..."
     wait_for_macos_ssh "$project_vm" &>/dev/null || {
         error "VM SSH did not become available in time."
+        # Surface the otherwise-discarded output so the cause is visible. The VM boots
+        # but is unreachable via SSH most often because gvproxy crashed or the guest
+        # never got its address — both show up in these logs.
+        error "Diagnostics (kept on disk):"
+        error "  VM log:      $(macos_vm_log)"
+        if egress_enabled; then
+            error "  gvproxy log: $(gvproxy_log)"
+            if [[ -s "$(gvproxy_log)" ]]; then
+                error "  ---- last gvproxy lines ----"
+                tail -n 20 "$(gvproxy_log)" 2>/dev/null | while IFS= read -r _l; do error "  | $_l"; done
+            fi
+        fi
+        if [[ -s "$(macos_vm_log)" ]]; then
+            error "  ---- last VM lines ----"
+            tail -n 10 "$(macos_vm_log)" 2>/dev/null | while IFS= read -r _l; do error "  | $_l"; done
+        fi
         # Tear down what we started so a stranded VM/gvproxy/proxy isn't left behind.
         "$VM_CLI" stop "$project_vm" 2>/dev/null || true
         stop_gvproxy
