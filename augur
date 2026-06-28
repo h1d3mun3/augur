@@ -682,6 +682,24 @@ cmd_down() {
     docker network rm "$(egress_network_name)" &>/dev/null || true
 }
 
+# Print the container toolchain WITHOUT building anything — status inspects only what
+# already exists. Prefer the running container (the exact env Claude runs in), fall back
+# to a one-shot run against the built image, and note when nothing is built yet.
+docker_toolchain_versions() {
+    local runner
+    if container_running; then
+        runner=(docker exec "$CONTAINER_NAME")
+    elif docker image inspect "$IMAGE_NAME" &>/dev/null; then
+        runner=(docker run --rm "$IMAGE_NAME")
+    else
+        echo -e "    ${YELLOW}(image not built — run: augur up)${RESET}"
+        return 0
+    fi
+    "${runner[@]}" swift --version 2>/dev/null || echo "    swift:  (unable to fetch)"
+    "${runner[@]}" claude --version 2>/dev/null || echo "    claude: (unable to fetch)"
+    "${runner[@]}" gh --version 2>/dev/null | head -1 || echo "    gh:     (unable to fetch)"
+}
+
 cmd_status() {
     require_docker
     echo -e "${BOLD}Container:${RESET}  ${CONTAINER_NAME}"
@@ -705,20 +723,9 @@ cmd_status() {
     fi
     echo ""
 
-    if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]] || [[ -f "$HOME/.claude_code_oauth_token" ]]; then
-        echo -e "  ${GREEN}✓${RESET} Claude (OAuth token)"
-    elif [[ -n "${ANTHROPIC_API_KEY:-}" ]] || [[ -f "$HOME/.anthropic_api_key" ]]; then
-        echo -e "  ${GREEN}✓${RESET} Claude (API key)"
-    elif [[ -f "$HOME/.claude/.credentials.json" ]]; then
-        echo -e "  ${GREEN}✓${RESET} Claude (account auth)"
-    else
-        echo -e "  ${RED}✗${RESET} Claude (not authenticated)"
-    fi
-    if [[ -f "$HOME/.config/gh/hosts.yml" ]]; then
-        echo -e "  ${GREEN}✓${RESET} GitHub CLI (gh) (authenticated)"
-    else
-        echo -e "  ${RED}✗${RESET} GitHub CLI (gh) (run: gh auth login)"
-    fi
+    echo -e "${BOLD}Toolchain:${RESET}"
+    docker_toolchain_versions
+    echo ""
 }
 
 cmd_update() {
@@ -743,17 +750,12 @@ augur_version() {
     fi
 }
 
+# `version` reports the installed augur commit and nothing else. It is side-effect-free
+# (no Docker), so it answers instantly even with the daemon down or the image unbuilt.
+# The image name/tag and the actual container toolchain live in `augur status`.
 cmd_version() {
-    require_docker
     echo ""
     echo -e "  ${BOLD}augur${RESET}  ${CYAN}$(augur_version)${RESET}"
-    echo -e "  ${BOLD}Swift${RESET}       ${CYAN}${SWIFT_IMAGE_TAG}${RESET}  (image: ${IMAGE_NAME})"
-    echo ""
-    ensure_image
-    echo -e "  ${BOLD}Container tool versions:${RESET}"
-    docker run --rm "$IMAGE_NAME" swift --version 2>/dev/null || echo "    swift:  (unable to fetch)"
-    docker run --rm "$IMAGE_NAME" claude --version 2>/dev/null || echo "    claude: (unable to fetch)"
-    docker run --rm "$IMAGE_NAME" gh --version 2>/dev/null | head -1 || echo "    gh:     (unable to fetch)"
     echo ""
 }
 
@@ -1259,20 +1261,20 @@ cmd_status_macos() {
     fi
 
     echo ""
-    if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]] || [[ -f "$HOME/.claude_code_oauth_token" ]]; then
-        echo -e "  ${GREEN}✓${RESET} Claude (OAuth token)"
-    elif [[ -n "${ANTHROPIC_API_KEY:-}" ]] || [[ -f "$HOME/.anthropic_api_key" ]]; then
-        echo -e "  ${GREEN}✓${RESET} Claude (API key)"
-    elif [[ -f "$HOME/.claude/.credentials.json" ]]; then
-        echo -e "  ${GREEN}✓${RESET} Claude (account auth)"
+    # Toolchain is read from the running project VM only — status never boots a VM.
+    # When the VM is stopped we just point at `augur up --macos` instead.
+    echo -e "${BOLD}Toolchain:${RESET}"
+    if macos_vm_running "$project_vm" && macos_vm_ip "$project_vm" &>/dev/null; then
+        ssh_macos "$project_vm" '
+            eval "$(/opt/homebrew/bin/brew shellenv)" 2>/dev/null
+            export PATH="$HOME/.local/bin:$PATH"
+            echo "    xcode:  $(xcodebuild -version 2>/dev/null | head -1 || echo "(unable to fetch)")"
+            echo "    claude: $(claude --version 2>/dev/null || echo "(unable to fetch)")"
+        ' || true
     else
-        echo -e "  ${RED}✗${RESET} Claude (not authenticated)"
+        echo -e "    ${YELLOW}(VM not running — run: augur up --macos)${RESET}"
     fi
-    if [[ -f "$HOME/.config/gh/hosts.yml" ]]; then
-        echo -e "  ${GREEN}✓${RESET} GitHub CLI (gh) (authenticated)"
-    else
-        echo -e "  ${RED}✗${RESET} GitHub CLI (gh) (run: gh auth login)"
-    fi
+    echo ""
 }
 
 cmd_list_macos() {
@@ -1334,28 +1336,12 @@ cmd_update_macos() {
     warn "Run ${BOLD}augur down --macos && augur up --macos${RESET} to apply to the current project."
 }
 
+# `version` reports the installed augur commit and nothing else. Side-effect-free —
+# unlike before, it does NOT boot the base VM to read its toolchain. The base VM name
+# and the running project VM's toolchain live in `augur status --macos`.
 cmd_version_macos() {
-    require_vz
-    macos_vm_exists "$MACOS_BASE_VM" || {
-        error "Base VM '${MACOS_BASE_VM}' not found."
-        exit 1
-    }
     echo ""
     echo -e "  ${BOLD}augur${RESET}  ${CYAN}$(augur_version)${RESET}  (macOS VM mode)"
-    echo ""
-    echo -e "  ${BOLD}Base VM tool versions:${RESET}"
-    "$VM_CLI" run --no-graphics "$MACOS_BASE_VM" &>/dev/null &
-    local vm_pid=$!
-    if macos_vm_ip "$MACOS_BASE_VM" &>/dev/null; then
-        ssh_macos "$MACOS_BASE_VM" '
-            eval "$(/opt/homebrew/bin/brew shellenv)" 2>/dev/null
-            export PATH="$HOME/.local/bin:$PATH"
-            echo "    xcode:  $(xcodebuild -version 2>/dev/null | head -1 || echo "(unable to fetch)")"
-            echo "    claude: $(claude --version 2>/dev/null || echo "(unable to fetch)")"
-        ' || true
-    fi
-    "$VM_CLI" stop "$MACOS_BASE_VM" 2>/dev/null || true
-    wait "$vm_pid" 2>/dev/null || true
     echo ""
 }
 
@@ -1399,10 +1385,10 @@ cmd_help() {
     echo -e "    augur ${CYAN}claude${RESET}                     Launch Claude Code"
     echo -e "    augur ${CYAN}shell${RESET}                      Open a bash shell"
     echo -e "    augur ${CYAN}down${RESET}                       Stop and remove the container"
-    echo -e "    augur ${CYAN}status${RESET}                     Check status and auth info"
+    echo -e "    augur ${CYAN}status${RESET}                     Check status and toolchain"
     echo -e "    augur ${CYAN}build${RESET}   [--swift VERSION]  Build the Docker image"
     echo -e "    augur ${CYAN}update${RESET}  [--swift VERSION]  Rebuild image with latest versions"
-    echo -e "    augur ${CYAN}version${RESET}                    Show version information"
+    echo -e "    augur ${CYAN}version${RESET}                    Show augur version"
     echo -e "    augur ${CYAN}init-conf${RESET}                  Scaffold a ./.augur.conf egress allowlist"
     echo ""
     echo -e "  ${BOLD}MACOS VM MODE${RESET}  ${YELLOW}(macOS VM — full Xcode, xcodebuild, Simulator)${RESET}"
@@ -1412,10 +1398,10 @@ cmd_help() {
     echo -e "    augur ${CYAN}shell${RESET}  --macos                                   Open bash shell"
     echo -e "    augur ${CYAN}down${RESET}    --macos                                   Stop the VM (keep the clone)"
     echo -e "    augur ${CYAN}destroy${RESET} --macos                                   Stop and remove the VM clone"
-    echo -e "    augur ${CYAN}status${RESET}  --macos                                   Check VM status"
+    echo -e "    augur ${CYAN}status${RESET}  --macos                                   Check VM status and toolchain"
     echo -e "    augur ${CYAN}list${RESET}    --macos                                   List all VMs and their state"
     echo -e "    augur ${CYAN}update${RESET}  --macos                                   Update CLI tools in base VM"
-    echo -e "    augur ${CYAN}version${RESET} --macos                                   Show tool versions in base VM"
+    echo -e "    augur ${CYAN}version${RESET} --macos                                   Show augur version (macOS mode)"
     echo ""
     echo -e "  ${BOLD}OPTIONS${RESET}"
     echo -e "    --swift VERSION    Swift version for Docker mode (default: ${CYAN}latest${RESET})"
