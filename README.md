@@ -46,14 +46,16 @@ The install script copies `Dockerfile` and `augur` to `~/.augur/` and configures
 ```bash
 cd ~/projects/my-app
 
-augur up        # start the container
-augur claude    # launch Claude Code
-augur shell     # open a bash shell (for debugging)
-augur down      # stop and remove the container
-augur status    # show status and auth info
-augur build     # build the Docker image
-augur update    # rebuild image with latest tool versions
-augur version   # show tool versions
+augur up [--swift VERSION]      # start the container
+augur claude                    # launch Claude Code
+augur shell                     # open a bash shell (for debugging)
+augur setup-token               # get a Claude subscription token (runs in the guest, saves on the host)
+augur down                      # stop and remove the container
+augur status                    # show status, toolchain, and auth info
+augur build [--swift VERSION]   # build the Docker image
+augur update [--swift VERSION]  # rebuild image with latest tool versions
+augur init-conf                 # scaffold a ./.augur.conf egress allowlist
+augur version                   # show augur version
 ```
 
 ### File access
@@ -67,7 +69,7 @@ augur version   # show tool versions
 | Claude auth | injected via env (`CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY`) — the host's credential store is never mounted |
 | Everything else | **not visible to the container** |
 
-> Auth is env-based in both modes now. If you only ever logged in via the browser, run `claude setup-token` once on the host (or set `ANTHROPIC_API_KEY`); see [API keys and authentication](#api-keys-and-authentication). Upgrading from an older augur requires a one-time `augur build` (the image now pre-creates the scoped history dir).
+> Auth is env-based in both modes now. If you only ever logged in via the browser, run `augur setup-token` (or set `ANTHROPIC_API_KEY`); see [API keys and authentication](#api-keys-and-authentication). Upgrading from an older augur requires a one-time `augur build` (the image now pre-creates the scoped history dir).
 
 ### Requirements
 
@@ -107,7 +109,7 @@ augur build --macos --ipsw ~/Downloads/macOS.ipsw --xcode-xip ~/Downloads/Xcode.
 This will:
 1. Create a macOS VM from your IPSW (`augur-vm create --from-ipsw`)
 2. Open the VM window for manual Setup Assistant completion (credentials: `admin` / `admin`, Remote Login enabled)
-3. Install Xcode, Homebrew, Node.js, and Claude Code
+3. Install Xcode, Homebrew, GitHub CLI, and Claude Code
 4. Download the iOS Simulator runtime (Xcode installed from a XIP does not bundle it)
 5. Save the result as a reusable base VM (`augur-macos-base`)
 
@@ -134,11 +136,13 @@ augur up --macos        # clone base VM and start (first run clones automaticall
 augur up --macos --gui  # same, but also open a VM window (display + keyboard + pointer)
 augur claude --macos    # launch Claude Code  (starts VM if not running)
 augur shell --macos     # open a bash shell   (starts VM if not running)
+augur setup-token --macos  # get a Claude subscription token (runs in the VM, saves on the host)
 augur down --macos      # stop the VM (keeps the clone — next up is fast)
 augur destroy --macos   # stop and remove the project VM clone
-augur status --macos    # show VM status and auth info
+augur status --macos    # show VM status, toolchain, and auth info
+augur list --macos      # list all VMs and their state
 augur update --macos    # update Claude Code in the base VM
-augur version --macos   # show tool versions in the base VM
+augur version --macos   # show augur version (macOS mode)
 ```
 
 ### Authentication
@@ -147,8 +151,10 @@ On macOS, Claude Code stores its OAuth login in the Keychain, which is unreadabl
 absent from a freshly cloned VM. So macOS mode injects a credential through the environment on
 every `up` (the same way it does for the GitHub token):
 
-- `CLAUDE_CODE_OAUTH_TOKEN` — subscription token; run `claude setup-token` once on the host, then
-  set the env var or save it to `~/.claude_code_oauth_token`.
+- `CLAUDE_CODE_OAUTH_TOKEN` — subscription token; either set the env var / save it to
+  `~/.claude_code_oauth_token`, or run **`augur setup-token`**: it runs `claude setup-token`
+  inside the guest (so you don't install Claude Code on the host), then you paste the token
+  back once and augur saves it to `~/.claude_code_oauth_token`.
 - `ANTHROPIC_API_KEY` — Console API key (env or `~/.anthropic_api_key`). Takes priority if both are set.
 
 ### File access
@@ -216,8 +222,11 @@ EOF
 augur up            # Docker, egress on (baseline + augur.conf + .augur.conf if present)
 augur up --macos    # macOS VM, same
 augur up --no-egress  # disable egress filtering for this run
+augur up --egress     # force egress filtering on (re-enables if AUGUR_EGRESS=0)
 augur status        # shows: Egress on/off + the active allowlist
 ```
+
+Filtering is on by default; set `AUGUR_EGRESS=0` to disable it persistently, or `AUGUR_EGRESS=1` to force it on. The `--no-egress` / `--egress` flags override that environment variable for a single run.
 
 ### `.augur.conf` format
 
@@ -270,7 +279,9 @@ Alternatively, place the key in a file (`~/.anthropic_api_key`).
 
 **Account-based auth** (subscription, no API key needed): augur never mounts the host's
 Claude credential store into the guest — auth is injected via the environment in both
-modes. Generate a long-lived subscription token once on the host:
+modes. The easiest way to get a long-lived subscription token is **`augur setup-token`**,
+which runs `claude setup-token` inside the guest (no Claude install on the host) and saves
+the token for you. Or generate one yourself if you already have Claude Code on the host:
 
 ```bash
 claude setup-token            # prints a token for CLAUDE_CODE_OAUTH_TOKEN

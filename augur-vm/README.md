@@ -16,7 +16,7 @@ Implemented:
 - `augur-vm smoke` — prove VZ links and the virtualization entitlement is embedded
 - `augur-vm create <name> --from-ipsw <path> [--disk-size <GB>]` — install macOS from an IPSW
 - `augur-vm set <name> [--cpu N] [--memory MB]` — adjust CPU / memory (memory in MB)
-- `augur-vm run <name> --no-graphics [--dir name:path ...]` — boot headless with NAT + shared dirs
+- `augur-vm run <name> --no-graphics [--dir name:path ...] [--net-vfkit <socket>]` — boot headless with shared dirs
 - `augur-vm run <name>` — boot with a GUI window (display + keyboard + pointer) for Setup Assistant
 - `augur-vm ip <name>` — print the guest IP (from `/var/db/dhcpd_leases`)
 - `augur-vm stop <name>` — graceful shutdown (SIGTERM to the run process; force-kill fallback)
@@ -26,6 +26,10 @@ Implemented:
 `--dir name:path` shares are auto-mounted by the macOS guest under
 `/Volumes/My Shared Files/<name>` (via the virtiofs automount tag), the path
 augur's `~/workspace` symlink targets — so directory sharing works unchanged.
+
+`--net-vfkit <socket>` attaches the guest NIC to a vfkit unixgram socket (gvproxy)
+instead of NAT, so all egress passes through the host egress filter. Without it, the
+guest uses NAT and traffic is unfiltered.
 
 ### Try the vertical slice (macOS Apple Silicon host)
 
