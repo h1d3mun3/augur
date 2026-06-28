@@ -653,3 +653,22 @@ index c7bc35c..d6d01de 100644
  	if err != nil {
  		return nil, err
  	}
+diff --git a/pkg/tap/switch.go b/pkg/tap/switch.go
+index 3f57c55..92221e4 100644
+--- a/pkg/tap/switch.go
++++ b/pkg/tap/switch.go
+@@ -280,6 +280,14 @@ loop:
+ }
+ 
+ func (e *Switch) rxBuf(_ context.Context, id int, buf []byte) {
++	// augur: drop runt frames (shorter than an Ethernet header). A guest fully
++	// controls each L2 frame it emits over its NIC, and the header.Ethernet
++	// accessors slice fixed offsets (SourceAddress buf[6:12], Type buf[12:14])
++	// with no length check, so a sub-14-byte frame would panic the un-recovered
++	// rx goroutine and take down the whole datapath. Drop it instead.
++	if len(buf) < header.EthernetMinimumSize {
++		return
++	}
+ 	if e.debug {
+ 		packet := gopacket.NewPacket(buf, layers.LayerTypeEthernet, gopacket.Default)
+ 		log.Info(packet.String())

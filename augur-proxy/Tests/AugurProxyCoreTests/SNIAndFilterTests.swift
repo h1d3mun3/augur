@@ -66,7 +66,9 @@ final class SNIAndFilterTests: XCTestCase {
         let pins = PinTable(clock: { now })
         pins.pin(ip: "1.1.1.1", forClient: "c", domain: "github.com", ttl: 10)
         XCTAssertEqual(pins.domain(forIP: "1.1.1.1", client: "c"), "github.com")
-        now = Date(timeIntervalSince1970: 1000 + 10 + 5 + 1)  // past ttl+floor+grace
+        // pin() floors the lifetime at max(ttl, 30) + 5s grace, so a ttl=10 pin lives
+        // 35s, not 15s. Advance past the floored expiry (1000 + 30 + 5) to see it expire.
+        now = Date(timeIntervalSince1970: 1000 + 30 + 5 + 1)
         XCTAssertNil(pins.domain(forIP: "1.1.1.1", client: "c"))
     }
 

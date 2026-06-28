@@ -172,11 +172,12 @@ enum Sock {
         case 100:        return b >= 64 && b <= 127 // 100.64/10 CGNAT (Tailscale etc.)
         case 169:        return b == 254           // 169.254/16 link-local
         case 172:        return b >= 16 && b <= 31  // 172.16/12 private
-        case 192:        return (b == 168)          // 192.168/16 private
-                              || (b == 0 && c == 0)  // 192.0.0/24 IETF protocol
+        case 192:        return (b == 168)           // 192.168/16 private
+                              || (b == 0 && c == 0)   // 192.0.0/24 IETF protocol
+                              || (b == 88 && c == 99)  // 192.88.99/24 6to4 relay anycast (deprecated)
         case 198:        return b == 18 || b == 19   // 198.18/15 benchmark
-        case 255:        return b == 255 && c == 255 && d == 255 // broadcast
-        default:         return a >= 240            // 240/4 reserved (incl. 255/8)
+        case 224...255:  return true                // 224/4 multicast + 240/4 reserved (incl. broadcast)
+        default:         return false               // globally-routable public space
         }
     }
 }
