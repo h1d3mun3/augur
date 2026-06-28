@@ -46,15 +46,16 @@ The install script copies `Dockerfile` and `augur` to `~/.augur/` and configures
 ```bash
 cd ~/projects/my-app
 
-augur up           # start the container
-augur claude       # launch Claude Code
-augur shell        # open a bash shell (for debugging)
-augur setup-token  # get a Claude subscription token (runs in the guest, saves on the host)
-augur down         # stop and remove the container
-augur status       # show status and auth info
-augur build        # build the Docker image
-augur update       # rebuild image with latest tool versions
-augur version      # show tool versions
+augur up [--swift VERSION]      # start the container
+augur claude                    # launch Claude Code
+augur shell                     # open a bash shell (for debugging)
+augur setup-token               # get a Claude subscription token (runs in the guest, saves on the host)
+augur down                      # stop and remove the container
+augur status                    # show status, toolchain, and auth info
+augur build [--swift VERSION]   # build the Docker image
+augur update [--swift VERSION]  # rebuild image with latest tool versions
+augur init-conf                 # scaffold a ./.augur.conf egress allowlist
+augur version                   # show augur version
 ```
 
 ### File access
@@ -105,7 +106,7 @@ augur build --macos --ipsw ~/Downloads/macOS.ipsw --xcode-xip ~/Downloads/Xcode.
 This will:
 1. Create a macOS VM from your IPSW (`augur-vm create --from-ipsw`)
 2. Open the VM window for manual Setup Assistant completion (credentials: `admin` / `admin`, Remote Login enabled)
-3. Install Xcode, Homebrew, Node.js, and Claude Code
+3. Install Xcode, Homebrew, GitHub CLI, and Claude Code
 4. Download the iOS Simulator runtime (Xcode installed from a XIP does not bundle it)
 5. Save the result as a reusable base VM (`augur-macos-base`)
 
@@ -135,9 +136,10 @@ augur shell --macos     # open a bash shell   (starts VM if not running)
 augur setup-token --macos  # get a Claude subscription token (runs in the VM, saves on the host)
 augur down --macos      # stop the VM (keeps the clone — next up is fast)
 augur destroy --macos   # stop and remove the project VM clone
-augur status --macos    # show VM status and auth info
+augur status --macos    # show VM status, toolchain, and auth info
+augur list --macos      # list all VMs and their state
 augur update --macos    # update Claude Code in the base VM
-augur version --macos   # show tool versions in the base VM
+augur version --macos   # show augur version (macOS mode)
 ```
 
 ### Authentication
@@ -215,8 +217,11 @@ EOF
 augur up            # Docker, egress on (baseline + augur.conf + .augur.conf if present)
 augur up --macos    # macOS VM, same
 augur up --no-egress  # disable egress filtering for this run
+augur up --egress     # force egress filtering on (re-enables if AUGUR_EGRESS=0)
 augur status        # shows: Egress on/off + the active allowlist
 ```
+
+Filtering is on by default; set `AUGUR_EGRESS=0` to disable it persistently, or `AUGUR_EGRESS=1` to force it on. The `--no-egress` / `--egress` flags override that environment variable for a single run.
 
 ### `.augur.conf` format
 
