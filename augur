@@ -109,6 +109,18 @@ container_exists() {
     docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$CONTAINER_NAME"
 }
 
+# True if the running container was created from a different image than the tag
+# currently points at — e.g. after `augur build` rebuilt the image. (Mount/run-arg
+# changes from an augur-script update aren't baked into the image, so they aren't
+# detected here; recreating is the safe reset for both.) Fails closed to "not
+# outdated" if either id can't be read, so it never blocks a normal `up`.
+container_image_outdated() {
+    local running current
+    running="$(docker inspect -f '{{.Image}}' "$CONTAINER_NAME" 2>/dev/null)" || return 1
+    current="$(docker image inspect -f '{{.Id}}' "$IMAGE_NAME" 2>/dev/null)" || return 1
+    [[ -n "$running" && -n "$current" && "$running" != "$current" ]]
+}
+
 require_docker() {
     if ! command -v docker &>/dev/null; then
         error "Docker is not installed or not in PATH."
@@ -661,8 +673,27 @@ cmd_up() {
     warn_if_image_stale
 
     if container_running; then
-        warn "Container '${CONTAINER_NAME}' is already running."
-        return 0
+        if container_image_outdated; then
+            warn "Container '${CONTAINER_NAME}' is running on an ${BOLD}older image${RESET} than the latest build —"
+            warn "its mounts and baked toolchain are stale (recreate to apply 'augur build' / augur updates)."
+            if [[ -t 0 && -t 1 ]]; then
+                local _yn=""
+                read -rp "$(echo -e "${CYAN}[augur]${RESET} Recreate it now to apply the latest? [y/N] ")" _yn || true
+                if [[ "$_yn" != [yY] ]]; then
+                    warn "Left running. Run ${BOLD}augur down && augur up${RESET} when ready."
+                    return 0
+                fi
+                info "Recreating '${CONTAINER_NAME}'..."
+                docker rm -f "$CONTAINER_NAME" &>/dev/null || true
+                # fall through to recreate with the current image and mounts
+            else
+                warn "Run ${BOLD}augur down && augur up${RESET} to recreate. Leaving it running."
+                return 0
+            fi
+        else
+            warn "Container '${CONTAINER_NAME}' is already running."
+            return 0
+        fi
     fi
 
     # Gate the untrusted project ./.augur.conf before tearing anything down or
