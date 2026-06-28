@@ -250,3 +250,221 @@ M1, L2, L3, and L4 reduce to cheap hygiene under this model. The throughline:
 the premise relaxes "another user reads my secrets" (Axis A) but not "the
 disposable guest writes back into / widens its way out of the trusted host"
 (Axis B) — so the egress boundary and the host write boundary stay the priority.
+
+---
+
+# Addendum — Guest→Host (Axis B) audit, 2026-06-28
+
+A second pass focused exclusively on **Axis B** (the disposable, possibly
+prompt-injected guest attacking the trusted single-user host). Method: a
+component-by-component read of the whole codebase (the `augur` driver,
+`augur-proxy`, the gvproxy fork patch, `augur-vm`, the Dockerfile/topology, and
+`install`), with every candidate finding run through an adversarial
+three-lens verification (exploitability, premise-fit, claim-correctness) that
+defaulted to *refuted*. Six items survived; the notable refutations are recorded
+below so they need not be re-investigated.
+
+**Headline:** no host RCE, no VM/container escape, and no direct egress-allowlist
+bypass were found. The containment core (`Allowlist`/`SNI`/`Filter`, the
+fail-closed `augur-vm` networking, the gvproxy DNS gate + `--deny-direct`, and
+the `publicOnly` SSRF guard) holds, and the M2/M3 fixes are complete in the
+driver. What survived are **two operator-trust breaks (High)** and **one
+lateral-persistence channel (Medium)** — all squarely Axis B.
+
+New finding IDs are `A1`–`A6` (severity is stated per finding, not implied by the
+letter, unlike the M/L scheme above).
+
+## Priority
+
+| Finding | Severity | Axis | Class | One-line |
+|---|---|---|---|---|
+| **A1** — `.augur.conf` terminal-escape injection spoofs the L1 approval UI | **High** | B | operator-trick → egress break | The operator approves an egress domain they were prevented from seeing. |
+| **A2** — `setup-token` runs a guest-writable `claude` binary on the operator's TTY | **High** | B | operator-trick → lateral-persist | A trojaned guest `claude` can phish the token the host then persists and re-injects everywhere. |
+| **A3** — Docker history dir lives inside the host's `~/.claude/projects` tree | **Medium** | B | lateral-persist | Guest-forged transcripts become trusted context for a host-side Claude resume. |
+| **A4** — IP-literal pin path is dead code | Low | — | doc/fail-secure | IP literals are *unconditionally* denied; the documented pin mechanism does not exist. |
+| **A5** — short Ethernet frame panics gvproxy | Low | B | self-DoS | A root guest can crash its own egress datapath; no escalation. |
+| **A6** — `publicOnly` SSRF guard confirmed on; minor `isPrivate` gaps | Info | B | egress | Strength confirmed; `224/4` and `192.88.99/24` uncovered but not exfil-routable. |
+
+Net priority: **A1**, then **A2**, then **A3**. A4–A6 are defense-in-depth.
+
+## Findings
+
+### A1 — Project `.augur.conf` terminal-escape injection spoofs the L1 approval UI (High, Axis B)
+
+`augur:399-404` (`check_project_conf_approved`), and the same data in
+`augur:907` / `augur:1522` (`status` / `status --macos`).
+
+The guest writes `./.augur.conf` through the read-write workspace mount.
+`project_conf_domains()` (`augur:354-356`) only runs `sed 's/#.*//'` plus an awk
+whitespace trim — it strips ASCII spaces/tabs/comments but **not raw control
+bytes (ESC `0x1b`)**. The approval loop then renders each line with
+`echo -e "    + ${d}"`, which emits those bytes verbatim to the operator's real
+terminal.
+
+Attack: ship a `.augur.conf` with two lines — `evil-exfil.com`, then
+`\e[1A\e[2K\e[G` followed by `api.github.com`. On `augur up`, the cursor-up +
+erase-line sequence overwrites the printed `evil-exfil.com`, so the operator
+visually sees only `+ api.github.com`, approves, and the TOFU hash plus the
+merged allowlist (`write_merged_allowlist` `cat`s the raw file) both now contain
+`evil-exfil.com`. The proxy parses `evil-exfil.com` as a clean LDH host and
+**allows** egress to it (the escape-laden line is non-LDH and is silently
+dropped by the proxy). `augur status` pipes the same raw bytes through `echo -e`,
+so post-hoc inspection is spoofable too.
+
+This defeats the one thing L1's display exists to provide — letting the operator
+*see* what they authorize — so the guest obtains egress to an arbitrary
+attacker-chosen host: a containment break, not merely a cosmetic glitch.
+
+**Fix:** in `project_conf_domains`, drop non-printing bytes and reject any line
+that is not a strict LDH hostname (mirror `isValidHostname`), so a non-hostname
+line is removed rather than rendered. Print with a non-interpreting
+`printf '    + %s\n' "$sanitized"` (never `echo -e` on raw guest bytes) in both
+the approval prompt and `status`. Optionally have `write_merged_allowlist` also
+drop non-LDH lines so "what was shown" == "what is allowed".
+
+### A2 — `setup-token` runs a guest-controlled `claude` binary attached to the operator's TTY (High, Axis B)
+
+`augur:843-855` (`cmd_setup_token`, `docker exec -it … claude setup-token`) and
+`augur:1436-1448` (`cmd_setup_token_macos`, `ssh_macos -t … 'claude setup-token'`).
+
+In Docker the `claude` binary is installed to `/home/dev/.local/bin/claude`
+**owned by uid 1001 (the `dev` user the agent runs as)** and first on `PATH`
+(`Dockerfile:27-34`); in macOS the guest is `admin`/`admin` and `claude` lives in
+the guest-writable `~/.local/bin`. A prompt-injected agent can therefore replace
+that binary. `setup-token` attaches it to the operator's real terminal as a
+full-screen TUI.
+
+A trojaned `claude setup-token` can render a convincing sign-in screen that
+substitutes an attacker's OAuth/device-code URL (or uses escapes to hide the real
+prompt), so the operator authorizes a flow the attacker initiated. Back on the
+host, `read -rp … token` accepts whatever is pasted after only a `sk-ant-*`
+prefix check (`save_oauth_token`, `augur:182-190`) and writes it to
+`~/.claude_code_oauth_token`; augur then injects it as `CLAUDE_CODE_OAUTH_TOKEN`
+into **every** future `up`, in **every** project (`augur:759-761`, `1382`). The
+attacker-backed credential thus persists across the disposable-guest boundary and
+re-enters all future guests.
+
+**Fix:** don't run the guest's `claude` against the operator's TTY for a
+security-sensitive token flow. Verify the binary's provenance before exec (the
+macOS *build* does `codesign … | grep Anthropic`; the Docker image does not check
+at run time and the binary is guest-writable), make the image's `claude`
+root-owned and read-only, and run `setup-token` only against a freshly recreated
+guest so a tampered binary from a prior session cannot persist. Tighten
+`save_oauth_token` validation and warn against pasting attacker-supplied values.
+
+### A3 — Docker history dir lives in the host's `~/.claude/projects` tree (Medium, Axis B)
+
+`augur:770-772` (mount), `Dockerfile:45-46`.
+
+The Docker history mount is `~/.claude/projects/-workspace-<slug>` —
+**inside the host's own global Claude Code projects tree**. (macOS mode was
+relocated by M2 to `~/.augur/claude-projects/<vm>`, *outside* `~/.claude`; Docker
+was not.) The guest (uid 1001) can write forged `*.jsonl` transcripts there
+(fabricated user/assistant/tool-result turns with embedded instructions). Because
+the directory is a real entry under the host's `~/.claude/projects`, host-side
+Claude Code enumerates and parses it (session list / resume picker); if the
+operator ever resumes that session on the host, the guest-authored content loads
+as trusted prior context into a host agent that holds the operator's real
+credentials and unconfined filesystem access.
+
+This is a lateral move from the disposable guest into a higher-privilege host
+agent, exceeding the intended "persist *this project's* history" grant (faithful
+round-tripping of the guest's own conversation, not guest-forged context a host
+agent trusts).
+
+**Fix:** mirror the macOS fix — persist Docker history under
+`~/.augur/claude-projects/<slug>` (outside `~/.claude/projects`) and bind-mount
+that, or persist via host-mediated copy-back (`rsync`) on `augur down` so the
+guest never holds a live FD into the host's Claude tree. At minimum, document
+that the operator must never run host-side Claude Code in `/workspace-<slug>` or
+resume an augur project's session on the host.
+
+### A4 — IP-literal pin path is dead code (Low; fail-secure, doc divergence)
+
+`PinTable.swift` (`PinTable.pin(...)` has no production caller); `Filter.swift:41-49`.
+
+The "Strengths" note above states IP literals are allowed only via the pin table
+(IPs the filtering DNS handed out for an allowed name). In fact `PinTable.pin(...)`
+is called **only from XCTest**; no production code populates it (`augur-proxy` has
+no DNS responder, and gvproxy's Go DNS is a separate process with no channel to
+the in-memory `PinTable`). So `Filter.decide`'s pin branch always returns nil and
+**every IP-literal connect is unconditionally denied** — fail-secure, *more*
+restrictive than documented. The risk is purely the divergence: a future change
+that wires DNS→pin without re-validating could silently open IP-literal egress.
+
+**Fix:** either remove `PinTable` and the pin branch (and update the Strengths
+note to say IP literals are unconditionally denied), or wire the pin design
+correctly (have the datapath's resolver populate it) while keeping the by-name
+re-validation. Reconcile the doc either way.
+
+### A5 — Short/truncated Ethernet frame panics gvproxy (Low, Axis B; self-DoS)
+
+Upstream `pkg/tap/switch.go` `rxBuf`, reachable via the `--listen-vfkit`
+datapath the fork relies on.
+
+`rxBuf` casts the received buffer to `header.Ethernet` and reads
+source/destination/type without checking `len(buf) >= 14`. A root guest emitting
+a deliberately truncated frame triggers an index-out-of-range panic with no
+`recover()`, crashing the gvproxy process. Impact is bounded and self-inflicted:
+the guest knocks out **its own** egress datapath; no host code execution, host
+write, or egress past the allowlist. It is an upstream robustness gap, but it is
+reachable specifically because `--deny-direct` makes gvproxy the sole datapath.
+
+**Fix (optional, in the fork patch):** length-check before the `header.Ethernet`
+casts in `rxBuf` and/or wrap the rx loop in `recover()` so a malformed guest
+frame cannot crash the whole proxy.
+
+### A6 — `publicOnly` SSRF guard confirmed on; minor `isPrivate` gaps (Info, Axis B)
+
+`SocketIO.swift` `isPrivate`/`isPrivateV4`/`connect`; `augur:454`, `augur:545`.
+
+Confirmed strength: `publicOnly` defaults true and augur never passes
+`--allow-private` (host proxy `augur:454`; Docker sidecar `augur:545`), so the
+SSRF guard is armed in both modes. `connect` checks `isPrivate` on the actual
+resolved address it then dials (no TOCTOU, no fall-open), blocking
+`169.254.169.254`, `0/8`, `10/8`, `127/8`, `172.16/12`, `192.168/16`,
+`100.64/10`, `::1`, IPv4-mapped/NAT64/`fe80::/10`/`fc00::/7`/multicast, and
+refusing unknown families — so an allowlisted name rebound to a host-local IP is
+blocked. Gaps (not exfil-routable, no host gain): IPv4 multicast `224.0.0.0/4`
+(`224–239`) and `192.88.99.0/24` (6to4 anycast) are not in `isPrivateV4`.
+
+**Fix (optional, completeness):** add `224.0.0.0/4` and `192.88.99.0/24` to
+`isPrivateV4`. Not a containment hole.
+
+## Additional observation — basename-only project slug collision (Low footgun)
+
+`workspace_slug` derives solely from `basename(cwd)` (`augur:87-91`), and that
+slug keys the container name, the Claude history dir, the egress proxy
+ports/allowlist, **and** the `.augur.conf` approval-hash file
+(`project_conf_hash_file`, `augur:361-364`). Two different host directories with
+the same basename (e.g. a hostile `~/Downloads/app` and a trusted `~/src/app`)
+therefore share all of those namespaces. Mixing in a hash of the full path would
+remove the collision. Not run through full Axis-B verification; recorded as a
+hardening note.
+
+## Checked and refuted (do not re-investigate)
+
+- **`.augur.conf` symlink → arbitrary host file read** (0c/3r): the target's
+  contents land only in the host-side merged allowlist, which the guest cannot
+  read back — not an exfil channel. (The displayed contents are still subject to
+  A1's escape-injection concern, handled there.)
+- **virtiofs share symlink escape** (0c/3r): VZ confines the share root; no
+  host-side following was exploitable.
+- **`DHCPLeases.ip` returns the lease IP unvalidated** (0c/3r): the file is
+  written by macOS `bootpd` (root), not guest-injectable, and the consumer uses
+  it as `admin@${ip}` where an injected value cannot become an ssh option.
+- **macOS SOCKS peek re-dial desync** (refuted): a spoofed SNI/Host cannot
+  desync the destination (the proxy re-dials by name) — confirms the documented
+  design.
+- **Docker history *leaf* symlink redirects host writes** (0c/3r): no host
+  process writes/reads inside that dir following symlinks out of the share
+  (`mkdir -p` only).
+- **L3 sidecar `0.0.0.0` bind** (refuted as Axis B): needs another container on
+  the host bridge — Axis A (informational) on a single-user host, as already
+  noted for L3.
+
+## Status
+
+These are documented here as an addendum only; code fixes for A1–A3 are tracked
+separately. M2/M3 remain complete; A3 narrows a Docker-mode residual that the
+macOS M2 fix already closed on its side.
