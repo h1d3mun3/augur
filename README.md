@@ -46,14 +46,15 @@ The install script copies `Dockerfile` and `augur` to `~/.augur/` and configures
 ```bash
 cd ~/projects/my-app
 
-augur up        # start the container
-augur claude    # launch Claude Code
-augur shell     # open a bash shell (for debugging)
-augur down      # stop and remove the container
-augur status    # show status and auth info
-augur build     # build the Docker image
-augur update    # rebuild image with latest tool versions
-augur version   # show tool versions
+augur up           # start the container
+augur claude       # launch Claude Code
+augur shell        # open a bash shell (for debugging)
+augur setup-token  # get a Claude subscription token (runs in the guest, saves on the host)
+augur down         # stop and remove the container
+augur status       # show status and auth info
+augur build        # build the Docker image
+augur update       # rebuild image with latest tool versions
+augur version      # show tool versions
 ```
 
 ### File access
@@ -131,6 +132,7 @@ augur up --macos        # clone base VM and start (first run clones automaticall
 augur up --macos --gui  # same, but also open a VM window (display + keyboard + pointer)
 augur claude --macos    # launch Claude Code  (starts VM if not running)
 augur shell --macos     # open a bash shell   (starts VM if not running)
+augur setup-token --macos  # get a Claude subscription token (runs in the VM, saves on the host)
 augur down --macos      # stop the VM (keeps the clone — next up is fast)
 augur destroy --macos   # stop and remove the project VM clone
 augur status --macos    # show VM status and auth info
@@ -144,8 +146,9 @@ On macOS, Claude Code stores its OAuth login in the Keychain, which is unreadabl
 absent from a freshly cloned VM. So macOS mode injects a credential through the environment on
 every `up` (the same way it does for the GitHub token):
 
-- `CLAUDE_CODE_OAUTH_TOKEN` — subscription token; run `claude setup-token` once on the host, then
-  set the env var or save it to `~/.claude_code_oauth_token`.
+- `CLAUDE_CODE_OAUTH_TOKEN` — subscription token; either set the env var / save it to
+  `~/.claude_code_oauth_token`, or run **`augur setup-token`** to generate one inside the guest
+  and save it on the host automatically (no need to install Claude Code on the host).
 - `ANTHROPIC_API_KEY` — Console API key (env or `~/.anthropic_api_key`). Takes priority if both are set.
 
 ### File access
