@@ -6,6 +6,12 @@ import Foundation
 /// per-client and expire. This is defense-in-depth that also enables IP-literal
 /// connects to legitimately-resolved hosts; the by-name allowlist remains primary.
 ///
+/// NOTE: as of this writing NO production datapath calls `pin(...)` — augur-proxy has no
+/// DNS responder and the macOS filtering DNS is gvproxy's separate process — so this table
+/// is empty at runtime and IP-literal connects are denied unconditionally (fail-secure).
+/// It is retained as a tested scaffold (see `Filter.decide`); if a future datapath wires it
+/// up, that caller must keep the by-name `Allowlist.allows` re-validation.
+///
 /// Thread-safe: the DNS responder writes pins and connection handlers read them
 /// concurrently.
 public final class PinTable {

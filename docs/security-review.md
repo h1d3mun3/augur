@@ -62,9 +62,11 @@ Net: prioritize **L1** and **M3** (Axis B, premise-independent), then re-scope
   (`augur-proxy/Tests/AugurProxyCoreTests/SecurityTests.swift`).
 - **Label-anchored subdomain match.** `evilgithub.com` does not match
   `*.github.com` (`Allowlist.isSubdomain` boundary `.` check).
-- **IP-literal / ECH direct-connect blocked.** IP literals are only allowed via
-  the pin table (IPs the filtering DNS handed out for an allowed name); Docker
-  DNS points at TEST-NET (`192.0.2.1`) so DNS exfil fails closed.
+- **IP-literal / ECH direct-connect blocked.** IP literals are denied
+  unconditionally — the pin table that could re-allow a recently-resolved IP is a
+  tested-but-unwired scaffold (no production datapath populates it; see addendum
+  A4), so the decision is fail-secure. Docker DNS points at TEST-NET
+  (`192.0.2.1`) so DNS exfil fails closed.
 - **Fail-closed throughout.** SNI parse failure, unreachable upstream, and a
   failed `verify_egress_locked` self-test all deny / tear down. The self-test
   checks direct-hostname, direct-IP, DNS, and proxy reachability.
@@ -465,9 +467,9 @@ hardening note.
 
 ## Status — fixes applied
 
-A1, A2, and A3 are fixed on `fix/guest-host-audit-findings`
-(`augur` + `Dockerfile`); A4–A6 and the slug-collision note remain documented
-only. M2/M3 are unchanged and still complete.
+A1–A6 and the slug-collision note are addressed on `fix/guest-host-audit-findings`
+(`augur`, `Dockerfile`, `augur-proxy`, and the gvproxy patch). M2/M3 are unchanged
+and still complete.
 
 - **A1** — a new `conf_line_valid` validates every `./.augur.conf` line against the
   proxy's grammar (optional `*.`/`.` prefix + strict LDH host, **no byte outside
@@ -486,9 +488,36 @@ only. M2/M3 are unchanged and still complete.
   notice before the paste, and `save_oauth_token` now enforces length + a
   token-safe charset (no whitespace/control bytes). Residual: a fully host-side
   token flow would remove the guest-TTY trust entirely — noted as further work.
-- **A3** — Docker history now persists under `~/.augur/claude-projects/<slug>`
-  (outside `~/.claude/projects`), mirroring the macOS M2 layout, so host-side
-  Claude Code never enumerates or resumes guest-written transcripts. The container
-  still sees it at the cwd-derived path. (Pre-existing history under
-  `~/.claude/projects/-workspace-<slug>` is not migrated — not destroyed, just no
-  longer surfaced — matching how the macOS M2 fix handled the same move.)
+- **A3** — Docker history now persists under
+  `~/.augur/claude-projects/<slug>-<path-hash>` (outside `~/.claude/projects`),
+  mirroring the macOS M2 layout, so host-side Claude Code never enumerates or
+  resumes guest-written transcripts. The container still sees it at the cwd-derived
+  path. (Pre-existing history under `~/.claude/projects/-workspace-<slug>` is not
+  migrated — not destroyed, just no longer surfaced — matching how the macOS M2 fix
+  handled the same move.)
+- **A4** — reconciled code and docs: `Filter.decide` and `PinTable` now state that
+  no production datapath populates the pin table, so IP-literal connects are denied
+  **unconditionally** (fail-secure); the by-name re-validation is retained so a
+  future DNS→pin wiring stays safe. The "Strengths" bullet above is corrected.
+- **A5** — `gvproxy/augur-egress.patch` gains a hunk guarding `switch.go`'s
+  `rxBuf`: a runt (sub-14-byte) guest frame is dropped instead of panicking the
+  un-recovered rx goroutine. Verified the full patch still applies cleanly against
+  the pinned upstream commit (`git apply --check`). (Go toolchain absent here, so
+  not compile-tested; the change is a length guard using the already-imported
+  `header.EthernetMinimumSize`.)
+- **A6** — `isPrivateV4` now also rejects `224.0.0.0/4` (multicast) and
+  `192.88.99.0/24` (6to4 anycast), and treats all of `240/4`+`255/8` as non-public
+  (the prior `case 255` shadowed the reserved-range default). `publicOnly` stays on
+  in both modes. `swift build` + `swift test` pass; this branch also fixes a
+  pre-existing `testPinExpiry` timing bug (it advanced the clock past `ttl+grace`
+  but not past `pin()`'s `max(ttl,30)` floor, so the pin had not yet expired —
+  unrelated to A6).
+- **slug collision** — the `.augur.conf` approval fingerprint
+  (`project_conf_hash_file`) and the Docker history dir are now keyed on the full
+  workspace path (`<slug>-<path-hash>`), so a hostile repo sharing a basename with a
+  trusted project can neither inherit its egress approval nor cross-contaminate its
+  history. **Residual (documented):** the container/VM names, egress ports, and the
+  macOS project-VM identity remain basename-keyed, so two *simultaneously* running
+  same-basename projects still collide there — a functional limit (both are the
+  operator's own), not an Axis-B escalation; changing them would orphan existing
+  containers/VMs.

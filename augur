@@ -446,11 +446,28 @@ project_conf_invalid_count() {
     echo $((total - valid))
 }
 
-# Host-side record of approved project-conf fingerprints (TOFU). Under ~/.augur — NEVER
-# the project tree or a mounted share — so the guest cannot forge its own approval.
+# A short, stable hex digest of the FULL workspace path. Two different directories that
+# share a basename also share workspace_slug; this distinguishes them so security-sensitive
+# per-project host state — the .augur.conf approval fingerprint and the Docker history dir —
+# is never shared between an unrelated (possibly hostile) same-named project and a trusted
+# one. Display names, egress ports, and the in-container /workspace-<slug> path stay slug-based.
+workspace_path_hash() {
+    local h
+    if command -v sha256sum &>/dev/null; then
+        h="$(printf '%s' "$WORKSPACE_DIR" | sha256sum)"
+    else
+        h="$(printf '%s' "$WORKSPACE_DIR" | shasum -a 256)"
+    fi
+    echo "${h:0:12}"
+}
+
+# Host-side record of approved project-conf fingerprints (TOFU). Under ~/.augur — NEVER the
+# project tree or a mounted share — so the guest cannot forge its own approval. Keyed on the
+# FULL workspace path (slug + path hash), so a hostile repo that shares a basename with a
+# trusted project cannot inherit that project's egress approval (addendum: slug collision).
 project_conf_hash_file() {
     mkdir -p "$AUGUR_DIR/project-hashes"
-    echo "$AUGUR_DIR/project-hashes/$(workspace_slug)"
+    echo "$AUGUR_DIR/project-hashes/$(workspace_slug)-$(workspace_path_hash)"
 }
 
 project_conf_hash() {
@@ -870,7 +887,10 @@ cmd_up() {
     # could otherwise inject instructions into a higher-privilege host-side agent). The
     # container still sees it at the path Claude derives from its cwd (/workspace-<slug>).
     local claude_proj_dir="-workspace-$(workspace_slug)"
-    local host_hist_dir="$AUGUR_DIR/claude-projects/${claude_proj_dir}"
+    # Host source dir is keyed on the FULL path (slug + path hash) so two same-basename
+    # projects never share history; the CONTAINER path must stay the cwd-derived
+    # -workspace-<slug> Claude expects.
+    local host_hist_dir="$AUGUR_DIR/claude-projects/$(workspace_slug)-$(workspace_path_hash)"
     mkdir -p "$host_hist_dir"
     docker_args+=(-v "${host_hist_dir}:/home/dev/.claude/projects/${claude_proj_dir}")
 

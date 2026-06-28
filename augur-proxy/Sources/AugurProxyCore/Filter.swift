@@ -39,9 +39,13 @@ public final class Filter {
     public func decide(_ dest: Destination, client: String) -> Verdict {
         let list = currentList()
         if dest.isIPLiteral {
-            // An IP-literal connect is only allowed if the filtering DNS recently
-            // handed this client that exact IP for an allowed name (pin). Otherwise
-            // deny — this blocks IP-literal exfil and ECH-hidden direct connects.
+            // IP-literal connects are denied unless a live pin maps this exact IP (for this
+            // client) to an allowed name. NOTE: no production datapath populates the pin
+            // table today — augur-proxy runs no DNS responder, and the macOS filtering DNS
+            // is gvproxy's separate process — so in practice this branch ALWAYS denies
+            // (fail-secure: IP-literal exfil and ECH-hidden direct connects are blocked
+            // unconditionally). The pin lookup is kept as a tested scaffold; should a future
+            // datapath populate it, the `list.allows(domain)` re-check here keeps it safe.
             if let domain = pins.domain(forIP: dest.host, client: client), list.allows(domain) {
                 return .allow()
             }
