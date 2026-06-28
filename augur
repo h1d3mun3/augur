@@ -170,8 +170,8 @@ resolve_api_key() {
 save_oauth_token() {
     local token="$1" dest="$HOME/.claude_code_oauth_token"
     if [[ -z "$token" || "$token" != sk-ant-* ]]; then
-        error "Could not capture a token from 'claude setup-token'."
-        error "If it printed one (sk-ant-…), save it manually:"
+        error "No valid token saved (expected a value starting with sk-ant-…)."
+        error "If 'claude setup-token' printed one, save it manually:"
         error "  echo '<token>' > ${dest} && chmod 600 ${dest}"
         return 1
     fi
@@ -691,16 +691,16 @@ cmd_shell() {
 cmd_setup_token() {
     require_docker
     ensure_running
-    local cap="/tmp/augur-setup-token.$$"
     info "Running 'claude setup-token' in '${CONTAINER_NAME}'..."
-    info "Open the printed URL in your browser; paste the code back if prompted."
-    # Don't let an aborted/failed setup-token abort the script (set -e): fall through
-    # to the capture + fallback message below.
-    docker exec -it -e DISABLE_AUTOUPDATER=1 "$CONTAINER_NAME" \
-        bash -c "claude setup-token 2>&1 | tee '$cap'" || true
-    local token
-    token="$(docker exec "$CONTAINER_NAME" sh -c "grep -oE 'sk-ant-[A-Za-z0-9_-]+' '$cap' 2>/dev/null | tail -n1" || true)"
-    docker exec "$CONTAINER_NAME" rm -f "$cap" 2>/dev/null || true
+    info "Complete the browser sign-in; when it prints the token, copy it."
+    # Run attached straight to the terminal (no pipe). `claude setup-token` is a
+    # full-screen TUI; capturing its stdout forces a non-TTY and garbles the redraw,
+    # so we don't capture it — the token is pasted back here instead.
+    docker exec -it -e DISABLE_AUTOUPDATER=1 "$CONTAINER_NAME" claude setup-token || true
+    stty sane 2>/dev/null || true   # restore cooked mode if the TUI left the tty raw
+    echo ""
+    local token=""
+    read -rp "$(echo -e "${CYAN}[augur]${RESET} Paste the token (sk-ant-…) here to save it on the host: ")" token || true
     save_oauth_token "$token"
 }
 
@@ -1231,14 +1231,15 @@ cmd_setup_token_macos() {
     project_vm="$(macos_project_vm)"
     macos_vm_running "$project_vm" || cmd_up_macos
     ensure_macos_claude_bin "$project_vm"
-    local cap="/tmp/augur-setup-token.$$"
     info "Running 'claude setup-token' in '${project_vm}'..."
-    info "Open the printed URL in your browser; paste the code back if prompted."
-    # Don't let an aborted/failed setup-token abort the script (set -e).
-    ssh_macos "$project_vm" -t "zsh -l -c 'claude setup-token 2>&1 | tee \"$cap\"'" || true
-    local token
-    token="$(ssh_macos "$project_vm" "grep -oE 'sk-ant-[A-Za-z0-9_-]+' '$cap' 2>/dev/null | tail -n1" || true)"
-    ssh_macos "$project_vm" "rm -f '$cap'" 2>/dev/null || true
+    info "Complete the browser sign-in; when it prints the token, copy it."
+    # Run attached to the terminal (no pipe) so the full-screen TUI renders cleanly;
+    # the token is pasted back here instead of being captured.
+    ssh_macos "$project_vm" -t "zsh -l -c 'claude setup-token'" || true
+    stty sane 2>/dev/null || true   # restore cooked mode if the TUI left the tty raw
+    echo ""
+    local token=""
+    read -rp "$(echo -e "${CYAN}[augur]${RESET} Paste the token (sk-ant-…) here to save it on the host: ")" token || true
     save_oauth_token "$token"
 }
 

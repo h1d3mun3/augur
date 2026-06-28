@@ -147,8 +147,9 @@ absent from a freshly cloned VM. So macOS mode injects a credential through the 
 every `up` (the same way it does for the GitHub token):
 
 - `CLAUDE_CODE_OAUTH_TOKEN` — subscription token; either set the env var / save it to
-  `~/.claude_code_oauth_token`, or run **`augur setup-token`** to generate one inside the guest
-  and save it on the host automatically (no need to install Claude Code on the host).
+  `~/.claude_code_oauth_token`, or run **`augur setup-token`**: it runs `claude setup-token`
+  inside the guest (so you don't install Claude Code on the host), then you paste the token
+  back once and augur saves it to `~/.claude_code_oauth_token`.
 - `ANTHROPIC_API_KEY` — Console API key (env or `~/.anthropic_api_key`). Takes priority if both are set.
 
 ### File access
