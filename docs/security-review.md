@@ -463,8 +463,32 @@ hardening note.
   the host bridge — Axis A (informational) on a single-user host, as already
   noted for L3.
 
-## Status
+## Status — fixes applied
 
-These are documented here as an addendum only; code fixes for A1–A3 are tracked
-separately. M2/M3 remain complete; A3 narrows a Docker-mode residual that the
-macOS M2 fix already closed on its side.
+A1, A2, and A3 are fixed on `fix/guest-host-audit-findings`
+(`augur` + `Dockerfile`); A4–A6 and the slug-collision note remain documented
+only. M2/M3 are unchanged and still complete.
+
+- **A1** — a new `conf_line_valid` validates every `./.augur.conf` line against the
+  proxy's grammar (optional `*.`/`.` prefix + strict LDH host, **no byte outside
+  `[A-Za-z0-9.*-]`**); `project_conf_domains` now drops any line that fails it, so
+  escape/control bytes can never reach the terminal. The approval prompt and
+  `status` render with `printf '%s'` (not `echo -e`) and report the count of
+  dropped lines as a red flag. `write_merged_allowlist` writes the **sanitized**
+  project patterns into the host allowlist, so "what the operator saw" == "what the
+  proxy honors". Verified: a conf carrying a hidden `\e[1A\e[2K` line drops that
+  whole line (0 ESC bytes reach output) while clean LDH patterns pass unchanged.
+- **A2** — `setup-token` no longer trusts the guest's `claude` blindly. Docker:
+  the image pins `DISABLE_AUTOUPDATER=1` and augur refuses to run if the
+  container's `claude` differs from the image's pristine copy
+  (`verify_docker_claude_pristine`). macOS: augur refuses unless the guest binary
+  is Anthropic-signed (`verify_macos_claude_signed`). Both modes show a security
+  notice before the paste, and `save_oauth_token` now enforces length + a
+  token-safe charset (no whitespace/control bytes). Residual: a fully host-side
+  token flow would remove the guest-TTY trust entirely — noted as further work.
+- **A3** — Docker history now persists under `~/.augur/claude-projects/<slug>`
+  (outside `~/.claude/projects`), mirroring the macOS M2 layout, so host-side
+  Claude Code never enumerates or resumes guest-written transcripts. The container
+  still sees it at the cwd-derived path. (Pre-existing history under
+  `~/.claude/projects/-workspace-<slug>` is not migrated — not destroyed, just no
+  longer surfaced — matching how the macOS M2 fix handled the same move.)

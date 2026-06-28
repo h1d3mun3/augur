@@ -32,6 +32,12 @@ RUN _installer=$(mktemp) \
     && bash "$_installer" stable \
     && rm -f "$_installer"
 ENV PATH=/home/dev/.local/bin:$PATH
+# Pin the Claude binary: never auto-update it at runtime. The binary lives in the
+# agent-writable ~/.local/bin, and `augur setup-token` attaches it to the operator's
+# terminal — so augur verifies it against this image before that flow. Disabling the
+# autoupdater keeps the on-disk binary byte-identical to the image (no false positives
+# in that check) and removes the binary's ability to rewrite itself.
+ENV DISABLE_AUTOUPDATER=1
 
 # Pre-create the per-project history dir (dev-owned) and seed a minimal
 # ~/.claude.json. augur bind-mounts ONLY ~/.claude/projects/-workspace-<slug>
