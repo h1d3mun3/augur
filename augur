@@ -555,10 +555,15 @@ start_gvproxy() {
     #   reach the VM (it has no host-routable IP behind gvproxy's user-space net).
     # --dns-allowlist: only resolve names in the same merged allowlist used for
     #   connections, so DNS-resolvable == connection-allowed (closes DNS-exfil).
+    # AUGUR_DEBUG=1 makes gvproxy log every frame/DHCP/ARP event — needed to tell a
+    # silent guest (no frames) apart from a wrong-IP guest (DHCP served, not .2).
+    local gvp_debug=()
+    [[ "${AUGUR_DEBUG:-}" == "1" ]] && gvp_debug=(--debug)
     "$gvp" --listen-vfkit "unixgram://${sock}" \
            --socks-upstream "127.0.0.1:${AUGUR_PROXY_SOCKS_PORT}" \
            --dns-allowlist "$(proxy_allowlist)" \
            --ssh-port "$AUGUR_SSH_FWD_PORT" \
+           ${gvp_debug[@]+"${gvp_debug[@]}"} \
            --deny-direct &>"$(gvproxy_log)" &
     echo $! > "$pidfile"
     disown
