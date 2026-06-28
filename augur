@@ -84,6 +84,69 @@ success() { echo -e "${GREEN}[augur]${RESET} $*"; }
 warn()    { echo -e "${YELLOW}[augur]${RESET} $*"; }
 error()   { echo -e "${RED}[augur]${RESET} $*" >&2; }
 
+# ══ AGENT SEAM (AUGUR_AGENT_SEAM) ═══════════════════════════════════════════════
+# Anti-Corruption Layer between augur (the sandbox) and the coding agent it runs.
+# Today the ONLY agent is Claude Code. Every Claude-/Anthropic-specific value and
+# command is funneled through the agent_* functions below (plus a few in-place
+# members tagged `AUGUR_AGENT_SEAM` where extraction would change behavior, and
+# markers in Dockerfile / augur.conf). A future swap is then one discoverable change
+# surface: `grep -rn AUGUR_AGENT_SEAM`.
+#
+# DESIGN RULE — do not break: the agent side only DECLARES DATA; the sandbox core
+# (cmd_up, the egress/proxy stack, the mount keying, resolve_api_key injection) OWNS
+# and ENFORCES every security mechanism. Adding a second agent must NOT move a control
+# out of the core. See docs/swappable-agent-abstraction-design.md (§5).
+# ────────────────────────────────────────────────────────────────────────────────
+
+# Human-facing product name (info/help text only). DATA.
+agent_display_name() { echo "Claude Code"; }
+
+# Guest CLI binary / command name. DATA.
+agent_cli_name() { echo "claude"; }
+
+# Interactive launch argv (space-separated tokens). DATA.
+# CONTRACT (C4): on macOS this is interpolated into an SSH remote-command string. It is
+#   a single constant token today (safe). BEFORE it becomes variable per agent, add a
+#   metachar/control-byte reject guard and pass argv via printf %q (docs §4 C4). Docker
+#   passes it as an argv array to `docker exec` — safe by construction.
+agent_launch_argv() { echo "claude"; }
+
+# Credential-capture / login subcommand argv. DATA.
+agent_login_argv() { echo "claude setup-token"; }
+
+# Non-secret agent env set at exec/launch (space-separated KEY=VALUE tokens). DATA.
+agent_fixed_env() { echo "DISABLE_AUTOUPDATER=1"; }
+
+# Command that prints the agent version, for `augur status`. DATA.
+agent_version_cmd() { echo "claude --version"; }
+
+# Credential specs, one per line: GUEST_ENV|HOST_ENV|HOST_FILE|VALIDATOR. DATA.
+# The core (cmd_up / cmd_up_macos) resolves each via resolve_api_key and injects ONLY
+# these NAMED vars — never the wholesale host env, never a mounted credential store.
+# CONTRACT (C3): VALIDATOR is the per-value check a FUTURE multi-agent build must run on
+#   every resolved value before it is interpolated into a shell / sourced file. It is
+#   'none' here to preserve current behavior byte-for-byte (today only the setup-token
+#   capture path validates, via save_oauth_token). See docs §4 C3.
+# CONTRACT (precedence): both are injected; the agent applies the official
+#   ANTHROPIC_API_KEY > CLAUDE_CODE_OAUTH_TOKEN precedence when both are set.
+agent_auth_specs() {
+    echo "ANTHROPIC_API_KEY|ANTHROPIC_API_KEY|$HOME/.anthropic_api_key|none"
+    echo "CLAUDE_CODE_OAUTH_TOKEN|CLAUDE_CODE_OAUTH_TOKEN|$HOME/.claude_code_oauth_token|none"
+}
+
+# Per-project history/state layout. DATA only — the KEYING discipline (host source keyed
+# on slug+path-hash, kept OUTSIDE the host's own agent tree, scoped to the current project)
+# lives in the CORE (cmd_up). CONTRACT (A3/C7): a future agent whose state dir is flat (no
+# cwd fan-out) or colocated with its credential file must still be hash-keyed and must never
+# mount its credential store. See docs §4 C7.
+agent_state_host_subdir()        { echo "claude-projects"; }              # dir under $AUGUR_DIR (both modes)
+agent_state_guest_projects_dir() { echo "/home/dev/.claude/projects"; }   # Docker: guest parent dir
+agent_state_guest_leaf()         { echo "-workspace-$1"; }                # Docker: leaf name from slug ($1)
+# Integrity gate (agent_verify_integrity_docker/_macos), save_oauth_token,
+# setup_token_security_notice and the macOS state/install helpers are tagged
+# AUGUR_AGENT_SEAM in place. Egress baseline is file-based: see augur.conf.
+# ══ end AGENT SEAM ══════════════════════════════════════════════════════════════
+
 workspace_slug() {
     local dir_name
     dir_name="$(basename "$WORKSPACE_DIR")"
@@ -179,6 +242,9 @@ resolve_api_key() {
 # Persist a captured Claude subscription token to the host token file augur reads on
 # every `up` (resolve_api_key picks it up as CLAUDE_CODE_OAUTH_TOKEN). Validates the
 # shape and writes it 0600. The host never needs claude installed for this.
+# AUGUR_AGENT_SEAM | token persistence — Claude-specific shape (sk-ant-*) + dest file. CONTRACT (C3):
+# this charset/length check is the only credential validator today; generalize it to every agent's
+# resolved credential value before broadening agent_auth_specs. See docs §4 C3.
 save_oauth_token() {
     local token="$1" dest="$HOME/.claude_code_oauth_token"
     # Validate the shape conservatively: the sk-ant- prefix, a sane length, and only
@@ -204,6 +270,7 @@ save_oauth_token() {
 # and the guest's `claude` binary is guest-writable — so a compromised guest could present
 # a lookalike sign-in pointing at an attacker's OAuth flow (addendum A2). Warn before the
 # host persists and replays whatever is pasted into every future guest.
+# AUGUR_AGENT_SEAM | operator warning before pasting a token (mentions the genuine claude.ai flow).
 setup_token_security_notice() {
     warn "Heads-up: this token comes from 'claude setup-token' running INSIDE the guest."
     warn "Only paste it if the sign-in you completed was the genuine ${BOLD}claude.ai${RESET} flow."
@@ -215,7 +282,8 @@ setup_token_security_notice() {
 # it to the operator's TTY (addendum A2) we confirm it was not tampered with. The image
 # disables the autoupdater, so a mismatch means modification, not version drift; a freshly
 # `up`-ped container matches, a reused one a prior session tampered with does not.
-verify_docker_claude_pristine() {
+# AUGUR_AGENT_SEAM | integrity-verify (Docker) — A2 gate before TTY attach; see docs §4 C2.
+agent_verify_integrity_docker() {
     local img_hash cont_hash
     img_hash="$(docker run --rm "$IMAGE_NAME" sh -c 'sha256sum "$(readlink -f "$(command -v claude)")"' 2>/dev/null | awk '{print $1}')"
     cont_hash="$(docker exec "$CONTAINER_NAME" sh -c 'sha256sum "$(readlink -f "$(command -v claude)")"' 2>/dev/null | awk '{print $1}')"
@@ -225,7 +293,8 @@ verify_docker_claude_pristine() {
 # True iff the guest VM's `claude` binary is Anthropic-signed (the same signer the base-VM
 # build pins). The binary is guest-writable, so re-checking here refuses to run setup-token
 # against a tampered lookalike that would phish the token on the operator's TTY (addendum A2).
-verify_macos_claude_signed() {
+# AUGUR_AGENT_SEAM | integrity-verify (macOS) — A2 gate; codesign signer (provenance), see docs §4 C2.
+agent_verify_integrity_macos() {
     ssh_macos "$1" 'codesign -dvv "$HOME/.local/bin/claude" 2>&1 | grep -qi "Anthropic"'
 }
 
@@ -867,11 +936,15 @@ cmd_up() {
     # otherwise the subscription token (run `claude setup-token` once on the host,
     # or place it in ~/.claude_code_oauth_token). Mirrors macOS VM mode and keeps
     # the guest off the host's ~/.claude entirely.
-    local anthropic_key claude_oauth_token
-    anthropic_key="$(resolve_api_key "${ANTHROPIC_API_KEY:-}" "$HOME/.anthropic_api_key")"
-    claude_oauth_token="$(resolve_api_key "${CLAUDE_CODE_OAUTH_TOKEN:-}" "$HOME/.claude_code_oauth_token")"
-    [[ -n "$anthropic_key" ]]      && docker_args+=(-e "ANTHROPIC_API_KEY=${anthropic_key}")
-    [[ -n "$claude_oauth_token" ]] && docker_args+=(-e "CLAUDE_CODE_OAUTH_TOKEN=${claude_oauth_token}")
+    # AUGUR_AGENT_SEAM | auth injection — core enforces named-only (never wholesale host env,
+    # never a mounted credential store); the agent only DECLARES the names + host sources
+    # (agent_auth_specs). CONTRACT (C3): a future multi-agent build validates each value here.
+    local _genv _henv _hfile _hvalidator _aval
+    while IFS='|' read -r _genv _henv _hfile _hvalidator; do
+        [[ -z "$_genv" ]] && continue
+        _aval="$(resolve_api_key "${!_henv:-}" "$_hfile")"
+        [[ -n "$_aval" ]] && docker_args+=(-e "${_genv}=${_aval}")
+    done < <(agent_auth_specs)
 
     # Persist ONLY this project's Claude history, not the whole ~/.claude. Claude
     # keys history by cwd (the container runs in /workspace-<slug>, which Claude
@@ -886,13 +959,14 @@ cmd_up() {
     # host's own Claude Code never enumerates or resumes guest-forged transcripts (which
     # could otherwise inject instructions into a higher-privilege host-side agent). The
     # container still sees it at the path Claude derives from its cwd (/workspace-<slug>).
-    local claude_proj_dir="-workspace-$(workspace_slug)"
-    # Host source dir is keyed on the FULL path (slug + path hash) so two same-basename
-    # projects never share history; the CONTAINER path must stay the cwd-derived
-    # -workspace-<slug> Claude expects.
-    local host_hist_dir="$AUGUR_DIR/claude-projects/$(workspace_slug)-$(workspace_path_hash)"
+    # AUGUR_AGENT_SEAM | history mount — core OWNS the keying/scope (host source keyed on the
+    # FULL path = slug + path hash, so two same-basename projects never share history, kept
+    # OUTSIDE the host's own agent tree); the agent only DECLARES its guest paths. See docs §4 C7.
+    local agent_proj_leaf host_hist_dir
+    agent_proj_leaf="$(agent_state_guest_leaf "$(workspace_slug)")"
+    host_hist_dir="$AUGUR_DIR/$(agent_state_host_subdir)/$(workspace_slug)-$(workspace_path_hash)"
     mkdir -p "$host_hist_dir"
-    docker_args+=(-v "${host_hist_dir}:/home/dev/.claude/projects/${claude_proj_dir}")
+    docker_args+=(-v "${host_hist_dir}:$(agent_state_guest_projects_dir)/${agent_proj_leaf}")
 
     [[ -f "$HOME/.gitconfig" ]] && docker_args+=(-v "${HOME}/.gitconfig:/home/dev/.gitconfig:ro")
 
@@ -942,8 +1016,13 @@ cmd_up() {
 cmd_claude() {
     require_docker
     ensure_running
-    info "Launching Claude Code in '${CONTAINER_NAME}'..."
-    docker exec -it -e DISABLE_AUTOUPDATER=1 "$CONTAINER_NAME" claude
+    info "Launching $(agent_display_name) in '${CONTAINER_NAME}'..."
+    # AUGUR_AGENT_SEAM | interactive launch (Docker: argv array — safe by construction)
+    local _env=() _argv=() kv
+    for kv in $(agent_fixed_env); do _env+=(-e "$kv"); done
+    read -ra _argv <<< "$(agent_launch_argv)"
+    # empty-safe expansion (bash 3.2 + set -u) so a future agent_fixed_env="" can't crash this
+    docker exec -it ${_env[@]+"${_env[@]}"} "$CONTAINER_NAME" ${_argv[@]+"${_argv[@]}"}
 }
 
 cmd_shell() {
@@ -968,18 +1047,23 @@ cmd_setup_token() {
     # attaches that binary to the operator's TTY. Refuse if it differs from the image's
     # pristine copy — a freshly-upped container matches; a reused one tampered with by a
     # prior session does not (recreate to get a clean binary).
-    if ! verify_docker_claude_pristine; then
+    if ! agent_verify_integrity_docker; then
         error "The claude binary in '${CONTAINER_NAME}' differs from the image — it may have been modified by the guest."
         error "Recreate a clean container first: ${BOLD}augur down && augur up${RESET}, then re-run setup-token."
         if $started_here; then cmd_down; fi
         return 1
     fi
-    info "Running 'claude setup-token' in '${CONTAINER_NAME}'..."
+    info "Running '$(agent_login_argv)' in '${CONTAINER_NAME}'..."
     info "Complete the browser sign-in; when it prints the token, copy it."
     # Run attached straight to the terminal (no pipe). `claude setup-token` is a
     # full-screen TUI; capturing its stdout forces a non-TTY and garbles the redraw,
     # so we don't capture it — the token is pasted back here instead.
-    docker exec -it -e DISABLE_AUTOUPDATER=1 "$CONTAINER_NAME" claude setup-token || true
+    # AUGUR_AGENT_SEAM | login launch (Docker: argv array)
+    local _lenv=() _largv=() kv
+    for kv in $(agent_fixed_env); do _lenv+=(-e "$kv"); done
+    read -ra _largv <<< "$(agent_login_argv)"
+    # empty-safe expansion (bash 3.2 + set -u)
+    docker exec -it ${_lenv[@]+"${_lenv[@]}"} "$CONTAINER_NAME" ${_largv[@]+"${_largv[@]}"} || true
     stty sane 2>/dev/null || true   # restore cooked mode if the TUI left the tty raw
     echo ""
     setup_token_security_notice
@@ -1021,7 +1105,9 @@ docker_toolchain_versions() {
         return 0
     fi
     "${runner[@]}" swift --version 2>/dev/null || echo "    swift:  (unable to fetch)"
-    "${runner[@]}" claude --version 2>/dev/null || echo "    claude: (unable to fetch)"
+    # AUGUR_AGENT_SEAM | agent version probe
+    local _vcmd=(); read -ra _vcmd <<< "$(agent_version_cmd)"
+    "${runner[@]}" ${_vcmd[@]+"${_vcmd[@]}"} 2>/dev/null || echo "    $(agent_cli_name): (unable to fetch)"
     "${runner[@]}" gh --version 2>/dev/null | head -1 || echo "    gh:     (unable to fetch)"
 }
 
@@ -1275,6 +1361,7 @@ cmd_build_macos() {
         # and gh respects GH_TOKEN automatically, so installing the binary is all that is needed for
         # an authenticated gh (no hosts.yml / Keychain handling required). See cmd_up_macos.
         brew install gh
+        # AUGUR_AGENT_SEAM | macOS base-VM agent install + provenance (codesign signer). See docs §4 C2.
         # Claude Code: do NOT use npm. The npm-distributed native binary arrives with a code
         # signature that gets corrupted during tar extraction, so Apple Silicon AMFI kills it
         # on launch (SIGKILL / "zsh: killed"). The official installer downloads a correctly
@@ -1358,6 +1445,9 @@ ensure_macos_workspace() {
 # ~/.claude/projects aren't auto-listed (they are not destroyed, just not surfaced here). Whatever
 # subdir name Claude derives from the guest cwd lands inside the shared parent, so no path-encoding
 # assumption is needed. Auth is NOT shared (see the ~/.claude note above). Idempotent.
+# AUGUR_AGENT_SEAM | macOS state symlink — in-VM agent projects dir → shared share.
+# CONTRACT (A3/C7): the share name MUST equal agent_state_host_subdir; the in-VM path is
+# the agent's projects dir. Keep both in lockstep when swapping agents. See docs §4 C7.
 ensure_macos_claude_projects() {
     local vm="$1"
     ssh_macos "$vm" '
@@ -1369,6 +1459,7 @@ ensure_macos_claude_projects() {
     '
 }
 
+# AUGUR_AGENT_SEAM | macOS agent install / self-heal (official installer into ~/.local/bin).
 ensure_macos_claude_bin() {
     local vm="$1"
     # Claude is installed via the official installer into ~/.local/bin (see cmd_build_macos).
@@ -1421,7 +1512,8 @@ cmd_up_macos() {
     mkdir -p "$HOME/.config/gh"
     # Per-VM isolated history parent (NOT the host's shared ~/.claude/projects): the
     # guest only ever sees its own project's transcripts, never other projects'.
-    mkdir -p "$AUGUR_DIR/claude-projects/$project_vm"
+    # AUGUR_AGENT_SEAM | per-VM history parent (share dir name = agent_state_host_subdir)
+    mkdir -p "$AUGUR_DIR/$(agent_state_host_subdir)/$project_vm"
     info "Starting VM '${project_vm}'..."
     info "Mounting: ${BOLD}${WORKSPACE_DIR}${RESET} → ~/${MACOS_SHARE}"
     # A GUI window (--gui) and headless mode build the same VM (same NAT networking and
@@ -1454,7 +1546,7 @@ cmd_up_macos() {
         ${net_args[@]+"${net_args[@]}"} \
         --dir="${MACOS_SHARE}:${WORKSPACE_DIR}" \
         --dir="gh-config:${HOME}/.config/gh:ro" \
-        --dir="claude-projects:${AUGUR_DIR}/claude-projects/${project_vm}" \
+        --dir="$(agent_state_host_subdir):${AUGUR_DIR}/$(agent_state_host_subdir)/${project_vm}" \
         "$project_vm" &>"$(macos_vm_log)" &
     disown
 
@@ -1504,16 +1596,21 @@ cmd_up_macos() {
     # unreadable over SSH, so we inject a token via the environment instead.
     # Precedence (official): ANTHROPIC_API_KEY > CLAUDE_CODE_OAUTH_TOKEN — if both are set the
     # API key wins. Provide either via env or a file (~/.anthropic_api_key / ~/.claude_code_oauth_token).
-    local anthropic_key claude_oauth_token gh_token
-    anthropic_key="$(resolve_api_key "${ANTHROPIC_API_KEY:-}" "$HOME/.anthropic_api_key")"
-    claude_oauth_token="$(resolve_api_key "${CLAUDE_CODE_OAUTH_TOKEN:-}" "$HOME/.claude_code_oauth_token")"
+    # AUGUR_AGENT_SEAM | auth injection — core enforces named-only; the agent DECLARES names +
+    # host sources (agent_auth_specs). CONTRACT (C3): these values are interpolated into a SOURCED
+    # shell file; a future multi-agent build must validate each value (reject quotes/control bytes)
+    # before this point. See docs §4 C3.
+    local gh_token _genv _henv _hfile _hvalidator _aval
     gh_token="$(gh auth token 2>/dev/null || true)"
     {
         echo '# augur (regenerated at VM startup)'
         echo 'eval "$(/opt/homebrew/bin/brew shellenv)" 2>/dev/null || true'
         echo 'export PATH="$HOME/.local/bin:$PATH"   # claude (official installer)'
-        [[ -n "$anthropic_key" ]]      && echo "export ANTHROPIC_API_KEY='${anthropic_key}'"
-        [[ -n "$claude_oauth_token" ]] && echo "export CLAUDE_CODE_OAUTH_TOKEN='${claude_oauth_token}'"
+        while IFS='|' read -r _genv _henv _hfile _hvalidator; do
+            [[ -z "$_genv" ]] && continue
+            _aval="$(resolve_api_key "${!_henv:-}" "$_hfile")"
+            [[ -n "$_aval" ]] && echo "export ${_genv}='${_aval}'"
+        done < <(agent_auth_specs)
         [[ -n "$gh_token" ]]           && echo "export GH_TOKEN='${gh_token}'"
     } | ssh_macos "$project_vm" "cat > /Users/${MACOS_SSH_USER}/.augur-env && chmod 600 /Users/${MACOS_SSH_USER}/.augur-env"
     ssh_macos "$project_vm" \
@@ -1542,8 +1639,11 @@ cmd_claude_macos() {
     ensure_macos_workspace "$project_vm"
     ensure_macos_claude_projects "$project_vm"
     ensure_macos_claude_bin "$project_vm"
-    info "Launching Claude Code in '${project_vm}'..."
-    ssh_macos "$project_vm" -t "zsh -l -c 'cd ~/${MACOS_SHARE} && DISABLE_AUTOUPDATER=1 claude'"
+    info "Launching $(agent_display_name) in '${project_vm}'..."
+    # AUGUR_AGENT_SEAM | interactive launch (macOS: interpolated into SSH string — see C4 on agent_launch_argv)
+    local _renv _rargv
+    _renv="$(agent_fixed_env)"; _rargv="$(agent_launch_argv)"
+    ssh_macos "$project_vm" -t "zsh -l -c 'cd ~/${MACOS_SHARE} && ${_renv} ${_rargv}'"
 }
 
 cmd_shell_macos() {
@@ -1572,17 +1672,18 @@ cmd_setup_token_macos() {
     # A2: the guest is root and can replace its claude binary; setup-token attaches it to
     # the operator's TTY. Refuse an unsigned/lookalike binary (the build pins the Anthropic
     # signer) — a tampered one could phish the token flow.
-    if ! verify_macos_claude_signed "$project_vm"; then
+    if ! agent_verify_integrity_macos "$project_vm"; then
         error "The guest's claude binary is not Anthropic-signed — refusing to run setup-token (it may have been tampered with)."
         error "Recreate the VM: ${BOLD}augur destroy --macos && augur up --macos${RESET}, then re-run setup-token."
         if $started_here; then cmd_down_macos; fi
         return 1
     fi
-    info "Running 'claude setup-token' in '${project_vm}'..."
+    info "Running '$(agent_login_argv)' in '${project_vm}'..."
     info "Complete the browser sign-in; when it prints the token, copy it."
     # Run attached to the terminal (no pipe) so the full-screen TUI renders cleanly;
     # the token is pasted back here instead of being captured.
-    ssh_macos "$project_vm" -t "zsh -l -c 'claude setup-token'" || true
+    # AUGUR_AGENT_SEAM | login launch (macOS: interpolated into SSH string — see C4)
+    ssh_macos "$project_vm" -t "zsh -l -c '$(agent_login_argv)'" || true
     stty sane 2>/dev/null || true   # restore cooked mode if the TUI left the tty raw
     echo ""
     setup_token_security_notice
@@ -1685,6 +1786,7 @@ cmd_status_macos() {
         # SSH runs a non-login shell, so ~/.zprofile (where the build pins DEVELOPER_DIR)
         # is not sourced. Pin it here too so xcodebuild uses the full Xcode install instead
         # of the CLT, which would otherwise fail and show "(unable to fetch)".
+        # AUGUR_AGENT_SEAM | agent version (macOS, in-VM; runs `claude --version`)
         ssh_macos "$project_vm" '
             eval "$(/opt/homebrew/bin/brew shellenv)" 2>/dev/null
             export PATH="$HOME/.local/bin:$PATH"
@@ -1840,6 +1942,7 @@ cmd_help() {
     echo -e "                       default: ${CYAN}iOS${RESET} — comma-separated (e.g. ${CYAN}iOS,watchOS${RESET}) or ${CYAN}all${RESET}"
     echo ""
     echo -e "  ${BOLD}ENVIRONMENT${RESET}"
+    # AUGUR_AGENT_SEAM | agent credential env-var docs (mirror agent_auth_specs)
     echo -e "    ANTHROPIC_API_KEY        Anthropic API key (or ~/.anthropic_api_key)"
     echo -e "    CLAUDE_CODE_OAUTH_TOKEN  Claude subscription token (or ~/.claude_code_oauth_token; run: augur setup-token)"
     echo -e "    SWIFT_VERSION            Default Swift version (default: latest)"

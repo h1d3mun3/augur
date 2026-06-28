@@ -17,6 +17,7 @@ RUN apt-get update \
 # Create non-root user (no sudo — the agent runs as dev with no elevated privileges)
 RUN useradd -m -u 1001 -s /bin/bash dev
 
+# AUGUR_AGENT_SEAM | agent install (Docker image). Swap installer + pin per agent. See docs §4 C2.
 # Install Claude Code via the official native installer so installMethod matches
 # the host's (the shared ~/.claude.json reports "native"). The AMFI code-signing
 # issue that forces native on macOS does not apply to Linux; native is used here
@@ -37,6 +38,7 @@ ENV PATH=/home/dev/.local/bin:$PATH
 # terminal — so augur verifies it against this image before that flow. Disabling the
 # autoupdater keeps the on-disk binary byte-identical to the image (no false positives
 # in that check) and removes the binary's ability to rewrite itself.
+# AUGUR_AGENT_SEAM | agent fixed env (mirror agent_fixed_env). Pins the binary (no self-rewrite).
 ENV DISABLE_AUTOUPDATER=1
 
 # Pre-create the per-project history dir (dev-owned) and seed a minimal
@@ -48,6 +50,7 @@ ENV DISABLE_AUTOUPDATER=1
 # minimal ~/.claude.json skips onboarding WITHOUT copying the host's real config
 # (which enumerates every project on the host). Auth is injected via env
 # (CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY), never mounted.
+# AUGUR_AGENT_SEAM | agent state seed — pre-create the per-project history parent + minimal config.
 RUN mkdir -p /home/dev/.claude/projects \
     && printf '{"hasCompletedOnboarding":true,"installMethod":"native"}\n' > /home/dev/.claude.json
 
