@@ -836,7 +836,11 @@ cmd_shell() {
 # headless: it prints a URL to open in any browser; paste the code back here.
 cmd_setup_token() {
     require_docker
-    ensure_running
+    # Auto-start a container if none is running, and tear it back down afterward, so
+    # this command leaves no stray container/proxy. The token is saved to the host
+    # for future `up`s regardless; an already-running container is left untouched.
+    local started_here=false
+    if ! container_running; then cmd_up; started_here=true; fi
     info "Running 'claude setup-token' in '${CONTAINER_NAME}'..."
     info "Complete the browser sign-in; when it prints the token, copy it."
     # Run attached straight to the terminal (no pipe). `claude setup-token` is a
@@ -847,7 +851,11 @@ cmd_setup_token() {
     echo ""
     local token=""
     read -rp "$(echo -e "${CYAN}[augur]${RESET} Paste the token (sk-ant-…) here to save it on the host: ")" token || true
-    save_oauth_token "$token"
+    local rc=0
+    save_oauth_token "$token" || rc=1
+    # Restore the prior state even if the save failed.
+    if $started_here; then cmd_down; fi
+    return $rc
 }
 
 cmd_down() {
@@ -1421,7 +1429,11 @@ cmd_setup_token_macos() {
     require_vz
     local project_vm
     project_vm="$(macos_project_vm)"
-    macos_vm_running "$project_vm" || cmd_up_macos
+    # Auto-start the VM if it isn't running, and stop it again afterward, so this
+    # command leaves the VM as it found it (the CoW clone is kept, costs ~0). An
+    # already-running VM is left untouched.
+    local started_here=false
+    if ! macos_vm_running "$project_vm"; then cmd_up_macos; started_here=true; fi
     ensure_macos_claude_bin "$project_vm"
     info "Running 'claude setup-token' in '${project_vm}'..."
     info "Complete the browser sign-in; when it prints the token, copy it."
@@ -1432,7 +1444,11 @@ cmd_setup_token_macos() {
     echo ""
     local token=""
     read -rp "$(echo -e "${CYAN}[augur]${RESET} Paste the token (sk-ant-…) here to save it on the host: ")" token || true
-    save_oauth_token "$token"
+    local rc=0
+    save_oauth_token "$token" || rc=1
+    # Restore the prior state even if the save failed.
+    if $started_here; then cmd_down_macos; fi
+    return $rc
 }
 
 cmd_down_macos() {
