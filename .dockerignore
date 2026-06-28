@@ -1,0 +1,23 @@
+# Docker build context trimming.
+#
+# `augur build` runs `docker build "$SCRIPT_DIR"`, where $SCRIPT_DIR is the install dir
+# (~/.augur) for an installed augur, or this repo for a dev build. The Dockerfile installs
+# everything over the network (it has NO COPY/ADD), so the build context is UNUSED — yet
+# Docker still tars the whole dir and ships it to the daemon. Without this file the macOS
+# VM disk images under ~/.augur/vms (tens of GB) get swept in, ballooning the context to
+# 17 GB+. Excluding augur's runtime state and build artifacts keeps it to a few hundred bytes.
+
+# augur runtime state (installed layout under ~/.augur)
+vms/
+claude-projects/
+proxy/
+*.img
+
+# build artifacts (repo + staged sidecar source)
+.build/
+**/.build/
+
+# vcs / editor cruft
+.git/
+.DS_Store
+**/.DS_Store
