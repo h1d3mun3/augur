@@ -1120,6 +1120,12 @@ cmd_up_macos() {
     if ! macos_vm_exists "$project_vm"; then
         info "Cloning base VM to '${project_vm}'..."
         "$VM_CLI" clone "$MACOS_BASE_VM" "$project_vm"
+        # A fresh clone gets a fresh SSH host key. The egress SSH target is a fixed
+        # 127.0.0.1:<fwd-port>, so a pinned key from a previous clone of the same
+        # project would mismatch and StrictHostKeyChecking=accept-new would reject it
+        # (the connection reaches sshd but is refused — looks like an SSH timeout).
+        # Drop the stale pin so the new key is accepted on first connect.
+        rm -f "$(vm_known_hosts_file "$project_vm")"
     fi
 
     mkdir -p "$HOME/.config/gh"
@@ -1161,6 +1167,10 @@ cmd_up_macos() {
         # but is unreachable via SSH most often because gvproxy crashed or the guest
         # never got its address — both show up in these logs.
         error "Diagnostics (kept on disk):"
+        # One probe with stderr shown — the wait loop suppresses it, which hides the
+        # common cases (a changed/pinned host key, or auth failure) behind the timeout.
+        error "  ---- ssh probe (stderr) ----"
+        ssh_macos "$project_vm" true 2>&1 | head -n 6 | while IFS= read -r _l; do error "  | $_l"; done || true
         error "  VM log:      $(macos_vm_log)"
         if egress_enabled; then
             error "  gvproxy log: $(gvproxy_log)"
@@ -1301,6 +1311,9 @@ cmd_destroy_macos() {
     info "Stopping and removing VM '${project_vm}'..."
     "$VM_CLI" stop "$project_vm" 2>/dev/null || true
     "$VM_CLI" delete "$project_vm"
+    # Drop the pinned SSH host key so the next clone (which will have a new key) is
+    # not rejected against this project's fixed 127.0.0.1:<fwd-port> egress target.
+    rm -f "$(vm_known_hosts_file "$project_vm")"
     success "VM '${project_vm}' has been removed."
 }
 
