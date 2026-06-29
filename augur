@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # augur - Run AI coding agents in an isolated environment
-#   Docker mode (default): lightweight Linux container
+#   Container mode (default): lightweight Linux container. The backend ("engine") is
+#     Apple Container (`container`) on macOS 26+ when installed, else Docker (`docker`).
+#     Both speak a near-identical CLI; the few differences are absorbed by the engine
+#     abstraction below (see "Container engine abstraction").
 #   macOS VM mode (--macos): macOS VM with full Xcode support
 
 set -euo pipefail
@@ -107,8 +110,8 @@ agent_cli_name() { echo "claude"; }
 # Interactive launch argv (space-separated tokens). DATA.
 # CONTRACT (C4): on macOS this is interpolated into an SSH remote-command string. It is
 #   a single constant token today (safe). BEFORE it becomes variable per agent, add a
-#   metachar/control-byte reject guard and pass argv via printf %q (docs §4 C4). Docker
-#   passes it as an argv array to `docker exec` — safe by construction.
+#   metachar/control-byte reject guard and pass argv via printf %q (docs §4 C4). The
+#   container engines pass it as an argv array to `<engine> exec` — safe by construction.
 agent_launch_argv() { echo "claude"; }
 
 # Credential-capture / login subcommand argv. DATA.
@@ -142,10 +145,106 @@ agent_auth_specs() {
 agent_state_host_subdir()        { echo "claude-projects"; }              # dir under $AUGUR_DIR (both modes)
 agent_state_guest_projects_dir() { echo "/home/dev/.claude/projects"; }   # Docker: guest parent dir
 agent_state_guest_leaf()         { echo "-workspace-$1"; }                # Docker: leaf name from slug ($1)
-# Integrity gate (agent_verify_integrity_docker/_macos), save_oauth_token,
+# Integrity gate (agent_verify_integrity_engine/_macos), save_oauth_token,
 # setup_token_security_notice and the macOS state/install helpers are tagged
 # AUGUR_AGENT_SEAM in place. Egress baseline is file-based: see augur.conf.
 # ══ end AGENT SEAM ══════════════════════════════════════════════════════════════
+
+# ══ Container engine abstraction ═════════════════════════════════════════════════
+# augur's default (non --macos) mode runs the agent in a Linux container. Two engines
+# can host that container:
+#   • docker     — Docker Engine / Desktop. Works on Linux and macOS. The original backend.
+#   • container  — Apple Container (github.com/apple/container). macOS 26+ only; runs each
+#                  container in its own lightweight Linux VM. Selected automatically on a
+#                  macOS 26+ host when the `container` CLI is installed.
+#
+# The two CLIs are deliberately close: `run`, `exec`, `build`, `start`, `image inspect`,
+# and `network create --internal --subnet …` are byte-identical in the argv augur builds,
+# so those go through `eng` (just the engine binary). The handful of real differences are
+# wrapped: daemon health, container listing/status (Docker Go-templates vs Apple JSON),
+# `rm -f` vs `delete --force`, and `network rm` vs `network delete`. The egress datapath
+# differs more substantially (Docker sidecar vs Apple host-only proxy) and is branched on
+# $ENGINE at its call sites (see the egress sections).
+#
+# Override the auto-selection with AUGUR_ENGINE=docker|container.
+# ─────────────────────────────────────────────────────────────────────────────────
+
+# macOS product major version (e.g. 26 for Tahoe), or 0 when not on macOS / unknown.
+macos_major() {
+    [[ "$(uname)" == "Darwin" ]] || { echo 0; return; }
+    local v maj
+    v="$(sw_vers -productVersion 2>/dev/null)"
+    maj="${v%%.*}"
+    # Default to 0 when sw_vers yields nothing, so the caller's `(( … >= 26 ))` always has
+    # a numeric operand (an empty value would be an arithmetic syntax error).
+    echo "${maj:-0}"
+}
+
+# Pick the container engine: an explicit override wins; otherwise prefer Apple Container
+# on macOS 26+ when its CLI is present (its multi-container networking — needed for the
+# egress path — exists only on macOS 26 / Tahoe), and fall back to Docker everywhere else.
+detect_engine() {
+    case "${AUGUR_ENGINE:-}" in
+        docker|container) echo "$AUGUR_ENGINE"; return ;;
+    esac
+    if [[ "$(uname)" == "Darwin" ]] && (( $(macos_major) >= 26 )) && command -v container &>/dev/null; then
+        echo "container"
+    else
+        echo "docker"
+    fi
+}
+
+# Engine binary for the subcommands whose argv is identical across docker and Apple
+# `container` (run/exec/build/start/image inspect/network create/network inspect).
+eng() { "$ENGINE" "$@"; }
+
+# Human label for messages.
+engine_label() { [[ "$ENGINE" == "container" ]] && echo "Apple Container" || echo "Docker"; }
+
+# Is the engine installed and its service reachable? Docker needs a running daemon; Apple
+# Container needs its launchd apiserver, which we transparently start (no sudo) if down.
+engine_ready() {
+    case "$ENGINE" in
+        docker)
+            command -v docker &>/dev/null || { error "Docker is not installed or not in PATH."; return 1; }
+            docker info &>/dev/null      || { error "Docker daemon is not running."; return 1; }
+            ;;
+        container)
+            command -v container &>/dev/null || {
+                error "Apple Container (the 'container' CLI) is not installed or not in PATH."
+                error "Install it from https://github.com/apple/container, or set ${BOLD}AUGUR_ENGINE=docker${RESET}."
+                return 1
+            }
+            if ! container system status &>/dev/null; then
+                info "Starting the Apple Container service (container system start)..."
+                container system start &>/dev/null || true
+                container system status &>/dev/null || {
+                    error "The Apple Container service is not running and could not be started."
+                    error "Start it manually: ${BOLD}container system start${RESET}."
+                    return 1
+                }
+            fi
+            ;;
+    esac
+}
+
+# `<engine> rm -f` ⇒ Docker; `container delete --force` ⇒ Apple (which spells removal
+# "delete", with "rm" as an alias, and uses --force to drop a still-running container).
+engine_rm_force() {
+    case "$ENGINE" in
+        docker)    docker rm -f "$@" ;;
+        container) container delete --force "$@" ;;
+    esac
+}
+
+# Network removal: Docker "network rm", Apple "network delete" (alias "rm", no --force).
+engine_network_rm() {
+    case "$ENGINE" in
+        docker)    docker network rm "$@" ;;
+        container) container network delete "$@" ;;
+    esac
+}
+# ══ end Container engine abstraction ═════════════════════════════════════════════
 
 workspace_slug() {
     local dir_name
@@ -164,12 +263,26 @@ make_workspace_mount() {
     echo "/workspace-$(workspace_slug)"
 }
 
+# Docker enumerates names with a Go template; Apple Container has no `ps` and no
+# Go-template --format, so we inspect the container by name and read its status from the
+# JSON. We extract the FIRST "status":"…" field (the inspected container's own top-level
+# status — it precedes any nested config) rather than substring-matching the whole document,
+# so an embedded value can't false-positive. `container inspect` exits non-zero when the
+# name doesn't exist, which doubles as the existence check.
 container_running() {
-    docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$CONTAINER_NAME"
+    case "$ENGINE" in
+        docker)    docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$CONTAINER_NAME" ;;
+        container) container inspect "$CONTAINER_NAME" 2>/dev/null \
+                       | grep -oE '"status"[[:space:]]*:[[:space:]]*"[A-Za-z]+"' | head -n1 \
+                       | grep -q '"running"' ;;
+    esac
 }
 
 container_exists() {
-    docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$CONTAINER_NAME"
+    case "$ENGINE" in
+        docker)    docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$CONTAINER_NAME" ;;
+        container) container inspect "$CONTAINER_NAME" &>/dev/null ;;
+    esac
 }
 
 # True if the running container was created from a different image than the tag
@@ -178,31 +291,33 @@ container_exists() {
 # detected here; recreating is the safe reset for both.) Fails closed to "not
 # outdated" if either id can't be read, so it never blocks a normal `up`.
 container_image_outdated() {
+    # Docker exposes the running container's image id and the tag's current id via
+    # Go-template inspect, so we can compare them. Apple Container's inspect JSON shape
+    # for these ids isn't pinned, so the container engine fails closed to "not outdated"
+    # (return 1) — the same safe default this function already uses when an id can't be
+    # read, so a normal `up` is never blocked.
+    [[ "$ENGINE" == "docker" ]] || return 1
     local running current
     running="$(docker inspect -f '{{.Image}}' "$CONTAINER_NAME" 2>/dev/null)" || return 1
     current="$(docker image inspect -f '{{.Id}}' "$IMAGE_NAME" 2>/dev/null)" || return 1
     [[ -n "$running" && -n "$current" && "$running" != "$current" ]]
 }
 
-require_docker() {
-    if ! command -v docker &>/dev/null; then
-        error "Docker is not installed or not in PATH."
-        exit 1
-    fi
-    if ! docker info &>/dev/null; then
-        error "Docker daemon is not running."
-        exit 1
-    fi
+require_engine() {
+    engine_ready || exit 1
 }
 
 ensure_image() {
-    if ! docker image inspect "$IMAGE_NAME" &>/dev/null; then
-        info "Docker image '${IMAGE_NAME}' not found. Building..."
+    if ! eng image inspect "$IMAGE_NAME" &>/dev/null; then
+        info "$(engine_label) image '${IMAGE_NAME}' not found. Building..."
         cmd_build
     fi
 }
 
 warn_if_image_stale() {
+    # Docker-only nicety: Apple Container's image-inspect timestamp field isn't pinned,
+    # so skip the staleness hint there (the explicit `augur update` still works).
+    [[ "$ENGINE" == "docker" ]] || return 0
     local created created_epoch now_epoch age_days
     created=$(docker image inspect --format '{{.Created}}' "$IMAGE_NAME" 2>/dev/null) || return 0
     if created_epoch=$(date -d "$created" +%s 2>/dev/null); then
@@ -221,7 +336,7 @@ ensure_running() {
     if ! container_running; then
         if container_exists; then
             info "Container exists but is stopped. Starting it..."
-            docker start "$CONTAINER_NAME" &>/dev/null
+            eng start "$CONTAINER_NAME" &>/dev/null
         else
             warn "No container found for this directory."
             warn "Run ${BOLD}augur up${RESET} first."
@@ -282,11 +397,12 @@ setup_token_security_notice() {
 # it to the operator's TTY (addendum A2) we confirm it was not tampered with. The image
 # disables the autoupdater, so a mismatch means modification, not version drift; a freshly
 # `up`-ped container matches, a reused one a prior session tampered with does not.
-# AUGUR_AGENT_SEAM | integrity-verify (Docker) — A2 gate before TTY attach; see docs §4 C2.
-agent_verify_integrity_docker() {
+# AUGUR_AGENT_SEAM | integrity-verify (container engine) — A2 gate before TTY attach; see docs §4 C2.
+# Engine-agnostic: `run --rm` and `exec` are identical argv on Docker and Apple Container.
+agent_verify_integrity_engine() {
     local img_hash cont_hash
-    img_hash="$(docker run --rm "$IMAGE_NAME" sh -c 'sha256sum "$(readlink -f "$(command -v claude)")"' 2>/dev/null | awk '{print $1}')"
-    cont_hash="$(docker exec "$CONTAINER_NAME" sh -c 'sha256sum "$(readlink -f "$(command -v claude)")"' 2>/dev/null | awk '{print $1}')"
+    img_hash="$(eng run --rm "$IMAGE_NAME" sh -c 'sha256sum "$(readlink -f "$(command -v claude)")"' 2>/dev/null | awk '{print $1}')"
+    cont_hash="$(eng exec "$CONTAINER_NAME" sh -c 'sha256sum "$(readlink -f "$(command -v claude)")"' 2>/dev/null | awk '{print $1}')"
     [[ -n "$img_hash" && "$img_hash" == "$cont_hash" ]]
 }
 
@@ -659,20 +775,34 @@ stop_proxy() {
     rm -f "$pidfile" 2>/dev/null || true
 }
 
-# ── Docker egress topology (no host sudo; enforced by Docker's network layer) ──
+# ── Container-engine egress topology (no host sudo) ───────────────────────────
+# Two datapaths, one goal — the agent's ONLY way out is augur-proxy's allowlist:
+#
+#   Docker:  agent on a --internal network (no route to host OR internet) + a proxy
+#            SIDECAR dual-homed on that network and a bridge. The sidecar is the agent's
+#            only reachable peer, and the bridge is its egress. Airtight by construction.
+#
+#   Apple:   Apple Container can't dual-home a container (no --ip, no repeated --network,
+#            no `network connect`), so the sidecar model is impossible. Instead we use the
+#            fact that Apple's --internal is "host-only": the guest can reach the HOST (but
+#            not the internet). augur-proxy runs ON THE HOST (the same native binary macOS
+#            VM mode uses), and the agent's HTTP_PROXY points at the host-only gateway.
+#            TRADE-OFF: host-only also lets the agent reach other host services bound to
+#            0.0.0.0 — weaker than Docker's airtight sidecar. Closing that needs host pf
+#            rules (sudo), which augur deliberately avoids, so it's documented, not enforced.
 
 egress_network_name() { echo "augur-$(workspace_slug)-net"; }
 egress_sidecar_name() { echo "augur-$(workspace_slug)-proxy"; }
 
-# The agent's --internal network: no route to the host or the internet (Docker
-# installs no MASQUERADE/forward rules). A per-project subnet gives the sidecar a stable
-# IP the agent points HTTPS_PROXY at.
+# The agent's --internal network. On Docker this severs host AND internet; on Apple it is
+# "host-only" (host reachable, internet severed). `network inspect` / `network create
+# --internal --subnet` are identical argv across engines, so both go through `eng`.
 ensure_egress_network() {
     local net; net="$(egress_network_name)"
-    if ! docker network inspect "$net" &>/dev/null; then
+    if ! eng network inspect "$net" &>/dev/null; then
         info "Creating internal egress network '${net}' (${AUGUR_INTERNAL_SUBNET})..."
         local err
-        if ! err="$(docker network create --internal --subnet "$AUGUR_INTERNAL_SUBNET" "$net" 2>&1)"; then
+        if ! err="$(eng network create --internal --subnet "$AUGUR_INTERNAL_SUBNET" "$net" 2>&1)"; then
             error "Failed to create egress network '${net}': ${err}"
             # The subnet is derived per-project, but a hash collision (or a leftover
             # network from another project) can still overlap. Override with a free one:
@@ -682,10 +812,34 @@ ensure_egress_network() {
     fi
 }
 
-# Build the Linux augur-proxy the sidecar runs (the host binary is for macOS and is
+# The address the agent points HTTP_PROXY at: the dual-homed sidecar's fixed IP (Docker)
+# or the host-only network's gateway = the host where augur-proxy listens (Apple).
+egress_proxy_url() {
+    case "$ENGINE" in
+        docker)    echo "http://${AUGUR_SIDECAR_IP}:${AUGUR_PROXY_HTTP_PORT}" ;;
+        container) echo "http://$(container_egress_gateway):${AUGUR_PROXY_HTTP_PORT}" ;;
+    esac
+}
+
+# Apple host-only gateway (where the host-side proxy is reachable from the guest). Prefer
+# the address the engine actually assigned (network inspect), fall back to the first usable
+# address of our subnet, and allow an explicit override.
+# VALIDATE on macOS 26: confirm this is the reachable host gateway for a host-only network.
+container_egress_gateway() {
+    [[ -n "${AUGUR_CONTAINER_GATEWAY:-}" ]] && { echo "$AUGUR_CONTAINER_GATEWAY"; return; }
+    local gw
+    # `|| true`: a no-match grep makes the pipeline exit nonzero under pipefail, which would
+    # abort this plain assignment under set -e — fall through to the computed default instead.
+    gw="$(container network inspect "$(egress_network_name)" 2>/dev/null \
+          | grep -oE '"gateway"[^,}]*' | grep -oE '[0-9]+(\.[0-9]+){3}' | head -1 || true)"
+    [[ -n "$gw" ]] && { echo "$gw"; return; }
+    echo "172.31.${_augur_subnet_third}.$(( _augur_subnet_fourth + 1 ))"
+}
+
+# Build the Linux augur-proxy the DOCKER sidecar runs (the host binary is for macOS and is
 # the wrong architecture/OS for a container). Built once via the augur image (which
 # carries the Swift toolchain); the .build dir is a host mount so the binary lands
-# on the host fs. Idempotent.
+# on the host fs. Idempotent. (Apple mode uses the HOST proxy, so it never calls this.)
 ensure_linux_proxy() {
     [[ -x "$AUGUR_PROXY_LINUX" ]] && return 0
     [[ -d "$AUGUR_PROXY_SRC" ]] || {
@@ -700,7 +854,7 @@ ensure_linux_proxy() {
     # → the host file. Avoids host-mount write/permission issues. augur-proxy has no
     # dependencies, so the build needs no network.
     mkdir -p "$AUGUR_DIR"
-    docker run --rm -v "${AUGUR_PROXY_SRC}:/src:ro" "$IMAGE_NAME" \
+    eng run --rm -v "${AUGUR_PROXY_SRC}:/src:ro" "$IMAGE_NAME" \
         sh -c 'cp -a /src /tmp/aps && cd /tmp/aps && swift build -c release 1>&2 && cat .build/release/augur-proxy' \
         > "$AUGUR_PROXY_LINUX"
     if [[ ! -s "$AUGUR_PROXY_LINUX" ]]; then
@@ -710,7 +864,7 @@ ensure_linux_proxy() {
     chmod +x "$AUGUR_PROXY_LINUX"
 }
 
-# Start the proxy sidecar: dual-homed on the agent's internal network (fixed IP) and
+# Start the Docker proxy sidecar: dual-homed on the agent's internal network (fixed IP) and
 # a normal bridge for egress. Runs the Linux augur-proxy (mounted) with the merged
 # allowlist (mounted read-only). The agent reaches it at AUGUR_SIDECAR_IP.
 start_sidecar() {
@@ -734,41 +888,73 @@ stop_sidecar() {
     docker rm -f "$(egress_sidecar_name)" &>/dev/null || true
 }
 
-# Boot self-test: prove the agent can ONLY egress via the sidecar. Direct (proxy-less)
-# requests must fail; a request THROUGH the sidecar must get an HTTP response.
+# Bring up the egress datapath for the current engine. Docker: sidecar on the internal
+# network. Apple: the host-side augur-proxy, reached over the host-only network. Both end
+# with the agent able to egress ONLY through augur-proxy's allowlist.
+start_egress() {
+    ensure_egress_network
+    case "$ENGINE" in
+        docker)
+            ensure_linux_proxy
+            start_sidecar
+            ;;
+        container)
+            # Reuse the host-side proxy macOS VM mode runs. Bind 0.0.0.0 so the guest can
+            # reach it over the host-only network's gateway (the host interface IP isn't
+            # known to exist until a container attaches, so we don't bind it specifically).
+            start_proxy "0.0.0.0"
+            ;;
+    esac
+}
+
+# Tear down the egress datapath (safe no-ops if it was never up).
+stop_egress() {
+    case "$ENGINE" in
+        docker)    stop_sidecar ;;
+        container) stop_proxy ;;
+    esac
+    engine_network_rm "$(egress_network_name)" &>/dev/null || true
+}
+
+# Boot self-test: prove the agent can ONLY egress via the proxy. Direct (proxy-less)
+# requests must fail; a request THROUGH the proxy must get an HTTP response. Engine-agnostic
+# (`exec` is identical argv); only the proxy URL differs (sidecar IP vs host-only gateway).
 verify_egress_locked() {
     info "Running egress self-test..."
-    local leaked=false
-    # Direct egress (no proxy) on the internal network must fail — hostname and IP.
-    if docker exec -e HTTP_PROXY= -e HTTPS_PROXY= -e http_proxy= -e https_proxy= -e NO_PROXY="*" \
-        "$CONTAINER_NAME" sh -c 'curl -s --max-time 6 -o /dev/null https://example.com' 2>/dev/null; then
-        leaked=true; error "Self-test: the container reached the internet directly (not isolated)."
-    fi
-    if docker exec -e HTTP_PROXY= -e HTTPS_PROXY= -e http_proxy= -e https_proxy= -e NO_PROXY="*" \
-        "$CONTAINER_NAME" sh -c 'curl -s --max-time 6 -o /dev/null https://1.1.1.1' 2>/dev/null; then
-        leaked=true; error "Self-test: the container reached a public IP directly (not isolated)."
-    fi
-    # External DNS must fail closed (resolver points at an unreachable address).
-    if docker exec "$CONTAINER_NAME" sh -c 'getent hosts dns-leak-probe.example' &>/dev/null; then
+    local leaked=false purl; purl="$(egress_proxy_url)"
+    # Direct egress (no proxy) must fail. The hostname probe also catches a working resolver,
+    # but on the Apple path DNS is closed by --no-dns, so it can pass without proving routing
+    # is severed. The IP-LITERAL probes are what actually test raw routing — use several
+    # distinct public anycast addresses on both :443 and :80 so a single blackholed/rerouted
+    # IP can't make a routable network look isolated. ANY success is a leak.
+    local _probe
+    for _probe in https://example.com https://1.1.1.1 https://8.8.8.8 http://1.1.1.1 http://8.8.8.8; do
+        if eng exec -e HTTP_PROXY= -e HTTPS_PROXY= -e http_proxy= -e https_proxy= -e NO_PROXY="*" \
+            "$CONTAINER_NAME" sh -c "curl -s --max-time 6 -o /dev/null ${_probe}" 2>/dev/null; then
+            leaked=true; error "Self-test: the container reached ${_probe} directly (not isolated)."
+        fi
+    done
+    # External DNS must fail closed (Docker: resolver at an unreachable address; Apple: --no-dns).
+    if eng exec "$CONTAINER_NAME" sh -c 'getent hosts dns-leak-probe.example' &>/dev/null; then
         leaked=true; error "Self-test: the container resolved an external name (DNS not fail-closed)."
     fi
-    # The sidecar proxy MUST be reachable: a request through it (even a 403 deny) must
-    # return an HTTP status, not a connection failure. curl prints 000 on failure.
+    # The proxy MUST be reachable: a request through it (even a 403 deny) must return an HTTP
+    # status, not a connection failure. curl prints 000 (and exits nonzero) on failure, so
+    # `|| true` keeps the failure on the fail-closed branch below instead of aborting under set -e.
     local pcode
-    pcode="$(docker exec "$CONTAINER_NAME" sh -c \
-        "curl -s -o /dev/null -w '%{http_code}' --max-time 8 -x 'http://${AUGUR_SIDECAR_IP}:${AUGUR_PROXY_HTTP_PORT}' http://egress-proxy-probe.invalid/" 2>/dev/null)"
+    pcode="$(eng exec "$CONTAINER_NAME" sh -c \
+        "curl -s -o /dev/null -w '%{http_code}' --max-time 8 -x '${purl}' http://egress-proxy-probe.invalid/" 2>/dev/null || true)"
     if [[ -z "$pcode" || "$pcode" == "000" ]]; then
         leaked=true
-        error "Self-test: the egress proxy sidecar (${AUGUR_SIDECAR_IP}:${AUGUR_PROXY_HTTP_PORT}) is not reachable."
+        error "Self-test: the egress proxy (${purl}) is not reachable."
     fi
     if $leaked; then
         error "Egress self-test FAILED — refusing to continue. Tearing down."
-        docker rm -f "$CONTAINER_NAME" &>/dev/null || true
-        stop_sidecar
-        docker network rm "$(egress_network_name)" &>/dev/null || true
+        engine_rm_force "$CONTAINER_NAME" &>/dev/null || true
+        stop_egress
         exit 1
     fi
-    success "Egress self-test passed: the sidecar is the agent's only egress; only allowlisted domains are reachable."
+    success "Egress self-test passed: the proxy is the agent's only egress; only allowlisted domains are reachable."
 }
 
 # ── macOS egress datapath (VZFileHandle + gvproxy) ────────────────────────────
@@ -850,17 +1036,19 @@ stop_gvproxy() {
     rm -f "$pidfile" "$(gvproxy_socket)" 2>/dev/null || true
 }
 
-# ── Docker mode commands ──────────────────────────────────────────────────────
+# ── Container mode commands (engine: docker or Apple container) ────────────────
 
 cmd_build() {
-    require_docker
-    info "Building Docker image '${IMAGE_NAME}' (Swift ${SWIFT_IMAGE_TAG})..."
-    docker build --build-arg SWIFT_VERSION="${SWIFT_IMAGE_TAG}" -t "$IMAGE_NAME" "$SCRIPT_DIR"
+    require_engine
+    info "Building $(engine_label) image '${IMAGE_NAME}' (Swift ${SWIFT_IMAGE_TAG})..."
+    # `build --build-arg … -t … <ctx>` is identical argv on both engines (both read the
+    # Dockerfile in the context; Apple's BuildKit-based builder honors .dockerignore too).
+    eng build --build-arg SWIFT_VERSION="${SWIFT_IMAGE_TAG}" -t "$IMAGE_NAME" "$SCRIPT_DIR"
     success "Image '${IMAGE_NAME}' built successfully."
 }
 
 cmd_up() {
-    require_docker
+    require_engine
     ensure_image
     warn_if_image_stale
 
@@ -876,7 +1064,7 @@ cmd_up() {
                     return 0
                 fi
                 info "Recreating '${CONTAINER_NAME}'..."
-                docker rm -f "$CONTAINER_NAME" &>/dev/null || true
+                engine_rm_force "$CONTAINER_NAME" &>/dev/null || true
                 # fall through to recreate with the current image and mounts
             else
                 warn "Run ${BOLD}augur down && augur up${RESET} to recreate. Leaving it running."
@@ -894,12 +1082,14 @@ cmd_up() {
 
     if container_exists; then
         info "Removing stale container '${CONTAINER_NAME}'..."
-        docker rm -f "$CONTAINER_NAME" &>/dev/null
+        engine_rm_force "$CONTAINER_NAME" &>/dev/null
     fi
 
     info "Starting container '${CONTAINER_NAME}'..."
     info "Mounting: ${BOLD}${WORKSPACE_DIR}${RESET} → ${WORKSPACE_MOUNT}"
 
+    # `run -dit -v -e -w --network --cap-drop` is identical argv on Docker and Apple
+    # `container`; only the egress DNS flags differ (handled in the egress block below).
     local docker_args=(
         run -dit
         --name "$CONTAINER_NAME"
@@ -907,28 +1097,32 @@ cmd_up() {
         -w "${WORKSPACE_MOUNT}"
     )
 
-    # Egress allowlist: put the agent on an internal network (no route to the host
-    # or the internet) with NET_ADMIN dropped so the root agent can't re-route, and
-    # point all egress at the proxy SIDECAR (the agent's only reachable peer). No
-    # host sudo required. The sidecar enforces the allowlist and egresses for it.
+    # Egress allowlist: put the agent on an --internal network with NET_ADMIN dropped so
+    # the root agent can't re-route, and point all egress at augur-proxy (Docker: the
+    # dual-homed SIDECAR; Apple: the HOST proxy reached over the host-only gateway). No
+    # host sudo required. The proxy enforces the allowlist and egresses for the agent.
     if egress_enabled; then
-        ensure_egress_network
-        ensure_linux_proxy
-        start_sidecar
-        local proxy_url="http://${AUGUR_SIDECAR_IP}:${AUGUR_PROXY_HTTP_PORT}"
+        start_egress
+        local proxy_url; proxy_url="$(egress_proxy_url)"
         docker_args+=(
             --network "$(egress_network_name)"
             --cap-drop NET_ADMIN
             -e "HTTP_PROXY=${proxy_url}"  -e "http_proxy=${proxy_url}"
             -e "HTTPS_PROXY=${proxy_url}" -e "https_proxy=${proxy_url}"
             -e "NO_PROXY=localhost,127.0.0.1" -e "no_proxy=localhost,127.0.0.1"
-            # Resolver points at an unreachable address (RFC 5737 TEST-NET-1):
-            # external DNS fails closed (the agent reaches the sidecar by IP and
-            # proxies by name, so it needs no working external DNS). Closes DNS-exfil.
-            --dns 192.0.2.1
-            --dns-search .
         )
-        info "Egress restricted to allowlisted domains (sidecar: ${BOLD}${proxy_url}${RESET})."
+        # External DNS must fail closed — the agent reaches the proxy by IP and proxies by
+        # name, so it needs no working external resolver. This shuts DNS-exfil. Docker:
+        # point the resolver at an unreachable RFC 5737 TEST-NET-1 address. Apple: --no-dns
+        # injects no resolver at all (and the host-only network has no external DNS anyway).
+        # VALIDATE on macOS 26: confirm --no-dns leaves no usable resolver (empty
+        # /etc/resolv.conf), not the host's nameservers reachable via the host-only gateway.
+        # Either way verify_egress_locked's getent probe fails the boot self-test if it doesn't.
+        case "$ENGINE" in
+            docker)    docker_args+=(--dns 192.0.2.1 --dns-search .) ;;
+            container) docker_args+=(--no-dns) ;;
+        esac
+        info "Egress restricted to allowlisted domains (proxy: ${BOLD}${proxy_url}${RESET})."
     fi
 
     # Claude auth via env only — the host's credential store is never mounted into
@@ -994,13 +1188,10 @@ cmd_up() {
 
     docker_args+=("$IMAGE_NAME" bash)
 
-    if ! docker "${docker_args[@]}" &>/dev/null; then
+    if ! eng "${docker_args[@]}" &>/dev/null; then
         error "Failed to start the container."
-        # Don't leave a started sidecar / internal network orphaned.
-        if egress_enabled; then
-            stop_sidecar
-            docker network rm "$(egress_network_name)" &>/dev/null || true
-        fi
+        # Don't leave a started proxy / internal network orphaned.
+        if egress_enabled; then stop_egress; fi
         exit 1
     fi
 
@@ -1014,22 +1205,22 @@ cmd_up() {
 }
 
 cmd_claude() {
-    require_docker
+    require_engine
     ensure_running
     info "Launching $(agent_display_name) in '${CONTAINER_NAME}'..."
-    # AUGUR_AGENT_SEAM | interactive launch (Docker: argv array — safe by construction)
+    # AUGUR_AGENT_SEAM | interactive launch (engine `exec`: argv array — safe by construction)
     local _env=() _argv=() kv
     for kv in $(agent_fixed_env); do _env+=(-e "$kv"); done
     read -ra _argv <<< "$(agent_launch_argv)"
     # empty-safe expansion (bash 3.2 + set -u) so a future agent_fixed_env="" can't crash this
-    docker exec -it ${_env[@]+"${_env[@]}"} "$CONTAINER_NAME" ${_argv[@]+"${_argv[@]}"}
+    eng exec -it ${_env[@]+"${_env[@]}"} "$CONTAINER_NAME" ${_argv[@]+"${_argv[@]}"}
 }
 
 cmd_shell() {
-    require_docker
+    require_engine
     ensure_running
     info "Opening bash shell in '${CONTAINER_NAME}'..."
-    docker exec -it "$CONTAINER_NAME" bash
+    eng exec -it "$CONTAINER_NAME" bash
 }
 
 # Generate a long-lived Claude subscription token by running `claude setup-token`
@@ -1037,7 +1228,7 @@ cmd_shell() {
 # host for augur to inject. setup-token uses a copy-the-code OAuth flow that works
 # headless: it prints a URL to open in any browser; paste the code back here.
 cmd_setup_token() {
-    require_docker
+    require_engine
     # Auto-start a container if none is running, and tear it back down afterward, so
     # this command leaves no stray container/proxy. The token is saved to the host
     # for future `up`s regardless; an already-running container is left untouched.
@@ -1047,7 +1238,7 @@ cmd_setup_token() {
     # attaches that binary to the operator's TTY. Refuse if it differs from the image's
     # pristine copy — a freshly-upped container matches; a reused one tampered with by a
     # prior session does not (recreate to get a clean binary).
-    if ! agent_verify_integrity_docker; then
+    if ! agent_verify_integrity_engine; then
         error "The claude binary in '${CONTAINER_NAME}' differs from the image — it may have been modified by the guest."
         error "Recreate a clean container first: ${BOLD}augur down && augur up${RESET}, then re-run setup-token."
         if $started_here; then cmd_down; fi
@@ -1058,12 +1249,12 @@ cmd_setup_token() {
     # Run attached straight to the terminal (no pipe). `claude setup-token` is a
     # full-screen TUI; capturing its stdout forces a non-TTY and garbles the redraw,
     # so we don't capture it — the token is pasted back here instead.
-    # AUGUR_AGENT_SEAM | login launch (Docker: argv array)
+    # AUGUR_AGENT_SEAM | login launch (engine `exec`: argv array)
     local _lenv=() _largv=() kv
     for kv in $(agent_fixed_env); do _lenv+=(-e "$kv"); done
     read -ra _largv <<< "$(agent_login_argv)"
     # empty-safe expansion (bash 3.2 + set -u)
-    docker exec -it ${_lenv[@]+"${_lenv[@]}"} "$CONTAINER_NAME" ${_largv[@]+"${_largv[@]}"} || true
+    eng exec -it ${_lenv[@]+"${_lenv[@]}"} "$CONTAINER_NAME" ${_largv[@]+"${_largv[@]}"} || true
     stty sane 2>/dev/null || true   # restore cooked mode if the TUI left the tty raw
     echo ""
     setup_token_security_notice
@@ -1077,29 +1268,28 @@ cmd_setup_token() {
 }
 
 cmd_down() {
-    require_docker
+    require_engine
     if container_exists; then
         info "Stopping and removing container '${CONTAINER_NAME}'..."
-        docker rm -f "$CONTAINER_NAME" &>/dev/null
+        engine_rm_force "$CONTAINER_NAME" &>/dev/null
         success "Container '${CONTAINER_NAME}' has been stopped and removed."
     else
         warn "No container found for this directory (${CONTAINER_NAME})."
     fi
     # Always tear down egress (safe no-ops if it was never enabled) so a stranded
-    # sidecar/network from a crashed or out-of-band-removed container is cleaned up.
-    stop_sidecar
-    docker network rm "$(egress_network_name)" &>/dev/null || true
+    # proxy/network from a crashed or out-of-band-removed container is cleaned up.
+    stop_egress
 }
 
 # Print the container toolchain WITHOUT building anything — status inspects only what
 # already exists. Prefer the running container (the exact env Claude runs in), fall back
 # to a one-shot run against the built image, and note when nothing is built yet.
-docker_toolchain_versions() {
+engine_toolchain_versions() {
     local runner
     if container_running; then
-        runner=(docker exec "$CONTAINER_NAME")
-    elif docker image inspect "$IMAGE_NAME" &>/dev/null; then
-        runner=(docker run --rm "$IMAGE_NAME")
+        runner=(eng exec "$CONTAINER_NAME")
+    elif eng image inspect "$IMAGE_NAME" &>/dev/null; then
+        runner=(eng run --rm "$IMAGE_NAME")
     else
         echo -e "    ${YELLOW}(image not built — run: augur up)${RESET}"
         return 0
@@ -1111,15 +1301,25 @@ docker_toolchain_versions() {
     "${runner[@]}" gh --version 2>/dev/null | head -1 || echo "    gh:     (unable to fetch)"
 }
 
+# Is the egress proxy up? Docker runs it as the sidecar container; Apple as the host proxy.
+egress_proxy_running() {
+    case "$ENGINE" in
+        docker)    docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$(egress_sidecar_name)" ;;
+        container) proxy_running ;;
+    esac
+}
+
 cmd_status() {
-    require_docker
+    require_engine
+    echo -e "${BOLD}Engine:${RESET}     $(engine_label) (${ENGINE})"
     echo -e "${BOLD}Container:${RESET}  ${CONTAINER_NAME}"
     echo -e "${BOLD}Directory:${RESET}  ${WORKSPACE_DIR}"
     echo -e "${BOLD}Image:${RESET}      ${IMAGE_NAME}"
     if egress_enabled; then
-        local estate="${RED}stopped${RESET}"
-        docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$(egress_sidecar_name)" && estate="${GREEN}running${RESET}"
-        echo -e "${BOLD}Egress:${RESET}     ${GREEN}on${RESET} (allowlist; sidecar ${estate})"
+        local estate="${RED}stopped${RESET}" ekind="sidecar"
+        [[ "$ENGINE" == "container" ]] && ekind="host proxy"
+        egress_proxy_running && estate="${GREEN}running${RESET}"
+        echo -e "${BOLD}Egress:${RESET}     ${GREEN}on${RESET} (allowlist; ${ekind} ${estate})"
         echo -e "${BOLD}Allowlist:${RESET}  baseline$( [[ -f "$AUGUR_GLOBAL_CONF" ]] && echo " + augur.conf" )$( [[ -f "$AUGUR_PROJECT_CONF" ]] && echo " + .augur.conf" )"
         if [[ -f "$AUGUR_PROJECT_CONF" ]]; then
             local _st="${YELLOW}unapproved (prompts on next up)${RESET}"
@@ -1140,14 +1340,14 @@ cmd_status() {
     echo ""
 
     echo -e "${BOLD}Toolchain:${RESET}"
-    docker_toolchain_versions
+    engine_toolchain_versions
     echo ""
 }
 
 cmd_update() {
-    require_docker
-    info "Updating Docker image '${IMAGE_NAME}' (Swift ${SWIFT_IMAGE_TAG}) to latest versions..."
-    docker build --no-cache --build-arg SWIFT_VERSION="${SWIFT_IMAGE_TAG}" -t "$IMAGE_NAME" "$SCRIPT_DIR"
+    require_engine
+    info "Updating $(engine_label) image '${IMAGE_NAME}' (Swift ${SWIFT_IMAGE_TAG}) to latest versions..."
+    eng build --no-cache --build-arg SWIFT_VERSION="${SWIFT_IMAGE_TAG}" -t "$IMAGE_NAME" "$SCRIPT_DIR"
     success "Image '${IMAGE_NAME}' updated successfully."
     warn "Existing containers use the old image. Run ${BOLD}augur down && augur up${RESET} to apply."
 }
@@ -1931,8 +2131,8 @@ cmd_help() {
     echo -e "    augur ${CYAN}version${RESET} --macos                                   Show augur version (macOS mode)"
     echo ""
     echo -e "  ${BOLD}OPTIONS${RESET}"
-    echo -e "    --swift VERSION    Swift version for Docker mode (default: ${CYAN}latest${RESET})"
-    echo -e "    --macos            Use macOS VM with Xcode instead of Docker"
+    echo -e "    --swift VERSION    Swift version for container mode (default: ${CYAN}latest${RESET})"
+    echo -e "    --macos            Use macOS VM with Xcode instead of a Linux container"
     echo -e "    --gui              Open a VM window in macOS VM mode (for: augur up --macos)"
     echo -e "    --egress           Force the egress allowlist on (re-enables if AUGUR_EGRESS=0)"
     echo -e "    --no-egress        Disable the egress allowlist for this run"
@@ -1947,16 +2147,19 @@ cmd_help() {
     echo -e "    CLAUDE_CODE_OAUTH_TOKEN  Claude subscription token (or ~/.claude_code_oauth_token; run: augur setup-token)"
     echo -e "    SWIFT_VERSION            Default Swift version (default: latest)"
     echo -e "    AUGUR_EGRESS             Disable (0) or force-enable (1) egress filtering; default is always on"
+    echo -e "    AUGUR_ENGINE             Container backend: ${CYAN}docker${RESET} or ${CYAN}container${RESET} (Apple, macOS 26+); default: auto"
     echo ""
     echo -e "  ${BOLD}NOTES${RESET}"
+    echo -e "    • Container backend: Apple Container (${CYAN}container${RESET}) is auto-selected on macOS 26+ when"
+    echo -e "      installed, else Docker (${CYAN}docker${RESET}). Override with ${CYAN}AUGUR_ENGINE${RESET}. See ${BOLD}augur status${RESET}."
     echo -e "    • Egress allowlist: on by default (global ${CYAN}~/.augur/augur.conf${RESET}). Add a ${CYAN}.augur.conf${RESET}"
     echo -e "      in the project root to extend it with project-specific domains. Use ${CYAN}--no-egress${RESET} to"
-    echo -e "      disable for one run. Works in both modes, needs no sudo. macOS egress also needs Go (augur-gvproxy)."
-    echo -e "    • Docker mode:   current directory mounted at /workspace-<project> (Linux container)"
-    echo -e "    • macOS VM mode: current directory exposed at ~/workspace-<project> (macOS VM)"
+    echo -e "      disable for one run. Needs no sudo. macOS VM egress also needs Go (augur-gvproxy)."
+    echo -e "    • Container mode: current directory mounted at /workspace-<project> (Linux container)"
+    echo -e "    • macOS VM mode:  current directory exposed at ~/workspace-<project> (macOS VM)"
     echo -e "    • macOS VM mode requires: augur-vm (the bundled Swift VM backend)"
     echo -e "      build it on macOS with: bash install   (or augur-vm/scripts/build.sh)"
-    echo -e "    • Docker mode shares ~/.claude, ~/.config/gh, ~/.gitconfig; macOS mode injects"
+    echo -e "    • Container mode shares ~/.claude, ~/.config/gh, ~/.gitconfig; macOS mode injects"
     echo -e "      Claude/GitHub credentials via env (see ENVIRONMENT) and copies ~/.gitconfig"
     echo -e "    • macOS VM mode IPSW + XIP must be downloaded from Apple directly:"
     echo -e "      IPSW: https://ipsw.me or System Preferences > Software Update"
@@ -1987,6 +2190,15 @@ SWIFT_IMAGE_TAG="${SWIFT_VERSION:-latest}"
 IMAGE_NAME="augur:swift-${SWIFT_IMAGE_TAG}"
 CONTAINER_NAME="$(make_container_name)"
 WORKSPACE_MOUNT="$(make_workspace_mount)"
+# Container backend for the default (non --macos) mode: Apple `container` on macOS 26+
+# when installed, else `docker`. Override with AUGUR_ENGINE. (Unused by --macos mode.)
+# Reject a bad override loudly here (at top level, where `exit` works) rather than letting
+# detect_engine silently discard it and fall back to docker.
+case "${AUGUR_ENGINE:-}" in
+    ''|docker|container) ;;
+    *) error "AUGUR_ENGINE must be 'docker' or 'container' (got: '${AUGUR_ENGINE}')."; exit 1 ;;
+esac
+ENGINE="$(detect_engine)"
 # Per-project virtiofs share name for macOS VM mode. The automount exposes it at
 # "/Volumes/My Shared Files/<name>", which is the path Claude actually records as cwd (it resolves
 # the ~/workspace-<slug> symlink), so a per-project name keeps each project's history under a distinct slug.

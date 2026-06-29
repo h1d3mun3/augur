@@ -21,7 +21,10 @@ same command is safe in CI, the Linux dev container, and on a macOS host.
 |---|---|---|
 | `00_seam_unit.sh` | nothing | Every pure `agent_*` function emits its expected DATA (byte-equivalence floor). |
 | `10_construct_docker.sh` | nothing | The **real** `cmd_up` / `cmd_claude` build the expected `docker run` / `docker exec` argv from the seam — auth env (named-only), cwd-keyed history mount, fixed env, launch argv. Uses a `docker` **shim**, so no daemon. |
+| `11_construct_container.sh` | nothing | Same contract as `10`, but forces the Apple Container backend (`AUGUR_ENGINE=container`) and asserts the `container run` / `container exec` argv. Proves the engine abstraction builds byte-identical agent argv on either backend. Uses a `container` **shim**. |
+| `12_engine_select.sh` | nothing | `AUGUR_ENGINE` override picks the right backend and `augur status` reports it; `require_engine` accepts both. Default on a non-macOS host is Docker. |
 | `20_docker_live.sh` | Docker | The built image actually runs the agent; `AUGUR_TEST_LIVE=1` adds a real `up → exec → down` lifecycle. |
+| `21_container_live.sh` | Apple Container (macOS 26+) | Same as `20` for the Apple backend; auto-skips unless the `container` CLI + service are present, so it's a no-op on Linux/CI and macOS < 26. |
 | `30_macos_vm.sh` | (guards: nothing) / macOS host | Source guards: the macOS launch/state paths consume the seam (no re-hardcoded `claude`). Live smoke is gated on macOS + `augur-vm` + `AUGUR_TEST_LIVE=1`. |
 
 ## How the offline construction test works

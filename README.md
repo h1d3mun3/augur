@@ -11,20 +11,27 @@ Works in any directory — only the current directory is exposed to the containe
 
 Two modes are available:
 
-| | Docker mode | macOS VM mode |
+| | Container mode | macOS VM mode |
 |---|---|---|
 | **Isolation** | Linux container | macOS VM (Apple Virtualization Framework) |
 | **Xcode / xcodebuild** | ✗ | ✓ |
 | **iOS Simulator** | ✗ | ✓ |
 | **Setup time** | ~5 min (image build) | ~75 min (VM build) |
 | **Disk usage** | ~2 GB | ~70 GB+ |
-| **Requires** | Docker | augur-vm (bundled), IPSW, Xcode XIP |
+| **Requires** | Docker, or Apple Container (macOS 26+) | augur-vm (bundled), IPSW, Xcode XIP |
 
 ---
 
-## Docker mode (default)
+## Container mode (default)
 
 Lightweight Linux container. Suitable for most projects that don't need Xcode.
+
+The **engine** that hosts the container is chosen automatically:
+
+- **Apple Container** (`container`, github.com/apple/container) on **macOS 26+** when installed — runs each container in its own lightweight Linux VM.
+- **Docker** (`docker`) everywhere else (Linux, or macOS < 26).
+
+Override with `AUGUR_ENGINE=docker|container`. `augur status` shows the active engine.
 
 ### Setup
 
@@ -35,11 +42,11 @@ bash install
 # 2. Reload shell config
 source ~/.zshrc  # or source ~/.bashrc
 
-# 3. Build the Docker image
+# 3. Build the image
 augur build
 ```
 
-The install script copies `Dockerfile` and `augur` to `~/.augur/` and configures `PATH`. Safe to re-run.
+The install script copies `Dockerfile` and `augur` to `~/.augur/` and configures `PATH`. Safe to re-run. The same `Dockerfile` builds the image on either engine.
 
 ### Usage
 
@@ -73,7 +80,9 @@ augur version                   # show augur version
 
 ### Requirements
 
-- Docker (Docker Desktop or Docker Engine)
+- A container engine — either:
+  - **Docker** (Docker Desktop or Docker Engine), Linux or macOS; or
+  - **Apple Container** (`container`) on macOS 26+ (auto-selected when installed)
 - bash
 
 ---
@@ -252,14 +261,15 @@ The merge happens on the host, so the guest can't widen its own policy by editin
 
 | Mode | Enforcement |
 |------|-------------|
-| **Docker** | The agent runs on an internal network (no route to the host or the internet) with `NET_ADMIN` dropped, so a root agent can't re-route. A proxy **sidecar** container joins that internal network (to receive the agent's traffic) and a normal bridge (to egress) — making it the agent's only way out. A boot self-test fails closed if direct egress is ever reachable. |
+| **Container — Docker** | The agent runs on an internal network (no route to the host or the internet) with `NET_ADMIN` dropped, so a root agent can't re-route. A proxy **sidecar** container joins that internal network (to receive the agent's traffic) and a normal bridge (to egress) — making it the agent's only way out. A boot self-test fails closed if direct egress is ever reachable. |
+| **Container — Apple** | Apple Container can't dual-home a container, so there is no sidecar. The agent runs on a **host-only** `--internal` network (internet severed; the host reachable) with `NET_ADMIN` dropped and `--no-dns` (external DNS fails closed). The **host-side** `augur-proxy` is its only egress, reached via the host-only gateway. The same boot self-test fails closed. **Trade-off:** host-only also lets the agent reach other host services bound to `0.0.0.0` — weaker than Docker's airtight sidecar; closing it would need host `pf` rules (sudo), which augur avoids. |
 | **macOS VM** | The guest's only NIC is a host-owned socket (`VZFileHandleNetworkDeviceAttachment`); a bundled `gvproxy` runs the guest's network on the host and funnels every connection to the proxy. Needs no special entitlement. |
 
-In both modes the proxy decides by domain (the CONNECT host, or the TLS SNI / HTTP Host) and connects out by name.
+In every mode the proxy decides by domain (the CONNECT host, or the TLS SNI / HTTP Host) and connects out by name.
 
 ### Requirements
 
-`install` builds the proxy (`augur-proxy`, Swift) automatically. **macOS egress also needs Go** (for `augur-gvproxy`) — `brew install go`, then re-run `bash install`. Without it, macOS egress is unavailable but everything else works.
+`install` builds the proxy (`augur-proxy`, Swift) automatically. The Docker engine runs it as a Linux sidecar (built once from source on first egress `up`); the Apple Container and macOS VM engines run the native host `augur-proxy`. **macOS VM egress also needs Go** (for `augur-gvproxy`) — `brew install go`, then re-run `bash install`. Without it, macOS VM egress is unavailable but everything else works.
 
 The host ports the proxy uses are derived per-project so two egress-enabled projects can run at once; override with `AUGUR_PROXY_HTTP_PORT` / `AUGUR_PROXY_SOCKS_PORT` / `AUGUR_SSH_FWD_PORT` if needed.
 
