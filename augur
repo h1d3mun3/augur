@@ -899,10 +899,18 @@ start_egress() {
             start_sidecar
             ;;
         container)
-            # Reuse the host-side proxy macOS VM mode runs. Bind 0.0.0.0 so the guest can
-            # reach it over the host-only network's gateway (the host interface IP isn't
-            # known to exist until a container attaches, so we don't bind it specifically).
-            start_proxy "0.0.0.0"
+            # Reuse the host-side proxy macOS VM mode runs. Bind it to the host-only
+            # network's GATEWAY IP — the single host interface the guest reaches the proxy
+            # through — NOT 0.0.0.0. Binding all interfaces would expose this allowlist
+            # forward proxy (HTTP CONNECT + SOCKS5) on the host's physical LAN/Wi-Fi, where
+            # any LAN peer could use it as an (allowlist-limited) relay — a regression vs the
+            # Docker sidecar (reachable only inside the container network) and vs macOS VM
+            # mode (loopback). The host-only gateway interface is the agent's only path in,
+            # so a scoped bind keeps the guest reachable while staying off the LAN.
+            # VALIDATE on macOS 26: confirm the gateway interface is bindable at this point
+            # (the host-only network is created just above); if a container must attach first
+            # for the host interface to exist, start the proxy after `eng run` instead.
+            start_proxy "$(container_egress_gateway)"
             ;;
     esac
 }
