@@ -27,7 +27,7 @@ if [[ -f "$run" ]]; then
   body="$(cat "$run")"
   cname="$(awk 'p{print;exit} $0=="--name"{p=1}' "$run")"
   eq  "run" "$(head -n1 "$run")"                               "up: invokes the engine 'run' subcommand"
-  has "$body" "-dit"                                            "up: detached interactive tty (-dit)"
+  grep -qxF -- '-d' "$run" && ok "up: detached (-d, no keep-alive TTY)" || fail "up: not detached (-d missing)"
   has "$cname" "augur-${slug}-swift-"                           "up: container name derived from slug"
   has "$body" "ANTHROPIC_API_KEY=sk-ant-test123"               "up: injects ANTHROPIC_API_KEY (auth seam)"
   hasnt "$body" "CLAUDE_CODE_OAUTH_TOKEN"                       "up: omits the unset oauth token (named-only auth)"

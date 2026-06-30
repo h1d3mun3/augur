@@ -1115,10 +1115,13 @@ cmd_up() {
     info "Starting container '${CONTAINER_NAME}'..."
     info "Mounting: ${BOLD}${WORKSPACE_DIR}${RESET} → ${WORKSPACE_MOUNT}"
 
-    # `run -dit -v -e -w --network --cap-drop` is identical argv on Docker and Apple
+    # `run -d -v -e -w --network --cap-drop` is identical argv on Docker and Apple
     # `container`; only the egress DNS flags differ (handled in the egress block below).
+    # Detached only — NO -t/-i: a detached TTY (-t) gets hung up when `run` returns, and
+    # Apple Container then SIGHUPs PID 1 (sleep infinity), stopping the container. The
+    # interactive TTY belongs on `exec -it` (augur claude/shell), not the keep-alive PID 1.
     local docker_args=(
-        run -dit
+        run -d
         --name "$CONTAINER_NAME"
         -v "${WORKSPACE_DIR}:${WORKSPACE_MOUNT}"
         -w "${WORKSPACE_MOUNT}"
@@ -1213,10 +1216,10 @@ cmd_up() {
         )
     fi
 
-    # Keep-alive PID 1 so the container stays up for repeated `exec` (augur claude/shell).
-    # Docker keeps a detached `bash` alive via -dit, but Apple Container lets a detached bash
-    # exit immediately (no attached stdin) and stops the container; `sleep infinity` keeps
-    # both engines up identically. The agent/shell still run via `<engine> exec`, not PID 1.
+    # Keep-alive PID 1 so the container stays up (detached) for repeated `exec` (augur
+    # claude/shell). A bare `bash` exits immediately on Apple Container (no stdin) and stops
+    # the container; `sleep infinity` with no TTY (see -d above) keeps both engines up
+    # identically. The agent/shell still run via `<engine> exec -it`, not PID 1.
     docker_args+=("$IMAGE_NAME" sleep infinity)
 
     if ! eng "${docker_args[@]}" &>/dev/null; then
