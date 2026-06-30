@@ -153,10 +153,13 @@ agent_state_guest_leaf()         { echo "-workspace-$1"; }                # Dock
 # ══ Container engine abstraction ═════════════════════════════════════════════════
 # augur's default (non --macos) mode runs the agent in a Linux container. Two engines
 # can host that container:
-#   • docker     — Docker Engine / Desktop. Works on Linux and macOS. The original backend.
-#   • container  — Apple Container (github.com/apple/container). macOS 26+ only; runs each
-#                  container in its own lightweight Linux VM. Selected automatically on a
-#                  macOS 26+ host when the `container` CLI is installed.
+#   • container  — Apple Container (github.com/apple/container). The PRIMARY, recommended
+#                  engine: auto-selected on a macOS 26+ host when the `container` CLI is
+#                  installed; runs each container in its own lightweight Linux VM.
+#   • docker     — Docker Engine / Desktop. A COMPATIBILITY FALLBACK for Linux and macOS
+#                  < 26. Maintained but NOT actively developed; slated for removal once
+#                  Apple Container is the only target (see issue #54). Do not add new
+#                  features to the docker path — invest in the container path.
 #
 # The two CLIs are deliberately close: `run`, `exec`, `build`, `start`, `image inspect`,
 # and `network create --internal --subnet …` are byte-identical in the argv augur builds,
@@ -2188,11 +2191,12 @@ cmd_help() {
     echo -e "    CLAUDE_CODE_OAUTH_TOKEN  Claude subscription token (or ~/.claude_code_oauth_token; run: augur setup-token)"
     echo -e "    SWIFT_VERSION            Default Swift version (default: latest)"
     echo -e "    AUGUR_EGRESS             Disable (0) or force-enable (1) egress filtering; default is always on"
-    echo -e "    AUGUR_ENGINE             Container backend: ${CYAN}docker${RESET} or ${CYAN}container${RESET} (Apple, macOS 26+); default: auto"
+    echo -e "    AUGUR_ENGINE             Container backend: ${CYAN}container${RESET} (Apple, primary) or ${CYAN}docker${RESET} (fallback); default: auto"
     echo ""
     echo -e "  ${BOLD}NOTES${RESET}"
-    echo -e "    • Container backend: Apple Container (${CYAN}container${RESET}) is auto-selected on macOS 26+ when"
-    echo -e "      installed, else Docker (${CYAN}docker${RESET}). Override with ${CYAN}AUGUR_ENGINE${RESET}. See ${BOLD}augur status${RESET}."
+    echo -e "    • Container backend: ${CYAN}container${RESET} (Apple Container) is the primary engine, auto-selected on"
+    echo -e "      macOS 26+. ${CYAN}docker${RESET} is a fallback for Linux / macOS < 26 (maintained, not developed)."
+    echo -e "      Override with ${CYAN}AUGUR_ENGINE${RESET}. See ${BOLD}augur status${RESET}."
     echo -e "    • Egress allowlist: on by default (global ${CYAN}~/.augur/augur.conf${RESET}). Add a ${CYAN}.augur.conf${RESET}"
     echo -e "      in the project root to extend it with project-specific domains. Use ${CYAN}--no-egress${RESET} to"
     echo -e "      disable for one run. Needs no sudo. macOS VM egress also needs Go (augur-gvproxy)."
