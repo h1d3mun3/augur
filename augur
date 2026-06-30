@@ -1213,7 +1213,11 @@ cmd_up() {
         )
     fi
 
-    docker_args+=("$IMAGE_NAME" bash)
+    # Keep-alive PID 1 so the container stays up for repeated `exec` (augur claude/shell).
+    # Docker keeps a detached `bash` alive via -dit, but Apple Container lets a detached bash
+    # exit immediately (no attached stdin) and stops the container; `sleep infinity` keeps
+    # both engines up identically. The agent/shell still run via `<engine> exec`, not PID 1.
+    docker_args+=("$IMAGE_NAME" sleep infinity)
 
     if ! eng "${docker_args[@]}" &>/dev/null; then
         error "Failed to start the container."
