@@ -445,7 +445,7 @@ Containment:
 2. Verify the constructed `docker run`/`docker exec` argv and the seam outputs are **byte-identical**
    before/after (done: a unit harness sources the real `agent_*` functions and asserts every constructed
    string matches the original literal; `bash -n` passes; no old function names remain).
-3. Keep the `docs/security-review.md` checks and existing tests green.
+3. Keep the `docs/security-reviews/2026-06-28-full-review.md` checks and existing tests green.
 
 ---
 
