@@ -310,3 +310,57 @@ gh auth login
 
 `gh` credentials are shared automatically in both modes (token injected via `GH_TOKEN`;
 the host's `~/.config/gh` is mounted read-only so the guest can't rewrite it).
+
+---
+
+## Testing & CI
+
+augur's tests are split by what each layer can prove on a free runner, and by which bugs
+each layer actually catches.
+
+```bash
+make unit           # Swift build/test + shellcheck + offline shell tiers + version smoke
+make container-e2e  # egress FAIL-CLOSED proof on Docker (builds the image, brings up egress)
+make e2e            # LOCAL pre-release gate: macOS VM boot + xcodebuild test (never in CI)
+```
+
+The shell test tiers live in `tests/` and run via `tests/run.sh` (see `tests/README.md`);
+each live tier self-skips when its prerequisites are absent, so the same command is safe in
+CI, the Linux dev container, and on a Mac.
+
+### Continuous integration (`.github/workflows/ci.yml`)
+
+CI runs on **free GitHub-hosted runners only**, and **no CI job boots a VZ guest**:
+
+| Job | Runner | What it proves |
+|-----|--------|----------------|
+| `build-unit` | `macos-26` | `swift build`/`swift test` the CLIs (`augur-vm` builds, `augur-proxy` builds + tests), `shellcheck`, and a side-effect-free `augur version` smoke. No engine, no VM. |
+| `container-e2e` | `ubuntu-latest` | The **security layer**: Docker container mode with egress on, asserting the guest can only reach allowlisted domains (allowlisted reachable · non-allowlisted blocked · DNS closed · direct egress severed). Fails **closed**. |
+
+Both jobs are **secrets-zero** — the coding agent is never authenticated in CI (the
+`container-e2e` job even asserts the guest has no agent token). So `pull_request` runs from
+forks are safe: there is nothing to exfiltrate.
+
+**Why the VM-boot E2E is *not* in CI.** GitHub's arm64 macOS runners are themselves
+Virtualization.framework guests with **no nested virtualization** (confirmed by GitHub; the
+request to enable it was closed as not planned). So anything that boots a VM/microVM — the
+macOS VM mode, Apple Container mode, or Docker-on-macOS — **cannot run on any GitHub-hosted
+runner** (standard *or* larger). A bigger runner gives more cores/RAM, not nesting. That
+heavy path is gated locally instead.
+
+### Pre-release gate (`make e2e`, local only)
+
+Before tagging a release, run the macOS-VM E2E on a real Mac:
+
+```bash
+# from your project directory (boots the VM; verifies mount + testmanagerd + egress fail-closed)
+make -C /path/to/augur e2e
+# add a real in-VM build:
+AUGUR_E2E_PROJECT=/path/to/app AUGUR_E2E_SCHEME=App make -C /path/to/augur e2e
+```
+
+This boots the macOS VM, checks the **virtiofs** workspace mount and **testmanagerd**
+reachability, optionally runs **`xcodebuild test`** inside the VM, and re-proves the
+**egress fail-closed** guarantee for the VM datapath (the macOS-VM variant of the
+`container-e2e` assertions). It's local-only for the nested-virtualization reason above, and
+because it needs Apple-signed IPSW/XIP that can't live in CI.
