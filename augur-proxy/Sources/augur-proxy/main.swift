@@ -24,10 +24,18 @@ struct Options {
     var logPath: String? = nil
     var pidfile: String? = nil
     var publicOnly = true
+    // Max concurrent connections (≈2 threads each). Default sized well below the macOS
+    // per-process thread ceiling; raise for heavy multi-agent workloads. Precedence:
+    // --max-connections flag > AUGUR_PROXY_MAX_CONNECTIONS env > default.
+    var maxConnections = 128
 }
 
 func parseOptions() -> Options {
     var o = Options()
+    if let env = ProcessInfo.processInfo.environment["AUGUR_PROXY_MAX_CONNECTIONS"],
+       let v = Int(env), v > 0 {
+        o.maxConnections = v
+    }
     var args = Array(CommandLine.arguments.dropFirst())
     func next(_ flag: String) -> String {
         guard !args.isEmpty else { die("missing value for \(flag)") }
@@ -40,6 +48,7 @@ func parseOptions() -> Options {
         case "--listen":      o.listen = next(a)
         case "--http-port":   o.httpPort = parsePort(next(a), a)
         case "--socks-port":  o.socksPort = parsePort(next(a), a)
+        case "--max-connections": o.maxConnections = parseCount(next(a), a)
         case "--log":         o.logPath = next(a)
         case "--pidfile":     o.pidfile = next(a)
         case "--allow-private": o.publicOnly = false
@@ -54,7 +63,8 @@ func printUsage() {
     FileHandle.standardError.write(Data("""
     usage: augur-proxy --allowlist <path> [--listen 127.0.0.1]
                        [--http-port N] [--socks-port N]
-                       [--log <path>] [--pidfile <path>] [--allow-private]
+                       [--max-connections N] [--log <path>] [--pidfile <path>]
+                       [--allow-private]
     \n
     """.utf8))
 }
@@ -66,6 +76,11 @@ func die(_ msg: String) -> Never {
 
 func parsePort(_ s: String, _ flag: String) -> UInt16 {
     guard let v = UInt16(s) else { die("bad value for \(flag): \(s)") }
+    return v
+}
+
+func parseCount(_ s: String, _ flag: String) -> Int {
+    guard let v = Int(s), v > 0 else { die("bad value for \(flag): \(s) (expected a positive integer)") }
     return v
 }
 
@@ -88,7 +103,9 @@ guard let initialList = loadAllowlist(opts.allowlist) else {
 
 let log = DecisionLog(path: opts.logPath, alsoStderr: opts.logPath == nil)
 let filter = Filter(allowlist: initialList)
-let server = ProxyServer(filter: filter, log: log, publicOnly: opts.publicOnly)
+let server = ProxyServer(filter: filter, log: log, publicOnly: opts.publicOnly,
+                         maxConnections: opts.maxConnections)
+log.info("max concurrent connections: \(opts.maxConnections) (≈\(opts.maxConnections * 2) threads)")
 
 if initialList.isEmpty {
     log.info("allowlist is empty — all egress will be DENIED")
