@@ -497,7 +497,15 @@ ssh_macos() {
     if [[ -f "$MACOS_SSH_KEY" ]]; then
         key_opts=(-i "$MACOS_SSH_KEY" -o PasswordAuthentication=no -o BatchMode=yes)
     fi
-    ssh -p "$port" \
+    # Hermetic SSH (-F /dev/null): read NO ssh_config. This closes the one host-env leak in
+    # macOS VM mode — OpenSSH's stock `SendEnv LANG LC_*` (and any SendEnv a user added to
+    # ~/.ssh/config, which could forward arbitrary host vars/secrets into the guest) would
+    # otherwise be sent over the connection. A command-line `-o SendEnv=-LANG -o SendEnv=-LC_*`
+    # does NOT work: command-line `-o` is parsed BEFORE the config files, so the system config
+    # re-adds the patterns afterwards (verified with `ssh -G`). Dropping ssh_config loses
+    # nothing — every option augur relies on is passed explicitly below.
+    ssh -F /dev/null \
+        -p "$port" \
         -o StrictHostKeyChecking=accept-new \
         -o UserKnownHostsFile="$(vm_known_hosts_file "$vm")" \
         -o LogLevel=ERROR \
@@ -515,7 +523,10 @@ scp_to_macos() {
     if [[ -f "$MACOS_SSH_KEY" ]]; then
         key_opts=(-i "$MACOS_SSH_KEY" -o PasswordAuthentication=no -o BatchMode=yes)
     fi
-    scp -P "$port" \
+    # Hermetic SSH (-F /dev/null): same rationale as ssh_macos — never forward host env
+    # (LANG/LC_* or any user-configured SendEnv) into the guest over the scp transport.
+    scp -F /dev/null \
+        -P "$port" \
         -o StrictHostKeyChecking=accept-new \
         -o UserKnownHostsFile="$(vm_known_hosts_file "$vm")" \
         -o LogLevel=ERROR \
@@ -1515,7 +1526,9 @@ cmd_build_macos() {
 
     # Configure passwordless sudo so subsequent ssh_macos calls don't need a TTY
     info "Configuring passwordless sudo..."
-    ssh -o StrictHostKeyChecking=accept-new \
+    # Hermetic SSH (-F /dev/null): never forward host env into the VM (see ssh_macos).
+    ssh -F /dev/null \
+        -o StrictHostKeyChecking=accept-new \
         -o UserKnownHostsFile="$(vm_known_hosts_file "$MACOS_BUILD_VM")" \
         -o LogLevel=ERROR \
         -o ConnectTimeout=10 \
@@ -1530,7 +1543,9 @@ cmd_build_macos() {
         mkdir -p "$(dirname "$MACOS_SSH_KEY")"
         ssh-keygen -t ed25519 -f "$MACOS_SSH_KEY" -N "" -C "augur-vm"
     fi
-    ssh -o StrictHostKeyChecking=accept-new \
+    # Hermetic SSH (-F /dev/null): never forward host env into the VM (see ssh_macos).
+    ssh -F /dev/null \
+        -o StrictHostKeyChecking=accept-new \
         -o UserKnownHostsFile="$(vm_known_hosts_file "$MACOS_BUILD_VM")" \
         -o LogLevel=ERROR \
         -o ConnectTimeout=10 \
@@ -1655,7 +1670,8 @@ wait_for_macos_ssh() {
     while ((retries-- > 0)); do
         host="$(macos_ssh_host "$vm")"
         [[ -n "$host" ]] && \
-            ssh -p "$port" \
+            ssh -F /dev/null \
+                -p "$port" \
                 -o StrictHostKeyChecking=accept-new \
                 -o UserKnownHostsFile="$(vm_known_hosts_file "$vm")" \
                 -o LogLevel=ERROR \
