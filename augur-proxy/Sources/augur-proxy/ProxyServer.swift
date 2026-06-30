@@ -13,17 +13,22 @@ final class ProxyServer {
     let filter: Filter
     let log: DecisionLog
     let publicOnly: Bool
-    /// Cap the number of concurrently active handler threads (each holds 2 threads
-    /// during the splice phase). The accept loop blocks when the cap is reached,
-    /// using the kernel's listen backlog as the wait queue. This prevents thread
-    /// exhaustion under heavy parallel workloads (e.g. many simultaneous agent
-    /// tool calls) which would otherwise cause the proxy to freeze silently.
-    private let connectionCap = DispatchSemaphore(value: 64)
+    /// Cap the number of concurrently active connections. Each in-flight connection
+    /// costs ~2 threads (the handler plus the splice peer it spawns), so the process
+    /// holds at most ~2× this many proxy threads — keep the value safely below the
+    /// macOS per-process thread ceiling (`sysctl kern.num_taskthreads`). The accept
+    /// loop blocks when the cap is reached, using the kernel's listen backlog as the
+    /// wait queue. This bounds the thread growth that froze the proxy under heavy
+    /// parallel workloads (e.g. many simultaneous agent tool calls). The value is
+    /// tunable (--max-connections / AUGUR_PROXY_MAX_CONNECTIONS, see main.swift)
+    /// because the right ceiling depends on the host and the workload's concurrency.
+    private let connectionCap: DispatchSemaphore
 
-    init(filter: Filter, log: DecisionLog, publicOnly: Bool) {
+    init(filter: Filter, log: DecisionLog, publicOnly: Bool, maxConnections: Int = 128) {
         self.filter = filter
         self.log = log
         self.publicOnly = publicOnly
+        self.connectionCap = DispatchSemaphore(value: max(1, maxConnections))
     }
 
     /// Start a listener and dispatch accepted connections to `handler` on threads.
@@ -43,9 +48,19 @@ final class ProxyServer {
                 // Block the accept loop (not the caller) when the cap is full.
                 // The kernel's listen backlog queues further SYNs while we wait.
                 s.connectionCap.wait()
-                Thread.detachNewThread {
+                // The accept loop owns the slot release: if the worker thread can't be
+                // started (the exact thread-pressure condition the cap guards against),
+                // spawnDetached returns false and we reclaim the slot + close the fd
+                // HERE. Were the release left to a worker that never ran, the slot would
+                // leak and the accept loop would eventually deadlock on connectionCap.
+                let started = PosixThread.spawnDetached {
                     defer { s.connectionCap.signal() }
                     handler(cfd, client)
+                }
+                if !started {
+                    s.log.info("could not start handler thread; dropping connection from \(client)")
+                    close(cfd)
+                    s.connectionCap.signal()
                 }
             }
         }

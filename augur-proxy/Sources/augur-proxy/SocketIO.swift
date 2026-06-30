@@ -55,7 +55,13 @@ enum Sock {
 
     /// Connect to `host:port`, refusing non-public destinations when `publicOnly`.
     /// Resolves via getaddrinfo and tries addresses in order. Returns a connected fd.
-    static func connect(host: String, port: UInt16, publicOnly: Bool) throws -> Int32 {
+    ///
+    /// Each dial is bounded by `timeoutSecs`: a handler holds a connectionCap slot for
+    /// its whole lifetime (see ProxyServer), so an unbounded blocking connect to a
+    /// black-holed allowlisted host would pin slots for the OS default (~75 s × N
+    /// addresses) and could wedge the accept loop. We connect non-blocking and poll for
+    /// writability with a deadline, then restore blocking mode for the splice phase.
+    static func connect(host: String, port: UInt16, publicOnly: Bool, timeoutSecs: Int32 = 10) throws -> Int32 {
         var hints = addrinfo()
         hints.ai_family = AF_UNSPEC
         hints.ai_socktype = sockStreamType
@@ -74,13 +80,54 @@ enum Sock {
             }
             let fd = socket(cur.pointee.ai_family, cur.pointee.ai_socktype, cur.pointee.ai_protocol)
             if fd < 0 { lastErr = errnoString(); continue }
-            if Glibc_connect(fd, cur.pointee.ai_addr, cur.pointee.ai_addrlen) == 0 {
+            if connectWithTimeout(fd, cur.pointee.ai_addr, cur.pointee.ai_addrlen,
+                                  timeoutSecs: timeoutSecs, err: &lastErr) {
                 return fd
             }
-            lastErr = errnoString()
             close(fd)
         }
         throw SockError("connect \(host):\(port) failed: \(lastErr)")
+    }
+
+    /// Non-blocking connect with a bounded deadline. Returns true (and leaves `fd`
+    /// connected + back in blocking mode) on success; false on error/timeout, with a
+    /// reason in `err`. Caller owns closing `fd` on failure.
+    private static func connectWithTimeout(_ fd: Int32, _ addr: UnsafePointer<sockaddr>,
+                                           _ addrlen: socklen_t, timeoutSecs: Int32,
+                                           err: inout String) -> Bool {
+        let flags = fcntl(fd, F_GETFL, 0)
+        if flags < 0 { err = "fcntl(F_GETFL): \(errnoString())"; return false }
+        if fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0 { err = "fcntl(O_NONBLOCK): \(errnoString())"; return false }
+
+        var connected = false
+        if Glibc_connect(fd, addr, addrlen) == 0 {
+            connected = true                          // connected immediately (rare)
+        } else if errno == EINPROGRESS {
+            var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+            let pr = poll(&pfd, 1, timeoutSecs * 1000)
+            if pr == 0 {
+                err = "connect timed out after \(timeoutSecs)s"
+            } else if pr < 0 {
+                err = "poll: \(errnoString())"
+            } else {
+                // Writable: SO_ERROR distinguishes a real connect from a refused/failed one.
+                var soErr: Int32 = 0
+                var len = socklen_t(MemoryLayout<Int32>.size)
+                if getsockopt(fd, SOL_SOCKET, SO_ERROR, &soErr, &len) == 0 {
+                    if soErr == 0 { connected = true } else { err = String(cString: strerror(soErr)) }
+                } else {
+                    err = "getsockopt(SO_ERROR): \(errnoString())"
+                }
+            }
+        } else {
+            err = errnoString()
+        }
+
+        if connected {
+            _ = fcntl(fd, F_SETFL, flags)             // restore blocking for the splice phase
+            return true
+        }
+        return false
     }
 
     /// Apply a receive timeout (seconds) so a peer that connects but never sends
@@ -206,6 +253,45 @@ struct SockError: Error, CustomStringConvertible {
 }
 
 func errnoString() -> String { String(cString: strerror(errno)) }
+
+/// Heap box carrying a Swift closure across the C `pthread_create` boundary.
+private final class ThreadBody {
+    let run: () -> Void
+    init(_ run: @escaping () -> Void) { self.run = run }
+}
+
+/// Spawn a detached worker thread, REPORTING whether it actually started — unlike
+/// `Thread.detachNewThread`, which silently no-ops when `pthread_create` fails (e.g.
+/// EAGAIN at the per-process thread limit). The caller relies on the return value to
+/// avoid leaking resources whose cleanup is tied to the worker running (a connectionCap
+/// slot and the client fd): a leaked slot would eventually deadlock the accept loop.
+enum PosixThread {
+    @discardableResult
+    static func spawnDetached(_ body: @escaping () -> Void) -> Bool {
+        var attr = pthread_attr_t()
+        guard pthread_attr_init(&attr) == 0 else { return false }
+        defer { pthread_attr_destroy(&attr) }
+        pthread_attr_setdetachstate(&attr, Int32(PTHREAD_CREATE_DETACHED))
+
+        // Retain the box for the worker; the worker takes ownership and releases it.
+        let box = Unmanaged.passRetained(ThreadBody(body))
+        #if canImport(Darwin)
+        var tid: pthread_t?
+        let rc = pthread_create(&tid, &attr, { raw in
+            Unmanaged<ThreadBody>.fromOpaque(raw).takeRetainedValue().run()
+            return nil
+        }, box.toOpaque())
+        #else
+        var tid = pthread_t()
+        let rc = pthread_create(&tid, &attr, { raw in
+            Unmanaged<ThreadBody>.fromOpaque(raw!).takeRetainedValue().run()
+            return nil
+        }, box.toOpaque())
+        #endif
+        if rc != 0 { box.release(); return false }   // worker never ran: balance the retain
+        return true
+    }
+}
 
 // Cross-platform aliases (Glibc vs Darwin differ in a few symbol shapes).
 #if canImport(Glibc)
