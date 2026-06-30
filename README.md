@@ -28,8 +28,8 @@ Lightweight Linux container. Suitable for most projects that don't need Xcode.
 
 The **engine** that hosts the container is chosen automatically:
 
-- **Apple Container** (`container`, github.com/apple/container) on **macOS 26+** when installed — runs each container in its own lightweight Linux VM.
-- **Docker** (`docker`) everywhere else (Linux, or macOS < 26).
+- **Apple Container** (`container`, github.com/apple/container) — the **recommended, primary engine**, auto-selected on **macOS 26+** when installed. Native to macOS, no Docker Desktop, no licensing; runs each container in its own lightweight Linux VM.
+- **Docker** (`docker`) — a **compatibility fallback** for Linux and macOS < 26. Maintained but **not actively developed** (no new features), and **planned for eventual removal** once Apple Container is the only target — see [#54](https://github.com/h1d3mun3/augur/issues/54).
 
 Override with `AUGUR_ENGINE=docker|container`. `augur status` shows the active engine.
 
