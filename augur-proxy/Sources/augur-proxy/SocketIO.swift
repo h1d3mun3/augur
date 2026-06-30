@@ -90,6 +90,23 @@ enum Sock {
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
     }
 
+    /// Enable TCP keepalives so dead peers are detected and stalled splice threads
+    /// eventually unblock. idleSecs: silence before first probe; intervalSecs/count:
+    /// probe cadence. Defaults: 60 s idle → 3 probes × 10 s = detected within ~90 s.
+    static func setKeepAlive(_ fd: Int32, idleSecs: Int32 = 60, intervalSecs: Int32 = 10, count: Int32 = 3) {
+        var yes: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, socklen_t(MemoryLayout<Int32>.size))
+        var idle = idleSecs, intvl = intervalSecs, cnt = count
+        let tcp = Int32(IPPROTO_TCP)
+        #if canImport(Darwin)
+        setsockopt(fd, tcp, TCP_KEEPALIVE,       &idle, socklen_t(MemoryLayout<Int32>.size))
+        #else
+        setsockopt(fd, tcp, Int32(TCP_KEEPIDLE), &idle, socklen_t(MemoryLayout<Int32>.size))
+        #endif
+        setsockopt(fd, tcp, Int32(TCP_KEEPINTVL), &intvl, socklen_t(MemoryLayout<Int32>.size))
+        setsockopt(fd, tcp, Int32(TCP_KEEPCNT),   &cnt,   socklen_t(MemoryLayout<Int32>.size))
+    }
+
     /// Read up to `max` bytes. Returns [] on clean EOF, throws on error.
     static func read(_ fd: Int32, max: Int = 65536) throws -> [UInt8] {
         var buf = [UInt8](repeating: 0, count: max)

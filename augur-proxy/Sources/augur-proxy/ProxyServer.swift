@@ -13,6 +13,12 @@ final class ProxyServer {
     let filter: Filter
     let log: DecisionLog
     let publicOnly: Bool
+    /// Cap the number of concurrently active handler threads (each holds 2 threads
+    /// during the splice phase). The accept loop blocks when the cap is reached,
+    /// using the kernel's listen backlog as the wait queue. This prevents thread
+    /// exhaustion under heavy parallel workloads (e.g. many simultaneous agent
+    /// tool calls) which would otherwise cause the proxy to freeze silently.
+    private let connectionCap = DispatchSemaphore(value: 64)
 
     init(filter: Filter, log: DecisionLog, publicOnly: Bool) {
         self.filter = filter
@@ -33,8 +39,14 @@ final class ProxyServer {
                 }
                 if cfd < 0 { continue }
                 let client = Self.peerIP(&ss)
-                guard self != nil else { close(cfd); return }
-                Thread.detachNewThread { handler(cfd, client) }
+                guard let s = self else { close(cfd); return }
+                // Block the accept loop (not the caller) when the cap is full.
+                // The kernel's listen backlog queues further SYNs while we wait.
+                s.connectionCap.wait()
+                Thread.detachNewThread {
+                    defer { s.connectionCap.signal() }
+                    handler(cfd, client)
+                }
             }
         }
     }
@@ -212,6 +224,10 @@ final class ProxyServer {
     /// Bidirectional copy: one direction on this thread, the other on a new one.
     private func spliceBoth(_ a: Int32, _ b: Int32) {
         Sock.setReadTimeout(a, seconds: 0)   // established tunnel: no read timeout
+        // Keepalives detect dead peers (crashed host, network partition) so stalled
+        // splice threads unblock instead of holding their slot in connectionCap forever.
+        Sock.setKeepAlive(a)
+        Sock.setKeepAlive(b)
         let done = DispatchSemaphore(value: 0)
         Thread.detachNewThread { Sock.splice(from: a, to: b); done.signal() }
         Sock.splice(from: b, to: a)
