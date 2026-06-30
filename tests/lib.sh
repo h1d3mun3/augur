@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # tests/lib.sh — minimal assert library. `source` me from a test script.
 # No `set -e`: a failed assertion records and continues so one script reports every check.
 set -uo pipefail
