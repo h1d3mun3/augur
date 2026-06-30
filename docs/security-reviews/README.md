@@ -22,8 +22,8 @@ continuously up to date.
 > The person landing a security fix is responsible for "the defense actually works,"
 > not for keeping a prose description of the posture current. The former (the
 > invariants — the contract) and the latter (these snapshots) have different owners
-> and cadences, so we keep them separate. The invariants are tracked separately (a
-> dedicated file is planned).
+> and cadences, so we keep them separate. For the invariants, see
+> [`INVARIANTS.md`](./INVARIANTS.md).
 
 ## Snapshots
 
