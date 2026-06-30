@@ -2245,6 +2245,13 @@ cmd_help() {
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+# Test seam (mirrors the existing AUGUR_TEST_* seams used by tests/): allow a harness to
+# `source` this script purely to REUSE its functions — e.g. ssh_macos for the local macOS-VM
+# e2e gate (tests/e2e_macos_vm.sh) — without running a command. Never set in normal use, so
+# production dispatch is unaffected. `return` succeeds only when sourced; when executed it
+# errors, and `|| true` falls through to normal dispatch.
+if [[ "${AUGUR_SOURCE_ONLY:-0}" == "1" ]]; then return 0 2>/dev/null || true; fi
+
 COMMAND="${1:-help}"
 shift || true
 
