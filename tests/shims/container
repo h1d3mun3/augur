@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Test shim for Apple `container` (github.com/apple/container). Mirrors tests/shims/docker:
+# stands in for the real CLI so augur's command CONSTRUCTION (cmd_up / cmd_claude) can be
+# captured with AUGUR_ENGINE=container and NO real runtime. It:
+#   • records every invocation to $AUGUR_TEST_SHIMLOG.trace (human-readable), and
+#   • dumps the exact argv of `run`/`exec` (one arg per line) to $AUGUR_TEST_SHIMLOG.run /
+#     .exec for the test to assert on, and
+#   • fakes just enough preflight (system status / image inspect / inspect) for augur to
+#     reach the real `container run`/`container exec` it builds from the agent seam.
+# Container "running" state is controlled by $AUGUR_TEST_CONTAINER_RUNNING (0|1); the
+# running container's name is $AUGUR_TEST_CONTAINER_NAME.
+set -u
+log="${AUGUR_TEST_SHIMLOG:-/tmp/augur-shim}"
+printf 'container %s\n' "$*" >> "$log.trace"
+
+case "${1:-}" in
+  run|exec)
+    : > "$log.$1"
+    for a in "$@"; do printf '%s\n' "$a" >> "$log.$1"; done
+    exit 0 ;;
+  system)
+    # `system status` → service up (exit 0); `system start` → succeed.
+    exit 0 ;;
+  image)
+    # `image inspect IMAGE` → image "exists" (exit 0, skip build).
+    exit 0 ;;
+  inspect)
+    # container_running greps this for the nested .status.state == "running"; container_exists
+    # treats a non-zero exit as "absent". Mirrors Apple's real inspect shape (status is an
+    # OBJECT carrying "state").
+    if [[ "${AUGUR_TEST_CONTAINER_RUNNING:-0}" == 1 ]]; then
+      printf '[{"id":"%s","status":{"state":"running"}}]\n' "${AUGUR_TEST_CONTAINER_NAME:-}"
+      exit 0
+    fi
+    exit 1 ;;
+  network)
+    # `network inspect NAME` → absent (exit 1 so ensure_egress_network would create it);
+    # create/delete → succeed.
+    case "${2:-}" in
+      inspect) exit 1 ;;
+      *)       exit 0 ;;
+    esac ;;
+  *)
+    # build / start / delete / list / etc. — construction already captured; just succeed.
+    exit 0 ;;
+esac
