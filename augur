@@ -821,17 +821,21 @@ egress_proxy_url() {
     esac
 }
 
-# Apple host-only gateway (where the host-side proxy is reachable from the guest). Prefer
-# the address the engine actually assigned (network inspect), fall back to the first usable
-# address of our subnet, and allow an explicit override.
-# VALIDATE on macOS 26: confirm this is the reachable host gateway for a host-only network.
+# Apple host-only gateway: the IP of the host's vmnet interface for this network, which the
+# guest reaches the host-side proxy through, and which the host proxy binds. Confirmed on
+# macOS 26: `container network inspect` reports it as .status.ipv4Gateway, and it equals the
+# first usable address of the subnet (network+1). NOTE: that host interface only comes up
+# once a container ATTACHES to the network — so the proxy must be bound AFTER `eng run`
+# (see start_egress_proxy), not before. Prefer the inspected value, fall back to computed,
+# and allow an explicit override.
 container_egress_gateway() {
     [[ -n "${AUGUR_CONTAINER_GATEWAY:-}" ]] && { echo "$AUGUR_CONTAINER_GATEWAY"; return; }
     local gw
-    # `|| true`: a no-match grep makes the pipeline exit nonzero under pipefail, which would
-    # abort this plain assignment under set -e — fall through to the computed default instead.
+    # Match the ipv4Gateway field (any "*gateway*" key, case-insensitive) and pull its IP.
+    # `|| true`: a no-match grep trips pipefail, which would abort this plain assignment under
+    # set -e — fall through to the computed default instead.
     gw="$(container network inspect "$(egress_network_name)" 2>/dev/null \
-          | grep -oE '"gateway"[^,}]*' | grep -oE '[0-9]+(\.[0-9]+){3}' | head -1 || true)"
+          | grep -iE 'gateway' | grep -oE '[0-9]+(\.[0-9]+){3}' | head -1 || true)"
     [[ -n "$gw" ]] && { echo "$gw"; return; }
     echo "172.31.${_augur_subnet_third}.$(( _augur_subnet_fourth + 1 ))"
 }
@@ -888,9 +892,11 @@ stop_sidecar() {
     docker rm -f "$(egress_sidecar_name)" &>/dev/null || true
 }
 
-# Bring up the egress datapath for the current engine. Docker: sidecar on the internal
-# network. Apple: the host-side augur-proxy, reached over the host-only network. Both end
-# with the agent able to egress ONLY through augur-proxy's allowlist.
+# Bring up everything the egress datapath needs BEFORE the agent container is created.
+# Docker: the internal network + the dual-homed sidecar (itself a container, so it can run
+# first). Apple: ONLY the host-only network — the host's gateway interface for it doesn't
+# come up until a container attaches, so the host proxy can't bind it yet; it is started by
+# start_egress_proxy() AFTER `eng run`.
 start_egress() {
     ensure_egress_network
     case "$ENGINE" in
@@ -899,20 +905,33 @@ start_egress() {
             start_sidecar
             ;;
         container)
-            # Reuse the host-side proxy macOS VM mode runs. Bind it to the host-only
-            # network's GATEWAY IP — the single host interface the guest reaches the proxy
-            # through — NOT 0.0.0.0. Binding all interfaces would expose this allowlist
-            # forward proxy (HTTP CONNECT + SOCKS5) on the host's physical LAN/Wi-Fi, where
-            # any LAN peer could use it as an (allowlist-limited) relay — a regression vs the
-            # Docker sidecar (reachable only inside the container network) and vs macOS VM
-            # mode (loopback). The host-only gateway interface is the agent's only path in,
-            # so a scoped bind keeps the guest reachable while staying off the LAN.
-            # VALIDATE on macOS 26: the gateway interface may not be bindable until a
-            # container attaches; if start_proxy fails to bind, override the listen address
-            # with AUGUR_PROXY_LISTEN (e.g. 0.0.0.0 to confirm the datapath, then scope it).
-            start_proxy "${AUGUR_PROXY_LISTEN:-$(container_egress_gateway)}"
+            : # host proxy deferred to start_egress_proxy (post-attach) — see below
             ;;
     esac
+}
+
+# Start the host-side proxy once the agent container has ATTACHED to the host-only network
+# (Apple only). On macOS 26 the host's vmnet interface for an --internal network — carrying
+# the gateway IP — comes up only when a container attaches, so this must run AFTER `eng run`.
+# Binding that gateway IP (not 0.0.0.0) keeps the proxy reachable by the guest but OFF the
+# host's physical LAN/Wi-Fi: 0.0.0.0 would expose this allowlist forward proxy (HTTP CONNECT
+# + SOCKS5) as a LAN-reachable relay — weaker than the Docker sidecar (container-network only)
+# and macOS VM mode (loopback). AUGUR_PROXY_LISTEN overrides the bind address (e.g. 0.0.0.0)
+# for diagnosis. Docker's proxy is the sidecar, already up, so this is a no-op there.
+start_egress_proxy() {
+    [[ "$ENGINE" == "container" ]] || return 0
+    local listen; listen="${AUGUR_PROXY_LISTEN:-$(container_egress_gateway)}"
+    # The gateway interface can appear a beat after `eng run` returns. Wait (briefly) for the
+    # bind address to show up on a host interface so start_proxy doesn't race it and fail to
+    # bind. Skipped for 0.0.0.0 (always bindable) and if ifconfig is unavailable.
+    if [[ "$listen" != "0.0.0.0" ]] && command -v ifconfig &>/dev/null; then
+        local _t=25
+        while (( _t-- > 0 )); do
+            ifconfig 2>/dev/null | grep -qwF "$listen" && break
+            sleep 0.2
+        done
+    fi
+    start_proxy "$listen"
 }
 
 # Tear down the egress datapath (safe no-ops if it was never up).
@@ -1203,7 +1222,14 @@ cmd_up() {
         exit 1
     fi
 
-    if egress_enabled; then verify_egress_locked; fi
+    # The agent container has now ATTACHED to the network. On Apple this is when the host's
+    # host-only gateway interface comes up, so start the host proxy now (no-op on Docker,
+    # whose sidecar is already running). The container is idle `bash` until `augur claude`,
+    # so nothing egresses in the gap before the proxy is up — and the self-test gates it.
+    if egress_enabled; then
+        start_egress_proxy
+        verify_egress_locked
+    fi
 
     success "Container '${CONTAINER_NAME}' is up."
     echo ""
