@@ -907,10 +907,10 @@ start_egress() {
             # Docker sidecar (reachable only inside the container network) and vs macOS VM
             # mode (loopback). The host-only gateway interface is the agent's only path in,
             # so a scoped bind keeps the guest reachable while staying off the LAN.
-            # VALIDATE on macOS 26: confirm the gateway interface is bindable at this point
-            # (the host-only network is created just above); if a container must attach first
-            # for the host interface to exist, start the proxy after `eng run` instead.
-            start_proxy "$(container_egress_gateway)"
+            # VALIDATE on macOS 26: the gateway interface may not be bindable until a
+            # container attaches; if start_proxy fails to bind, override the listen address
+            # with AUGUR_PROXY_LISTEN (e.g. 0.0.0.0 to confirm the datapath, then scope it).
+            start_proxy "${AUGUR_PROXY_LISTEN:-$(container_egress_gateway)}"
             ;;
     esac
 }
