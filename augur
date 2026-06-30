@@ -1313,10 +1313,18 @@ cmd_setup_token() {
     # empty-safe expansion (bash 3.2 + set -u)
     eng exec -it ${_lenv[@]+"${_lenv[@]}"} "$CONTAINER_NAME" ${_largv[@]+"${_largv[@]}"} || true
     stty sane 2>/dev/null || true   # restore cooked mode if the TUI left the tty raw
+    # Apple's `container exec -it` returns with our inherited stdin (fd 0) left in
+    # non-blocking mode. O_NONBLOCK is an open-file-description status flag (fcntl),
+    # a different axis from the termios state `stty sane` resets — so stty can't clear
+    # it, and the `read` below would then fail with EAGAIN ("read error: 0: Resource
+    # temporarily unavailable"). Docker's CLI restored this; Apple's does not. Clear the
+    # flag (perl ships with macOS) and read from a freshly opened /dev/tty as a belt-and-
+    # suspenders, so the paste works even if perl is somehow unavailable.
+    perl -e 'use Fcntl; fcntl(STDIN, F_SETFL, fcntl(STDIN, F_GETFL, 0) & ~O_NONBLOCK);' 2>/dev/null || true
     echo ""
     setup_token_security_notice
     local token=""
-    read -rp "$(echo -e "${CYAN}[augur]${RESET} Paste the token (sk-ant-…) here to save it on the host: ")" token || true
+    read -rp "$(echo -e "${CYAN}[augur]${RESET} Paste the token (sk-ant-…) here to save it on the host: ")" token < /dev/tty || true
     local rc=0
     save_oauth_token "$token" || rc=1
     # Restore the prior state even if the save failed.
@@ -1947,10 +1955,15 @@ cmd_setup_token_macos() {
     # AUGUR_AGENT_SEAM | login launch (macOS: interpolated into SSH string — see C4)
     ssh_macos "$project_vm" -t "zsh -l -c '$(agent_login_argv)'" || true
     stty sane 2>/dev/null || true   # restore cooked mode if the TUI left the tty raw
+    # Same guard as the container path: an attached interactive client (`ssh -t` here)
+    # can return with our stdin (fd 0) left non-blocking, which `stty sane` cannot clear
+    # (O_NONBLOCK is an fcntl file-status flag, not termios), making the `read` below fail
+    # with EAGAIN. Clear it and read from a fresh /dev/tty.
+    perl -e 'use Fcntl; fcntl(STDIN, F_SETFL, fcntl(STDIN, F_GETFL, 0) & ~O_NONBLOCK);' 2>/dev/null || true
     echo ""
     setup_token_security_notice
     local token=""
-    read -rp "$(echo -e "${CYAN}[augur]${RESET} Paste the token (sk-ant-…) here to save it on the host: ")" token || true
+    read -rp "$(echo -e "${CYAN}[augur]${RESET} Paste the token (sk-ant-…) here to save it on the host: ")" token < /dev/tty || true
     local rc=0
     save_oauth_token "$token" || rc=1
     # Restore the prior state even if the save failed.
