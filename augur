@@ -1159,9 +1159,11 @@ cmd_up() {
         # name, so it needs no working external resolver. This shuts DNS-exfil. Docker:
         # point the resolver at an unreachable RFC 5737 TEST-NET-1 address. Apple: --no-dns
         # injects no resolver at all (and the host-only network has no external DNS anyway).
-        # VALIDATE on macOS 26: confirm --no-dns leaves no usable resolver (empty
-        # /etc/resolv.conf), not the host's nameservers reachable via the host-only gateway.
-        # Either way verify_egress_locked's getent probe fails the boot self-test if it doesn't.
+        # Confirmed on macOS 26: --no-dns leaves no usable resolver (empty /etc/resolv.conf;
+        # the host's nameservers are NOT reachable via the host-only gateway). Verified from
+        # inside a running guest: `cat /etc/resolv.conf` is empty and `getent hosts <name>`
+        # fails, while allowlisted egress still works through the proxy (resolves host-side).
+        # verify_egress_locked's getent probe fails the boot self-test if this ever regresses.
         case "$ENGINE" in
             docker)    docker_args+=(--dns 192.0.2.1 --dns-search .) ;;
             container) docker_args+=(--no-dns) ;;
