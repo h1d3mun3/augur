@@ -264,17 +264,17 @@ make_workspace_mount() {
 }
 
 # Docker enumerates names with a Go template; Apple Container has no `ps` and no
-# Go-template --format, so we inspect the container by name and read its status from the
-# JSON. We extract the FIRST "status":"…" field (the inspected container's own top-level
-# status — it precedes any nested config) rather than substring-matching the whole document,
-# so an embedded value can't false-positive. `container inspect` exits non-zero when the
-# name doesn't exist, which doubles as the existence check.
+# Go-template --format, so we inspect the container by name and read its running state from
+# the JSON. Confirmed on macOS 26: the container's run state is nested at .status.state
+# (.status is an OBJECT, not a string — "state":"running" when up). We match that exact
+# field; it is unique to the top-level state, so it can't false-positive on config. NOTE:
+# the field is `state`, NOT `status` (which is the enclosing object). `container inspect`
+# exits non-zero when the name doesn't exist, which doubles as the existence check.
 container_running() {
     case "$ENGINE" in
         docker)    docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$CONTAINER_NAME" ;;
         container) container inspect "$CONTAINER_NAME" 2>/dev/null \
-                       | grep -oE '"status"[[:space:]]*:[[:space:]]*"[A-Za-z]+"' | head -n1 \
-                       | grep -q '"running"' ;;
+                       | grep -qE '"state"[[:space:]]*:[[:space:]]*"running"' ;;
     esac
 }
 

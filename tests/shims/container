@@ -25,10 +25,11 @@ case "${1:-}" in
     # `image inspect IMAGE` → image "exists" (exit 0, skip build).
     exit 0 ;;
   inspect)
-    # container_running greps this for a top-level "status":"running"; container_exists
-    # treats a non-zero exit as "absent". Apple's inspect emits a JSON array.
+    # container_running greps this for the nested .status.state == "running"; container_exists
+    # treats a non-zero exit as "absent". Mirrors Apple's real inspect shape (status is an
+    # OBJECT carrying "state").
     if [[ "${AUGUR_TEST_CONTAINER_RUNNING:-0}" == 1 ]]; then
-      printf '[{"status":"running","configuration":{"id":"%s"}}]\n' "${AUGUR_TEST_CONTAINER_NAME:-}"
+      printf '[{"id":"%s","status":{"state":"running"}}]\n' "${AUGUR_TEST_CONTAINER_NAME:-}"
       exit 0
     fi
     exit 1 ;;
