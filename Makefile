@@ -4,8 +4,10 @@
 # NO GitHub-hosted runner can do — their arm64 macOS runners are themselves Virtualization.
 # framework guests with no nested virt. See README "Continuous integration").
 #
-#   make unit           build-unit job (macos-26): Swift build/test, shellcheck, offline shell
-#                        tiers, version smoke. No engine/VM needed.
+#   make unit           build-unit job (macos-26): Swift build/test, shellcheck, version smoke.
+#                        No engine/VM needed. (The offline seam/construction tiers run on the
+#                        Linux job via `make offline-tests` — one of them asserts non-macOS engine
+#                        selection, so it belongs on ubuntu, not a macOS runner.)
 #   make container-e2e  container-e2e job (ubuntu-latest): egress FAIL-CLOSED proof on Docker
 #                        (stage -> build image -> live egress assertions). The security layer.
 #   make e2e            LOCAL macOS pre-release gate: boot the VM, xcodebuild test, virtiofs +
@@ -19,13 +21,14 @@ UNAME := $(shell uname)
 
 help:
 	@echo "augur make targets:"
-	@echo "  make unit           Swift build/test + shellcheck + offline tiers + version smoke (CI: macos-26)"
+	@echo "  make unit           Swift build/test + shellcheck + version smoke (CI: macos-26)"
+	@echo "  make offline-tests  seam + command-construction shell tiers (CI: ubuntu-latest)"
 	@echo "  make container-e2e  egress fail-closed E2E on Docker (CI: ubuntu-latest)"
 	@echo "  make e2e            LOCAL macOS VM pre-release gate (boots a VM — never in CI)"
 	@echo "  components: swift-build  swift-test  shellcheck  offline-tests  version-smoke"
 
 # ── build-unit (macos-26) ─────────────────────────────────────────────────────
-unit: swift-build swift-test shellcheck offline-tests version-smoke
+unit: swift-build swift-test shellcheck version-smoke
 	@echo "== unit: all checks passed =="
 
 # augur-vm imports Virtualization.framework (macOS only) — build it only on Darwin. augur-proxy
@@ -61,7 +64,9 @@ shellcheck:
 	SHELLCHECK_OPTS='-e SC1090 -e SC1091' shellcheck --severity=warning tests/22_egress_failclosed.sh tests/e2e_macos_vm.sh
 
 # Offline shell tiers (00/10/11/12): seam + command-construction contracts via shims. Live tiers
-# (20/21/22/30) self-skip without their prereqs, so this is safe with no engine/VM present.
+# (20/21/22/30) self-skip without their prereqs, so this is safe with no engine/VM present. Runs on
+# the Linux (ubuntu) CI job: tier 12 asserts that a NON-macOS host defaults to the Docker engine, so
+# it must not run on a macOS runner (where the default is correctly Apple Container on macOS 26+).
 offline-tests:
 	@echo "== offline shell tiers =="
 	bash tests/run.sh

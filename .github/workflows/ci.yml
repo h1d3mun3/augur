@@ -40,8 +40,9 @@ jobs:
       - name: Toolchain
         run: swift --version && sw_vers
       # swift build (augur-vm + augur-proxy) · swift test (augur-proxy) · shellcheck ·
-      # offline shell tiers · `augur version` smoke. Deliberately no `augur status`/`up`:
-      # they require a container engine that isn't (and can't be) on this runner.
+      # `augur version` smoke. Deliberately no `augur status`/`up`: they require a container
+      # engine that isn't (and can't be) on this runner. The offline seam/construction tiers
+      # run on the Linux job (one asserts non-macOS engine selection).
       - name: Build + unit + lint
         run: make unit
 
@@ -51,6 +52,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Seam + command-construction tiers (shimmed engine, no daemon). Linux is their home: tier 12
+      # asserts a non-macOS host defaults to Docker. Live tiers (20/21/22/30) self-skip here.
+      - name: Seam + construction tiers (offline shell)
+        run: make offline-tests
       # Stage ~/.augur -> build the agent image -> bring up egress mode -> assert fail-closed.
       # The bring-up fires augur's boot self-test (verify_egress_locked); the tier then adds the
       # allowlisted-reachable / non-allowlisted-blocked assertions. AUGUR_TEST_REQUIRE_EGRESS=1

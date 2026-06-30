@@ -319,8 +319,9 @@ augur's tests are split by what each layer can prove on a free runner, and by wh
 each layer actually catches.
 
 ```bash
-make unit           # Swift build/test + shellcheck + offline shell tiers + version smoke
-make container-e2e  # egress FAIL-CLOSED proof on Docker (builds the image, brings up egress)
+make unit           # Swift build/test + shellcheck + version smoke              (CI: macos-26)
+make offline-tests  # seam + command-construction shell tiers (shimmed engine)   (CI: ubuntu)
+make container-e2e  # egress FAIL-CLOSED proof on Docker (builds the image)       (CI: ubuntu)
 make e2e            # LOCAL pre-release gate: macOS VM boot + xcodebuild test (never in CI)
 ```
 
@@ -335,7 +336,7 @@ CI runs on **free GitHub-hosted runners only**, and **no CI job boots a VZ guest
 | Job | Runner | What it proves |
 |-----|--------|----------------|
 | `build-unit` | `macos-26` | `swift build`/`swift test` the CLIs (`augur-vm` builds, `augur-proxy` builds + tests), `shellcheck`, and a side-effect-free `augur version` smoke. No engine, no VM. |
-| `container-e2e` | `ubuntu-latest` | The **security layer**: Docker container mode with egress on, asserting the guest can only reach allowlisted domains (allowlisted reachable · non-allowlisted blocked · DNS closed · direct egress severed). Fails **closed**. |
+| `container-e2e` | `ubuntu-latest` | The offline seam/construction tiers, then the **security layer**: Docker container mode with egress on, asserting the guest can only reach allowlisted domains (allowlisted reachable · non-allowlisted blocked · DNS closed · direct egress severed). Fails **closed**. |
 
 Both jobs are **secrets-zero** — the coding agent is never authenticated in CI (the
 `container-e2e` job even asserts the guest has no agent token). So `pull_request` runs from
