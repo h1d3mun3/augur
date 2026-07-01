@@ -504,12 +504,18 @@ ssh_macos() {
     # does NOT work: command-line `-o` is parsed BEFORE the config files, so the system config
     # re-adds the patterns afterwards (verified with `ssh -G`). Dropping ssh_config loses
     # nothing — every option augur relies on is passed explicitly below.
+    # ServerAlive* bounds a session that connects at the TCP level but then hangs
+    # (ConnectTimeout only covers the initial handshake, not a stalled post-connect
+    # session): if the VM dies or the guest sshd stops responding, the client gives up
+    # after ~ServerAliveInterval×ServerAliveCountMax seconds instead of blocking forever.
     ssh -F /dev/null \
         -p "$port" \
         -o StrictHostKeyChecking=accept-new \
         -o UserKnownHostsFile="$(vm_known_hosts_file "$vm")" \
         -o LogLevel=ERROR \
         -o ConnectTimeout=10 \
+        -o ServerAliveInterval=15 \
+        -o ServerAliveCountMax=4 \
         ${key_opts[@]+"${key_opts[@]}"} \
         "${MACOS_SSH_USER}@${host}" "$@"
 }
@@ -1023,6 +1029,10 @@ gvproxy_pidfile() { echo "$AUGUR_PROXY_DIR/$(workspace_slug).gvproxy.pid"; }
 # these capture their stderr so the failure path can surface the real cause.
 gvproxy_log()     { echo "$AUGUR_PROXY_DIR/$(workspace_slug).gvproxy.log"; }
 macos_vm_log()    { echo "$AUGUR_PROXY_DIR/$(workspace_slug).vm.log"; }
+# Base-VM maintenance boot log (augur update --macos). Not project-specific, so it lives
+# under AUGUR_DIR (always present) rather than the per-project proxy dir. Captures the
+# base VM's NAT boot stderr so an "SSH did not come up" failure can surface the real cause.
+macos_base_vm_log() { echo "$AUGUR_DIR/base-vm.vm.log"; }
 
 gvproxy_running() {
     local pf; pf="$(gvproxy_pidfile)"
@@ -1671,14 +1681,23 @@ cmd_build_macos() {
 }
 
 # Poll until SSH is actually accepting connections (the VM having an IP does not guarantee
-# the SSH daemon is ready). Waits up to ~2 min (40 × 3s). Prints the IP on success.
+# the SSH daemon is ready). Bounded by a wall-clock budget (default ~2 min) rather than a
+# fixed iteration count, so slow per-probe cases (a stale DHCP lease pointing at a dead IP,
+# giving "Host is down") can't blow the intended ceiling. Callers may pass a larger budget
+# for a cold first boot. Prints the IP on success.
 wait_for_macos_ssh() {
     local vm="$1"
-    local host port retries=40 key_opts=()
+    local max_secs="${2:-120}"
+    local host port key_opts=()
     port="$(macos_ssh_port "$vm")"
     [[ -f "$MACOS_SSH_KEY" ]] && key_opts=(-i "$MACOS_SSH_KEY" -o PasswordAuthentication=no -o BatchMode=yes)
-    while ((retries-- > 0)); do
+    local deadline=$(( SECONDS + max_secs ))
+    while (( SECONDS < deadline )); do
         host="$(macos_ssh_host "$vm")"
+        # ServerAlive* caps a probe that connects but then stalls (e.g. sshd accepted the
+        # TCP connection while the guest is still mid-boot): without it such a probe blocks
+        # forever — ConnectTimeout only bounds the handshake — and wedges the whole retry
+        # loop past its nominal timeout, which shows up as an indefinite silent hang.
         [[ -n "$host" ]] && \
             ssh -F /dev/null \
                 -p "$port" \
@@ -1686,6 +1705,8 @@ wait_for_macos_ssh() {
                 -o UserKnownHostsFile="$(vm_known_hosts_file "$vm")" \
                 -o LogLevel=ERROR \
                 -o ConnectTimeout=5 \
+                -o ServerAliveInterval=4 \
+                -o ServerAliveCountMax=2 \
                 ${key_opts[@]+"${key_opts[@]}"} \
                 "${MACOS_SSH_USER}@${host}" true 2>/dev/null && { echo "$host"; return 0; }
         sleep 3
@@ -2111,24 +2132,62 @@ cmd_update_macos() {
     # Stop a stale base VM from a previous interrupted run before starting a fresh one.
     macos_vm_running "$MACOS_BASE_VM" && "$VM_CLI" stop "$MACOS_BASE_VM" 2>/dev/null || true
     # Base-VM maintenance runs over NAT (no gvproxy/agent); opt into it explicitly
-    # now that egress-filtered networking is the fail-closed default.
-    "$VM_CLI" run --no-graphics --net-nat "$MACOS_BASE_VM" &>/dev/null &
+    # now that egress-filtered networking is the fail-closed default. Keep the boot
+    # stderr on disk (not /dev/null) so a reachability failure below can show the cause.
+    "$VM_CLI" run --no-graphics --net-nat "$MACOS_BASE_VM" &>"$(macos_base_vm_log)" &
     local vm_pid=$!
-    wait_for_macos_ssh "$MACOS_BASE_VM" &>/dev/null || {
-        kill "$vm_pid" 2>/dev/null; wait "$vm_pid" 2>/dev/null || true
+    # A cold first boot of the base VM (full macOS boot + fresh DHCP lease + sshd up) can take
+    # well over the 2 min a warm project VM needs, so give it a generous wall-clock budget.
+    if ! wait_for_macos_ssh "$MACOS_BASE_VM" 300 &>/dev/null; then
+        error "VM '${MACOS_BASE_VM}' did not become reachable over SSH in time."
+        # Surface the otherwise-discarded cause (mirrors cmd_up_macos). The base VM boots
+        # over NAT; the usual reasons it stays unreachable are a boot failure or a missing/
+        # stale DHCP lease — augur-vm resolves its IP from /var/db/dhcpd_leases by MAC, so an
+        # empty host means it never booted far enough to lease an address.
+        local _bhost
+        _bhost="$(macos_ssh_host "$MACOS_BASE_VM" 2>/dev/null || true)"
+        error "Diagnostics (kept on disk):"
+        error "  base VM SSH host (from DHCP lease): ${_bhost:-<none — VM did not boot or never got an IP>}"
+        if [[ -n "$_bhost" ]]; then
+            error "  ---- ssh probe (stderr) ----"
+            ssh_macos "$MACOS_BASE_VM" true 2>&1 | head -n 6 | while IFS= read -r _l; do error "  | $_l"; done || true
+        fi
+        error "  VM log:      $(macos_base_vm_log)"
+        if [[ -s "$(macos_base_vm_log)" ]]; then
+            error "  ---- last VM lines ----"
+            tail -n 15 "$(macos_base_vm_log)" 2>/dev/null | while IFS= read -r _l; do error "  | $_l"; done
+        fi
+        # Tear the VM down via the bounded `augur-vm stop` (SIGTERM, then SIGKILL after 30s)
+        # BEFORE reaping. A raw `kill "$vm_pid"; wait "$vm_pid"` here hangs forever: the run
+        # process masks SIGTERM's default disposition and asks the guest for a graceful ACPI
+        # shutdown, which never completes while the guest is still mid-boot — so `wait` blocks
+        # indefinitely. That was the silent multi-minute hang with no error output.
         "$VM_CLI" stop "$MACOS_BASE_VM" 2>/dev/null || true
-        error "VM did not become reachable in time."
+        wait "$vm_pid" 2>/dev/null || true
+        error "The base VM may just be slow to boot — re-run ${BOLD}augur update --macos${RESET}."
         exit 1
-    }
+    fi
     if ! ssh_macos "$MACOS_BASE_VM" '
         # Claude Code via the official installer (see cmd_build_macos for why npm is avoided).
         # The base VM has no virtiofs mounts here, so ~/.claude is local and writable.
         # Download to a temp file before executing — avoids piping untrusted content to a shell.
+        # No "timeout" binary on stock macOS: background the command, race it against a
+        # backgrounded sleep+kill, and wait on the real PID for its actual exit status — a
+        # stalled network call (curl gives no output at all while blocked) cannot hang this
+        # step forever.
+        _with_timeout() {
+            local _secs="$1"; shift
+            "$@" & local _cpid=$!
+            ( sleep "$_secs"; kill -TERM "$_cpid" 2>/dev/null ) & local _wpid=$!
+            wait "$_cpid" 2>/dev/null; local _rc=$?
+            kill "$_wpid" 2>/dev/null; wait "$_wpid" 2>/dev/null
+            return $_rc
+        }
         _installer=$(mktemp)
-        curl -fsSL https://claude.ai/install.sh -o "$_installer" \
-            || { echo "augur: ERROR failed to download the Claude Code installer" >&2; rm -f "$_installer"; exit 1; }
-        bash "$_installer" latest \
-            || { echo "augur: ERROR Claude Code installer failed" >&2; rm -f "$_installer"; exit 1; }
+        curl -fsSL --connect-timeout 10 --max-time 120 https://claude.ai/install.sh -o "$_installer" \
+            || { echo "augur: ERROR failed to download the Claude Code installer (timed out or unreachable)" >&2; rm -f "$_installer"; exit 1; }
+        _with_timeout 180 bash "$_installer" latest \
+            || { echo "augur: ERROR Claude Code installer failed or timed out" >&2; rm -f "$_installer"; exit 1; }
         rm -f "$_installer"
         grep -q ".local/bin" ~/.zprofile 2>/dev/null || echo '\''export PATH="$HOME/.local/bin:$PATH"'\'' >> ~/.zprofile
         codesign -dvv "$HOME/.local/bin/claude" 2>&1 | grep -qi "Anthropic" \
