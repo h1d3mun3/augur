@@ -116,4 +116,22 @@ else
   ok "IP-literal direct egress severed in the VM (no raw-routing bypass)"
 fi
 
+# ── Bounded teardown (the #64 guarantee, end-to-end on a real VM) ─────────────────────────────
+# The base/build VM maintenance paths reap their backgrounded `augur-vm run` via
+# stop_and_reap_macos_vm (unit-tested against a SIGTERM-ignoring stand-in in 31_macos_teardown.sh).
+# Here we assert the real-VM teardown a user actually runs is bounded: a regression that
+# reintroduced a raw `kill "$vm_pid"; wait "$vm_pid"` on a VM that masks SIGTERM (never finishing
+# its ACPI shutdown mid-boot) would blow this budget instead of returning. `augur-vm stop`
+# SIGKILLs after 30s, so a real down (graceful ACPI, then the CLI returns) is well under 90s.
+section "Bounded teardown (no hang)"
+down_t0=$SECONDS
+( cd "$PROJECT" && bash "$AUGUR" down --macos ) >/dev/null 2>&1
+down_el=$(( SECONDS - down_t0 ))
+if (( down_el < 90 )); then
+  ok "augur down --macos completed in ${down_el}s (bounded — no teardown hang)"
+else
+  fail "augur down --macos took ${down_el}s" "possible unbounded teardown hang (regression in the reap path)"
+fi
+# The EXIT trap runs `down --macos` again — a harmless no-op now the VM is already stopped.
+
 finish
