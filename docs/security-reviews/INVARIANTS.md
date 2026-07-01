@@ -60,27 +60,36 @@ in time," this **prescribes** "what must never break." It changes rarely.
 - **Why:** Prevent egress from accidentally opening on file corruption or a transient read failure.
 - **Enforced by:** `SNIAndFilterTests.testHotReloadSwapsPolicy` (the swap is ✅; "keep old policy when unreadable" is ⚠ review-only)
 
-### I7. The guest cannot widen its own allowlist  ⚠ review-only
+### I7. The guest cannot widen its own allowlist  ✅ test
 - **Rule:** The merged allowlist is written host-side at `~/.augur/proxy/<slug>.allowlist`
   (**outside the project tree**). A `./.augur.conf` is merged only after TOFU approval
   and only its sanitized domains (via `conf_line_valid`).
 - **Why:** Prevent root-in-guest from rewriting the egress policy mid-session.
-- **Enforced by:** review only for now. `write_merged_allowlist` / `check_project_conf_approved` (`augur`). → test candidate.
+- **Enforced by:** `tests/01_egress_allowlist_unit.sh` (checks `conf_line_valid`'s grammar,
+  `project_conf_domains` sanitization, and that `write_merged_allowlist` drops guest-supplied
+  junk and writes **outside the project tree**). The TOFU approval itself
+  (`check_project_conf_approved`) is ⚠ review-only.
 
-### I8. Keep the private-IP dial guard always armed  ⚠ review-only
+### I8. Keep the private-IP dial guard always armed  ✅ test
 - **Rule:** Never pass `--allow-private` to `augur-proxy` on a production path. Before
   dialing, re-check the resolved `sockaddr` and block private / loopback / link-local
   / metadata destinations.
 - **Why:** Prevent SSRF where an allowlisted name resolves to a LAN / host / metadata IP.
-- **Enforced by:** review only for now (addendum A6). `Sock`/`isPrivate` (`SocketIO.swift`). → test candidate.
+- **Enforced by:** `AddressPolicyTests` (the classification logic was extracted into the core
+  lib `AddressPolicy.isPrivateV4`/`isPrivateV6` and tested directly: RFC1918, loopback, CGNAT,
+  metadata 169.254.169.254, IPv4-mapped, etc. are classified non-public, while public IPs and
+  each block boundary are classified public). Not passing `--allow-private` in production is a
+  structural guarantee (addendum A6).
 
-### I9. macOS guest network isolation  ⚠ review-only
+### I9. macOS guest network isolation  🟡 partial
 - **Rule:** The guest's NIC is a **single** host-owned socket (`VZFileHandleNetworkDeviceAttachment`).
   No NAT/bridged device and no second NIC is added. The only entitlement is
   `com.apple.security.virtualization`. The gvproxy patch drops UDP/ICMP and forces all TCP
   through the SOCKS allowlist.
 - **Why:** Physically remove any path for the guest to bypass the proxy.
-- **Enforced by:** configuration review only for now. `augur-vm` (NetworkAttachment) / `augur-vm.entitlements` / gvproxy patch.
+- **Enforced by:** the entitlement set (does **not** request `com.apple.vm.networking` = no
+  bridged networking) is checked by `tests/30_macos_vm.sh` (✅). The NIC count and the gvproxy
+  UDP/ICMP drop need a real VM host, so they are ⚠ review-only.
 
 ### I10. Do not expose credentials on argv  ⚠ review-only
 - **Rule:** On macOS the token is written to `~/.augur-env` (chmod 600) via SSH stdin,
@@ -92,7 +101,8 @@ in time," this **prescribes** "what must never break." It changes rarely.
 
 ---
 
-> Of the 10, I1–I5 are enforced by tests/self-tests, I6 is partial, and I7–I10 are
-> review-only. The 4 review-only items are the ones "not guarded by tests and able to
-> rot silently" — the priority candidates for adding tests (a separate task). For
-> background on each item, see the newest [review snapshot](./README.md).
+> Of the 10, I1–I5, I7, I8 are enforced by tests/self-tests; I6 and I9 are partial; I10
+> is review-only. The remaining review-only surface is I10 (credentials not on argv:
+> macOS goes through a file, but the Docker argv is an accepted residual, M1) and the
+> hardware-dependent parts of I6/I9. For background on each item, see the newest
+> [review snapshot](./README.md).

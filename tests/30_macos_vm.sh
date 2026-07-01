@@ -19,6 +19,22 @@ has "$claude_macos" '${_rargv}'          "macOS launch interpolates the seam lau
 up_macos="$(awk '/^cmd_up_macos\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
 has "$up_macos" 'agent_state_host_subdir' "macOS history share dir name comes from agent_state_host_subdir (A3/C7)"
 
+section "Tier 2 — macOS network isolation (entitlements, run anywhere)"
+# Invariant I9 (docs/security-reviews/INVARIANTS.md): the guest gets one host-owned NIC
+# and no bridged networking. The machine-checkable part is the entitlement set — bridged
+# networking would require com.apple.vm.networking, which augur must NOT ship. (NIC count
+# and the gvproxy UDP/ICMP drop stay review-only: they need a real VM host.)
+ent="$REPO/augur-vm/augur-vm.entitlements"
+if [[ -f "$ent" ]]; then
+  # Match the granted <key>…</key> ELEMENTS, not any substring — the file mentions
+  # com.apple.vm.networking inside an explanatory comment on purpose.
+  ent_txt="$(cat "$ent")"
+  has   "$ent_txt" '<key>com.apple.security.virtualization</key>' "entitlements grant Virtualization.framework"
+  hasnt "$ent_txt" '<key>com.apple.vm.networking</key>'           "entitlements do NOT grant bridged networking (I9)"
+else
+  fail "augur-vm.entitlements present" "not found at $ent"
+fi
+
 section "Tier 2 — macOS live smoke (gated)"
 if [[ "$(uname -s)" != "Darwin" ]]; then skip "live macOS checks" "not a macOS host"; finish; exit $?; fi
 if ! command -v augur-vm >/dev/null 2>&1; then skip "live macOS checks" "augur-vm not built (run: bash install)"; finish; exit $?; fi
