@@ -45,6 +45,19 @@ jobs:
       # run on the Linux job (one asserts non-macOS engine selection).
       - name: Build + unit + lint
         run: make unit
+      # Real augur-proxy per-mode bind + teardown isolation (32_proxy_per_mode.sh covers the pure
+      # logic; this exercises the ACTUAL binary just built by `make unit`, binding both mode
+      # instances on the same ports at different addresses — 127.0.0.1 for VM mode vs a second
+      # loopback standing in for the container gateway). A missing alias skips (never fails) so a
+      # runner quirk can't break CI; a real regression (the second instance not binding, or a
+      # `down` killing the other) fails it.
+      - name: Proxy per-mode bind isolation (real binary)
+        run: |
+          if sudo ifconfig lo0 alias 127.0.0.2 up 2>/dev/null; then
+            AUGUR_TEST_ADDR_B=127.0.0.2 bash tests/23_proxy_bind_isolation.sh
+          else
+            echo "note: could not add 127.0.0.2 loopback alias; skipping real-proxy bind isolation"
+          fi
 
   # ── Egress fail-closed E2E (the security layer) — Docker container mode ──────
   container-e2e:
