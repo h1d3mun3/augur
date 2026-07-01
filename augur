@@ -2112,7 +2112,7 @@ cmd_update_macos() {
     # now that egress-filtered networking is the fail-closed default.
     "$VM_CLI" run --no-graphics --net-nat "$MACOS_BASE_VM" &>/dev/null &
     local vm_pid=$!
-    macos_vm_ip "$MACOS_BASE_VM" &>/dev/null || {
+    wait_for_macos_ssh "$MACOS_BASE_VM" &>/dev/null || {
         kill "$vm_pid" 2>/dev/null; wait "$vm_pid" 2>/dev/null || true
         error "VM did not become reachable in time."
         exit 1
