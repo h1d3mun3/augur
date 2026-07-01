@@ -30,7 +30,7 @@ USER dev
 # from execution so the script can be inspected and avoids piping untrusted content to bash.
 RUN _installer=$(mktemp) \
     && curl -fsSL https://claude.ai/install.sh -o "$_installer" \
-    && bash "$_installer" stable \
+    && bash "$_installer" latest \
     && rm -f "$_installer"
 ENV PATH=/home/dev/.local/bin:$PATH
 # Pin the Claude binary: never auto-update it at runtime. The binary lives in the
