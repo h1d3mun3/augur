@@ -468,6 +468,18 @@ macos_vm_ip() {
     return 1
 }
 
+# Stop a backgrounded `augur-vm run` process and reap it, bounded. The run process masks
+# SIGTERM's default disposition and instead asks the guest for a graceful ACPI shutdown, which
+# never completes while the guest is still mid-boot — so a raw `kill "$pid"; wait "$pid"` on it
+# can block forever. Route through the bounded `augur-vm stop` (SIGTERM, then SIGKILL after 30s)
+# first, so the process is dead and the following `wait` returns promptly instead of hanging.
+# The optional pid is a `run` we backgrounded and must reap (avoids a zombie / stray job message).
+stop_and_reap_macos_vm() {
+    local vm="$1" pid="${2:-}"
+    "$VM_CLI" stop "$vm" 2>/dev/null || true
+    [[ -n "$pid" ]] && { wait "$pid" 2>/dev/null || true; }
+}
+
 # SSH target for a VM. The project VM in egress mode lives behind gvproxy's
 # user-space network (no host-routable IP); SSH reaches it via gvproxy's host-side
 # forward at 127.0.0.1:<AUGUR_SSH_FWD_PORT>. Every other case (build/base VM, or a
@@ -1535,7 +1547,7 @@ cmd_build_macos() {
     info "Waiting for SSH..."
     local vm_ip
     vm_ip="$(macos_vm_ip "$MACOS_BUILD_VM")" || {
-        kill "$vm_pid" 2>/dev/null; wait "$vm_pid" 2>/dev/null || true
+        stop_and_reap_macos_vm "$MACOS_BUILD_VM" "$vm_pid"
         error "VM did not become reachable. Check that Remote Login is enabled."
         exit 1
     }
@@ -1666,8 +1678,7 @@ cmd_build_macos() {
     ssh_macos "$MACOS_BUILD_VM" "sudo rm -f /etc/sudoers.d/augur"
 
     info "Saving base VM '${MACOS_BASE_VM}'..."
-    "$VM_CLI" stop "$MACOS_BUILD_VM" 2>/dev/null || true
-    wait "$vm_pid" 2>/dev/null || true
+    stop_and_reap_macos_vm "$MACOS_BUILD_VM" "$vm_pid"
 
     "$VM_CLI" clone "$MACOS_BUILD_VM" "$MACOS_BASE_VM"
     "$VM_CLI" delete "$MACOS_BUILD_VM"
@@ -2157,13 +2168,7 @@ cmd_update_macos() {
             error "  ---- last VM lines ----"
             tail -n 15 "$(macos_base_vm_log)" 2>/dev/null | while IFS= read -r _l; do error "  | $_l"; done
         fi
-        # Tear the VM down via the bounded `augur-vm stop` (SIGTERM, then SIGKILL after 30s)
-        # BEFORE reaping. A raw `kill "$vm_pid"; wait "$vm_pid"` here hangs forever: the run
-        # process masks SIGTERM's default disposition and asks the guest for a graceful ACPI
-        # shutdown, which never completes while the guest is still mid-boot — so `wait` blocks
-        # indefinitely. That was the silent multi-minute hang with no error output.
-        "$VM_CLI" stop "$MACOS_BASE_VM" 2>/dev/null || true
-        wait "$vm_pid" 2>/dev/null || true
+        stop_and_reap_macos_vm "$MACOS_BASE_VM" "$vm_pid"
         error "The base VM may just be slow to boot — re-run ${BOLD}augur update --macos${RESET}."
         exit 1
     fi
@@ -2193,14 +2198,12 @@ cmd_update_macos() {
         codesign -dvv "$HOME/.local/bin/claude" 2>&1 | grep -qi "Anthropic" \
             || echo "augur: WARNING claude binary is not signed by Anthropic" >&2
     '; then
-        "$VM_CLI" stop "$MACOS_BASE_VM" 2>/dev/null || true
-        wait "$vm_pid" 2>/dev/null || true
+        stop_and_reap_macos_vm "$MACOS_BASE_VM" "$vm_pid"
         error "Failed to update CLI tools in '${MACOS_BASE_VM}' (see the error above — often a transient network issue)."
         error "The base VM was left as-is. Try running 'augur update --macos' again."
         exit 1
     fi
-    "$VM_CLI" stop "$MACOS_BASE_VM" 2>/dev/null || true
-    wait "$vm_pid" 2>/dev/null || true
+    stop_and_reap_macos_vm "$MACOS_BASE_VM" "$vm_pid"
     success "CLI tools updated in '${MACOS_BASE_VM}'."
     warn "Project VMs cloned before this update will not be affected."
     warn "Run ${BOLD}augur destroy --macos && augur up --macos${RESET} to apply to the current project."
