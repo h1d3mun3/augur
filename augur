@@ -2108,12 +2108,15 @@ cmd_update_macos() {
         exit 1
     }
     info "Updating CLI tools in base VM '${MACOS_BASE_VM}'..."
+    # Stop a stale base VM from a previous interrupted run before starting a fresh one.
+    macos_vm_running "$MACOS_BASE_VM" && "$VM_CLI" stop "$MACOS_BASE_VM" 2>/dev/null || true
     # Base-VM maintenance runs over NAT (no gvproxy/agent); opt into it explicitly
     # now that egress-filtered networking is the fail-closed default.
     "$VM_CLI" run --no-graphics --net-nat "$MACOS_BASE_VM" &>/dev/null &
     local vm_pid=$!
     wait_for_macos_ssh "$MACOS_BASE_VM" &>/dev/null || {
         kill "$vm_pid" 2>/dev/null; wait "$vm_pid" 2>/dev/null || true
+        "$VM_CLI" stop "$MACOS_BASE_VM" 2>/dev/null || true
         error "VM did not become reachable in time."
         exit 1
     }
