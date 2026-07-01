@@ -16,9 +16,12 @@ section "Tier 1 — real augur-proxy per-mode bind + teardown isolation"
 AUGUR_SOURCE_ONLY=1 source "$AUGUR"
 set +e                                    # augur enables `set -e`; restore lib.sh assert-and-continue
 
-# Resolve the real proxy binary via augur's own logic; skip if it isn't built.
+# Resolve the real proxy binary via augur's own logic; skip if it isn't built. Require a real
+# executable FILE (or a PATH command) — resolve_proxy_cli falls back to the bare name "augur-proxy",
+# and a plain `-x` test would match the repo's augur-proxy/ DIRECTORY (dirs are searchable), so an
+# unbuilt binary would look present and start_proxy would then fail instead of skipping.
 bin="$(resolve_proxy_cli)"
-if ! command -v "$bin" >/dev/null 2>&1 && [[ ! -x "$bin" ]]; then
+if ! command -v "$bin" >/dev/null 2>&1 && [[ ! -f "$bin" || ! -x "$bin" ]]; then
   skip "real-proxy bind isolation" "augur-proxy not built (run: bash install, or make unit)"; finish; exit $?
 fi
 
