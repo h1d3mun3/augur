@@ -17,8 +17,9 @@ topology, where the guest's root cannot reach it:
 
 - **Docker**: the container runs on a `docker network --internal` (no route to the
   internet) with `--cap-drop=NET_ADMIN` (root can't re-route). Its only reachable
-  egress is this proxy via `host.docker.internal`. A boot self-test in `augur`
-  proves a direct (proxy-less) connection fails — else it refuses to start.
+  egress is this proxy, run as a dual-homed **sidecar** on that internal network and
+  reached by its fixed container-network IP. A boot self-test in `augur` proves a
+  direct (proxy-less) connection fails — else it refuses to start.
 - **macOS**: the VM's only NIC is a host-owned `socketpair` via
   `VZFileHandleNetworkDeviceAttachment` (see `augur-vm`'s `--net-vfkit`). A
   user-space network stack (`gvproxy`, see below) runs the guest's network on the
