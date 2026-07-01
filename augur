@@ -2120,23 +2120,31 @@ cmd_update_macos() {
         error "VM did not become reachable in time."
         exit 1
     }
-    ssh_macos "$MACOS_BASE_VM" '
+    if ! ssh_macos "$MACOS_BASE_VM" '
         # Claude Code via the official installer (see cmd_build_macos for why npm is avoided).
         # The base VM has no virtiofs mounts here, so ~/.claude is local and writable.
         # Download to a temp file before executing — avoids piping untrusted content to a shell.
         _installer=$(mktemp)
-        curl -fsSL https://claude.ai/install.sh -o "$_installer"
-        bash "$_installer" latest
+        curl -fsSL https://claude.ai/install.sh -o "$_installer" \
+            || { echo "augur: ERROR failed to download the Claude Code installer" >&2; rm -f "$_installer"; exit 1; }
+        bash "$_installer" latest \
+            || { echo "augur: ERROR Claude Code installer failed" >&2; rm -f "$_installer"; exit 1; }
         rm -f "$_installer"
         grep -q ".local/bin" ~/.zprofile 2>/dev/null || echo '\''export PATH="$HOME/.local/bin:$PATH"'\'' >> ~/.zprofile
         codesign -dvv "$HOME/.local/bin/claude" 2>&1 | grep -qi "Anthropic" \
             || echo "augur: WARNING claude binary is not signed by Anthropic" >&2
-    '
+    '; then
+        "$VM_CLI" stop "$MACOS_BASE_VM" 2>/dev/null || true
+        wait "$vm_pid" 2>/dev/null || true
+        error "Failed to update CLI tools in '${MACOS_BASE_VM}' (see the error above — often a transient network issue)."
+        error "The base VM was left as-is. Try running 'augur update --macos' again."
+        exit 1
+    fi
     "$VM_CLI" stop "$MACOS_BASE_VM" 2>/dev/null || true
     wait "$vm_pid" 2>/dev/null || true
     success "CLI tools updated in '${MACOS_BASE_VM}'."
     warn "Project VMs cloned before this update will not be affected."
-    warn "Run ${BOLD}augur down --macos && augur up --macos${RESET} to apply to the current project."
+    warn "Run ${BOLD}augur destroy --macos && augur up --macos${RESET} to apply to the current project."
 }
 
 # `version` reports the installed augur commit and nothing else. Side-effect-free —
