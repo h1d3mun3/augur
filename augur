@@ -563,8 +563,19 @@ egress_enabled() {
     esac
 }
 
-proxy_pidfile() { echo "$AUGUR_PROXY_DIR/$(workspace_slug).pid"; }
-proxy_logfile() { echo "$AUGUR_PROXY_DIR/$(workspace_slug).log"; }
+# The host proxy is PER-MODE, not just per-project. macOS VM mode binds it to 127.0.0.1
+# (gvproxy's SOCKS upstream) while Apple Container mode binds it to the container's host-only
+# gateway — two different addresses, so one proxy process cannot serve both. Both modes can be
+# up for the same project at once; keying the pidfile/log on the role keeps them as SEPARATE
+# instances. Without this they share one pidfile: the second `up` reuses the first's proxy
+# (bound to the wrong address, so its egress silently fails closed), and a `down` in either
+# mode kills the shared proxy out from under the other. The two instances bind the same ports
+# but on different addresses (127.0.0.1 vs the gateway), so they never collide. Docker mode
+# does not use the host proxy at all (it runs a sidecar container), so it is unaffected.
+proxy_role() { if $MACOS_MODE; then echo macos; else echo container; fi; }
+proxy_pidfile() { echo "$AUGUR_PROXY_DIR/$(workspace_slug)-$(proxy_role).pid"; }
+proxy_logfile() { echo "$AUGUR_PROXY_DIR/$(workspace_slug)-$(proxy_role).log"; }
+# The allowlist is shared content (identical merge regardless of mode), so it stays per-project.
 proxy_allowlist() { echo "$AUGUR_PROXY_DIR/$(workspace_slug).allowlist"; }
 
 proxy_running() {
@@ -793,6 +804,14 @@ stop_proxy() {
         kill "$(cat "$pidfile")" 2>/dev/null || true
     fi
     rm -f "$pidfile" 2>/dev/null || true
+    # Migration: reap a proxy left running under the pre-role pidfile ("<slug>.pid") by a
+    # version of augur before the per-role split. It is invisible to the role-keyed
+    # proxy_running above, so without this the next same-address `up` would collide with it.
+    local legacy; legacy="$AUGUR_PROXY_DIR/$(workspace_slug).pid"
+    if [[ -f "$legacy" ]]; then
+        kill "$(cat "$legacy" 2>/dev/null)" 2>/dev/null || true
+        rm -f "$legacy" 2>/dev/null || true
+    fi
 }
 
 # ── Container-engine egress topology (no host sudo) ───────────────────────────
