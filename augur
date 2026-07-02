@@ -38,6 +38,8 @@ AUGUR_VM_BIN="${AUGUR_VM_BIN:-}"
 # transparent proxy that only permits the domains in the merged allowlist
 # (managed baseline augur.conf.default + global ~/.augur/augur.conf + project
 # ./.augur.conf). Everything else is blocked. No host sudo is ever required. See augur-proxy/.
+# Security contract for this datapath: docs/security-reviews/INVARIANTS.md
+# (a change that breaks an invariant there is a contract change — see its header).
 AUGUR_DIR="$HOME/.augur"
 # Three-layer egress allowlist, all merged (union-only: a layer can widen but never
 # narrow the ones below it):
