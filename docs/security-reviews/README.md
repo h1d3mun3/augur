@@ -31,5 +31,6 @@ Newest on top.
 
 | Date | Scope | File |
 |---|---|---|
+| 2026-07-02 | Current-state review focused on egress control (re-baseline) | [2026-07-02-egress.md](./2026-07-02-egress.md) |
 | 2026-06-30 | Current-state review focused on egress control | [2026-06-30-egress.md](./2026-06-30-egress.md) |
 | 2026-06-28 | Full review of isolation / egress / credentials + Guest→Host (Axis B) audit | [2026-06-28-full-review.md](./2026-06-28-full-review.md) |
