@@ -53,12 +53,12 @@ in time," this **prescribes** "what must never break." It changes rarely.
 - **Why:** Prevent exfiltration by smuggling data in DNS queries.
 - **Enforced by:** the DNS probe in shell `verify_egress_locked()` (`augur`) / macOS relies on the gvproxy integration (🟡 review)
 
-### I6. Hot reload never falls open  🟡 partial
+### I6. Hot reload never falls open  ✅ test
 - **Rule:** If a reload of the allowlist is readable (even empty/garbage → deny all)
   it is swapped in atomically. **If it is unreadable, the previous policy is kept.** An
   in-flight request never sees a partial or widened policy.
 - **Why:** Prevent egress from accidentally opening on file corruption or a transient read failure.
-- **Enforced by:** `SNIAndFilterTests.testHotReloadSwapsPolicy` (the swap is ✅; "keep old policy when unreadable" is ⚠ review-only)
+- **Enforced by:** `SNIAndFilterTests.{testHotReloadSwapsPolicy, testFromFileReturnsNilOnUnreadable, testHotReloadKeepsPolicyWhenFileUnreadable}`. To make "unreadable → nil → keep old policy" testable, the file load was extracted into the core lib `Allowlist.fromFile`.
 
 ### I7. The guest cannot widen its own allowlist  ✅ test
 - **Rule:** The merged allowlist is written host-side at `~/.augur/proxy/<slug>.allowlist`
@@ -101,8 +101,8 @@ in time," this **prescribes** "what must never break." It changes rarely.
 
 ---
 
-> Of the 10, I1–I5, I7, I8 are enforced by tests/self-tests; I6 and I9 are partial; I10
-> is review-only. The remaining review-only surface is I10 (credentials not on argv:
+> Of the 10, I1–I8 are enforced by tests/self-tests; I9 is partial (entitlement only);
+> I10 is review-only. The remaining review-only surface is I10 (credentials not on argv:
 > macOS goes through a file, but the Docker argv is an accepted residual, M1) and the
-> hardware-dependent parts of I6/I9. For background on each item, see the newest
-> [review snapshot](./README.md).
+> hardware-dependent parts of I9 (NIC count, gvproxy UDP/ICMP drop). For background on
+> each item, see the newest [review snapshot](./README.md).

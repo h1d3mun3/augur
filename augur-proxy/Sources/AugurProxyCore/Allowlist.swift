@@ -45,6 +45,14 @@ public struct Allowlist {
         self.init(patterns: Allowlist.patterns(fromConf: confText))
     }
 
+    /// Load + parse an allowlist file. Returns nil when the file can't be read, so the
+    /// caller can FAIL CLOSED (invariant I6): refuse to start at boot, or keep the
+    /// previous policy on hot reload — never fall open to an empty / allow-all policy.
+    public static func fromFile(_ path: String) -> Allowlist? {
+        guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
+        return Allowlist(confText: text)
+    }
+
     public var isEmpty: Bool { exact.isEmpty && suffixes.isEmpty }
 
     /// The decision. `host` may carry a port (`example.com:443`) or a trailing dot.

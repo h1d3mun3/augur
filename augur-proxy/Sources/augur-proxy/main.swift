@@ -89,10 +89,8 @@ func parseCount(_ s: String, _ flag: String) -> Int {
 
 /// Read + parse the allowlist file. Returns nil if the file can't be read (the
 /// caller fails closed by refusing to start / keeping the old policy on reload).
-func loadAllowlist(_ path: String) -> Allowlist? {
-    guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
-    return Allowlist(confText: text)
-}
+/// Delegates to the testable core (see AllowlistTests / invariant I6).
+func loadAllowlist(_ path: String) -> Allowlist? { Allowlist.fromFile(path) }
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 

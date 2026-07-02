@@ -79,4 +79,35 @@ final class SNIAndFilterTests: XCTestCase {
         XCTAssertTrue(f.decide(Destination(host: "npmjs.org", port: 443, isIPLiteral: false), client: "c").allowed)
         XCTAssertFalse(f.decide(Destination(host: "github.com", port: 443, isIPLiteral: false), client: "c").allowed)
     }
+
+    // Invariant I6 (fail closed on an unreadable file): the loader must yield nil so the
+    // caller keeps the previous policy — it must never fall open to an allow-all policy.
+    private func tempConf(_ text: String) -> String {
+        let path = NSTemporaryDirectory() + "augur-i6-\(ProcessInfo.processInfo.globallyUniqueString).conf"
+        try? text.write(toFile: path, atomically: true, encoding: .utf8)
+        return path
+    }
+
+    func testFromFileReturnsNilOnUnreadable() {
+        XCTAssertNil(Allowlist.fromFile("/no/such/augur/allowlist"))
+        let path = tempConf("github.com\n")
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let list = Allowlist.fromFile(path)
+        XCTAssertNotNil(list)
+        XCTAssertTrue(list?.allows("github.com") ?? false)
+    }
+
+    func testHotReloadKeepsPolicyWhenFileUnreadable() {
+        let f = Filter(allowlist: Allowlist(patterns: ["github.com"]))
+        // The reload loop only swaps when the load succeeds; unreadable file → nil → no swap.
+        if let fresh = Allowlist.fromFile("/no/such/augur/allowlist") { f.reload(fresh) }
+        XCTAssertTrue(f.decide(Destination(host: "github.com", port: 443, isIPLiteral: false), client: "c").allowed,
+                      "old policy must be retained when the new file is unreadable")
+        // A readable file DOES swap, so we know the test isn't trivially passing.
+        let path = tempConf("npmjs.org\n")
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        if let fresh = Allowlist.fromFile(path) { f.reload(fresh) }
+        XCTAssertTrue(f.decide(Destination(host: "npmjs.org", port: 443, isIPLiteral: false), client: "c").allowed)
+        XCTAssertFalse(f.decide(Destination(host: "github.com", port: 443, isIPLiteral: false), client: "c").allowed)
+    }
 }
