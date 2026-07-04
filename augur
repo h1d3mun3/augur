@@ -2295,17 +2295,16 @@ cmd_version_macos() {
 
 # ── Config scaffolding ────────────────────────────────────────────────────────
 
-# Write a starter ./.augur/allowlist.conf in the project root. Never overwrites an existing
-# file (the project conf is hand-maintained); we only report that one was found.
+# Write starter ./.augur/allowlist.conf and ./.augur/resources.conf in the project root.
+# Never overwrites an existing file (both are hand-maintained); we only report one was found.
 cmd_init_conf() {
     local out="$AUGUR_PROJECT_CONF"
     if [[ -f "$out" ]]; then
         warn "A project config already exists: ${BOLD}${out}${RESET}"
         warn "Leaving it untouched. Edit it directly to change this project's egress allowlist."
-        return 0
-    fi
-    mkdir -p "$(dirname "$out")"
-    cat > "$out" <<'EOF'
+    else
+        mkdir -p "$(dirname "$out")"
+        cat > "$out" <<'EOF'
 # augur project egress allowlist
 #
 # Domains listed here (merged with the global ~/.augur/augur.conf) are reachable
@@ -2319,8 +2318,29 @@ cmd_init_conf() {
 
 # Add this project's endpoints below:
 EOF
-    success "Created ${BOLD}${out}${RESET}"
-    info "Edit it to list this project's endpoints, then run ${BOLD}augur up${RESET}."
+        success "Created ${BOLD}${out}${RESET}"
+        info "Edit it to list this project's endpoints, then run ${BOLD}augur up${RESET}."
+    fi
+
+    local res="$AUGUR_PROJECT_RESOURCES_CONF"
+    if [[ -f "$res" ]]; then
+        warn "A project resources file already exists: ${BOLD}${res}${RESET}"
+        warn "Leaving it untouched. Edit it directly to change this project's resource settings."
+    else
+        mkdir -p "$(dirname "$res")"
+        cat > "$res" <<'EOF'
+# augur project resource settings
+#
+# KEY=VALUE lines, '#' starts a comment. Unlike allowlist.conf, this file has no
+# approval prompt — a guest requesting more/less resources for itself isn't a
+# containment concern the way widening egress is.
+
+# MEMORY sets the Apple Container memory limit (e.g. 4g, 8g). Default: 4g.
+# An AUGUR_CONTAINER_MEMORY environment variable, if set, overrides this.
+# MEMORY=4g
+EOF
+        success "Created ${BOLD}${res}${RESET}"
+    fi
 }
 
 # ── Help ──────────────────────────────────────────────────────────────────────
@@ -2339,7 +2359,7 @@ cmd_help() {
     echo -e "    augur ${CYAN}build${RESET}   [--swift VERSION]  Build the Docker image"
     echo -e "    augur ${CYAN}update${RESET}  [--swift VERSION]  Rebuild image with latest versions"
     echo -e "    augur ${CYAN}version${RESET}                    Show augur version"
-    echo -e "    augur ${CYAN}init-conf${RESET}                  Scaffold a ./.augur/allowlist.conf egress allowlist"
+    echo -e "    augur ${CYAN}init-conf${RESET}                  Scaffold ./.augur/{allowlist,resources}.conf"
     echo ""
     echo -e "  ${BOLD}MACOS VM MODE${RESET}  ${YELLOW}(macOS VM — full Xcode, xcodebuild, Simulator)${RESET}"
     echo -e "    augur ${CYAN}build${RESET}  --macos --ipsw <path> --xcode-xip <path> [--platforms <list>]  Build base VM (one-time)"

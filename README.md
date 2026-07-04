@@ -61,7 +61,7 @@ augur down                      # stop and remove the container
 augur status                    # show status, toolchain, and auth info
 augur build [--swift VERSION]   # build the Docker image
 augur update [--swift VERSION]  # rebuild image with latest tool versions
-augur init-conf                 # scaffold a ./.augur.conf egress allowlist
+augur init-conf                 # scaffold ./.augur/{allowlist,resources}.conf
 augur version                   # show augur version
 ```
 
@@ -281,10 +281,10 @@ The host ports the proxy uses are derived per-project so two egress-enabled proj
 
 Apple Container's per-container default memory (~1 GB) is too tight for running an agent, so augur passes `--memory 4g` by default on that engine (Docker's own VM sizing is configured in Docker Desktop, not by augur).
 
-To change the default for a project — and have it apply consistently everywhere you clone or open that project, unlike an environment variable that only exists on the machine where you set it — commit a `.augur/resources.conf`:
+To change the default for a project — and have it apply consistently everywhere you clone or open that project, unlike an environment variable that only exists on the machine where you set it — commit a `.augur/resources.conf` (`augur init-conf` scaffolds one alongside the allowlist):
 
 ```bash
-mkdir -p .augur
+augur init-conf                   # or by hand: mkdir -p .augur
 echo "MEMORY=8g" > .augur/resources.conf
 ```
 
