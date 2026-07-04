@@ -61,7 +61,7 @@ engine_ready                              || missing "engine '$ENG' is available
 image_present                             || missing "an augur:swift-* image is built" "run 'augur build' first"
 
 # ── Bring up a throwaway project with egress ON ──────────────────────────────
-# AUGUR_ACCEPT_PROJECT_CONF=1: accept any project ./.augur.conf non-interactively (there is
+# AUGUR_ACCEPT_PROJECT_CONF=1: accept any project ./.augur/allowlist.conf non-interactively (there is
 # none here, but it keeps the run headless). Egress is ON by default (no --no-egress).
 proj="$(mktemp -d)"
 slug="$(basename "$proj" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]' '-' | sed 's/^-//;s/-$//')"

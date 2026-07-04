@@ -37,8 +37,8 @@ AUGUR_VM_BIN="${AUGUR_VM_BIN:-}"
 # When enabled, all guest egress is funneled through a host-side, host-user
 # transparent proxy that only permits the domains in the merged allowlist
 # (managed baseline augur.conf.default + global ~/.augur/augur.conf + project
-# ./.augur.conf). Everything else is blocked. No host sudo is ever required. See augur-proxy/.
-# Security contract for this datapath: docs/security-reviews/INVARIANTS.md
+# ./.augur/allowlist.conf). Everything else is blocked. No host sudo is ever required. See
+# augur-proxy/. Security contract for this datapath: docs/security-reviews/INVARIANTS.md
 # (a change that breaks an invariant there is a contract change — see its header).
 AUGUR_DIR="$HOME/.augur"
 # Three-layer egress allowlist, all merged (union-only: a layer can widen but never
@@ -46,10 +46,18 @@ AUGUR_DIR="$HOME/.augur"
 #   1. baseline (augur.conf.default) — augur-managed; refreshed on every install so
 #      shipped domain updates (e.g. new Anthropic endpoints) reach existing users.
 #   2. global   (augur.conf)         — the user's own global domains; never clobbered.
-#   3. project  (./.augur.conf)      — per-project domains.
+#   3. project  (./.augur/allowlist.conf) — per-project domains.
 AUGUR_BASELINE_CONF="$AUGUR_DIR/augur.conf.default"
 AUGUR_GLOBAL_CONF="${AUGUR_GLOBAL_CONF:-$AUGUR_DIR/augur.conf}"
-AUGUR_PROJECT_CONF="$WORKSPACE_DIR/.augur.conf"
+# Project-local settings dir — git-tracked, so it travels with the project across
+# machines (unlike env vars, which are per-host). Guest-writable (it's inside the
+# mounted workspace), same as its predecessor ./.augur.conf.
+AUGUR_PROJECT_DIR="$WORKSPACE_DIR/.augur"
+AUGUR_PROJECT_CONF="${AUGUR_PROJECT_CONF:-$AUGUR_PROJECT_DIR/allowlist.conf}"
+# Resource knobs (e.g. MEMORY=4g). No TOFU gate like the allowlist: a guest inflating
+# its own resource limits isn't a containment breach, just a self-serve request the
+# operator sees applied on the next `augur up` — not worth the approval-prompt UX cost.
+AUGUR_PROJECT_RESOURCES_CONF="${AUGUR_PROJECT_RESOURCES_CONF:-$AUGUR_PROJECT_DIR/resources.conf}"
 AUGUR_PROXY_DIR="$AUGUR_DIR/proxy"
 # Docker mode runs the proxy as a SIDECAR container, not on the host: on Docker
 # Desktop a `--internal` network severs the route to the host, so a host proxy is
@@ -77,10 +85,13 @@ AUGUR_PROXY_SOCKS_PORT="${AUGUR_PROXY_SOCKS_PORT:-$((14000 + _augur_port_offset)
 # SSH reaches it via gvproxy's host-side forward 127.0.0.1:<this port> → guest:22.
 AUGUR_SSH_FWD_PORT="${AUGUR_SSH_FWD_PORT:-$((20000 + _augur_port_offset))}"
 # Egress filtering is on by default. The managed baseline (augur.conf.default) is always
-# active; add global domains to ~/.augur/augur.conf or per-project ones to ./.augur.conf.
-# --no-egress / AUGUR_EGRESS=0 forces filtering off for a run.
+# active; add global domains to ~/.augur/augur.conf or per-project ones to
+# ./.augur/allowlist.conf. --no-egress / AUGUR_EGRESS=0 forces filtering off for a run.
 AUGUR_EGRESS="${AUGUR_EGRESS:-auto}"
 AUGUR_PROXY_BIN="${AUGUR_PROXY_BIN:-}"
+# AUGUR_CONTAINER_MEMORY is deliberately left UNSET here (no ":-default") — resolve_container_memory
+# (below) needs to distinguish "the operator exported it" from "fall through to the project file /
+# built-in default", which a top-level default would collapse.
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -601,7 +612,7 @@ proxy_running() {
 
 # Merge the managed baseline + user global + project conf into a host-side runtime
 # allowlist the proxy reads. Deliberately written under ~/.augur (NOT the project tree)
-# so the guest — which can write the mounted ./.augur.conf — cannot widen its own
+# so the guest — which can write the mounted ./.augur/allowlist.conf — cannot widen its own
 # policy mid-session.
 write_merged_allowlist() {
     mkdir -p "$AUGUR_PROXY_DIR"
@@ -620,7 +631,7 @@ write_merged_allowlist() {
     echo "$out"
 }
 
-# Validate a single ./.augur.conf line against the proxy's domain grammar: an optional
+# Validate a single ./.augur/allowlist.conf line against the proxy's domain grammar: an optional
 # '*.' / '.' prefix plus a strict LDH hostname, and NO byte outside [A-Za-z0-9.*-]. The
 # project conf is guest-writable, so this is the chokepoint that (a) stops a hostile conf
 # from injecting terminal-escape bytes into the approval UI / `status` (addendum A1) and
@@ -643,7 +654,7 @@ conf_line_valid() {
     [[ "$host" =~ $re ]]
 }
 
-# Effective domain patterns a project ./.augur.conf contributes: comments stripped,
+# Effective domain patterns a project ./.augur/allowlist.conf contributes: comments stripped,
 # whitespace trimmed, blanks dropped, and — crucially — every line validated by
 # conf_line_valid so only clean LDH patterns are ever emitted (for display AND for the
 # merged allowlist). Anything that is not a valid hostname pattern is dropped, not rendered.
@@ -659,7 +670,7 @@ project_conf_domains() {
     done < "$AUGUR_PROJECT_CONF"
 }
 
-# Count of ./.augur.conf non-comment, non-blank lines that conf_line_valid REJECTED (i.e.
+# Count of ./.augur/allowlist.conf non-comment, non-blank lines that conf_line_valid REJECTED (i.e.
 # were dropped as junk / obfuscation). Surfaced at approval so a conf hiding escape bytes
 # or garbage becomes a visible red flag instead of a silent omission.
 project_conf_invalid_count() {
@@ -676,9 +687,44 @@ project_conf_invalid_count() {
     echo $((total - valid))
 }
 
+# Read KEY from ./.augur/resources.conf ("KEY=value" lines, '#' comments, blanks
+# ignored). No TOFU gate (unlike the allowlist) — see AUGUR_PROJECT_RESOURCES_CONF's
+# definition for why a guest-writable resource knob isn't a containment concern.
+# Echoes the value (possibly empty) and returns 0 on a match, 1 if KEY is absent.
+project_resource_value() {
+    local key="$1"
+    [[ -f "$AUGUR_PROJECT_RESOURCES_CONF" ]] || return 1
+    local line k v
+    while IFS='=' read -r k v; do
+        k="${k%%#*}"
+        k="${k#"${k%%[![:space:]]*}"}"; k="${k%"${k##*[![:space:]]}"}"
+        [[ "$k" == "$key" ]] || continue
+        v="${v%%#*}"
+        v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+        printf '%s' "$v"
+        return 0
+    done < "$AUGUR_PROJECT_RESOURCES_CONF"
+    return 1
+}
+
+# Effective Apple-Container memory limit. Precedence: an explicit AUGUR_CONTAINER_MEMORY
+# env var (checked with `+x` so an operator override always wins, even set to something
+# unusual) > ./.augur/resources.conf's MEMORY= (git-tracked, so it travels with the
+# project across machines) > the built-in default. This is what makes the project file
+# actually solve the "works on machine A, forgotten on machine B" problem env vars have.
+resolve_container_memory() {
+    if [[ -n "${AUGUR_CONTAINER_MEMORY+x}" ]]; then
+        echo "$AUGUR_CONTAINER_MEMORY"
+        return
+    fi
+    local v
+    v="$(project_resource_value MEMORY)" && [[ -n "$v" ]] && { echo "$v"; return; }
+    echo "4g"
+}
+
 # A short, stable hex digest of the FULL workspace path. Two different directories that
 # share a basename also share workspace_slug; this distinguishes them so security-sensitive
-# per-project host state — the .augur.conf approval fingerprint and the Docker history dir —
+# per-project host state — the .augur/allowlist.conf approval fingerprint and the Docker history dir —
 # is never shared between an unrelated (possibly hostile) same-named project and a trusted
 # one. Display names, egress ports, and the in-container /workspace-<slug> path stay slug-based.
 workspace_path_hash() {
@@ -708,14 +754,14 @@ project_conf_hash() {
     fi
 }
 
-# L1 (trust-on-first-use): a project's ./.augur.conf widens the egress allowlist, so
+# L1 (trust-on-first-use): a project's ./.augur/allowlist.conf widens the egress allowlist, so
 # treat it as untrusted input (a hostile repo, or an agent that wrote it). Require the
 # operator to approve it on first sight and again whenever it changes — the same TOFU
 # model as the SSH host keys above. Approved fingerprints live host-side under
-# ~/.augur/project-hashes, so a guest that edits the mounted ./.augur.conf cannot get
+# ~/.augur/project-hashes, so a guest that edits the mounted ./.augur/allowlist.conf cannot get
 # the change honored without a fresh host-side approval. Non-interactive runs fail
 # closed unless AUGUR_ACCEPT_PROJECT_CONF=1 (kept for CI / disposable flows). Only the
-# egress-enabled paths call this — with filtering off, ./.augur.conf has no effect.
+# egress-enabled paths call this — with filtering off, ./.augur/allowlist.conf has no effect.
 check_project_conf_approved() {
     [[ -f "$AUGUR_PROJECT_CONF" ]] || return 0
 
@@ -726,14 +772,14 @@ check_project_conf_approved() {
     # gate must never silently approve. project_conf_hash runs in a $(...) subshell, so
     # an `exit` there wouldn't abort us — guard here in the caller instead.
     if [[ -z "$cur" ]]; then
-        error "Could not fingerprint ./.augur.conf (no sha256sum/shasum?). Refusing to continue (fail closed)."
+        error "Could not fingerprint ./.augur/allowlist.conf (no sha256sum/shasum?). Refusing to continue (fail closed)."
         exit 1
     fi
     recorded=""
     [[ -f "$hash_file" ]] && recorded="$(cat "$hash_file" 2>/dev/null || true)"
     [[ "$cur" == "$recorded" ]] && return 0
 
-    warn "This project's ${BOLD}.augur.conf${RESET} widens the egress allowlist with:"
+    warn "This project's ${BOLD}.augur/allowlist.conf${RESET} widens the egress allowlist with:"
     local d had=0
     while IFS= read -r d; do
         # printf %s (NOT echo -e) on the guest-derived domain; conf_line_valid already
@@ -744,7 +790,7 @@ check_project_conf_approved() {
     [[ "$had" == 1 ]] || printf '    %s\n' "(no valid domain patterns)"
     local _dropped; _dropped="$(project_conf_invalid_count)"
     [[ "${_dropped:-0}" -gt 0 ]] && \
-        warn "Ignored ${_dropped} line(s) that are not valid domain patterns (possible obfuscation — inspect ./.augur.conf)."
+        warn "Ignored ${_dropped} line(s) that are not valid domain patterns (possible obfuscation — inspect ./.augur/allowlist.conf)."
 
     if [[ "${AUGUR_ACCEPT_PROJECT_CONF:-}" == "1" ]]; then
         echo "$cur" > "$hash_file"
@@ -757,14 +803,14 @@ check_project_conf_approved() {
         read -rp "$(echo -e "${CYAN}[augur]${RESET} Accept these domains for this project? [y/N] ")" yn || true
         if [[ "$yn" == [yY] ]]; then
             echo "$cur" > "$hash_file"
-            success "Approved — won't ask again until .augur.conf changes."
+            success "Approved — won't ask again until .augur/allowlist.conf changes."
             return 0
         fi
-        error "Declined. Edit ./.augur.conf or approve it to continue."
+        error "Declined. Edit ./.augur/allowlist.conf or approve it to continue."
         exit 1
     fi
 
-    error "Project ./.augur.conf is unapproved and augur is non-interactive."
+    error "Project ./.augur/allowlist.conf is unapproved and augur is non-interactive."
     error "Re-run in a terminal to review it, or set AUGUR_ACCEPT_PROJECT_CONF=1 to accept."
     exit 1
 }
@@ -1160,7 +1206,7 @@ cmd_up() {
         fi
     fi
 
-    # Gate the untrusted project ./.augur.conf before tearing anything down or
+    # Gate the untrusted project ./.augur/allowlist.conf before tearing anything down or
     # starting the proxy (only relevant when egress filtering is on).
     if egress_enabled; then check_project_conf_approved; fi
 
@@ -1183,6 +1229,13 @@ cmd_up() {
         -v "${WORKSPACE_DIR}:${WORKSPACE_MOUNT}"
         -w "${WORKSPACE_MOUNT}"
     )
+
+    # Apple `container`'s default per-container memory is ~1GB — too tight for an agent.
+    # Docker Desktop's own default VM is already sized generously, so this only targets
+    # the Apple engine. See resolve_container_memory for the override precedence.
+    if [[ "$ENGINE" == "container" ]]; then
+        docker_args+=(--memory "$(resolve_container_memory)")
+    fi
 
     # Egress allowlist: put the agent on an --internal network with NET_ADMIN dropped so
     # the root agent can't re-route, and point all egress at augur-proxy (Docker: the
@@ -1423,16 +1476,17 @@ cmd_status() {
     echo -e "${BOLD}Container:${RESET}  ${CONTAINER_NAME}"
     echo -e "${BOLD}Directory:${RESET}  ${WORKSPACE_DIR}"
     echo -e "${BOLD}Image:${RESET}      ${IMAGE_NAME}"
+    [[ "$ENGINE" == "container" ]] && echo -e "${BOLD}Memory:${RESET}     $(resolve_container_memory)"
     if egress_enabled; then
         local estate="${RED}stopped${RESET}" ekind="sidecar"
         [[ "$ENGINE" == "container" ]] && ekind="host proxy"
         egress_proxy_running && estate="${GREEN}running${RESET}"
         echo -e "${BOLD}Egress:${RESET}     ${GREEN}on${RESET} (allowlist; ${ekind} ${estate})"
-        echo -e "${BOLD}Allowlist:${RESET}  baseline$( [[ -f "$AUGUR_GLOBAL_CONF" ]] && echo " + augur.conf" )$( [[ -f "$AUGUR_PROJECT_CONF" ]] && echo " + .augur.conf" )"
+        echo -e "${BOLD}Allowlist:${RESET}  baseline$( [[ -f "$AUGUR_GLOBAL_CONF" ]] && echo " + augur.conf" )$( [[ -f "$AUGUR_PROJECT_CONF" ]] && echo " + .augur/allowlist.conf" )"
         if [[ -f "$AUGUR_PROJECT_CONF" ]]; then
             local _st="${YELLOW}unapproved (prompts on next up)${RESET}"
             [[ "$(project_conf_hash "$AUGUR_PROJECT_CONF")" == "$(cat "$(project_conf_hash_file)" 2>/dev/null || true)" ]] && _st="${GREEN}approved${RESET}"
-            printf '%b.augur.conf:%b [%b] %s\n' "$BOLD" "$RESET" "$_st" "$(project_conf_domains | tr '\n' ' ')"
+            printf '%b.augur/allowlist.conf:%b [%b] %s\n' "$BOLD" "$RESET" "$_st" "$(project_conf_domains | tr '\n' ' ')"
         fi
     else
         echo -e "${BOLD}Egress:${RESET}     ${YELLOW}off${RESET} (disabled via --no-egress or AUGUR_EGRESS=0)"
@@ -1817,7 +1871,7 @@ cmd_up_macos() {
         return 0
     fi
 
-    # Gate the untrusted project ./.augur.conf before cloning or starting the proxy
+    # Gate the untrusted project ./.augur/allowlist.conf before cloning or starting the proxy
     # (only relevant when egress filtering is on).
     if egress_enabled; then check_project_conf_approved; fi
 
@@ -2088,11 +2142,11 @@ cmd_status_macos() {
         local estate="${RED}stopped${RESET}"; proxy_running && estate="${GREEN}running${RESET}"
         local gstate="${RED}stopped${RESET}"; gvproxy_running && gstate="${GREEN}running${RESET}"
         echo -e "${BOLD}Egress:${RESET}        ${GREEN}on${RESET} (proxy ${estate}, gvproxy ${gstate})"
-        echo -e "${BOLD}Allowlist:${RESET}     baseline$( [[ -f "$AUGUR_GLOBAL_CONF" ]] && echo " + augur.conf" )$( [[ -f "$AUGUR_PROJECT_CONF" ]] && echo " + .augur.conf" )"
+        echo -e "${BOLD}Allowlist:${RESET}     baseline$( [[ -f "$AUGUR_GLOBAL_CONF" ]] && echo " + augur.conf" )$( [[ -f "$AUGUR_PROJECT_CONF" ]] && echo " + .augur/allowlist.conf" )"
         if [[ -f "$AUGUR_PROJECT_CONF" ]]; then
             local _st="${YELLOW}unapproved (prompts on next up)${RESET}"
             [[ "$(project_conf_hash "$AUGUR_PROJECT_CONF")" == "$(cat "$(project_conf_hash_file)" 2>/dev/null || true)" ]] && _st="${GREEN}approved${RESET}"
-            printf '%b.augur.conf:%b    [%b] %s\n' "$BOLD" "$RESET" "$_st" "$(project_conf_domains | tr '\n' ' ')"
+            printf '%b.augur/allowlist.conf:%b    [%b] %s\n' "$BOLD" "$RESET" "$_st" "$(project_conf_domains | tr '\n' ' ')"
         fi
     else
         echo -e "${BOLD}Egress:${RESET}        ${YELLOW}off${RESET} (disabled via --no-egress or AUGUR_EGRESS=0)"
@@ -2241,16 +2295,16 @@ cmd_version_macos() {
 
 # ── Config scaffolding ────────────────────────────────────────────────────────
 
-# Write a starter ./.augur.conf in the project root. Never overwrites an existing
-# file (the project conf is hand-maintained); we only report that one was found.
+# Write starter ./.augur/allowlist.conf and ./.augur/resources.conf in the project root.
+# Never overwrites an existing file (both are hand-maintained); we only report one was found.
 cmd_init_conf() {
     local out="$AUGUR_PROJECT_CONF"
     if [[ -f "$out" ]]; then
         warn "A project config already exists: ${BOLD}${out}${RESET}"
         warn "Leaving it untouched. Edit it directly to change this project's egress allowlist."
-        return 0
-    fi
-    cat > "$out" <<'EOF'
+    else
+        mkdir -p "$(dirname "$out")"
+        cat > "$out" <<'EOF'
 # augur project egress allowlist
 #
 # Domains listed here (merged with the global ~/.augur/augur.conf) are reachable
@@ -2264,8 +2318,29 @@ cmd_init_conf() {
 
 # Add this project's endpoints below:
 EOF
-    success "Created ${BOLD}${out}${RESET}"
-    info "Edit it to list this project's endpoints, then run ${BOLD}augur up${RESET}."
+        success "Created ${BOLD}${out}${RESET}"
+        info "Edit it to list this project's endpoints, then run ${BOLD}augur up${RESET}."
+    fi
+
+    local res="$AUGUR_PROJECT_RESOURCES_CONF"
+    if [[ -f "$res" ]]; then
+        warn "A project resources file already exists: ${BOLD}${res}${RESET}"
+        warn "Leaving it untouched. Edit it directly to change this project's resource settings."
+    else
+        mkdir -p "$(dirname "$res")"
+        cat > "$res" <<'EOF'
+# augur project resource settings
+#
+# KEY=VALUE lines, '#' starts a comment. Unlike allowlist.conf, this file has no
+# approval prompt — a guest requesting more/less resources for itself isn't a
+# containment concern the way widening egress is.
+
+# MEMORY sets the Apple Container memory limit (e.g. 4g, 8g). Default: 4g.
+# An AUGUR_CONTAINER_MEMORY environment variable, if set, overrides this.
+# MEMORY=4g
+EOF
+        success "Created ${BOLD}${res}${RESET}"
+    fi
 }
 
 # ── Help ──────────────────────────────────────────────────────────────────────
@@ -2284,7 +2359,7 @@ cmd_help() {
     echo -e "    augur ${CYAN}build${RESET}   [--swift VERSION]  Build the Docker image"
     echo -e "    augur ${CYAN}update${RESET}  [--swift VERSION]  Rebuild image with latest versions"
     echo -e "    augur ${CYAN}version${RESET}                    Show augur version"
-    echo -e "    augur ${CYAN}init-conf${RESET}                  Scaffold a ./.augur.conf egress allowlist"
+    echo -e "    augur ${CYAN}init-conf${RESET}                  Scaffold ./.augur/{allowlist,resources}.conf"
     echo ""
     echo -e "  ${BOLD}MACOS VM MODE${RESET}  ${YELLOW}(macOS VM — full Xcode, xcodebuild, Simulator)${RESET}"
     echo -e "    augur ${CYAN}build${RESET}  --macos --ipsw <path> --xcode-xip <path> [--platforms <list>]  Build base VM (one-time)"
@@ -2317,14 +2392,17 @@ cmd_help() {
     echo -e "    SWIFT_VERSION            Default Swift version (default: latest)"
     echo -e "    AUGUR_EGRESS             Disable (0) or force-enable (1) egress filtering; default is always on"
     echo -e "    AUGUR_ENGINE             Container backend: ${CYAN}container${RESET} (Apple, primary) or ${CYAN}docker${RESET} (fallback); default: auto"
+    echo -e "    AUGUR_CONTAINER_MEMORY   Apple Container memory (e.g. 4g); overrides .augur/resources.conf; default: 4g"
     echo ""
     echo -e "  ${BOLD}NOTES${RESET}"
     echo -e "    • Container backend: ${CYAN}container${RESET} (Apple Container) is the primary engine, auto-selected on"
     echo -e "      macOS 26+. ${CYAN}docker${RESET} is a fallback for Linux / macOS < 26 (maintained, not developed)."
     echo -e "      Override with ${CYAN}AUGUR_ENGINE${RESET}. See ${BOLD}augur status${RESET}."
-    echo -e "    • Egress allowlist: on by default (global ${CYAN}~/.augur/augur.conf${RESET}). Add a ${CYAN}.augur.conf${RESET}"
+    echo -e "    • Egress allowlist: on by default (global ${CYAN}~/.augur/augur.conf${RESET}). Add a ${CYAN}.augur/allowlist.conf${RESET}"
     echo -e "      in the project root to extend it with project-specific domains. Use ${CYAN}--no-egress${RESET} to"
     echo -e "      disable for one run. Needs no sudo. macOS VM egress also needs Go (augur-gvproxy)."
+    echo -e "    • Container memory (Apple engine): defaults to 4g. Set ${CYAN}MEMORY=${RESET} in ${CYAN}.augur/resources.conf${RESET}"
+    echo -e "      (git-tracked, travels with the project) or override per-run with ${CYAN}AUGUR_CONTAINER_MEMORY${RESET}."
     echo -e "    • Container mode: current directory mounted at /workspace-<project> (Linux container)"
     echo -e "    • macOS VM mode:  current directory exposed at ~/workspace-<project> (macOS VM)"
     echo -e "    • macOS VM mode requires: augur-vm (the bundled Swift VM backend)"

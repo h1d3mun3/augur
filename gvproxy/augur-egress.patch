@@ -26,7 +26,7 @@ index 8fe3154..36693bc 100644
  	flagSet.StringVar(&args.notificationSocket, "notification", "", "Socket to be used to send network-ready notifications")
 +	flagSet.StringVar(&args.socksUpstream, "socks-upstream", "", "augur: dial all guest TCP through this SOCKS5 proxy (host:port) for allowlist enforcement")
 +	flagSet.BoolVar(&args.denyDirect, "deny-direct", false, "augur: disable UDP/ICMP forwarders so SOCKS-filtered TCP is the only egress")
-+	flagSet.StringVar(&args.dnsAllowlistFile, "dns-allowlist", "", "augur: only resolve names matching this allowlist file (same grammar as .augur.conf); refuse the rest (closes DNS-exfil)")
++	flagSet.StringVar(&args.dnsAllowlistFile, "dns-allowlist", "", "augur: only resolve names matching this allowlist file (same grammar as .augur/allowlist.conf); refuse the rest (closes DNS-exfil)")
  	if err := flagSet.Parse(argv); err != nil {
  		return nil, err
  	}
@@ -180,7 +180,7 @@ index 0000000..a78f51a
 +
 +// PatternsFromConf mirrors Swift Allowlist.patterns(fromConf:): for each line,
 +// cut at the first '#', trim ASCII whitespace, drop blanks. Exported so the CLI
-+// can parse the same .augur.conf grammar in one place.
++// can parse the same .augur/allowlist.conf grammar in one place.
 +func PatternsFromConf(text string) []string {
 +	out := []string{}
 +	for _, rawLine := range strings.FieldsFunc(text, func(r rune) bool { return r == '\n' || r == '\r' }) {
@@ -610,7 +610,7 @@ index 0e6a051..3f4a2c0 100644
 +	DenyDirectEgress bool   `yaml:"denyDirectEgress,omitempty"`
 +
 +	// augur: when non-nil, the gateway DNS server only resolves names matching
-+	// these allowlist patterns (same grammar as .augur.conf) and refuses the rest,
++	// these allowlist patterns (same grammar as .augur/allowlist.conf) and refuses the rest,
 +	// so DNS-resolvable == connection-allowed (closes DNS-exfil). nil => disabled.
 +	DNSAllowlist []string `yaml:"dnsAllowlist,omitempty"`
  }

@@ -1,12 +1,12 @@
 import Foundation
 
-/// The domain whitelist parsed from `.augur.conf`. This is the single security
+/// The domain whitelist parsed from `.augur/allowlist.conf`. This is the single security
 /// decision point: `allows(_:)` returns true only for hosts that match a
 /// configured pattern. A bug here is a bypass, so matching is intentionally
 /// label-anchored and conservative — see the test suite for the cases that must hold
 /// (notably `*.github.com` matching `api.github.com` but NOT `evilgithub.com`).
 ///
-/// Pattern grammar (one per line in `.augur.conf`, `#` starts a comment):
+/// Pattern grammar (one per line in `.augur/allowlist.conf`, `#` starts a comment):
 ///   - `example.com`    exact host only (the apex). Does NOT match subdomains.
 ///   - `*.example.com`  subdomains only (`api.example.com` yes; `example.com` no).
 ///   - `.example.com`   the apex AND every subdomain (a convenience for both).
@@ -40,7 +40,7 @@ public struct Allowlist {
         self.suffixes = suffixes
     }
 
-    /// Parse raw `.augur.conf` text (comments, blank lines, one pattern per line).
+    /// Parse raw `.augur/allowlist.conf` text (comments, blank lines, one pattern per line).
     public init(confText: String) {
         self.init(patterns: Allowlist.patterns(fromConf: confText))
     }

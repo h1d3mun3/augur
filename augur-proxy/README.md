@@ -1,6 +1,6 @@
 # augur-proxy
 
-Host-side egress filter for augur. Enforces a domain allowlist (`.augur.conf`) so
+Host-side egress filter for augur. Enforces a domain allowlist (`.augur/allowlist.conf`) so
 the container/VM can only reach explicitly-permitted domains; everything else is
 blocked. Runs as the **host user — never needs `sudo`**.
 
@@ -55,7 +55,7 @@ augur-proxy --allowlist <path> [--listen 127.0.0.1]
 
 `augur` starts/stops it automatically on `up`/`down`; you rarely run it by hand.
 
-## `.augur.conf` format
+## `.augur/allowlist.conf` format
 
 One pattern per line, `#` comments:
 
@@ -66,9 +66,9 @@ example.com     # exact host only (apex). Does NOT match subdomains.
 ```
 
 The effective allowlist is the global baseline `~/.augur/augur.conf` merged with the
-project's `./.augur.conf`. The merge happens on the host at `augur up`, and the proxy
+project's `./.augur/allowlist.conf`. The merge happens on the host at `augur up`, and the proxy
 reads the host-side copy under `~/.augur/proxy/` — so the guest editing the mounted
-`./.augur.conf` mid-session cannot widen its own policy.
+`./.augur/allowlist.conf` mid-session cannot widen its own policy.
 
 ## Build / test
 

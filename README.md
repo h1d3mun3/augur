@@ -61,7 +61,7 @@ augur down                      # stop and remove the container
 augur status                    # show status, toolchain, and auth info
 augur build [--swift VERSION]   # build the Docker image
 augur update [--swift VERSION]  # rebuild image with latest tool versions
-augur init-conf                 # scaffold a ./.augur.conf egress allowlist
+augur init-conf                 # scaffold ./.augur/{allowlist,resources}.conf
 augur version                   # show augur version
 ```
 
@@ -212,23 +212,23 @@ If builds are flaky from the shared mount (virtiofs is not tuned for heavy I/O �
 
 ---
 
-## Egress allowlist (`.augur.conf`)
+## Egress allowlist (`.augur/allowlist.conf`)
 
 Restrict the container/VM to a set of domains — everything else is blocked. Enforcement runs in a small proxy on the **host, as your user — it never needs `sudo`**. Useful for sandboxing an agent so it can only reach the services it should.
 
-**On by default.** Filtering is always active using a **managed baseline** (`~/.augur/augur.conf.default`, shipped with sensible defaults and refreshed on every install). Add your own always-on domains to `~/.augur/augur.conf`, or per-project ones to a `./.augur.conf` in the project root. To disable for one run, pass `--no-egress`.
+**On by default.** Filtering is always active using a **managed baseline** (`~/.augur/augur.conf.default`, shipped with sensible defaults and refreshed on every install). Add your own always-on domains to `~/.augur/augur.conf`, or per-project ones to a `./.augur/allowlist.conf` in the project root. To disable for one run, pass `--no-egress`.
 
 ```bash
 cd ~/projects/my-app
 
 # Optional: extend the baseline with project-specific domains
-cat > .augur.conf <<'EOF'
-# project-specific domains (merged on top of the managed baseline)
+augur init-conf   # scaffolds ./.augur/allowlist.conf
+cat >> .augur/allowlist.conf <<'EOF'
 registry.example.com
 api.myservice.com
 EOF
 
-augur up            # Docker, egress on (baseline + augur.conf + .augur.conf if present)
+augur up            # Docker, egress on (baseline + augur.conf + allowlist.conf if present)
 augur up --macos    # macOS VM, same
 augur up --no-egress  # disable egress filtering for this run
 augur up --egress     # force egress filtering on (re-enables if AUGUR_EGRESS=0)
@@ -237,7 +237,7 @@ augur status        # shows: Egress on/off + the active allowlist
 
 Filtering is on by default; set `AUGUR_EGRESS=0` to disable it persistently, or `AUGUR_EGRESS=1` to force it on. The `--no-egress` / `--egress` flags override that environment variable for a single run.
 
-### `.augur.conf` format
+### `.augur/allowlist.conf` format
 
 One pattern per line, `#` for comments:
 
@@ -251,11 +251,11 @@ The effective list is three layers merged (union — a layer can only widen, nev
 
 1. **Managed baseline** (`~/.augur/augur.conf.default`) — shipped defaults for Claude Code / GitHub / npm / Homebrew. augur owns this file and **refreshes it on every install**, so shipped domain updates reach you automatically. Don't edit it; your changes are overwritten.
 2. **Your global additions** (`~/.augur/augur.conf`) — always-on domains you add. **Never overwritten** by install.
-3. **Project** (`./.augur.conf`) — per-project domains.
+3. **Project** (`./.augur/allowlist.conf`) — per-project domains.
 
 The merge happens on the host, so the guest can't widen its own policy by editing the mounted file. Edits take effect on the next `augur up`.
 
-**Project domains require approval (trust-on-first-use).** Because `./.augur.conf` ships inside a repository you may not fully trust, augur shows the domains it adds and asks you to approve them on first sight and again whenever the file changes — the same model as SSH host keys. The approval fingerprint is stored host-side under `~/.augur/project-hashes/` (never in the project tree or a mounted share), so a compromised guest that rewrites `./.augur.conf` cannot get the change honored without a fresh host-side approval. `augur status` shows the project's domains and whether they're approved. For non-interactive / disposable runs (CI), set `AUGUR_ACCEPT_PROJECT_CONF=1` to accept automatically; without a TTY and without that variable, an unapproved/changed conf fails closed.
+**Project domains require approval (trust-on-first-use).** Because `./.augur/allowlist.conf` ships inside a repository you may not fully trust, augur shows the domains it adds and asks you to approve them on first sight and again whenever the file changes — the same model as SSH host keys. The approval fingerprint is stored host-side under `~/.augur/project-hashes/` (never in the project tree or a mounted share), so a compromised guest that rewrites `./.augur/allowlist.conf` cannot get the change honored without a fresh host-side approval. `augur status` shows the project's domains and whether they're approved. For non-interactive / disposable runs (CI), set `AUGUR_ACCEPT_PROJECT_CONF=1` to accept automatically; without a TTY and without that variable, an unapproved/changed conf fails closed.
 
 ### How it works
 
@@ -274,6 +274,21 @@ In every mode the proxy decides by domain (the CONNECT host, or the TLS SNI / HT
 The host ports the proxy uses are derived per-project so two egress-enabled projects can run at once; override with `AUGUR_PROXY_HTTP_PORT` / `AUGUR_PROXY_SOCKS_PORT` / `AUGUR_SSH_FWD_PORT` if needed.
 
 > **Scope.** This guarantees *"the guest can only reach allowlisted domains."* DNS is gated on the same allowlist (a name resolves only if it's connectable), so the guest can't tunnel data out via DNS queries either. It is still **not** exfiltration-proof: an allowlisted, writable host (e.g. `github.com` with your `GH_TOKEN`) and the shared workspace are intentional channels. See `augur-proxy/README.md` and `gvproxy/README.md`.
+
+---
+
+## Container memory (`.augur/resources.conf`)
+
+Apple Container's per-container default memory (~1 GB) is too tight for running an agent, so augur passes `--memory 4g` by default on that engine (Docker's own VM sizing is configured in Docker Desktop, not by augur).
+
+To change the default for a project — and have it apply consistently everywhere you clone or open that project, unlike an environment variable that only exists on the machine where you set it — commit a `.augur/resources.conf` (`augur init-conf` scaffolds one alongside the allowlist):
+
+```bash
+augur init-conf                   # or by hand: mkdir -p .augur
+echo "MEMORY=8g" > .augur/resources.conf
+```
+
+Precedence: an `AUGUR_CONTAINER_MEMORY` environment variable (if set) overrides `.augur/resources.conf`, which overrides the built-in `4g` default. `augur status` shows the effective value. Like `.augur/allowlist.conf`, this file is guest-writable (it lives inside the mounted workspace) — but unlike the allowlist, it carries **no approval gate**: a guest requesting more or less memory for itself isn't a containment breach the way widening egress is, so it just takes effect on the next `augur up`.
 
 ---
 

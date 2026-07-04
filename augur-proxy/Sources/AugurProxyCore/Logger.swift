@@ -1,7 +1,7 @@
 import Foundation
 
 /// Append-only structured logging of allow/deny decisions. Deny lines are the
-/// signal a user acts on (which domain to add to `.augur.conf`), so they are
+/// signal a user acts on (which domain to add to `.augur/allowlist.conf`), so they are
 /// formatted to be greppable and the proxy also surfaces recent denies to the CLI.
 public final class DecisionLog {
     private let handle: FileHandle?
