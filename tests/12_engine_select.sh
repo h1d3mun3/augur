@@ -25,8 +25,17 @@ has "$c" "Apple Container (container)"       "container: AUGUR_ENGINE=container 
 d="$(status_for docker)"
 has "$d" "Docker (docker)"                   "docker: AUGUR_ENGINE=docker selects the Docker backend"
 
-# Default (no override) on a non-macOS host falls back to docker.
+# Default (no override): mirrors augur's own detect_engine — Apple Container on macOS 26+
+# when its CLI is installed, Docker otherwise. Source augur (AUGUR_SOURCE_ONLY, like
+# 23_proxy_bind_isolation.sh) to call the REAL detect_engine instead of re-deriving the same
+# condition here and silently drifting from it (this assertion used to hardcode "Docker",
+# which is wrong on an actual macOS 26+ dev machine with Apple Container installed).
+AUGUR_SOURCE_ONLY=1 source "$AUGUR"
+set +e   # augur enables `set -e`; restore lib.sh assert-and-continue
+expected_label="Docker (docker)"
+[[ "$(detect_engine)" == "container" ]] && expected_label="Apple Container (container)"
+
 def="$( ( cd "$proj" && AUGUR_TEST_CONTAINER_RUNNING=0 bash "$AUGUR" status --no-egress ) 2>&1 | sed $'s/\033\\[[0-9;]*m//g' )"
-has "$def" "Docker (docker)"                 "default: non-macOS host auto-selects Docker"
+has "$def" "$expected_label"                 "default: auto-selects the right engine for this host"
 
 finish
