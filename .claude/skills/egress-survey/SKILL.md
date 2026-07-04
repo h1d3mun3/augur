@@ -44,7 +44,7 @@ The egress core (what "changed enough to matter" means): `augur`, `augur-proxy/`
    - **I8 / `--allow-private`:** `grep -n "allow-private" augur` — augur must never pass it on
      a production path.
    - **I7 / host-side merge:** `write_merged_allowlist` must still write under `~/.augur/proxy`
-     (outside the project tree), and `./.augur.conf` must go through `conf_line_valid`.
+     (outside the project tree), and `./.augur/allowlist.conf` must go through `conf_line_valid`.
    - **I9 / entitlements:** `augur-vm/augur-vm.entitlements` must NOT contain
      `<key>com.apple.vm.networking</key>` (bridged networking).
    - **New surface:** grep the engine cases / `AUGUR_EGRESS` / the 3-layer merge for any new

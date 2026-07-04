@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Tier 0 — egress allowlist hardening (pure functions, runs anywhere).
-# Invariant I7 (docs/security-reviews/INVARIANTS.md): a guest-writable ./.augur.conf
+# Invariant I7 (docs/security-reviews/INVARIANTS.md): a guest-writable ./.augur/allowlist.conf
 # cannot widen the egress policy — every project line is validated (conf_line_valid),
 # only sanitized LDH patterns reach the MERGED allowlist, and that allowlist is written
 # HOST-SIDE (under ~/.augur), never inside the project tree.
@@ -23,8 +23,8 @@ workspace_slug() { echo testslug; }   # stub the only external call the helpers 
 AUGUR_PROXY_DIR="$WORK/proxy"
 AUGUR_BASELINE_CONF="$WORK/baseline.conf"
 AUGUR_GLOBAL_CONF="$WORK/global.conf"
-AUGUR_PROJECT_CONF="$WORK/project/.augur.conf"
-mkdir -p "$WORK/project"
+AUGUR_PROJECT_CONF="$WORK/project/.augur/allowlist.conf"
+mkdir -p "$WORK/project/.augur"
 # shellcheck disable=SC1090
 source "$helpers"
 

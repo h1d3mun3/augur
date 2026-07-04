@@ -19,7 +19,7 @@ egress is forced through `augur-proxy`'s allowlist**.
   tunneling). With this flag, **SOCKS-filtered TCP is the only way out** — a root
   agent in the guest cannot bypass it.
 - `--dns-allowlist <file>` — the gateway DNS server only resolves names matching
-  this allowlist (same `.augur.conf` grammar) and returns NXDOMAIN otherwise;
+  this allowlist (same `.augur/allowlist.conf` grammar) and returns NXDOMAIN otherwise;
   non-address record types are refused. Makes DNS-resolvable == connection-allowed,
   closing DNS-exfil. The matcher (`pkg/services/dns/dns_allowlist.go`) is a 1:1 port
   of `augur-proxy`'s Swift `Allowlist`.
@@ -59,7 +59,7 @@ review of the datapath found and fixed two would-be bypasses in `augur-proxy`
 (NUL-byte SNI truncation; IPv4-mapped-IPv6 SSRF) — see `augur-proxy` `SecurityTests`.
 
 **DNS is gated (`--dns-allowlist`):** the gateway DNS server (`192.168.127.1:53`)
-only resolves names that match the allowlist — the SAME merged `.augur.conf` used
+only resolves names that match the allowlist — the SAME merged `.augur/allowlist.conf` used
 for connections — and returns NXDOMAIN otherwise; non-address record types
 (TXT/MX/NS/SRV) are refused. A disallowed query is answered locally and never
 leaves the host, so the QNAME-based DNS-exfil/C2 channel is closed. The matcher is

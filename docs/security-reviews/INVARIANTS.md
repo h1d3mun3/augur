@@ -62,8 +62,8 @@ in time," this **prescribes** "what must never break." It changes rarely.
 
 ### I7. The guest cannot widen its own allowlist  ✅ test
 - **Rule:** The merged allowlist is written host-side at `~/.augur/proxy/<slug>.allowlist`
-  (**outside the project tree**). A `./.augur.conf` is merged only after TOFU approval
-  and only its sanitized domains (via `conf_line_valid`).
+  (**outside the project tree**). A `./.augur/allowlist.conf` is merged only after TOFU
+  approval and only its sanitized domains (via `conf_line_valid`).
 - **Why:** Prevent root-in-guest from rewriting the egress policy mid-session.
 - **Enforced by:** `tests/01_egress_allowlist_unit.sh` (checks `conf_line_valid`'s grammar,
   `project_conf_domains` sanitization, and that `write_merged_allowlist` drops guest-supplied

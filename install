@@ -51,7 +51,7 @@ fi
 #   - augur.conf.default : augur-managed baseline. ALWAYS refreshed, so shipped domain
 #                          updates (e.g. new Anthropic endpoints) reach every install.
 #   - augur.conf         : the user's own global domains. NEVER clobbered; scaffolded once.
-# Per-project domains live in each project's ./.augur.conf.
+# Per-project domains live in each project's ./.augur/allowlist.conf.
 if [[ -f "$SCRIPT_DIR/augur.conf" ]]; then
     cp "$SCRIPT_DIR/augur.conf" "$INSTALL_DIR/augur.conf.default"
     info "Refreshed managed baseline $INSTALL_DIR/augur.conf.default."
@@ -61,7 +61,7 @@ if [[ -f "$SCRIPT_DIR/augur.conf" ]]; then
 #
 # augur ships a managed baseline (Anthropic, GitHub, npm, Homebrew, …) in
 # augur.conf.default, refreshed on every install. Add YOUR own always-on domains
-# here; this file is never overwritten. Per-project domains go in ./.augur.conf.
+# here; this file is never overwritten. Per-project domains go in ./.augur/allowlist.conf.
 #
 # Syntax (one pattern per line, '#' starts a comment):
 #   example.com     exact host only (the apex). Does NOT match subdomains.
