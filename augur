@@ -81,6 +81,10 @@ AUGUR_SSH_FWD_PORT="${AUGUR_SSH_FWD_PORT:-$((20000 + _augur_port_offset))}"
 # --no-egress / AUGUR_EGRESS=0 forces filtering off for a run.
 AUGUR_EGRESS="${AUGUR_EGRESS:-auto}"
 AUGUR_PROXY_BIN="${AUGUR_PROXY_BIN:-}"
+# Apple `container`'s per-container default memory is far too small to run an agent
+# comfortably (Docker Desktop's larger default VM isn't a per-project pain point the
+# same way, so this only needs to apply to the Apple engine — see cmd_up).
+AUGUR_CONTAINER_MEMORY="${AUGUR_CONTAINER_MEMORY:-4g}"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -1183,6 +1187,13 @@ cmd_up() {
         -v "${WORKSPACE_DIR}:${WORKSPACE_MOUNT}"
         -w "${WORKSPACE_MOUNT}"
     )
+
+    # Apple `container`'s default per-container memory is ~1GB — too tight for an agent.
+    # Docker Desktop's own default VM is already sized generously, so this only targets
+    # the Apple engine. AUGUR_CONTAINER_MEMORY overrides the amount.
+    if [[ "$ENGINE" == "container" ]]; then
+        docker_args+=(--memory "$AUGUR_CONTAINER_MEMORY")
+    fi
 
     # Egress allowlist: put the agent on an --internal network with NET_ADMIN dropped so
     # the root agent can't re-route, and point all egress at augur-proxy (Docker: the
