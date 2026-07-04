@@ -35,6 +35,21 @@ else
   fail "augur-vm.entitlements present" "not found at $ent"
 fi
 
+section "Tier 2 — augur-vm clone identity regeneration (source guard, run anywhere)"
+# Issue #67: `clone` copies the VM bundle via clonefile(2), which duplicates config.json
+# byte-for-byte — including machineIdentifier/macAddress. Without regenerating both on
+# the destination, running the source and the clone concurrently collides on the shared
+# NAT MAC (augur-vm ip resolves by MAC) and on VZMacMachineIdentifier, which
+# Virtualization.framework does not support running twice live.
+clone_src="$REPO/augur-vm/Sources/augur-vm/Clone.swift"
+if [[ -f "$clone_src" ]]; then
+  clone_txt="$(cat "$clone_src")"
+  has "$clone_txt" 'VZMacMachineIdentifier()' "clone regenerates machineIdentifier on the copy (issue #67)"
+  has "$clone_txt" 'VZMACAddress.randomLocallyAdministered()' "clone regenerates macAddress on the copy (issue #67)"
+else
+  fail "augur-vm/Sources/augur-vm/Clone.swift present" "not found at $clone_src"
+fi
+
 section "Tier 2 — macOS live smoke (gated)"
 if [[ "$(uname -s)" != "Darwin" ]]; then skip "live macOS checks" "not a macOS host"; finish; exit $?; fi
 if ! command -v augur-vm >/dev/null 2>&1; then skip "live macOS checks" "augur-vm not built (run: bash install)"; finish; exit $?; fi

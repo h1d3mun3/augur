@@ -1,13 +1,15 @@
 import ArgumentParser
 import Foundation
+import Virtualization
 #if canImport(Darwin)
 import Darwin
 #endif
 
 /// `augur-vm clone <source> <destination>` — copy-on-write clone of a VM bundle
 /// via APFS `clonefile(2)` (the `clone` command). The clone shares storage with the
-/// source until written, so it is near-free on disk. The machine identifier is
-/// intentionally preserved, which is fine for augur's isolated use.
+/// source until written, so it is near-free on disk. `machineIdentifier` and
+/// `macAddress` are regenerated on the destination's config.json so the clone can
+/// run concurrently with the source without colliding (see issue #67).
 struct Clone: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "clone",
@@ -40,6 +42,16 @@ struct Clone: ParsableCommand {
         guard result == 0 else {
             throw CLIError("clone failed: \(String(cString: strerror(errno)))")
         }
+
+        // clonefile(2) copies config.json byte-for-byte, so the destination starts out
+        // with the source's exact machineIdentifier/macAddress. Regenerate both so the
+        // clone is a distinct instance: same macAddress collides on the shared NAT
+        // segment (augur-vm ip resolves by MAC), and Virtualization.framework does not
+        // support running two live VMs with the same VZMacMachineIdentifier.
+        var config = try VMConfig.load(destination)
+        config.machineIdentifier = VZMacMachineIdentifier().dataRepresentation
+        config.macAddress = VZMACAddress.randomLocallyAdministered().string
+        try config.save(destination)
 
         // Drop any stale pidfile inherited from the source so the clone reads as stopped.
         try? FileManager.default.removeItem(at: Paths.pid(destination))
