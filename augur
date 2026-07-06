@@ -54,9 +54,10 @@ AUGUR_GLOBAL_CONF="${AUGUR_GLOBAL_CONF:-$AUGUR_DIR/augur.conf}"
 # mounted workspace), same as its predecessor ./.augur.conf.
 AUGUR_PROJECT_DIR="$WORKSPACE_DIR/.augur"
 AUGUR_PROJECT_CONF="${AUGUR_PROJECT_CONF:-$AUGUR_PROJECT_DIR/allowlist.conf}"
-# Resource knobs (e.g. MEMORY=4g). No TOFU gate like the allowlist: a guest inflating
-# its own resource limits isn't a containment breach, just a self-serve request the
-# operator sees applied on the next `augur up` — not worth the approval-prompt UX cost.
+# Resource knobs (e.g. MEMORY=4g, MACOS_CPU=4, MACOS_MEMORY_MB=8192). No TOFU gate like the
+# allowlist: a guest inflating its own resource limits isn't a containment breach, just a
+# self-serve request the operator sees applied on the next `augur up`/`augur up --macos` —
+# not worth the approval-prompt UX cost.
 AUGUR_PROJECT_RESOURCES_CONF="${AUGUR_PROJECT_RESOURCES_CONF:-$AUGUR_PROJECT_DIR/resources.conf}"
 AUGUR_PROXY_DIR="$AUGUR_DIR/proxy"
 # Docker mode runs the proxy as a SIDECAR container, not on the host: on Docker
@@ -89,9 +90,10 @@ AUGUR_SSH_FWD_PORT="${AUGUR_SSH_FWD_PORT:-$((20000 + _augur_port_offset))}"
 # ./.augur/allowlist.conf. --no-egress / AUGUR_EGRESS=0 forces filtering off for a run.
 AUGUR_EGRESS="${AUGUR_EGRESS:-auto}"
 AUGUR_PROXY_BIN="${AUGUR_PROXY_BIN:-}"
-# AUGUR_CONTAINER_MEMORY is deliberately left UNSET here (no ":-default") — resolve_container_memory
-# (below) needs to distinguish "the operator exported it" from "fall through to the project file /
-# built-in default", which a top-level default would collapse.
+# AUGUR_CONTAINER_MEMORY / AUGUR_MACOS_VM_CPU / AUGUR_MACOS_VM_MEMORY_MB are deliberately left
+# UNSET here (no ":-default") — resolve_container_memory / resolve_macos_vm_cpu /
+# resolve_macos_vm_memory_mb (below) need to distinguish "the operator exported it" from "fall
+# through to the project file / built-in default", which a top-level default would collapse.
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -728,6 +730,37 @@ resolve_container_memory() {
     local v
     v="$(project_resource_value MEMORY)" && [[ -n "$v" ]] && { echo "$v"; return; }
     echo "4g"
+}
+
+# Effective macOS VM vCPU count / memory (MB). Same precedence shape as
+# resolve_container_memory: an explicit AUGUR_MACOS_VM_CPU / AUGUR_MACOS_VM_MEMORY_MB env var
+# (checked with `+x` so an operator override always wins) > ./.augur/resources.conf's
+# MACOS_CPU= / MACOS_MEMORY_MB= (git-tracked, travels with the project) > the built-in default —
+# which matches the value every base/project VM has always booted with (augur-vm/Sources/
+# augur-vm/Installer.swift's Clamp defaults, applied explicitly in cmd_build_macos), so leaving
+# both unset changes nothing for existing users. Unlike container mode, this is APPLIED (not just
+# read) on every `augur up --macos` — see cmd_up_macos — because a VM clone's cpuCount/memorySize
+# are persisted in its own config.json (augur-vm's `clone` copies it byte-for-byte from the base
+# VM) rather than re-specified fresh at boot like a container's `--memory` flag, so without an
+# explicit resize call here a project VM would keep whatever the base VM happened to have forever.
+resolve_macos_vm_cpu() {
+    if [[ -n "${AUGUR_MACOS_VM_CPU+x}" ]]; then
+        echo "$AUGUR_MACOS_VM_CPU"
+        return
+    fi
+    local v
+    v="$(project_resource_value MACOS_CPU)" && [[ -n "$v" ]] && { echo "$v"; return; }
+    echo "4"
+}
+
+resolve_macos_vm_memory_mb() {
+    if [[ -n "${AUGUR_MACOS_VM_MEMORY_MB+x}" ]]; then
+        echo "$AUGUR_MACOS_VM_MEMORY_MB"
+        return
+    fi
+    local v
+    v="$(project_resource_value MACOS_MEMORY_MB)" && [[ -n "$v" ]] && { echo "$v"; return; }
+    echo "8192"
 }
 
 # A short, stable hex digest of the FULL workspace path. Two different directories that
@@ -1894,6 +1927,14 @@ cmd_up_macos() {
         rm -f "$(vm_known_hosts_file "$project_vm")"
     fi
 
+    # A clone's cpuCount/memorySize start as a byte-for-byte copy of the base VM's config.json
+    # (augur-vm's `clone`) and are otherwise never revisited, so a fixed base-VM default would
+    # follow every project VM forever regardless of host capability or .augur/resources.conf.
+    # Re-apply the resolved sizing here on every `up` (not just at first clone) so a
+    # resources.conf/env-var change takes effect on the VM's next boot — safe because we've
+    # already confirmed above the VM isn't running. See resolve_macos_vm_cpu/_memory_mb.
+    "$VM_CLI" set "$project_vm" --cpu "$(resolve_macos_vm_cpu)" --memory "$(resolve_macos_vm_memory_mb)"
+
     mkdir -p "$HOME/.config/gh"
     # Per-VM isolated history parent (NOT the host's shared ~/.claude/projects): the
     # guest only ever sees its own project's transcripts, never other projects'.
@@ -2132,6 +2173,7 @@ cmd_status_macos() {
     echo -e "${BOLD}VM (project):${RESET}  ${project_vm}"
     echo -e "${BOLD}VM (base):${RESET}     ${MACOS_BASE_VM}"
     echo -e "${BOLD}Directory:${RESET}     ${WORKSPACE_DIR}"
+    echo -e "${BOLD}Resources:${RESET}     $(resolve_macos_vm_cpu) vCPU / $(resolve_macos_vm_memory_mb) MB$(macos_vm_running "$project_vm" && echo " (applies on next up --macos if changed)")"
 
     if macos_vm_running "$project_vm"; then
         local ip
@@ -2346,6 +2388,14 @@ EOF
 # MEMORY sets the Apple Container memory limit (e.g. 4g, 8g). Default: 4g.
 # An AUGUR_CONTAINER_MEMORY environment variable, if set, overrides this.
 # MEMORY=4g
+
+# MACOS_CPU / MACOS_MEMORY_MB set the macOS VM mode vCPU count / memory (in MB).
+# Applied on every `augur up --macos`, so a change here takes effect on the VM's
+# next boot without needing to destroy/re-clone it. Defaults: 4 / 8192.
+# An AUGUR_MACOS_VM_CPU / AUGUR_MACOS_VM_MEMORY_MB environment variable, if set,
+# overrides these.
+# MACOS_CPU=4
+# MACOS_MEMORY_MB=8192
 EOF
         success "Created ${BOLD}${res}${RESET}"
     fi
@@ -2401,6 +2451,8 @@ cmd_help() {
     echo -e "    AUGUR_EGRESS             Disable (0) or force-enable (1) egress filtering; default is always on"
     echo -e "    AUGUR_ENGINE             Container backend: ${CYAN}container${RESET} (Apple, primary) or ${CYAN}docker${RESET} (fallback); default: auto"
     echo -e "    AUGUR_CONTAINER_MEMORY   Apple Container memory (e.g. 4g); overrides .augur/resources.conf; default: 4g"
+    echo -e "    AUGUR_MACOS_VM_CPU       macOS VM vCPU count; overrides .augur/resources.conf; default: 4"
+    echo -e "    AUGUR_MACOS_VM_MEMORY_MB macOS VM memory in MB; overrides .augur/resources.conf; default: 8192"
     echo ""
     echo -e "  ${BOLD}NOTES${RESET}"
     echo -e "    • Container backend: ${CYAN}container${RESET} (Apple Container) is the primary engine, auto-selected on"
@@ -2411,6 +2463,9 @@ cmd_help() {
     echo -e "      disable for one run. Needs no sudo. macOS VM egress also needs Go (augur-gvproxy)."
     echo -e "    • Container memory (Apple engine): defaults to 4g. Set ${CYAN}MEMORY=${RESET} in ${CYAN}.augur/resources.conf${RESET}"
     echo -e "      (git-tracked, travels with the project) or override per-run with ${CYAN}AUGUR_CONTAINER_MEMORY${RESET}."
+    echo -e "    • macOS VM sizing: defaults to 4 vCPU / 8192 MB regardless of host power. Set ${CYAN}MACOS_CPU=${RESET}/"
+    echo -e "      ${CYAN}MACOS_MEMORY_MB=${RESET} in ${CYAN}.augur/resources.conf${RESET} or override per-run with ${CYAN}AUGUR_MACOS_VM_CPU${RESET}/"
+    echo -e "      ${CYAN}AUGUR_MACOS_VM_MEMORY_MB${RESET}. Applied on every ${BOLD}augur up --macos${RESET}, no destroy/re-clone needed."
     echo -e "    • Container mode: current directory mounted at /workspace-<project> (Linux container)"
     echo -e "    • macOS VM mode:  current directory exposed at ~/workspace-<project> (macOS VM)"
     echo -e "    • macOS VM mode requires: augur-vm (the bundled Swift VM backend)"
