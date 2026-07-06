@@ -125,6 +125,8 @@ agent_cli_name() { echo "claude"; }
 #   a single constant token today (safe). BEFORE it becomes variable per agent, add a
 #   metachar/control-byte reject guard and pass argv via printf %q (docs §4 C4). The
 #   container engines pass it as an argv array to `<engine> exec` — safe by construction.
+# NOTE: no argv forwarding is added here for Claude Code's `--worktree` flag — this is a
+#   deliberate non-fix, not an oversight. See docs/claude-worktree-support-design.md.
 agent_launch_argv() { echo "claude"; }
 
 # Credential-capture / login subcommand argv. DATA.
@@ -155,6 +157,12 @@ agent_auth_specs() {
 # lives in the CORE (cmd_up). CONTRACT (A3/C7): a future agent whose state dir is flat (no
 # cwd fan-out) or colocated with its credential file must still be hash-keyed and must never
 # mount its credential store. See docs §4 C7.
+# NOTE: this stays pinned to exactly ONE leaf on purpose. A Claude Code `--worktree`
+#   session gets its own, different leaf that this mount does not cover, so its history is
+#   ephemeral (lost on container recreation) — deliberate, not a bug. Mounting the
+#   `~/.claude/projects` parent instead would cover it, but a compromised session in one
+#   leaf would then have filesystem access to every sibling leaf in the same container.
+#   See docs/claude-worktree-support-design.md before "fixing" this.
 agent_state_host_subdir()        { echo "claude-projects"; }              # dir under $AUGUR_DIR (both modes)
 agent_state_guest_projects_dir() { echo "/home/dev/.claude/projects"; }   # Docker: guest parent dir
 agent_state_guest_leaf()         { echo "-workspace-$1"; }                # Docker: leaf name from slug ($1)
