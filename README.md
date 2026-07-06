@@ -48,6 +48,8 @@ augur build
 
 The install script copies `Dockerfile` and `augur` to `~/.augur/` and configures `PATH`. Safe to re-run. The same `Dockerfile` builds the image on either engine.
 
+> **Apple Container only:** `augur build`/`augur update` implicitly starts a BuildKit "builder" VM (~2 CPU/2GiB) that keeps running after the build finishes, to speed up the next one. It's a single instance shared by every `container build` on the machine — not scoped to a project — so augur deliberately never stops it for you (doing so from one project's `down`/`build` could kill another project's in-flight build). If you want to free the RAM/CPU, run `container builder stop` yourself once you're sure nothing else is building.
+
 ### Usage
 
 ```bash
