@@ -36,6 +36,16 @@
   assertion) — full suite green (`tests/run.sh`); `shellcheck` unavailable offline in this
   environment (no sudo, no decompressor for the release tarball), so CI's `make unit` is
   the first real lint pass this change gets.
+- **Revised:** 2026-07-08 (correction, doc-only). Live testing on a real Mac
+  (`make unit`, `tests/run.sh`, then a manual `--worktree` session on both backends)
+  confirmed §9's implementation works, and surfaced that §7's "history is lost only on
+  `augur destroy --macos`" claim was wrong — `cmd_destroy_macos` never touches the
+  host-side history directory, so it survives `destroy` + a fresh clone too, as long as
+  the project directory doesn't move. §7 and §8 are corrected below; no code changed. A
+  separately-considered fix (auto-migrating an existing macOS project's *pre-hash-fix*
+  history directory forward to its new hashed name) was built, tested, then explicitly
+  declined and reverted — losing that continuity across the naming-scheme change was
+  judged acceptable, not worth the extra code.
 
 ---
 
@@ -314,9 +324,9 @@ this way, for two independent reasons — either alone would already close gap 2
    `"$VM_CLI" stop`, printing "clone kept; CoW so it costs ~0 on disk"; `cmd_up_macos`
    only re-clones from the base VM if the project VM doesn't already exist
    (`macos_vm_exists "$project_vm" || ... clone`). So anything written to the VM's own
-   filesystem — including a `--worktree` session's `~/.claude/projects/<leaf>/*.jsonl`,
-   even if nothing were shared out to the host at all — survives an ordinary `down`/`up`
-   cycle. Only `cmd_destroy_macos` (`"$VM_CLI" delete`) actually discards it.
+   filesystem survives an ordinary `down`/`up` cycle. **This reason turns out to be moot
+   for `~/.claude/projects` specifically** — see the correction below; item 2 is what
+   actually governs it.
 2. **`~/.claude/projects` is shared as a whole directory, not one pinned leaf.**
    `ensure_macos_claude_projects` symlinks the VM's entire `~/.claude/projects` to
    `/Volumes/My Shared Files/claude-projects`, a virtiofs share backed by a host-side
@@ -326,8 +336,28 @@ this way, for two independent reasons — either alone would already close gap 2
    addition, it's `--macos` mode's own pre-existing design for its single-VM history
    persistence, adopted before `--worktree` was ever a consideration.
 
+> **Corrected 2026-07-08, after live testing on a real Mac.** The original claim below —
+> "lost only on `augur destroy --macos`" — is wrong. `cmd_destroy_macos` only calls
+> `"$VM_CLI" delete "$project_vm"`; it never touches the host-side
+> `~/.augur/claude-projects/<vm-name>` directory item 2 backs `~/.claude/projects` with.
+> Since `macos_project_vm()` is a deterministic function of the project directory's path
+> (not a random ID), a fresh `up --macos` after `destroy` resolves to the *same* VM name
+> and therefore the *same* host-side directory, and `ensure_macos_claude_projects`
+> (called again by the very next `claude --macos`/`shell --macos`, not just by `up`)
+> re-establishes the same symlink. Confirmed live: `destroy --macos` → fresh
+> `up --macos` → `shell --macos` → both the main and `--worktree` leaves were still
+> there. Item 1 (the VM disk surviving `down`) is real but doesn't actually decide this
+> either way for `~/.claude/projects` — that path is redirected to the host from the
+> moment `ensure_macos_claude_projects` first runs, never mind what happens to the VM
+> disk afterward. The only ways to actually lose this project's `--macos`-mode Claude
+> history: manually delete `~/.augur/claude-projects/<vm-name>` on the host, or move/
+> rename the project directory (changes `workspace_path_hash`, hence the VM name — the
+> same one-time-orphaning cost §9 documents for its own basename+hash fix).
+
 Consequence: a `--worktree` session's conversation history is not lost on
-`augur down && up --macos` — only on `augur destroy --macos`. This comes with the same
+`augur down && up --macos`, nor on `augur destroy --macos` followed by a fresh
+`up --macos` for the same project directory — only by deleting the host-side directory
+directly, or by moving the project (see the correction above). This comes with the same
 cross-leaf, no-isolation-within-one-project trade-off §3's Option A was rejected for in
 the Docker/`container` case (any leaf in the shared VM can read or tamper with any sibling
 leaf's transcript) — except `--macos` mode already accepted this trade-off
@@ -359,12 +389,14 @@ For a user who wants `--worktree` today, despite no formal support: run `augur s
 - **One trivial gap:** `agent_fixed_env` (`DISABLE_AUTOUPDATER=1`) is only injected at
   `cmd_claude`'s exec time, so a manually-launched `claude` inside `augur shell` won't have
   it set unless the user exports it themselves. Cosmetic; not a functional blocker.
-- **What persists is now the same on both backends** (as of §9): survives `down`/`up` on
-  both — lost only on `destroy --macos` for `--macos` (§7), lost only if the
-  Docker/`container` engine's own state is wiped out from under augur (e.g. deleting the
-  volume/host directory by hand), since `cmd_up` mounts the whole `~/.claude/projects`
-  parent now, not one pinned leaf (§2.2, §9). Before §9, Docker/`container` mode lost a
-  `--worktree` session's history on every `down && up`; that asymmetry no longer exists.
+- **What persists is now the same on both backends** (as of §9): on both, the history
+  lives in a host-side directory keyed by `workspace_slug`+`workspace_path_hash`, outside
+  the container/VM's own lifecycle — surviving `down`/`up`, and (per §7's correction)
+  surviving `destroy --macos` + a fresh `up --macos` too, since that host-side directory
+  is untouched by `destroy` and the next VM resolves to the same name. On either backend
+  it's lost only by deleting that host-side directory directly, or by moving/renaming the
+  project (which changes the key). Before §9, Docker/`container` mode lost a `--worktree`
+  session's history on every `down && up`; that asymmetry no longer exists.
 
 This is the same scenario §5's closing paragraph already accepted ("if a user runs
 `claude --worktree <name>` ad hoc from inside an existing `augur claude` session
