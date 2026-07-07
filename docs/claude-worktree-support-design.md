@@ -1,25 +1,41 @@
 # augur × Claude Code `--worktree`: why augur does not add special support
 
 - **Date:** 2026-07-06
-- **Status:** Design record. **Decision: do NOT add special handling for Claude Code's
-  `--worktree` flag.** No argv forwarding, no history-mount changes. Documented so this
-  isn't reconsidered and rebuilt from scratch (or "fixed" into a weaker security posture)
-  without re-deriving the trade-offs below.
+- **Status:** Design record, partially superseded — see the 2026-07-07 (implementation)
+  revision below. **Still true:** no argv forwarding is added to `cmd_claude` for
+  `--worktree`; `augur claude --worktree ...` still does not work, and the sanctioned path
+  remains `augur shell` + manual launch (§8). **No longer true:** "no history-mount
+  changes" — §9's symmetric swap (mount the whole `~/.claude/projects` parent in
+  Docker/`container` mode; key `--macos`'s per-project VM name on `workspace_path_hash`,
+  not `basename` alone) was reconsidered and **implemented**. Kept as a design record so
+  the *reasoning* (why each option was rejected, then why the calculus changed) isn't lost
+  and doesn't need re-deriving from scratch.
 - **Method:** Source inspection of `augur` (`cmd_claude`, `agent_launch_argv`,
   `agent_state_guest_leaf`, `cmd_up`, `cmd_down`), an empirical `git worktree add` probe in
   this repo to confirm the on-disk `.git` file format, and verified facts about Claude
   Code's `--worktree` feature (path layout, project-leaf keying, `Ctrl+W` resume picker).
-- **Revised:** 2026-07-07. Follow-up review added the sanctioned `augur shell` +
-  manual-launch workaround (§8), the finding that `--macos` mode's persistence model
-  sidesteps gap 2 entirely (§7), a considered-and-declined "symmetric swap" between the
-  two backends' mount models (§9), and an incidentally-found, out-of-scope
-  `macos_project_vm` naming-collision gap (appended to §6). The original decision (§5) is
-  unchanged: still no argv forwarding, still no history-mount change. Additional method:
-  reading `cmd_shell`/`cmd_shell_macos`, `agent_fixed_env`, `cmd_up_macos`/
-  `cmd_down_macos`/`cmd_destroy_macos`, `ensure_macos_claude_projects`,
+- **Revised:** 2026-07-07 (analysis). Follow-up review added the sanctioned `augur shell`
+  + manual-launch workaround (§8), the finding that `--macos` mode's persistence model
+  sidesteps gap 2 entirely (§7), the "symmetric swap" between the two backends' mount
+  models — at this point still only analyzed, not built (§9 as first written) — and an
+  incidentally-found, out-of-scope `macos_project_vm` naming-collision gap (appended to
+  §6). Additional method: reading `cmd_shell`/`cmd_shell_macos`, `agent_fixed_env`,
+  `cmd_up_macos`/`cmd_down_macos`/`cmd_destroy_macos`, `ensure_macos_claude_projects`,
   `macos_project_vm`, `workspace_slug`/`workspace_path_hash`; an empirical
   `git clone --local` inode check confirming object hardlinking is a generic
   same-filesystem git behavior, not APFS-specific.
+- **Revised:** 2026-07-07 (implementation), later the same day. The symmetric swap was
+  reconsidered and shipped: `cmd_up`'s history mount now binds the whole
+  `~/.claude/projects` parent (not one leaf), with a one-time migration for pre-existing
+  installs' flat layout; `macos_project_vm()` now keys on `workspace_path_hash` too, not
+  `basename` alone. §9 is rewritten to describe what was actually built instead of what
+  was declined. `agent_launch_argv`/`cmd_claude` argv forwarding is untouched — that half
+  of the original decision still stands. Verified via `tests/00_seam_unit.sh`,
+  `tests/10_construct_docker.sh`, `tests/11_construct_container.sh` (new migration and
+  parent-mount assertions), `tests/30_macos_vm.sh` (new same-basename-different-VM
+  assertion) — full suite green (`tests/run.sh`); `shellcheck` unavailable offline in this
+  environment (no sudo, no decompressor for the release tarball), so CI's `make unit` is
+  the first real lint pass this change gets.
 
 ---
 
@@ -48,17 +64,16 @@
   directory and run `augur up`/`augur claude` there** — gets the same isolation and
   persistence guarantees `augur` already provides for any project, with none of the new
   surface area.
-- **Decision: ship nothing for `--worktree`.** No argv forwarding, no history-mount
-  changes. The sanctioned path for a user who wants it anyway: run `augur shell` (or
-  `augur shell --macos`) and type `claude --worktree <name>` manually at the prompt —
-  this bypasses gap §2.1 entirely (never goes through `cmd_claude`'s fixed
-  `agent_launch_argv`) at zero cost in augur code (§8). What survives `augur down && up`
-  then depends on the backend: lost in Docker/`container` mode (§2.2 still applies), but
-  persisted in `--macos` mode, since a project VM's disk is stopped, not destroyed, on
-  `down`, and survives until an explicit `augur destroy --macos` (§7). Making the two
-  backends match either way — adopting `--macos`'s whole-directory history share in
-  Docker/`container` mode, or fixing `--macos`'s own project-keying gap the other way —
-  was considered and declined (§9).
+- **Decision: no argv forwarding for `--worktree`, but the history-mount trade-off is now
+  shared by both backends (§9).** `augur claude --worktree ...` still doesn't work — the
+  sanctioned path remains `augur shell` (or `augur shell --macos`) + typing
+  `claude --worktree <name>` manually, which bypasses gap §2.1 entirely at zero cost in
+  augur code (§8). What survives `augur down && up` is now the same on both backends: any
+  leaf under the current project — main checkout or a worktree — persists, because
+  Docker/`container` mode's `cmd_up` mounts the whole `~/.claude/projects` parent instead
+  of one leaf (§2.2's gap is closed), matching what `--macos` mode already did (§7).
+  `--macos`'s own project-keying gap (§6) was fixed the same day, in the same direction:
+  `macos_project_vm()` now includes `workspace_path_hash`.
 
 ---
 
@@ -104,6 +119,9 @@ quoting first. Docker/`container` mode is unaffected (argv is passed as an array
 
 ### 2.2 History persistence is pinned to one leaf, decided at container-creation time
 
+> **Fixed 2026-07-07 — see §9.** This section is kept as-is for the historical record of
+> what the gap was and why it existed; `cmd_up` no longer mounts a single leaf.
+
 `cmd_up` mounts exactly one host directory at exactly one guest leaf path:
 
 ```
@@ -134,6 +152,12 @@ persistence model is structurally different and does not have this gap — see �
 ## 3. Options considered for the history gap (all rejected)
 
 ### Option A — mount the `~/.claude/projects` parent instead of one leaf
+
+> **Adopted 2026-07-07 — see §9.** Rejected here on first analysis; the calculus changed
+> once `--macos` mode turned out to already ship this exact trade-off unconditionally
+> (§7), making it something to *match*, not something new to *introduce*. The rejection
+> reasoning below is kept because it's still the correct description of the trade-off
+> being accepted, not a mistake that was corrected.
 
 Mounting the per-project host directory at the *parent* guest path instead of one named
 leaf would automatically capture any leaf Claude ever creates for this project (main or
@@ -233,11 +257,16 @@ repos on this machine.
 
 ## 5. Decision
 
-**Do not add special `--worktree` support.** Concretely: no argv forwarding is added to
-`cmd_claude`/`agent_launch_argv` for this purpose, and no change is made to
-`agent_state_guest_leaf`/the history mount. For parallel work on multiple branches, the
-supported path is: clone the repository into a second directory and run `augur up`/
-`augur claude` there independently — this already works today.
+**Do not add special `--worktree` support** — still true. No argv forwarding is added to
+`cmd_claude`/`agent_launch_argv` for this purpose. For parallel work on multiple branches,
+the supported path remains: clone the repository into a second directory and run
+`augur up`/`augur claude` there independently.
+
+**Superseded in part, 2026-07-07 (see §9):** "no change is made to
+`agent_state_guest_leaf`/the history mount" is no longer accurate. `agent_state_guest_leaf`
+itself is unchanged, but `cmd_up` now mounts `agent_state_guest_projects_dir()` (the
+parent) instead of `agent_state_guest_projects_dir()/agent_proj_leaf` (one leaf) —
+Docker/`container` mode now behaves like `--macos` mode always did (§7).
 
 If a user runs `claude --worktree <name>` ad hoc from inside an existing `augur claude`
 session anyway (once/if argv forwarding is ever added for unrelated reasons), the worktree
@@ -297,14 +326,20 @@ this way, for two independent reasons — either alone would already close gap 2
    addition, it's `--macos` mode's own pre-existing design for its single-VM history
    persistence, adopted before `--worktree` was ever a consideration.
 
-Consequence: a `--worktree` session's conversation history, unlike in Docker/`container`
-mode, is not lost on `augur down && up --macos` — only on `augur destroy --macos`. This
-comes with the same cross-leaf, no-isolation-within-one-project trade-off §3's Option A
-was rejected for in the Docker/`container` case (any leaf in the shared VM can read or
-tamper with any sibling leaf's transcript) — except `--macos` mode already accepts this
-trade-off unconditionally, for its own reasons, independent of `--worktree`. Using
+Consequence: a `--worktree` session's conversation history is not lost on
+`augur down && up --macos` — only on `augur destroy --macos`. This comes with the same
+cross-leaf, no-isolation-within-one-project trade-off §3's Option A was rejected for in
+the Docker/`container` case (any leaf in the shared VM can read or tamper with any sibling
+leaf's transcript) — except `--macos` mode already accepted this trade-off
+unconditionally, for its own reasons, independent of `--worktree`, before Docker/`container`
+mode did too (§9 later closed that gap the same way, deliberately). Using
 `claude --worktree` there (§8) doesn't introduce a new risk category; it just exercises a
-risk surface `--macos` mode already ships.
+risk surface `--macos` mode already ships — and, as of §9, so does Docker/`container` mode.
+
+(Comparison note: at the time this section was first written, `augur down && up --macos`
+preserving worktree history *unlike* Docker/`container` mode was the whole point of §7.
+§9 later closed that asymmetry, so the "unlike" no longer holds — kept here as history,
+not current behavior.)
 
 ## 8. The sanctioned ad hoc workaround: `augur shell` + manual `claude --worktree`
 
@@ -324,37 +359,100 @@ For a user who wants `--worktree` today, despite no formal support: run `augur s
 - **One trivial gap:** `agent_fixed_env` (`DISABLE_AUTOUPDATER=1`) is only injected at
   `cmd_claude`'s exec time, so a manually-launched `claude` inside `augur shell` won't have
   it set unless the user exports it themselves. Cosmetic; not a functional blocker.
-- **What persists differs by backend** — see §7 for `--macos` (survives `down`/`up`, lost
-  only on `destroy --macos`) vs §2.2 for Docker/`container` (lost on any `down && up`,
-  since only the one pinned main-checkout leaf is bind-mounted).
+- **What persists is now the same on both backends** (as of §9): survives `down`/`up` on
+  both — lost only on `destroy --macos` for `--macos` (§7), lost only if the
+  Docker/`container` engine's own state is wiped out from under augur (e.g. deleting the
+  volume/host directory by hand), since `cmd_up` mounts the whole `~/.claude/projects`
+  parent now, not one pinned leaf (§2.2, §9). Before §9, Docker/`container` mode lost a
+  `--worktree` session's history on every `down && up`; that asymmetry no longer exists.
 
 This is the same scenario §5's closing paragraph already accepted ("if a user runs
 `claude --worktree <name>` ad hoc from inside an existing `augur claude` session
 anyway..."), just entered more cleanly — via a shell that was never itself running
 `claude`, rather than nesting a second `claude` process inside a running session.
 
-## 9. Considered and declined: symmetrizing the two backends' mount models
+## 9. Implemented: symmetrizing the two backends' mount models
 
-Since `--macos` mode already accepts Option A's cross-leaf trade-off (§7) and
-Docker/`container` mode already avoids it (only one leaf is ever mounted), and since
-`--macos` mode has its own, separate project-keying gap Docker/`container` mode doesn't
+Since `--macos` mode already accepted Option A's cross-leaf trade-off (§7) and
+Docker/`container` mode avoided it only because it mounted a single leaf (§2.2), and since
+`--macos` mode had its own, separate project-keying gap Docker/`container` mode didn't
 (§6's added paragraph: `macos_project_vm`'s `basename`-only keying vs
-`workspace_slug`+`workspace_path_hash`), a natural next thought is to symmetrize both
-ways: adopt Option A's whole-directory mount in Docker/`container` mode (closing gap 2
-there, matching `--macos`), and adopt `workspace_path_hash`-style keying in `--macos` mode
-(closing its basename-collision gap, matching Docker/`container`).
+`workspace_slug`+`workspace_path_hash`), symmetrizing both ways — Option A's
+whole-directory mount in Docker/`container` mode, `workspace_path_hash`-style keying in
+`--macos` mode — leaves both backends with an identical isolation model: strict
+cross-project separation, no cross-leaf separation within one project. It introduces no
+new category of risk beyond what §3's Option A and §6's added paragraph already separately
+describe — it just means both backends now carry the same, already-analyzed trade-offs
+instead of one carrying a version the other didn't.
 
-This would work, and would leave both backends with an identical isolation model: strict
-cross-project separation, no cross-leaf separation within one project. It does not
-introduce any new category of risk beyond what §3's Option A and §6's added paragraph
-already separately describe — symmetrizing just means both backends carry the same,
-already-analyzed trade-offs instead of one carrying a version the other doesn't.
+First analyzed and declined as not worth the surface area purely to formalize a
+`--worktree` path that already worked via §8's workaround. Reconsidered and **implemented
+2026-07-07**, same day, once weighed against a concrete, unrelated cost of *not* fixing
+§6's basename-collision gap (a correctness bug independent of `--worktree`, not a
+nice-to-have): leaving it unfixed after documenting it here would mean shipping a design
+doc that names a known collision bug without shipping the one-line fix for it. Bundling
+that fix with the mount-topology change (both touch the same "state/history" contract
+seam, §4 C7 of `docs/swappable-agent-abstraction-design.md`) was judged cheaper than
+tracking it as a separate follow-up indefinitely.
 
-**Declined anyway.** Whether augur should spend this surface area at all — two
-non-trivial changes (a mount-topology change in `cmd_up`'s `docker_args`, a
-project-keying change in `macos_project_vm` that orphans every existing project VM under
-its old name, requiring a fresh clone) — purely to formalize a `--worktree` code path that
-already works today via §8's shell-based workaround with zero code changes, was judged not
-worth it. §8 gets users the actual outcome (worktree usable, history persistence
-backend-dependent) without committing augur to maintaining new mount logic or a VM
-re-keying migration.
+### What actually shipped
+
+**Docker/`container` mode (`cmd_up`):** the bind mount changed from
+
+```
+docker_args+=(-v "${host_hist_dir}:$(agent_state_guest_projects_dir)/${agent_proj_leaf}")
+```
+
+to
+
+```
+docker_args+=(-v "${host_hist_dir}:$(agent_state_guest_projects_dir)")
+```
+
+i.e. `host_hist_dir` (still keyed on `workspace_slug`+`workspace_path_hash` — the C7
+project-scoping is untouched) is now mounted at the *parent* projects directory, not one
+leaf inside it. Any leaf Claude creates for this project — main checkout or a `--worktree`
+session launched via §8 — now lands under the same host-persisted directory and survives
+`down`/`up`.
+
+**Migration for existing installs:** pre-this-change, `host_hist_dir` held the main
+checkout's `*.jsonl` files directly (it used to be mounted *at* that leaf path). Mounting
+the parent instead means those files need to live one level deeper — at
+`host_hist_dir/$agent_proj_leaf/` — to keep surfacing at the guest path Claude already
+expects. `cmd_up` now does this once, idempotently, guarded on the leaf subdirectory not
+already existing: on first `up` after upgrading, any pre-existing flat contents of
+`host_hist_dir` move into `host_hist_dir/$agent_proj_leaf/` before the mount is set up.
+Covered by `tests/10_construct_docker.sh` (seeds a legacy flat file, re-runs `up`, asserts
+it lands in the leaf subdir and nothing is left behind at the old path).
+
+**`--macos` mode (`macos_project_vm`):** changed from
+
+```
+echo "augur-macos-${dir_name}"
+```
+
+to
+
+```
+echo "augur-macos-${dir_name}-$(workspace_path_hash)"
+```
+
+**Cost accepted, not mitigated:** this changes every existing project's VM name, so every
+project VM cloned under the old (`basename`-only) name is orphaned — `macos_vm_exists`
+no longer finds it under the new name, so the next `augur up --macos` for that project
+clones fresh from the base VM rather than resuming the old one. The old VM/clone is not
+deleted; it is left in place (`augur list --macos` still shows it under its old name) and
+can be removed manually if no longer wanted. No migration tooling was built for this, on
+the same reasoning §9's predecessor (the now-superseded "considered and declined"
+analysis) gave for declining an `augur-vm import` command in
+[[macos-vm-basevm-portability]]: a coarse, one-time cost taken deliberately rather than
+engineered around.
+
+**Verification:** `tests/00_seam_unit.sh` (unchanged functions still byte-identical),
+`tests/10_construct_docker.sh` / `tests/11_construct_container.sh` (new: mount targets the
+parent exactly, not a leaf; migration moves a seeded legacy file and leaves nothing behind
+at the old path), `tests/30_macos_vm.sh` (new: two directories sharing a basename now
+resolve to different VM names; the same directory is stable across calls). Full suite:
+`tests/run.sh` — all green. Not verified: an actual live Docker/`container` run or a real
+macOS VM boot (this environment has neither); the shimmed construction tests exercise the
+exact code path but do not replace a live smoke test before release.

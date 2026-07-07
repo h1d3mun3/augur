@@ -467,10 +467,18 @@ require_vz() {
     fi
 }
 
+# Keyed on basename + workspace_path_hash (mirrors the Docker/container-mode
+# host_hist_dir key), not basename alone: two distinct directories that happen to
+# share a basename (e.g. ~/work/myapp and ~/archive/myapp) must never collide onto
+# the same VM/history-dir/egress-config (see
+# docs/claude-worktree-support-design.md §6/§9). Changing this key means any
+# project VM cloned under the old (basename-only) name is orphaned — a one-time
+# fresh clone on next `up`, not data loss (the old VM/clone is left in place;
+# `augur list --macos` still shows it and it can be removed manually).
 macos_project_vm() {
     local dir_name
     dir_name="$(basename "$WORKSPACE_DIR" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]' '-' | sed 's/^-//;s/-$//')"
-    echo "augur-macos-${dir_name}"
+    echo "augur-macos-${dir_name}-$(workspace_path_hash)"
 }
 
 macos_vm_exists() {
@@ -1325,11 +1333,18 @@ cmd_up() {
 
     # Persist ONLY this project's Claude history, not the whole ~/.claude. Claude
     # keys history by cwd (the container runs in /workspace-<slug>, which Claude
-    # encodes as projects/-workspace-<slug>), so we bind just that leaf dir. The
-    # guest can therefore neither read other projects' transcripts nor tamper with
-    # host auth/settings. The container-side parent (~/.claude/projects) and a
-    # minimal ~/.claude.json are baked dev-owned into the image (see Dockerfile),
-    # so onboarding is skipped without exposing the host's config.
+    # encodes as projects/-workspace-<slug>); we bind the whole ~/.claude/projects
+    # parent (not just that one leaf) so any leaf Claude creates for THIS project —
+    # the main checkout, or a `claude --worktree` session run ad hoc via `augur
+    # shell` (no augur support for that flag itself; see
+    # docs/claude-worktree-support-design.md §3 Option A / §7-§9) — persists across
+    # `down`/`up`. The guest can therefore neither read other projects' transcripts
+    # nor tamper with host auth/settings, but CAN read/tamper with a sibling leaf's
+    # transcript within this one project — an accepted trade-off, not a new one
+    # (see the doc). The container-side parent (~/.claude/projects) and a minimal
+    # ~/.claude.json are baked dev-owned into the image (see Dockerfile) only as a
+    # fallback for any path that skips this mount; normally this bind mount fully
+    # shadows that pre-baked parent.
     # A3: persist this project's history OUTSIDE the host's own ~/.claude/projects tree
     # (under ~/.augur/claude-projects, mirroring macOS mode). A hostile guest can write
     # arbitrary *.jsonl into this RW mount; keeping it out of ~/.claude/projects means the
@@ -1339,11 +1354,27 @@ cmd_up() {
     # AUGUR_AGENT_SEAM | history mount — core OWNS the keying/scope (host source keyed on the
     # FULL path = slug + path hash, so two same-basename projects never share history, kept
     # OUTSIDE the host's own agent tree); the agent only DECLARES its guest paths. See docs §4 C7.
+    # "current-project-only" (C7) means no OTHER project's data is reachable — it does not
+    # mean single-leaf; every leaf under this one project's host_hist_dir is in scope.
     local agent_proj_leaf host_hist_dir
     agent_proj_leaf="$(agent_state_guest_leaf "$(workspace_slug)")"
     host_hist_dir="$AUGUR_DIR/$(agent_state_host_subdir)/$(workspace_slug)-$(workspace_path_hash)"
     mkdir -p "$host_hist_dir"
-    docker_args+=(-v "${host_hist_dir}:$(agent_state_guest_projects_dir)/${agent_proj_leaf}")
+    # One-time, idempotent migration: pre-Option-A installs wrote this project's
+    # *.jsonl directly under host_hist_dir (it used to be mounted at exactly one
+    # guest leaf path). Now that the whole parent is mounted below, those files
+    # need to live one level deeper — under host_hist_dir/$agent_proj_leaf/ — to
+    # keep surfacing at the same guest path Claude already expects.
+    if [[ ! -d "$host_hist_dir/$agent_proj_leaf" ]]; then
+        shopt -s dotglob nullglob
+        local _pre_option_a_entries=("$host_hist_dir"/*)
+        shopt -u dotglob nullglob
+        mkdir -p "$host_hist_dir/$agent_proj_leaf"
+        if [[ ${#_pre_option_a_entries[@]} -gt 0 ]]; then
+            mv "${_pre_option_a_entries[@]}" "$host_hist_dir/$agent_proj_leaf/"
+        fi
+    fi
+    docker_args+=(-v "${host_hist_dir}:$(agent_state_guest_projects_dir)")
 
     [[ -f "$HOME/.gitconfig" ]] && docker_args+=(-v "${HOME}/.gitconfig:/home/dev/.gitconfig:ro")
 

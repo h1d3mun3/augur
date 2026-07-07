@@ -32,9 +32,13 @@ if [[ -f "$run" ]]; then
   has "$body" "ANTHROPIC_API_KEY=sk-ant-test123"               "up: injects ANTHROPIC_API_KEY (auth seam)"
   hasnt "$body" "CLAUDE_CODE_OAUTH_TOKEN"                       "up: omits the unset oauth token (named-only auth)"
   has "$body" "claude-projects/${slug}-"                        "up: host history under claude-projects/<slug>-… (state seam)"
-  has "$body" ":/home/dev/.claude/projects/-workspace-${slug}"  "up: guest leaf -workspace-<slug> (state seam)"
+  if grep -Eq ":/home/dev/\.claude/projects$" "$run"; then ok "up: mounts the whole projects parent, not one leaf (Option A)"
+  else fail "up: does not mount the projects parent exactly" "expected a line ending exactly in :/home/dev/.claude/projects"; fi
+  hasnt "$body" ":/home/dev/.claude/projects/-workspace-${slug}" "up: no leftover leaf-scoped mount target"
   if grep -Eq "claude-projects/${slug}-[0-9a-f]{12}:" "$run"; then ok "up: history host dir keyed on full-path hash (A3/C7)"
   else fail "up: history host dir not keyed on path hash"; fi
+  # migration behavior for the pre-Option-A flat layout is covered once, engine-agnostically,
+  # in tests/10_construct_docker.sh (cmd_up's history-mount code path doesn't vary by engine).
 else
   cname="augur-${slug}"
   fail "up: no container run captured" "trace: $(cat "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null)"
