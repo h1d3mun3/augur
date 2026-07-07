@@ -42,13 +42,13 @@ ENV PATH=/home/dev/.local/bin:$PATH
 ENV DISABLE_AUTOUPDATER=1
 
 # Pre-create the per-project history dir (dev-owned) and seed a minimal
-# ~/.claude.json. augur bind-mounts ONLY ~/.claude/projects/-workspace-<slug>
-# (this project's history) — never the whole ~/.claude — so the guest cannot read
-# other projects' transcripts or tamper with host auth/settings. Pre-creating the
-# parent here keeps it dev-owned; otherwise a bind mount of the leaf dir makes
-# Docker create ~/.claude as root and Claude Code (uid 1001) can't write. The
-# minimal ~/.claude.json skips onboarding WITHOUT copying the host's real config
-# (which enumerates every project on the host). Auth is injected via env
+# ~/.claude.json. augur bind-mounts ~/.claude/projects (this project's history
+# only — every leaf under it, never the whole ~/.claude) — so the guest cannot
+# read other projects' transcripts or tamper with host auth/settings. This RUN's
+# mkdir is a dev-owned fallback for any path that skips that mount; normally the
+# bind mount fully shadows it, source directory ownership and all. The minimal
+# ~/.claude.json skips onboarding WITHOUT copying the host's real config (which
+# enumerates every project on the host). Auth is injected via env
 # (CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY), never mounted.
 # AUGUR_AGENT_SEAM | agent state seed — pre-create the per-project history parent + minimal config.
 RUN mkdir -p /home/dev/.claude/projects \

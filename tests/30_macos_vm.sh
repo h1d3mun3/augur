@@ -19,6 +19,30 @@ has "$claude_macos" '${_rargv}'          "macOS launch interpolates the seam lau
 up_macos="$(awk '/^cmd_up_macos\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
 has "$up_macos" 'agent_state_host_subdir' "macOS history share dir name comes from agent_state_host_subdir (A3/C7)"
 
+section "Tier 2 — per-project VM naming is path-hash keyed, not basename-only (run anywhere)"
+# §6/§9 fix: macos_project_vm() used to key purely on basename(WORKSPACE_DIR), so two
+# distinct directories sharing a basename (e.g. ~/work/myapp and ~/archive/myapp) collided
+# onto the same VM name — and therefore the same history dir, egress config, and everything
+# else keyed by that name. See docs/claude-worktree-support-design.md §6/§9.
+project_vm_fns="$(mktemp)"
+work="$(mktemp -d)"
+trap 'rm -f "$project_vm_fns"; rm -rf "$work"' EXIT
+{
+  awk '/^workspace_path_hash\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR"
+  awk '/^macos_project_vm\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR"
+} > "$project_vm_fns"
+has "$(cat "$project_vm_fns")" 'workspace_path_hash' "macos_project_vm references workspace_path_hash (not basename-only)"
+# shellcheck disable=SC1090
+source "$project_vm_fns"
+
+mkdir -p "$work/work/myapp" "$work/archive/myapp"
+WORKSPACE_DIR="$work/work/myapp";    name_a="$(macos_project_vm)"
+WORKSPACE_DIR="$work/archive/myapp"; name_b="$(macos_project_vm)"
+if [[ "$name_a" != "$name_b" ]]; then ok "macos_project_vm: same-basename dirs get distinct VM names ($name_a vs $name_b)"
+else fail "macos_project_vm: same-basename dirs collided" "both resolved to $name_a"; fi
+WORKSPACE_DIR="$work/work/myapp"; name_a2="$(macos_project_vm)"
+eq "$name_a" "$name_a2" "macos_project_vm: same directory is stable across calls"
+
 section "Tier 2 — macOS network isolation (entitlements, run anywhere)"
 # Invariant I9 (docs/security-reviews/INVARIANTS.md): the guest gets one host-owned NIC
 # and no bridged networking. The machine-checkable part is the entitlement set — bridged
