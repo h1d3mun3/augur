@@ -14,6 +14,19 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
+# Optional extra apt packages declared in ~/.augur/provision/container-packages.conf
+# (host-side, TOFU-approved before this build — see container_provision_prepare in
+# `augur`). Empty by default, so a normal build is unaffected; each package name was
+# already validated against a safe charset host-side before reaching this ARG, so the
+# unquoted expansion below (needed to word-split multiple names into separate apt-get
+# arguments) cannot smuggle shell metacharacters.
+ARG EXTRA_APT_PACKAGES=""
+RUN if [ -n "$EXTRA_APT_PACKAGES" ]; then \
+      apt-get update \
+      && apt-get install -y --no-install-recommends $EXTRA_APT_PACKAGES \
+      && rm -rf /var/lib/apt/lists/*; \
+    fi
+
 # Create non-root user (no sudo — the agent runs as dev with no elevated privileges)
 RUN useradd -m -u 1001 -s /bin/bash dev
 
