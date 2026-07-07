@@ -9,6 +9,17 @@
   `agent_state_guest_leaf`, `cmd_up`, `cmd_down`), an empirical `git worktree add` probe in
   this repo to confirm the on-disk `.git` file format, and verified facts about Claude
   Code's `--worktree` feature (path layout, project-leaf keying, `Ctrl+W` resume picker).
+- **Revised:** 2026-07-07. Follow-up review added the sanctioned `augur shell` +
+  manual-launch workaround (§8), the finding that `--macos` mode's persistence model
+  sidesteps gap 2 entirely (§7), a considered-and-declined "symmetric swap" between the
+  two backends' mount models (§9), and an incidentally-found, out-of-scope
+  `macos_project_vm` naming-collision gap (appended to §6). The original decision (§5) is
+  unchanged: still no argv forwarding, still no history-mount change. Additional method:
+  reading `cmd_shell`/`cmd_shell_macos`, `agent_fixed_env`, `cmd_up_macos`/
+  `cmd_down_macos`/`cmd_destroy_macos`, `ensure_macos_claude_projects`,
+  `macos_project_vm`, `workspace_slug`/`workspace_path_hash`; an empirical
+  `git clone --local` inode check confirming object hardlinking is a generic
+  same-filesystem git behavior, not APFS-specific.
 
 ---
 
@@ -37,11 +48,17 @@
   directory and run `augur up`/`augur claude` there** — gets the same isolation and
   persistence guarantees `augur` already provides for any project, with none of the new
   surface area.
-- **Decision: ship nothing for `--worktree`.** If a user invokes it ad hoc inside an
-  existing `augur claude` session, the worktree's files persist normally (ordinary files
-  under the existing workspace bind mount), but that session's conversation history does
-  not survive `augur down && augur up` — call this out if it ever becomes user-visible
-  confusion (e.g. a help-text note), but no code changes.
+- **Decision: ship nothing for `--worktree`.** No argv forwarding, no history-mount
+  changes. The sanctioned path for a user who wants it anyway: run `augur shell` (or
+  `augur shell --macos`) and type `claude --worktree <name>` manually at the prompt —
+  this bypasses gap §2.1 entirely (never goes through `cmd_claude`'s fixed
+  `agent_launch_argv`) at zero cost in augur code (§8). What survives `augur down && up`
+  then depends on the backend: lost in Docker/`container` mode (§2.2 still applies), but
+  persisted in `--macos` mode, since a project VM's disk is stopped, not destroyed, on
+  `down`, and survives until an explicit `augur destroy --macos` (§7). Making the two
+  backends match either way — adopting `--macos`'s whole-directory history share in
+  Docker/`container` mode, or fixing `--macos`'s own project-keying gap the other way —
+  was considered and declined (§9).
 
 ---
 
@@ -110,6 +127,9 @@ image, never resuming the old one. So anything living only in the old container'
 layer — including any `--worktree` session's history — is gone the moment the container is
 recreated. The worktree's actual files (checked-out branch, `.git` file) are unaffected:
 they're ordinary files under `WORKSPACE_MOUNT`, which *is* a host bind mount.
+
+This entire gap is specific to Docker/`container` mode's `cmd_up`. `--macos` mode's
+persistence model is structurally different and does not have this gap — see §7.
 
 ## 3. Options considered for the history gap (all rejected)
 
@@ -225,6 +245,11 @@ itself should work at the file/git level (§1), but its conversation history wil
 survive `augur down && augur up` — only its code changes will, since those live under the
 already-persisted `WORKSPACE_MOUNT`.
 
+The cleaner way to get there: don't nest inside an already-running `augur claude` session
+— use `augur shell` (or `augur shell --macos`) first, then invoke
+`claude --worktree <name>` as the first and only Claude Code process in that shell. See §8
+for why this needs no code changes and what it actually persists per backend.
+
 ## 6. Residual observation (pre-existing, out of scope here)
 
 Not caused by anything above, but surfaced while investigating it: augur's
@@ -236,3 +261,100 @@ poisoned transcript if it (or the user) resumes. This is inherent to persisting 
 all, not something this decision introduces or changes — flagged here only so it isn't
 mistaken for a new consequence of the `--worktree` investigation, and as a candidate for a
 future, separate review if tamper-evident history ever becomes a priority.
+
+A second, unrelated residual surfaced while investigating the `--macos`/Docker
+persistence asymmetry (§7): `macos_project_vm()` keys the per-project VM name (and
+therefore its host-side history directory) purely off `basename "$WORKSPACE_DIR"`, with
+no equivalent of Docker/`container` mode's `workspace_path_hash` component. Two distinct
+directories that happen to share a basename (e.g. `~/work/myapp` and `~/archive/myapp`)
+collide onto the same VM name (`augur-macos-myapp`) and therefore the same history
+directory, egress config, and everything else keyed by that name — a cross-*project*
+collision with no Docker/`container`-mode equivalent. Not caused by anything in this
+document and not fixed by any option above; flagged here for the same reason as the rest
+of this section — a candidate for a future, separate review, not a new consequence of the
+`--worktree` investigation.
+
+## 7. `--macos` mode's persistence model is structurally different — gap 2 doesn't apply
+
+§2.2's gap is specific to how Docker/`container` mode's `cmd_up` works: it always
+discards the old container and creates a fresh one, so only the one host directory it
+explicitly bind-mounts at container-creation time survives. `--macos` mode does not work
+this way, for two independent reasons — either alone would already close gap 2:
+
+1. **The VM disk itself persists across `down`/`up`.** `cmd_down_macos` only calls
+   `"$VM_CLI" stop`, printing "clone kept; CoW so it costs ~0 on disk"; `cmd_up_macos`
+   only re-clones from the base VM if the project VM doesn't already exist
+   (`macos_vm_exists "$project_vm" || ... clone`). So anything written to the VM's own
+   filesystem — including a `--worktree` session's `~/.claude/projects/<leaf>/*.jsonl`,
+   even if nothing were shared out to the host at all — survives an ordinary `down`/`up`
+   cycle. Only `cmd_destroy_macos` (`"$VM_CLI" delete`) actually discards it.
+2. **`~/.claude/projects` is shared as a whole directory, not one pinned leaf.**
+   `ensure_macos_claude_projects` symlinks the VM's entire `~/.claude/projects` to
+   `/Volumes/My Shared Files/claude-projects`, a virtiofs share backed by a host-side
+   per-project directory (`~/.augur/claude-projects/<vm-name>`, keyed by
+   `macos_project_vm`). This is exactly the "Option A" pattern §3's first option proposes
+   and rejects for Docker/`container` mode — except here it isn't a worktree-motivated
+   addition, it's `--macos` mode's own pre-existing design for its single-VM history
+   persistence, adopted before `--worktree` was ever a consideration.
+
+Consequence: a `--worktree` session's conversation history, unlike in Docker/`container`
+mode, is not lost on `augur down && up --macos` — only on `augur destroy --macos`. This
+comes with the same cross-leaf, no-isolation-within-one-project trade-off §3's Option A
+was rejected for in the Docker/`container` case (any leaf in the shared VM can read or
+tamper with any sibling leaf's transcript) — except `--macos` mode already accepts this
+trade-off unconditionally, for its own reasons, independent of `--worktree`. Using
+`claude --worktree` there (§8) doesn't introduce a new risk category; it just exercises a
+risk surface `--macos` mode already ships.
+
+## 8. The sanctioned ad hoc workaround: `augur shell` + manual `claude --worktree`
+
+For a user who wants `--worktree` today, despite no formal support: run `augur shell`
+(`cmd_shell`: `eng exec -it "$CONTAINER_NAME" bash`) or `augur shell --macos`
+(`cmd_shell_macos`: `ssh_macos ... "cd ~/${MACOS_SHARE} && exec zsh -l"`), then type
+`claude --worktree <name>` at the resulting prompt. Verified:
+
+- **Gap §2.1 (argv forwarding) does not apply.** Both `cmd_shell` variants just open a
+  plain interactive shell — no argv is constructed or forwarded on the user's behalf, so
+  the metachar/quoting hardening §2.1 says `agent_launch_argv` would need before being
+  made variable is irrelevant here. The user is typing a command at a live prompt, same as
+  any other command.
+- **Auth already works.** `ANTHROPIC_API_KEY`/`CLAUDE_CODE_OAUTH_TOKEN` are injected at
+  container/VM-creation time (`cmd_up`'s `docker_args`/`cmd_up_macos`'s `~/.augur-env`),
+  not at `cmd_claude`'s exec call, so they're already present in a shell session.
+- **One trivial gap:** `agent_fixed_env` (`DISABLE_AUTOUPDATER=1`) is only injected at
+  `cmd_claude`'s exec time, so a manually-launched `claude` inside `augur shell` won't have
+  it set unless the user exports it themselves. Cosmetic; not a functional blocker.
+- **What persists differs by backend** — see §7 for `--macos` (survives `down`/`up`, lost
+  only on `destroy --macos`) vs §2.2 for Docker/`container` (lost on any `down && up`,
+  since only the one pinned main-checkout leaf is bind-mounted).
+
+This is the same scenario §5's closing paragraph already accepted ("if a user runs
+`claude --worktree <name>` ad hoc from inside an existing `augur claude` session
+anyway..."), just entered more cleanly — via a shell that was never itself running
+`claude`, rather than nesting a second `claude` process inside a running session.
+
+## 9. Considered and declined: symmetrizing the two backends' mount models
+
+Since `--macos` mode already accepts Option A's cross-leaf trade-off (§7) and
+Docker/`container` mode already avoids it (only one leaf is ever mounted), and since
+`--macos` mode has its own, separate project-keying gap Docker/`container` mode doesn't
+(§6's added paragraph: `macos_project_vm`'s `basename`-only keying vs
+`workspace_slug`+`workspace_path_hash`), a natural next thought is to symmetrize both
+ways: adopt Option A's whole-directory mount in Docker/`container` mode (closing gap 2
+there, matching `--macos`), and adopt `workspace_path_hash`-style keying in `--macos` mode
+(closing its basename-collision gap, matching Docker/`container`).
+
+This would work, and would leave both backends with an identical isolation model: strict
+cross-project separation, no cross-leaf separation within one project. It does not
+introduce any new category of risk beyond what §3's Option A and §6's added paragraph
+already separately describe — symmetrizing just means both backends carry the same,
+already-analyzed trade-offs instead of one carrying a version the other doesn't.
+
+**Declined anyway.** Whether augur should spend this surface area at all — two
+non-trivial changes (a mount-topology change in `cmd_up`'s `docker_args`, a
+project-keying change in `macos_project_vm` that orphans every existing project VM under
+its old name, requiring a fresh clone) — purely to formalize a `--worktree` code path that
+already works today via §8's shell-based workaround with zero code changes, was judged not
+worth it. §8 gets users the actual outcome (worktree usable, history persistence
+backend-dependent) without committing augur to maintaining new mount logic or a VM
+re-keying migration.
