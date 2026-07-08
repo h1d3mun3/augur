@@ -2780,6 +2780,16 @@ stop_provision_gvproxy() {
 # without `-n` ssh forwards its inherited stdin (the SAME process-substitution pipe the
 # loop's own `read` is consuming) to the remote command — draining every remaining manifest
 # line on the very first call and silently truncating the loop to one iteration.
+#
+# Also primes Homebrew's PATH/env before the caller's command: `ssh host "cmd"` always runs
+# a non-interactive, NON-LOGIN remote shell, and zsh only reads ~/.zshenv in that mode — not
+# ~/.zprofile, which is where cmd_build_macos's Homebrew install step put `brew shellenv`
+# (login-shell only, matching an interactive Terminal session). Without this, a bare `brew`
+# call here fails with "command not found: brew" even though it's fully installed
+# (confirmed on real hardware). `2>/dev/null` on the eval is defensive only — the base VM
+# build already guarantees brew exists at this path by the time provisioning ever runs; if
+# that assumption were ever wrong, the actual command right after would fail anyway with the
+# same diagnostic.
 ssh_macos_provision() {
     local vm="$1"; shift
     local key_opts=()
@@ -2795,7 +2805,8 @@ ssh_macos_provision() {
         -o ServerAliveInterval=15 \
         -o ServerAliveCountMax=4 \
         ${key_opts[@]+"${key_opts[@]}"} \
-        "${MACOS_SSH_USER}@127.0.0.1" "$@"
+        "${MACOS_SSH_USER}@127.0.0.1" \
+        "eval \"\$(/opt/homebrew/bin/brew shellenv)\" 2>/dev/null; $*"
 }
 
 scp_to_macos_provision() {
