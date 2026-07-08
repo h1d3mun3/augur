@@ -46,10 +46,9 @@ in time," this **prescribes** "what must never break." It changes rarely.
 - **Enforced by:** `AllowlistTests.testIPLiteralsNeverMatch` / `SNIAndFilterTests.testFilterDeniesUnpinnedIPLiteral`
 
 ### I5. DNS fails closed (no DNS tunnel)  ✅ test
-- **Rule:** Keep "resolvable == connectable." Docker points the resolver at an
-  unreachable TEST-NET address (`192.0.2.1`), Apple Container uses `--no-dns`, and the
-  macOS VM uses gvproxy's `--dns-allowlist` (NXDOMAIN for non-allowlisted; rejects
-  record types other than A/AAAA).
+- **Rule:** Keep "resolvable == connectable." Apple Container uses `--no-dns` (no
+  resolver in the guest), and the macOS VM uses gvproxy's `--dns-allowlist` (NXDOMAIN
+  for non-allowlisted; rejects record types other than A/AAAA).
 - **Why:** Prevent exfiltration by smuggling data in DNS queries.
 - **Enforced by:** the DNS probe in shell `verify_egress_locked()` (`augur`) / macOS relies on the gvproxy integration (🟡 review)
 
@@ -95,14 +94,14 @@ in time," this **prescribes** "what must never break." It changes rarely.
 - **Rule:** On macOS the token is written to `~/.augur-env` (chmod 600) via SSH stdin,
   never placed on a command line.
 - **Why:** Prevent a co-resident process from reading credentials via `ps` / `/proc`.
-- **Note:** The `docker run` argv exposure on the Docker path is a **known residual risk**
-  (M1, accepted under the single-user-host premise). It resurfaces if moved to a shared host.
+- **Note:** The `container run -e` argv exposure on the container path is a **known residual
+  risk** (M1, accepted under the single-user-host premise). It resurfaces if moved to a shared host.
 - **Enforced by:** review only (M1) for now.
 
 ---
 
 > Of the 10, I1–I8 are enforced by tests/self-tests; I9 is partial (entitlement only);
 > I10 is review-only. The remaining review-only surface is I10 (credentials not on argv:
-> macOS goes through a file, but the Docker argv is an accepted residual, M1) and the
+> macOS goes through a file, but the container-run argv is an accepted residual, M1) and the
 > hardware-dependent parts of I9 (NIC count, gvproxy UDP/ICMP drop). For background on
 > each item, see the newest [review snapshot](./README.md).

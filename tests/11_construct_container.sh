@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Tier 1 (offline) — Apple `container` command CONSTRUCTION via a `container` shim. No
-# runtime needed. Same contract as 10_construct_docker.sh, but forces the Apple Container
-# engine (AUGUR_ENGINE=container) and asserts the constructed `container run` / `container
-# exec` argv carries exactly what the agent seam declares. Proves the engine abstraction
-# builds byte-identical agent argv regardless of backend (docs §5 DoD).
+# runtime needed. Drives the REAL augur code paths (cmd_up / cmd_claude) with egress off and
+# a shimmed `container` on PATH, then asserts the constructed `container run` / `container
+# exec` argv carries exactly what the agent seam declares: auth env (named-only), the
+# cwd-keyed history mount, the fixed env, and the launch argv. This is the doc's
+# "byte-identical argv" check (docs/swappable-agent-abstraction-design.md §5 DoD) without a
+# live container.
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/.." && pwd)"
 source "$HERE/lib.sh"
 section "Tier 1 — Apple container run/exec construction (shimmed container, no runtime)"
@@ -13,7 +15,6 @@ export HOME="$work/home";        mkdir -p "$HOME"
 proj="$work/myproj";             mkdir -p "$proj"
 export AUGUR_TEST_SHIMLOG="$work/shim"
 export PATH="$HERE/shims:$PATH"
-export AUGUR_ENGINE="container"           # force the Apple Container backend (even on Linux)
 export ANTHROPIC_API_KEY="sk-ant-test123"
 unset CLAUDE_CODE_OAUTH_TOKEN || true
 AUGUR="$REPO/augur"
@@ -37,11 +38,25 @@ if [[ -f "$run" ]]; then
   hasnt "$body" ":/home/dev/.claude/projects/-workspace-${slug}" "up: no leftover leaf-scoped mount target"
   if grep -Eq "claude-projects/${slug}-[0-9a-f]{12}:" "$run"; then ok "up: history host dir keyed on full-path hash (A3/C7)"
   else fail "up: history host dir not keyed on path hash"; fi
-  # migration behavior for the pre-Option-A flat layout is covered once, engine-agnostically,
-  # in tests/10_construct_docker.sh (cmd_up's history-mount code path doesn't vary by engine).
 else
   cname="augur-${slug}"
   fail "up: no container run captured" "trace: $(cat "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null)"
+fi
+
+# ── augur up (again): pre-Option-A flat layout migrates into the new leaf subdir ──
+host_hist_dir="$(find "$HOME/.augur/claude-projects" -maxdepth 1 -type d -name "${slug}-*" 2>/dev/null | head -1)"
+leaf_dir="$host_hist_dir/-workspace-${slug}"
+if [[ -n "$host_hist_dir" && -d "$leaf_dir" ]]; then
+  ok "up: fresh project already gets the nested leaf dir (${leaf_dir#"$HOME"/})"
+  rmdir "$leaf_dir" 2>/dev/null || true
+  echo '{"fake":"pre-option-a session"}' > "$host_hist_dir/legacy-session.jsonl"
+  ( cd "$proj" && bash "$AUGUR" up --no-egress ) >/dev/null 2>&1 || true
+  if [[ -f "$leaf_dir/legacy-session.jsonl" ]]; then ok "up: pre-existing flat history migrated into the leaf subdir"
+  else fail "up: legacy-session.jsonl not migrated into $leaf_dir"; fi
+  if [[ -f "$host_hist_dir/legacy-session.jsonl" ]]; then fail "up: legacy-session.jsonl left behind at the old flat path"
+  else ok "up: nothing left behind at the old flat path"; fi
+else
+  fail "up: could not locate host_hist_dir to test migration" "looked under $HOME/.augur/claude-projects/${slug}-*"
 fi
 
 # ── augur claude: capture the constructed `container exec ... claude` ────────

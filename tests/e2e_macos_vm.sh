@@ -97,7 +97,7 @@ fi
 # In VM mode egress is transparent: gvproxy is the guest's only NIC and forwards all guest TCP to
 # augur-proxy's SOCKS5 (the allowlist decision point). The guest uses plain curl (no HTTP_PROXY);
 # the proxy decides. A non-allowlisted/IP-literal connection is denied by closing the socket, so
-# curl simply fails (unlike the Docker CONNECT path, which returns a clean 403).
+# curl simply fails (unlike the container CONNECT path, which returns a clean 403).
 section "VM-mode egress fail-closed"
 acode="$(vssh "curl -s -o /dev/null -w '%{http_code}' --max-time 30 https://api.github.com/" 2>/dev/null)"
 if [[ "$acode" =~ ^[23][0-9][0-9]$ ]]; then

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tier 0 — pure seam unit tests. No Docker, no VM; runs anywhere.
+# Tier 0 — pure seam unit tests. No container, no VM; runs anywhere.
 # Asserts every pure `agent_*` function in the AGENT SEAM emits its expected DATA.
 # This is the byte-equivalence floor: if these drift, the ACL contract changed.
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/.." && pwd)"

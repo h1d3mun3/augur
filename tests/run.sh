@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Orchestrator: run every tests/NN_*.sh in order, print a summary, exit nonzero iff
-# any script reported a FAIL. Scripts self-skip tiers whose prerequisites (docker, a
+# any script reported a FAIL. Scripts self-skip tiers whose prerequisites (container, a
 # macOS VM host) are absent, so this is safe to run anywhere — CI, the dev container,
 # or a Mac. Pass a glob to run a subset:  tests/run.sh 10
 set -uo pipefail

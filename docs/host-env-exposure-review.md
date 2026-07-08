@@ -1,7 +1,7 @@
 # Security review: host environment-variable exposure to the guest
 
-- **Date:** 2026-06-25 (citations re-verified 2026-06-28; re-baselined 2026-07-08 for the Apple Container engine migration, the unified auth seam, and the hermetic SSH helpers).
-- **Scope:** Whether host (developer-machine) *environment variables* are exposed to the guest OS, in **container mode** (Apple Container — the primary engine; Docker — the compatibility fallback) and **macOS VM mode**.
+- **Date:** 2026-06-25 (citations re-verified 2026-06-28; re-baselined 2026-07-08 for the Apple Container engine migration, the unified auth seam, and the hermetic SSH helpers; re-baselined again 2026-07-08 after Docker support was dropped — Apple Container is now the sole container engine).
+- **Scope:** Whether host (developer-machine) *environment variables* are exposed to the guest OS, in **container mode** (Apple Container, macOS 26+) and **macOS VM mode**.
 - **Status:** Living document — re-verify when the container `run`/`exec` invocations (`cmd_up` / `cmd_claude` / `cmd_shell`), the macOS `cmd_up_macos` injection block, the SSH helpers (`ssh_macos` / `ssh_macos_provision`), the base-image provisioning path, or the `augur-vm` VM configuration change. Source citations reference `augur` functions by name (not line numbers) so they survive unrelated edits.
 - **Method:** Multi-angle source inspection (container runtime, macOS runtime, build-time baking, mounted/copied files, full env-var census) followed by an adversarial pass that actively hunted for any channel leaking an *unnamed* host variable, plus a completeness pass that opened every otherwise-unread file/command path. Re-verified 2026-07-08 against the post-migration source (the `eng` engine abstraction, the `agent_auth_specs` auth seam, and the hermetic `-F /dev/null` SSH helpers), with an adversarial completeness sweep per mode.
 
@@ -11,9 +11,9 @@
 
 ## Bottom line
 
-**Neither mode exposes the host environment wholesale.** `augur` uses no environment-inheritance mechanism anywhere — no container `run`/`exec` env inheritance, no `--env-file`, no bare `-e VAR` pass-through, no ssh `SendEnv`/`SetEnv`/`AcceptEnv`, and no serialization of `ProcessInfo.environment` into the VM. Both container engines (Apple Container and Docker) share the **same** env-injection code (one `docker_args` array + `eng exec`); they differ only in the egress datapath and DNS flags, neither of which adds an env var. Only **explicitly named** variables cross, by value.
+**Neither mode exposes the host environment wholesale.** `augur` uses no environment-inheritance mechanism anywhere — no container `run`/`exec` env inheritance, no `--env-file`, no bare `-e VAR` pass-through, no ssh `SendEnv`/`SetEnv`/`AcceptEnv`, and no serialization of `ProcessInfo.environment` into the VM. Container mode injects env only via an explicit `run_args` array (`container run -e …`) and `container exec -e …`. Only **explicitly named** variables cross, by value.
 
-| | Container mode (Apple / Docker) | macOS VM mode |
+| | Container mode (Apple Container) | macOS VM mode |
 |---|---|---|
 | Wholesale host-env forwarding | **No** | **No** |
 | Host-derived secrets that become guest env vars | `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `GH_TOKEN` | `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `GH_TOKEN` |
@@ -41,31 +41,29 @@ The user's question is specifically about **environment variables**. Host *files
 
 ### `ANTHROPIC_API_KEY` — both modes (named secret)
 Read from the host env, else from `~/.anthropic_api_key`, via the `resolve_api_key` helper driven by the `agent_auth_specs` seam table.
-- Container: `<engine> run -e "ANTHROPIC_API_KEY=…"` (in `cmd_up`, via the shared `docker_args` array — byte-identical for Apple Container and Docker).
+- Container: `container run -e "ANTHROPIC_API_KEY=…"` (in `cmd_up`, via the `run_args` array).
 - macOS: written as `export ANTHROPIC_API_KEY='…'` into `~/.augur-env` (`chmod 600`), which `~/.zshenv` sources for every shell — i.e. a real guest env var (in `cmd_up_macos`).
 
 ### `CLAUDE_CODE_OAUTH_TOKEN` — **both modes** (named secret)
 Read from the host env, else `~/.claude_code_oauth_token`, via `resolve_api_key` — from the **same** `agent_auth_specs` table as `ANTHROPIC_API_KEY`.
-- Container: `<engine> run -e "CLAUDE_CODE_OAUTH_TOKEN=…"` (in `cmd_up`).
+- Container: `container run -e "CLAUDE_CODE_OAUTH_TOKEN=…"` (in `cmd_up`).
 - macOS: `export CLAUDE_CODE_OAUTH_TOKEN='…'` in `~/.augur-env` (in `cmd_up_macos`).
-- Both auth vars are injected whenever set; `augur` applies **no** precedence itself — Claude Code applies the official `ANTHROPIC_API_KEY` > `CLAUDE_CODE_OAUTH_TOKEN` order when both are present.
-- **Correction (2026-07-08):** an earlier revision of this doc said this token was "macOS only" and that "Docker does not forward it." That predates the unified `agent_auth_specs` seam. The container path now resolves it from the same table, so **both** modes forward it. (`cmd_status` still only *reads* it host-side for a display checkmark.)
+- Both auth vars are injected whenever set; `augur` applies **no** precedence itself — Claude Code applies the official `ANTHROPIC_API_KEY` > `CLAUDE_CODE_OAUTH_TOKEN` order when both are present. Both modes (container and macOS VM) forward it, resolved from the same `agent_auth_specs` table. (`cmd_status` still only *reads* it host-side for a display checkmark.)
 
 ### `GH_TOKEN` — both modes (named secret)
 Obtained by running the subprocess `gh auth token` (in `cmd_up` / `cmd_up_macos`).
-- Container: `<engine> run -e "GH_TOKEN=…"`.
+- Container: `container run -e "GH_TOKEN=…"`.
 - macOS: `export GH_TOKEN='…'` in `~/.augur-env`, plus a `git config --global` credential helper that echoes `password=$GH_TOKEN` for `github.com` (in `cmd_up_macos`) — the helper stores only the *reference* `$GH_TOKEN`, not the value.
 - **Note (unnamed-host-var transit):** `augur` does not read the shell `$GH_TOKEN`/`$GITHUB_TOKEN` directly, but `gh auth token` honors them, so a host token can transit into the guest's `GH_TOKEN` via that subprocess. This is the one path by which a host variable `augur` never *names* crosses in container mode too (macOS is the same).
 
-### `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` (+ lowercase) — **both engines**, egress only (augur-built, not host-derived)
-Set in the guest to force traffic through augur-proxy (in `cmd_up`, only when `egress_enabled`). **The host's own proxy variables are never read.** The value comes from `egress_proxy_url`: on Docker it points at the dual-homed sidecar (`AUGUR_SIDECAR_IP:AUGUR_PROXY_HTTP_PORT`); on Apple Container it points at the host-only gateway (`container_egress_gateway`, overridable by `AUGUR_CONTAINER_GATEWAY`). `NO_PROXY` is the literal `localhost,127.0.0.1`. macOS VM mode does not set these (its datapath is transparent via gvproxy/SOCKS).
-- **Correction (2026-07-08):** an earlier revision scoped these to "Docker egress only." The current code sets them for **both** engines; only the proxy address (and the DNS flag — `--dns` on Docker vs `--no-dns` on Apple) differs.
+### `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` (+ lowercase) — container mode, egress only (augur-built, not host-derived)
+Set in the guest to force traffic through augur-proxy (in `cmd_up`, only when `egress_enabled`). **The host's own proxy variables are never read.** The value comes from `egress_proxy_url`: it points at the host-only gateway (`container_egress_gateway`, overridable by `AUGUR_CONTAINER_GATEWAY`). `NO_PROXY` is the literal `localhost,127.0.0.1`. macOS VM mode does not set these (its datapath is transparent via gvproxy/SOCKS).
 
 ### `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_0` / `GIT_CONFIG_VALUE_0` — container mode only (augur literals)
 Added in `cmd_up` only inside the `[[ -n "$gh_token" ]]` guard, to give the container a self-contained git credential helper that reads `GH_TOKEN` without writing to the read-only `~/.gitconfig`. All three are hardcoded literals; `GIT_CONFIG_VALUE_0` is single-quoted so its embedded `$GH_TOKEN` expands **inside the container** at push time, not on the host. No host value rides in these — the secret only crosses via `GH_TOKEN`. (macOS achieves the same with a `git config --global` credential helper in `cmd_up_macos`, not env vars.)
 
 ### `DISABLE_AUTOUPDATER=1` — both modes (augur literal)
-Hardcoded in `agent_fixed_env`. Container: `<engine> exec -e DISABLE_AUTOUPDATER=1` at agent launch (in `cmd_claude` and the setup-token exec; `cmd_shell` passes no env). It is also baked as `ENV DISABLE_AUTOUPDATER=1` in the `Dockerfile`. macOS: an inline `DISABLE_AUTOUPDATER=1 claude` assignment prefix in the `zsh -l -c` command (in `cmd_claude_macos`). Not a host-env read.
+Hardcoded in `agent_fixed_env`. Container: `container exec -e DISABLE_AUTOUPDATER=1` at agent launch (in `cmd_claude` and the setup-token exec; `cmd_shell` passes no env). It is also baked as `ENV DISABLE_AUTOUPDATER=1` in the `Dockerfile`. macOS: an inline `DISABLE_AUTOUPDATER=1 claude` assignment prefix in the `zsh -l -c` command (in `cmd_claude_macos`). Not a host-env read.
 
 ---
 
@@ -75,13 +73,12 @@ Hardcoded in `agent_fixed_env`. Container: `<engine> exec -e DISABLE_AUTOUPDATER
 |---|---|---|
 | `HOME` | Locate host config files/dirs for mounts & scp sources (in `cmd_up` / `cmd_up_macos`) | No (guest `HOME` is fixed `/home/dev` / `/Users/admin`) |
 | `SWIFT_VERSION` | Container base-image tag via `--build-arg`; `ARG` declared before `FROM`, no `ENV` persists it (`Dockerfile`, in `cmd_build` / `cmd_update`) | Value-only (observable as the toolchain version, not a runtime env var) |
-| `AUGUR_SIDECAR_IP`, `AUGUR_PROXY_HTTP_PORT`, `AUGUR_CONTAINER_GATEWAY` | Sidecar / host-only gateway IP+port; value embedded in the guest `HTTP_PROXY` string (in `cmd_up` / `egress_proxy_url`) | Value-only (non-secret internal address) |
+| `AUGUR_PROXY_HTTP_PORT`, `AUGUR_CONTAINER_GATEWAY` | Host-only gateway IP+port; value embedded in the guest `HTTP_PROXY` string (in `cmd_up` / `egress_proxy_url`) | Value-only (non-secret internal address) |
 | `AUGUR_CONTAINER_MEMORY` | Sets the host-side `--memory` run flag on Apple Container (in `resolve_container_memory`) | No |
-| `AUGUR_PROXY_MAX_CONNECTIONS` | Read by the **host-side** augur-proxy process to size its connection cap (`augur-proxy` `main.swift`) | No (the proxy runs host-side / in the sidecar, not in the agent guest) |
+| `AUGUR_PROXY_MAX_CONNECTIONS` | Read by the **host-side** augur-proxy process to size its connection cap (`augur-proxy` `main.swift`) | No (the proxy runs host-side, not in the agent guest) |
 | `AUGUR_VM_BIN`, `AUGUR_PROXY_BIN`, `AUGUR_GVPROXY_BIN` | Host path overrides for the backend binaries | No |
 | `AUGUR_GLOBAL_CONF` | Path to the global egress allowlist; contents merged into a host-side allowlist enforced by the proxy | No |
 | `AUGUR_EGRESS` | Host-side on/off switch for egress filtering | No |
-| `AUGUR_ENGINE` | Selects the container engine (`container`/`docker`) host-side (in `detect_engine`) | No |
 | `AUGUR_PROXY_SOCKS_PORT`, `AUGUR_SSH_FWD_PORT`, `AUGUR_INTERNAL_SUBNET` | Host-side loopback ports / internal subnet | No |
 
 ---
@@ -95,7 +92,7 @@ Hardcoded in `agent_fixed_env`. Container: `<engine> exec -e DISABLE_AUTOUPDATER
 2. **`LANG` / `LC_*` — do NOT cross.** OpenSSH's stock `SendEnv LANG LC_*` lives in the system ssh_config, which `-F /dev/null` refuses to load; `augur` adds no `-o SendEnv`. So the env-request channel sends nothing and the guest sshd's `AcceptEnv` is moot.
    - **Correction (2026-07-08):** an earlier revision listed `LANG`/`LC_*` as able to cross "via OS-default `SendEnv`/`AcceptEnv`." That predates the hermetic `-F /dev/null` helpers; those variables no longer cross.
 
-`TERM` is the only path by which a host variable `augur` never names reaches a guest. It is **bounded to the terminal type, carries no secret, and is protocol-default behavior — not configured by augur.** Container mode is unaffected: `<engine> exec -it` / `run -t` allocate a PTY whose `TERM` is the engine's default, not a forward of the host `TERM`.
+`TERM` is the only path by which a host variable `augur` never names reaches a guest. It is **bounded to the terminal type, carries no secret, and is protocol-default behavior — not configured by augur.** Container mode is unaffected: `container exec -it` / `run -t` allocate a PTY whose `TERM` is the engine's default, not a forward of the host `TERM`.
 
 ---
 
@@ -124,7 +121,7 @@ These are file-origin credentials, not host-environment-variable exposure.
 ## Compiled components — no env channel to the guest
 
 - **augur-vm (Swift):** the VM configuration is built solely from `config.json` + the `--dir` virtiofs shares + the network socket. No `ProcessInfo.environment`/`getenv`; the only host-attribute read is `processorCount` for CPU sizing (`Installer.swift`). `VZMacOSBootLoader` exposes no kernel command line, so a boot-args env leak is impossible by API (`RunSession.swift`).
-- **augur-proxy (Swift):** reads its own (host-side) env var `AUGUR_PROXY_MAX_CONNECTIONS` to size the connection cap (`main.swift`), and otherwise only `CommandLine.arguments`. It runs on the host (Apple) or as a sidecar container started with **no** `-e` (Docker) — it never reads the agent guest's env and injects nothing into the guest.
+- **augur-proxy (Swift):** reads its own (host-side) env var `AUGUR_PROXY_MAX_CONNECTIONS` to size the connection cap (`main.swift`), and otherwise only `CommandLine.arguments`. It runs on the host — it never reads the agent guest's env and injects nothing into the guest.
   - **Correction (2026-07-08):** an earlier revision said augur-proxy had "zero `getenv`/`ProcessInfo`." It now reads `AUGUR_PROXY_MAX_CONNECTIONS` — host-side only; no value crosses to the guest.
 - **gvproxy (Go, augur patch):** zero `os.Getenv`/`os.Environ`; the DNS allowlist is read from a file passed by CLI flag.
 
@@ -134,8 +131,8 @@ These are file-origin credentials, not host-environment-variable exposure.
 
 If these ever change, the conclusion above changes. Candidates for executable tests/lint (cf. the existing `augur-proxy/Tests/AugurProxyCoreTests/SecurityTests.swift`):
 
-1. No bare `-e VAR` (without `=value`), no `--env-file`, and no `--env` glob in `augur` (both engines share the `docker_args` / `eng exec` path).
+1. No bare `-e VAR` (without `=value`), no `--env-file`, and no `--env` glob in `augur` (the `run_args` / `eng exec` path).
 2. Every ssh/scp invocation in macOS mode is hermetic (`-F /dev/null`) and sets no `SendEnv`/`SetEnv`; the guest sshd config is never modified to `AcceptEnv` extra vars. (This is what keeps `LANG`/`LC_*` from crossing — see the `TERM` nuance.)
-3. The only **secrets** injected — into the container `docker_args` and into the macOS `~/.augur-env` writer — are the three named ones (`ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `GH_TOKEN`), all resolved through the `agent_auth_specs` seam. The `~/.augur-env` writer's other lines (a header comment, the `brew shellenv` eval, and the `~/.local/bin` PATH export) carry no host-derived values. No additional host secret is ever added.
+3. The only **secrets** injected — into the container `run_args` and into the macOS `~/.augur-env` writer — are the three named ones (`ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `GH_TOKEN`), all resolved through the `agent_auth_specs` seam. The `~/.augur-env` writer's other lines (a header comment, the `brew shellenv` eval, and the `~/.local/bin` PATH export) carry no host-derived values. No additional host secret is ever added.
 4. The `augur-vm` backend never reads `ProcessInfo.environment`/`getenv` (only `processorCount` is permitted).
 5. Base-image provisioning takes package lists from files (`manifest.conf` / `container-packages.conf`), never from host env; `hook.sh` runs guest-side.

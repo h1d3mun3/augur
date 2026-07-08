@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Tier 1 — per-mode host proxy identity (runs anywhere; no Docker/VM host needed).
+# Tier 1 — per-mode host proxy identity (runs anywhere; no container/VM host needed).
 # Guards the fix for the shared-proxy bug: with BOTH Apple Container mode and macOS VM mode
 # up for the same project, they used to share ONE host augur-proxy (keyed only on the project
 # slug). The second `up` reused the first's proxy — bound to the wrong address, so its egress
 # silently failed closed — and a `down` in either mode killed the shared proxy out from under
 # the other. The proxy is now keyed on (project slug, role), so each mode owns a separate
-# instance. Docker mode uses a sidecar container (not the host proxy) and is unaffected.
+# instance.
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/.." && pwd)"
 source "$HERE/lib.sh"
 AUGUR="$REPO/augur"

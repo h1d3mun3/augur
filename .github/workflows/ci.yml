@@ -2,15 +2,16 @@ name: CI
 
 # augur CI uses ONLY free GitHub-hosted runners, and NO job boots a VZ guest. GitHub's arm64
 # macOS runners are themselves Virtualization.framework guests with no nested-virtualization
-# support, so anything that boots a VM/microVM — the macOS VM mode, Apple Container mode, or
-# Docker-on-macOS — cannot run on any GitHub-hosted runner (standard or larger). That heavy
-# "VM boots and xcodebuild test passes" E2E therefore lives in the LOCAL `make e2e` gate, run
-# before tagging a release; see README "Continuous integration".
+# support, so anything that boots a VM/microVM — the macOS VM mode or Apple Container mode —
+# cannot run on any GitHub-hosted runner (standard or larger). The heavy live E2Es therefore
+# live in LOCAL gates run before tagging a release: `make e2e` (macOS VM: boots a VM and runs
+# xcodebuild test) and the Apple Container egress FAIL-CLOSED proof (tests/22 via
+# tests/verify_apple_container_host.sh). See README "Continuous integration".
 #
 # What DOES run here:
-#   • build-unit  (macos-26)      Swift build/test of the CLIs, shellcheck, version smoke. No VM.
-#   • container-e2e (ubuntu-latest) The security layer: egress FAIL-CLOSED proven on Docker
-#                                   container mode (a plain Linux container — no nesting, free).
+#   • build-unit    (macos-26)      Swift build/test of the CLIs, shellcheck, version smoke. No VM.
+#   • offline-tests (ubuntu-latest) Seam + command-construction tiers (shimmed `container`, no
+#                                   runtime). No engine/VM needed.
 
 on:
   push:
@@ -18,16 +19,15 @@ on:
   pull_request:
 
 # Least privilege. NEITHER job uses a secret: the coding agent is never authenticated in CI
-# (mock-the-agent — container-e2e even asserts the guest has no agent token). So pull_request
-# runs from forks are safe — there is nothing to exfiltrate. Do NOT add `secrets.*` to these
-# jobs without first adding a fork-PR guard; that would break the guarantee above.
+# (mock-the-agent). So pull_request runs from forks are safe — there is nothing to exfiltrate.
+# Do NOT add `secrets.*` to these jobs without first adding a fork-PR guard; that would break
+# the guarantee above.
 permissions:
   contents: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  # Supersede stale PR iterations, but let every push to main run to completion so each merged
-  # commit gets a definitive pass/fail on the egress security layer (never cancelled mid-flight).
+  # Supersede stale PR iterations, but let every push to main run to completion.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -59,27 +59,15 @@ jobs:
             echo "note: could not add 127.0.0.2 loopback alias; skipping real-proxy bind isolation"
           fi
 
-  # ── Egress fail-closed E2E (the security layer) — Docker container mode ──────
-  container-e2e:
-    name: container-e2e (ubuntu-latest)
+  # ── Offline seam + command-construction tiers (shimmed container, no runtime) ─
+  offline-tests:
+    name: offline-tests (ubuntu-latest)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Seam + command-construction tiers (shimmed engine, no daemon). Linux is their home: tier 12
-      # asserts a non-macOS host defaults to Docker. Live tiers (20/21/22/30) self-skip here.
+      # Seam + command-construction tiers drive the REAL cmd_up/cmd_claude against a `container`
+      # shim on PATH — no engine/VM needed, so they run free on Linux. The live tiers (21/22/30)
+      # self-skip here. The Apple Container egress fail-closed proof (tier 22) is a LOCAL gate
+      # (Apple Container needs macOS 26+, which no GitHub-hosted runner provides).
       - name: Seam + construction tiers (offline shell)
         run: make offline-tests
-      # Stage ~/.augur -> build the agent image -> bring up egress mode -> assert fail-closed.
-      # The bring-up fires augur's boot self-test (verify_egress_locked); the tier then adds the
-      # allowlisted-reachable / non-allowlisted-blocked assertions. AUGUR_TEST_REQUIRE_EGRESS=1
-      # (inside the target) makes the whole thing FAIL CLOSED — a prerequisite that can't run
-      # fails the job rather than skipping a security check.
-      - name: Egress fail-closed E2E
-        run: make container-e2e
-      # Belt-and-suspenders: the tier's own trap already runs `augur down`. This just sweeps any
-      # augur agent/sidecar container and internal network a crashed run might have stranded.
-      - name: Tear down (always)
-        if: always()
-        run: |
-          docker ps -aq --filter 'name=augur-'       | xargs -r docker rm -f      >/dev/null 2>&1 || true
-          docker network ls -q --filter 'name=augur-' | xargs -r docker network rm >/dev/null 2>&1 || true

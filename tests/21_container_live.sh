@@ -13,8 +13,6 @@ section "Tier 1 — live Apple Container smoke"
 if ! command -v container >/dev/null 2>&1;   then skip "all Apple Container live checks" "container CLI not installed"; finish; exit $?; fi
 if ! container system status >/dev/null 2>&1; then skip "all Apple Container live checks" "container service not running"; finish; exit $?; fi
 
-export AUGUR_ENGINE="container"
-
 # Find the built augur image (tag varies with the configured Swift version).
 img="$(container image list --format json 2>/dev/null | grep -oE 'augur:swift-[A-Za-z0-9._-]+' | head -1 || true)"
 if [[ -z "$img" ]]; then
@@ -34,10 +32,10 @@ if [[ -z "$img" ]]; then finish; exit $?; fi
 # Full lifecycle in a throwaway project (egress off to avoid the host proxy datapath).
 proj="$(mktemp -d)"
 slug="$(basename "$proj" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]' '-' | sed 's/^-//;s/-$//')"
-cleanup() { ( cd "$proj" && AUGUR_ENGINE=container bash "$REPO/augur" down --no-egress ) >/dev/null 2>&1; rm -rf "$proj"; }
+cleanup() { ( cd "$proj" && bash "$REPO/augur" down --no-egress ) >/dev/null 2>&1; rm -rf "$proj"; }
 trap cleanup EXIT
 
-if ( cd "$proj" && AUGUR_ENGINE=container bash "$REPO/augur" up --no-egress ) >/dev/null 2>&1; then
+if ( cd "$proj" && bash "$REPO/augur" up --no-egress ) >/dev/null 2>&1; then
   ok "augur up brought a container online"
   cont="augur-${slug}-swift-$(printf '%s' "${SWIFT_VERSION:-latest}" | tr '.' '-')"
   cver="$(container exec "$cont" sh -lc 'claude --version' 2>/dev/null || true)"

@@ -1,15 +1,16 @@
 # augur — build/test orchestration shared by CI (.github/workflows/ci.yml) and humans, so the
-# exact commands CI runs are runnable locally (and vice-versa). Two targets map 1:1 to the two
-# free GitHub-hosted jobs; `e2e` is the LOCAL-only pre-release gate (it boots a macOS VM, which
-# NO GitHub-hosted runner can do — their arm64 macOS runners are themselves Virtualization.
-# framework guests with no nested virt. See README "Continuous integration").
+# exact commands CI runs are runnable locally (and vice-versa). `unit` and `offline-tests` map
+# 1:1 to the two free GitHub-hosted jobs; `container-e2e` and `e2e` are LOCAL-only pre-release
+# gates (they need Apple Container / a macOS VM, which NO GitHub-hosted runner can do — their
+# arm64 macOS runners are themselves Virtualization.framework guests with no nested virt. See
+# README "Continuous integration").
 #
 #   make unit           build-unit job (macos-26): Swift build/test, shellcheck, version smoke.
-#                        No engine/VM needed. (The offline seam/construction tiers run on the
-#                        Linux job via `make offline-tests` — one of them asserts non-macOS engine
-#                        selection, so it belongs on ubuntu, not a macOS runner.)
-#   make container-e2e  container-e2e job (ubuntu-latest): egress FAIL-CLOSED proof on Docker
-#                        (stage -> build image -> live egress assertions). The security layer.
+#                        No engine/VM needed.
+#   make offline-tests  offline-tests job (ubuntu-latest): seam + command-construction shell
+#                        tiers via a `container` shim. No engine/VM needed.
+#   make container-e2e  LOCAL egress FAIL-CLOSED proof on Apple Container (stage -> build image
+#                        -> live egress assertions). The security layer; needs macOS 26+.
 #   make e2e            LOCAL macOS pre-release gate: boot the VM, xcodebuild test, virtiofs +
 #                        testmanagerd + VM-mode egress fail-closed. Never a CI job.
 
@@ -23,7 +24,7 @@ help:
 	@echo "augur make targets:"
 	@echo "  make unit           Swift build/test + shellcheck + version smoke (CI: macos-26)"
 	@echo "  make offline-tests  seam + command-construction shell tiers (CI: ubuntu-latest)"
-	@echo "  make container-e2e  egress fail-closed E2E on Docker (CI: ubuntu-latest)"
+	@echo "  make container-e2e  LOCAL egress fail-closed E2E on Apple Container (needs macOS 26+)"
 	@echo "  make e2e            LOCAL macOS VM pre-release gate (boots a VM — never in CI)"
 	@echo "  components: swift-build  swift-test  shellcheck  offline-tests  version-smoke"
 
@@ -63,10 +64,9 @@ shellcheck:
 	@echo "== shellcheck (strict on the new test harness) =="
 	SHELLCHECK_OPTS='-e SC1090 -e SC1091' shellcheck --severity=warning tests/22_egress_failclosed.sh tests/e2e_macos_vm.sh
 
-# Offline shell tiers (00/10/11/12): seam + command-construction contracts via shims. Live tiers
-# (20/21/22/30) self-skip without their prereqs, so this is safe with no engine/VM present. Runs on
-# the Linux (ubuntu) CI job: tier 12 asserts that a NON-macOS host defaults to the Docker engine, so
-# it must not run on a macOS runner (where the default is correctly Apple Container on macOS 26+).
+# Offline shell tiers (00/01/11 + macOS source-guard tiers): seam + command-construction contracts
+# via a `container` shim. Live tiers (21/22/30) self-skip without their prereqs, so this is safe
+# with no engine/VM present. Runs on the free Linux (ubuntu) CI job.
 offline-tests:
 	@echo "== offline shell tiers =="
 	bash tests/run.sh
@@ -76,18 +76,16 @@ version-smoke:
 	@echo "== version smoke =="
 	bash ./augur version
 
-# ── container-e2e (ubuntu-latest) ─────────────────────────────────────────────
+# ── container-e2e (LOCAL — Apple Container, macOS 26+) ────────────────────────
 container-e2e: egress
 	@echo "== container-e2e: egress fail-closed proof passed =="
 
-# Stage ~/.augur (proxy source + managed allowlist). On Linux the host augur-proxy build is
-# skipped (Docker mode runs the proxy as a sidecar built inside the image) — that warning is
-# expected and harmless.
+# Stage ~/.augur (host augur-proxy + managed allowlist).
 stage:
 	@echo "== stage: bash install =="
 	bash install
 
-# Build the agent image from the Dockerfile — a normal Linux container build (no VM/nesting).
+# Build the agent image from the Dockerfile via Apple Container's BuildKit builder.
 image: stage
 	@echo "== image: augur build =="
 	bash ./augur build

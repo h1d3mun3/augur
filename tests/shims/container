@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Test shim for Apple `container` (github.com/apple/container). Mirrors tests/shims/docker:
-# stands in for the real CLI so augur's command CONSTRUCTION (cmd_up / cmd_claude) can be
-# captured with AUGUR_ENGINE=container and NO real runtime. It:
+# Test shim for Apple `container` (github.com/apple/container). Stands in for the real CLI
+# so augur's command CONSTRUCTION (cmd_up / cmd_claude) can be captured with NO real
+# runtime. It:
 #   • records every invocation to $AUGUR_TEST_SHIMLOG.trace (human-readable), and
 #   • dumps the exact argv of `run`/`exec` (one arg per line) to $AUGUR_TEST_SHIMLOG.run /
 #     .exec for the test to assert on, and
