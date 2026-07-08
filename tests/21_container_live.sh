@@ -13,10 +13,12 @@ section "Tier 1 — live Apple Container smoke"
 if ! command -v container >/dev/null 2>&1;   then skip "all Apple Container live checks" "container CLI not installed"; finish; exit $?; fi
 if ! container system status >/dev/null 2>&1; then skip "all Apple Container live checks" "container service not running"; finish; exit $?; fi
 
-# Find the built augur image (tag varies with the configured Swift version).
-img="$(container image list --format json 2>/dev/null | grep -oE 'augur:swift-[A-Za-z0-9._-]+' | head -1 || true)"
-if [[ -z "$img" ]]; then
-  skip "image checks" "no augur:swift-* image — run 'augur build' first"
+# The image augur builds (tag varies with the configured Swift version) — same name as
+# augur's IMAGE_NAME. Check it via `container image inspect` (the canonical existence check
+# augur itself uses); don't parse `container image list`, whose plain output splits name/tag.
+img="augur:swift-${SWIFT_VERSION:-latest}"
+if ! container image inspect "$img" >/dev/null 2>&1; then
+  skip "image checks" "no ${img} image — run 'augur build' first"
 else
   ver="$(container run --rm "$img" sh -lc 'claude --version' 2>/dev/null || true)"
   if [[ -n "$ver" ]]; then ok "image '$img' runs the agent ($(printf '%s' "$ver" | tr -d '\n'))"

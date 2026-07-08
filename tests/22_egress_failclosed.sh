@@ -36,7 +36,11 @@ missing() {  # $1 = what, $2 = detail
 }
 
 engine_ready() { command -v container >/dev/null 2>&1 && container system status >/dev/null 2>&1; }
-image_present() { container image list 2>/dev/null | grep -q 'augur:swift-'; }
+# Check by the exact tag augur builds (`augur:swift-<tag>`), via `container image inspect` —
+# the same canonical existence check augur's own ensure_image uses. (Do NOT grep `container
+# image list`: its plain output splits name/tag into separate columns, so the colon-joined
+# `augur:swift-` form never appears there.)
+image_present() { container image inspect "augur:swift-${SWIFT_VERSION:-latest}" >/dev/null 2>&1; }
 
 # Gate: this tier mutates containers, so a plain `tests/run.sh` never runs it.
 if [[ "$require" != "1" && "${AUGUR_TEST_LIVE:-0}" != "1" ]]; then
