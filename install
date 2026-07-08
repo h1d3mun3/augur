@@ -73,8 +73,8 @@ CONF
 fi
 success "Files copied."
 
-# Build the egress proxy (augur-proxy). Cross-platform (Linux + macOS); needed for
-# egress filtering in both modes. A failure here is a warning — filtering is opt-in.
+# Build the host egress proxy (augur-proxy). Needed for egress filtering in both
+# container and macOS VM modes. A failure here is a warning — filtering is opt-in.
 if command -v swift &>/dev/null && [[ -d "$SCRIPT_DIR/augur-proxy" ]]; then
     info "Building augur-proxy (egress filter)..."
     if (cd "$SCRIPT_DIR/augur-proxy" && swift build -c release) >/dev/null 2>&1; then
@@ -89,22 +89,6 @@ if command -v swift &>/dev/null && [[ -d "$SCRIPT_DIR/augur-proxy" ]]; then
     fi
 else
     warn "Skipping augur-proxy build (needs Swift); egress filtering will be unavailable."
-fi
-
-# Ship the augur-proxy SOURCE too: Docker egress runs the proxy as a sidecar
-# CONTAINER, so it needs a Linux build of augur-proxy. augur builds that on first
-# `augur up` (egress) using the Docker image's Swift toolchain — but it needs the
-# source here. Exclude the local .build dir (host-arch artifacts).
-if [[ -d "$SCRIPT_DIR/augur-proxy" ]]; then
-    rm -rf "$INSTALL_DIR/augur-proxy-src"
-    mkdir -p "$INSTALL_DIR/augur-proxy-src"
-    (cd "$SCRIPT_DIR/augur-proxy" && \
-     tar --exclude=.build --exclude='.git' -cf - . ) | tar -xf - -C "$INSTALL_DIR/augur-proxy-src"
-    # Drop the cached Linux build so the freshly-staged source actually takes effect:
-    # ensure_linux_proxy() skips rebuilding when the binary exists, so without this a
-    # reinstall would keep running the old sidecar proxy. Rebuilt on the next `augur up`.
-    rm -f "$INSTALL_DIR/augur-proxy-linux"
-    success "augur-proxy source staged for the Docker sidecar build."
 fi
 
 # Build augur-gvproxy (the gvisor-tap-vsock fork) — only needed for the macOS VM
@@ -123,7 +107,7 @@ if [[ "$(uname)" == "Darwin" ]] && [[ -f "$SCRIPT_DIR/gvproxy/build.sh" ]]; then
 fi
 
 # Build the macOS VM backend (augur-vm) when on macOS with a Swift toolchain.
-# Docker mode does not need this, so a failure here is only a warning.
+# Container mode does not need this, so a failure here is only a warning.
 if [[ "$(uname)" == "Darwin" ]]; then
     if command -v swift &>/dev/null && [[ -d "$SCRIPT_DIR/augur-vm" ]]; then
         info "Building augur-vm (macOS VM backend)..."

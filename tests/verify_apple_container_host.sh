@@ -11,7 +11,6 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/.." && pwd)"
 AUGUR="$REPO/augur"
-export AUGUR_ENGINE=container          # force the Apple backend for this verification
 
 pass=0 fail=0 warn=0
 P(){ printf '  \033[32mPASS\033[0m %s\n' "$1"; pass=$((pass+1)); }
@@ -41,12 +40,12 @@ if container system status >/dev/null 2>&1; then P "container service running"
 elif container system start >/dev/null 2>&1 && container system status >/dev/null 2>&1; then P "container service started (no sudo)"
 else F "container service not running and could not be started (try: container system start)"; exit 1; fi
 
-H "1. Engine auto-selection (no override → Apple on macOS 26)"
+H "1. Engine reported as Apple Container"
 proj="$(mktemp -d)"
-sel="$( cd "$proj" && AUGUR_ENGINE= bash "$AUGUR" status --no-egress 2>&1 | sed $'s/\033\\[[0-9;]*m//g' | grep -i '^Engine:' || true )"
+sel="$( cd "$proj" && bash "$AUGUR" status --no-egress 2>&1 | sed $'s/\033\\[[0-9;]*m//g' | grep -i '^Engine:' || true )"
 echo "$sel" | grep -qi "Apple Container" \
-  && P "auto-selected Apple Container — ${sel#Engine: }" \
-  || W "auto-detect engine line: ${sel:-<none>}" "expected 'Apple Container (container)'; check macOS major / container on PATH"
+  && P "status reports Apple Container — ${sel#Engine: }" \
+  || W "engine line: ${sel:-<none>}" "expected 'Apple Container'"
 
 H "2. container inspect exit code on a missing container (drives exists/running checks)"
 if container inspect __augur_does_not_exist__ >/dev/null 2>&1; then

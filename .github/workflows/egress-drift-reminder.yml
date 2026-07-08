@@ -6,7 +6,7 @@ name: Egress drift reminder
 # change drifted the egress posture.
 #
 # This never fails a PR and it does NOT verify correctness — that is ci.yml's job
-# (the egress fail-closed E2E on Docker + `swift test`). It only posts/updates a
+# (`swift test`) plus the local egress fail-closed E2E gate. It only posts/updates a
 # single sticky comment, and resolves it once the PR touches docs/security-reviews/.
 #
 # The `paths` filter is the "egress core changed" precondition; the job then checks

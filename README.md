@@ -18,7 +18,7 @@ Two modes are available:
 | **iOS Simulator** | ✗ | ✓ |
 | **Setup time** | ~5 min (image build) | ~75 min (VM build) |
 | **Disk usage** | ~2 GB | ~70 GB+ |
-| **Requires** | Docker, or Apple Container (macOS 26+) | augur-vm (bundled), IPSW, Xcode XIP |
+| **Requires** | Apple Container (macOS 26+) | augur-vm (bundled), IPSW, Xcode XIP |
 
 ---
 
@@ -26,12 +26,7 @@ Two modes are available:
 
 Lightweight Linux container. Suitable for most projects that don't need Xcode.
 
-The **engine** that hosts the container is chosen automatically:
-
-- **Apple Container** (`container`, github.com/apple/container) — the **recommended, primary engine**, auto-selected on **macOS 26+** when installed. Native to macOS, no Docker Desktop, no licensing; runs each container in its own lightweight Linux VM.
-- **Docker** (`docker`) — a **compatibility fallback** for Linux and macOS < 26. Maintained but **not actively developed** (no new features), and **planned for eventual removal** once Apple Container is the only target — see [#54](https://github.com/h1d3mun3/augur/issues/54).
-
-Override with `AUGUR_ENGINE=docker|container`. `augur status` shows the active engine.
+The container is hosted by **Apple Container** (`container`, github.com/apple/container) on **macOS 26+** — native to macOS, no Docker Desktop, no licensing; each container runs in its own lightweight Linux VM. `augur status` shows the active engine.
 
 ### Setup
 
@@ -46,7 +41,7 @@ source ~/.zshrc  # or source ~/.bashrc
 augur build
 ```
 
-The install script copies `Dockerfile` and `augur` to `~/.augur/` and configures `PATH`. Safe to re-run. The same `Dockerfile` builds the image on either engine.
+The install script copies `Dockerfile` and `augur` to `~/.augur/` and configures `PATH`. Safe to re-run.
 
 > **Apple Container only:** `augur build`/`augur update` implicitly starts a BuildKit "builder" VM (~2 CPU/2GiB) that keeps running after the build finishes, to speed up the next one. It's a single instance shared by every `container build` on the machine — not scoped to a project — so augur deliberately never stops it for you (doing so from one project's `down`/`build` could kill another project's in-flight build). If you want to free the RAM/CPU, run `container builder stop` yourself once you're sure nothing else is building.
 
@@ -61,7 +56,7 @@ augur shell                     # open a bash shell (for debugging)
 augur setup-token               # get a Claude subscription token (runs in the guest, saves on the host)
 augur down                      # stop and remove the container
 augur status                    # show status, toolchain, and auth info
-augur build [--swift VERSION]   # build the Docker image
+augur build [--swift VERSION]   # build the container image
 augur update [--swift VERSION]  # rebuild image with latest tool versions
 augur init-conf                 # scaffold ./.augur/{allowlist,resources}.conf
 augur version                   # show augur version
@@ -84,9 +79,7 @@ augur version                   # show augur version
 
 ### Requirements
 
-- A container engine — either:
-  - **Docker** (Docker Desktop or Docker Engine), Linux or macOS; or
-  - **Apple Container** (`container`) on macOS 26+ (auto-selected when installed)
+- **Apple Container** (`container`) on macOS 26+
 - bash
 
 ---
@@ -177,16 +170,16 @@ every `up` (the same way it does for the GitHub token):
 | Current directory | exposed at `~/workspace-<project>` in the VM (read/write, virtiofs auto-mount) |
 | `~/.gitconfig` | copied on VM start (HTTPS `git push` uses `GH_TOKEN`) |
 | `~/.config/gh/` | shared **read-only** (token also injected via `GH_TOKEN`) |
-| Claude history | **only this project's** history is shared, in a per-VM isolated dir (`~/.augur/claude-projects/<vm>`), so other projects' transcripts stay invisible. Cross-mode (Docker↔macOS) resume is no longer shared. |
+| Claude history | **only this project's** history is shared, in a per-VM isolated dir (`~/.augur/claude-projects/<vm>`), so other projects' transcripts stay invisible. Cross-mode (container↔macOS) resume is no longer shared. |
 | Claude auth | **not** shared — injected via env (the macOS Keychain is unreadable over SSH; see above) |
 | Everything else | **not visible to the VM** |
 
 > The macOS guest auto-mounts the shared directory under `/Volumes/My Shared Files/workspace-<project>`; augur
 > symlinks it to `~/workspace-<project>`. The sealed system volume can't host a symlink at `/workspace`, so the
-> per-project `~/workspace-<project>` path is used in the VM (Docker mode uses `/workspace-<project>`).
+> per-project `~/workspace-<project>` path is used in the VM (container mode uses `/workspace-<project>`).
 
-> Same caveat as Docker mode for Claude Code's `--worktree`: not specially supported, but `augur shell --macos` +
-> manually running `claude --worktree <name>` works today. Unlike Docker mode, its conversation history *does*
+> Same caveat as container mode for Claude Code's `--worktree`: not specially supported, but `augur shell --macos` +
+> manually running `claude --worktree <name>` works today. Unlike container mode, its conversation history *does*
 > survive `augur down --macos`/`up --macos` (the VM's disk is stopped, not destroyed, until `augur destroy --macos`).
 > See `docs/claude-worktree-support-design.md`.
 
@@ -237,7 +230,7 @@ registry.example.com
 api.myservice.com
 EOF
 
-augur up            # Docker, egress on (baseline + augur.conf + allowlist.conf if present)
+augur up            # container, egress on (baseline + augur.conf + allowlist.conf if present)
 augur up --macos    # macOS VM, same
 augur up --no-egress  # disable egress filtering for this run
 augur up --egress     # force egress filtering on (re-enables if AUGUR_EGRESS=0)
@@ -270,15 +263,14 @@ The merge happens on the host, so the guest can't widen its own policy by editin
 
 | Mode | Enforcement |
 |------|-------------|
-| **Container — Docker** | The agent runs on an internal network (no route to the host or the internet) with `NET_ADMIN` dropped, so a root agent can't re-route. A proxy **sidecar** container joins that internal network (to receive the agent's traffic) and a normal bridge (to egress) — making it the agent's only way out. A boot self-test fails closed if direct egress is ever reachable. |
-| **Container — Apple** | Apple Container can't dual-home a container, so there is no sidecar. The agent runs on a **host-only** `--internal` network (internet severed; the host reachable) with `NET_ADMIN` dropped and `--no-dns` (external DNS fails closed). The **host-side** `augur-proxy` is its only egress, reached via the host-only gateway. The same boot self-test fails closed. **Trade-off:** host-only also lets the agent reach other host services bound to `0.0.0.0` — weaker than Docker's airtight sidecar; closing it would need host `pf` rules (sudo), which augur avoids. |
+| **Container** | The agent runs on a **host-only** `--internal` network (internet severed; the host reachable) with `NET_ADMIN` dropped and `--no-dns` (external DNS fails closed). The **host-side** `augur-proxy` is its only egress, reached via the host-only gateway. A boot self-test fails closed if direct egress is ever reachable. **Trade-off:** host-only also lets the agent reach other host services bound to `0.0.0.0`; closing it would need host `pf` rules (sudo), which augur avoids. |
 | **macOS VM** | The guest's only NIC is a host-owned socket (`VZFileHandleNetworkDeviceAttachment`); a bundled `gvproxy` runs the guest's network on the host and funnels every connection to the proxy. Needs no special entitlement. |
 
 In every mode the proxy decides by domain (the CONNECT host, or the TLS SNI / HTTP Host) and connects out by name.
 
 ### Requirements
 
-`install` builds the proxy (`augur-proxy`, Swift) automatically. The Docker engine runs it as a Linux sidecar (built once from source on first egress `up`); the Apple Container and macOS VM engines run the native host `augur-proxy`. **macOS VM egress also needs Go** (for `augur-gvproxy`) — `brew install go`, then re-run `bash install`. Without it, macOS VM egress is unavailable but everything else works.
+`install` builds the proxy (`augur-proxy`, Swift) automatically — both container and macOS VM modes run the native host `augur-proxy`. **macOS VM egress also needs Go** (for `augur-gvproxy`) — `brew install go`, then re-run `bash install`. Without it, macOS VM egress is unavailable but everything else works.
 
 The host ports the proxy uses are derived per-project so two egress-enabled projects can run at once; override with `AUGUR_PROXY_HTTP_PORT` / `AUGUR_PROXY_SOCKS_PORT` / `AUGUR_SSH_FWD_PORT` if needed.
 
@@ -288,7 +280,7 @@ The host ports the proxy uses are derived per-project so two egress-enabled proj
 
 ## Container memory (`.augur/resources.conf`)
 
-Apple Container's per-container default memory (~1 GB) is too tight for running an agent, so augur passes `--memory 4g` by default on that engine (Docker's own VM sizing is configured in Docker Desktop, not by augur).
+Apple Container's per-container default memory (~1 GB) is too tight for running an agent, so augur passes `--memory 4g` by default.
 
 To change the default for a project — and have it apply consistently everywhere you clone or open that project, unlike an environment variable that only exists on the machine where you set it — commit a `.augur/resources.conf` (`augur init-conf` scaffolds one alongside the allowlist):
 
@@ -345,7 +337,7 @@ each layer actually catches.
 ```bash
 make unit           # Swift build/test + shellcheck + version smoke              (CI: macos-26)
 make offline-tests  # seam + command-construction shell tiers (shimmed engine)   (CI: ubuntu)
-make container-e2e  # egress FAIL-CLOSED proof on Docker (builds the image)       (CI: ubuntu)
+make container-e2e  # LOCAL egress FAIL-CLOSED proof on Apple Container (macOS 26+)
 make e2e            # LOCAL pre-release gate: macOS VM boot + xcodebuild test (never in CI)
 ```
 
@@ -360,18 +352,18 @@ CI runs on **free GitHub-hosted runners only**, and **no CI job boots a VZ guest
 | Job | Runner | What it proves |
 |-----|--------|----------------|
 | `build-unit` | `macos-26` | `swift build`/`swift test` the CLIs (`augur-vm` builds, `augur-proxy` builds + tests), `shellcheck`, and a side-effect-free `augur version` smoke. No engine, no VM. |
-| `container-e2e` | `ubuntu-latest` | The offline seam/construction tiers, then the **security layer**: Docker container mode with egress on, asserting the guest can only reach allowlisted domains (allowlisted reachable · non-allowlisted blocked · DNS closed · direct egress severed). Fails **closed**. |
+| `offline-tests` | `ubuntu-latest` | The seam + command-construction tiers: drive the real `cmd_up`/`cmd_claude` against a `container` shim and assert the built argv is byte-identical to the seam's declaration. No engine/VM needed. |
 
-Both jobs are **secrets-zero** — the coding agent is never authenticated in CI (the
-`container-e2e` job even asserts the guest has no agent token). So `pull_request` runs from
-forks are safe: there is nothing to exfiltrate.
+Both jobs are **secrets-zero** — the coding agent is never authenticated in CI. So
+`pull_request` runs from forks are safe: there is nothing to exfiltrate.
 
-**Why the VM-boot E2E is *not* in CI.** GitHub's arm64 macOS runners are themselves
+**Why the live E2Es are *not* in CI.** GitHub's arm64 macOS runners are themselves
 Virtualization.framework guests with **no nested virtualization** (confirmed by GitHub; the
 request to enable it was closed as not planned). So anything that boots a VM/microVM — the
-macOS VM mode, Apple Container mode, or Docker-on-macOS — **cannot run on any GitHub-hosted
-runner** (standard *or* larger). A bigger runner gives more cores/RAM, not nesting. That
-heavy path is gated locally instead.
+macOS VM mode or Apple Container mode — **cannot run on any GitHub-hosted runner** (standard
+*or* larger). A bigger runner gives more cores/RAM, not nesting. Those heavy paths — the
+Apple Container egress fail-closed proof (`make container-e2e`) and the macOS VM E2E (`make
+e2e`) — are gated locally instead.
 
 ### Pre-release gate (`make e2e`, local only)
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tier 1 — macOS VM teardown (runs anywhere; no Docker/VM host needed).
+# Tier 1 — macOS VM teardown (runs anywhere; no container/VM host needed).
 # Guards the fix for the base/build VM "silent hang on teardown": a backgrounded
 # `augur-vm run` masks SIGTERM (it asks the guest for a graceful ACPI shutdown that
 # never completes mid-boot), so a raw `kill "$vm_pid"; wait "$vm_pid"` on it blocks
