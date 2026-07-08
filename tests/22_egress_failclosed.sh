@@ -82,14 +82,13 @@ if ! container exec "$cont" true >/dev/null 2>&1; then
 fi
 ok "container '$cont' is running"
 
-# Secrets-zero: the agent is never authenticated in CI (mock-the-agent). Prove it from the
-# guest's own env so a future regression that wires a real token into egress runs is caught
-# here — this is what keeps fork PRs safe to run (nothing to exfiltrate).
-for v in ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN; do
-  val="$(container exec "$cont" printenv "$v" 2>/dev/null || true)"
-  if [[ -z "$val" ]]; then ok "agent credential $v is absent in the guest (secrets-zero / agent mocked)"
-  else fail "agent credential $v leaked into the guest" "CI must run agent-less so fork PRs stay safe"; fi
-done
+# NOTE: earlier revisions asserted "secrets-zero" here (no ANTHROPIC_API_KEY /
+# CLAUDE_CODE_OAUTH_TOKEN in the guest), a fork-PR-safety premise for when this tier ran
+# agentless in CI. It no longer runs in CI — Apple Container needs macOS 26+, so this is a
+# LOCAL gate on the trusted single-user host, where the developer IS authenticated and augur
+# correctly forwards their token. Asserting its ABSENCE would fail every real local run. The
+# egress fail-closed guarantee below does not depend on secrets-zero — it holds whether or
+# not a token is present (that is the whole point: the proxy is the only way out regardless).
 
 # The proxy URL augur injected — the agent's only configured egress. Without it the probes below
 # would run with `-x ''` (curl goes DIRECT), so a missing value fails closed here rather than
