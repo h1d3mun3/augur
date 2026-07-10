@@ -66,7 +66,7 @@ final class ProxyServer {
         }
     }
 
-    // MARK: - HTTP CONNECT / forward proxy (Docker datapath)
+    // MARK: - HTTP CONNECT / forward proxy (Apple Container datapath)
 
     func handleHTTP(_ cfd: Int32, client: String) {
         defer { close(cfd) }

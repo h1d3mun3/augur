@@ -1,9 +1,9 @@
 import Foundation
 
-/// The unified allow/deny decision used by every datapath (Docker CONNECT and
-/// macOS SOCKS). Both hand us a `Destination`; we apply the same rules so behavior
-/// is identical across modes. Fail-closed: anything not positively allowed is
-/// denied.
+/// The unified allow/deny decision used by every datapath (the Apple Container
+/// HTTP CONNECT path and the macOS VM SOCKS path). Both hand us a `Destination`;
+/// we apply the same rules so behavior is identical across modes. Fail-closed:
+/// anything not positively allowed is denied.
 public struct Verdict: Equatable {
     public let allowed: Bool
     public let reason: String        // for logging when denied; "" when allowed

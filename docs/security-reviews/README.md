@@ -31,6 +31,7 @@ Newest on top.
 
 | Date | Scope | File |
 |---|---|---|
+| 2026-07-10 | Current-state review focused on egress control (re-baseline — Docker removed, two engines; elevates the RW-workspace `.git/hooks` host-reach risk) | [2026-07-10-egress.md](./2026-07-10-egress.md) |
 | 2026-07-08 | Current-state review focused on egress control (re-baseline — covers base-image custom provisioning, PR #78) | [2026-07-08-egress.md](./2026-07-08-egress.md) |
 | 2026-07-02 | Current-state review focused on egress control (re-baseline) | [2026-07-02-egress.md](./2026-07-02-egress.md) |
 | 2026-06-30 | Current-state review focused on egress control | [2026-06-30-egress.md](./2026-06-30-egress.md) |
