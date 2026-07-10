@@ -8,12 +8,13 @@ import Darwin
 
 /// Thin POSIX-socket helpers shared by the CONNECT and SOCKS servers. No
 /// third-party networking dependency — the proxy stays a single lightweight
-/// static binary that builds on both Linux (Docker host) and macOS (VM host).
+/// static binary that builds on both Linux (CI) and macOS (where it runs
+/// host-side for both the Apple Container and macOS VM engines).
 enum Sock {
     /// Create, bind, and listen on `addr:port`. An IPv6 `addr` (e.g. "::") binds a
     /// DUAL-STACK socket (IPV6_V6ONLY off) so the proxy is reachable whether the
-    /// client connects over IPv4 or IPv6 — needed because Docker Desktop may resolve
-    /// host.docker.internal to an IPv6 host-gateway. Returns the listening fd.
+    /// client connects over IPv4 or IPv6 — needed because the host gateway/loopback
+    /// the proxy binds may be reachable over either family. Returns the listening fd.
     static func listen(addr: String, port: UInt16, backlog: Int32 = 128) throws -> Int32 {
         let isV6 = addr.contains(":")
         let fd = socket(isV6 ? AF_INET6 : AF_INET, sockStreamType, 0)

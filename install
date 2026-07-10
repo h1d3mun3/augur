@@ -59,7 +59,7 @@ if [[ -f "$SCRIPT_DIR/augur.conf" ]]; then
         cat > "$INSTALL_DIR/augur.conf" <<'CONF'
 # augur egress allowlist — your global additions
 #
-# augur ships a managed baseline (Anthropic, GitHub, npm, Homebrew, …) in
+# augur ships a managed baseline (Anthropic, GitHub, Homebrew, …) in
 # augur.conf.default, refreshed on every install. Add YOUR own always-on domains
 # here; this file is never overwritten. Per-project domains go in ./.augur/allowlist.conf.
 #

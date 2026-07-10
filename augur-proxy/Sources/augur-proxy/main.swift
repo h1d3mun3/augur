@@ -14,7 +14,7 @@ import Darwin
 //
 // At least one of --http-port / --socks-port must be non-zero. The allowlist file
 // must exist (fail-closed: we refuse to run with no policy). Both datapaths share
-// one Filter so Docker and macOS behave identically.
+// one Filter so the container (HTTP CONNECT) and macOS VM (SOCKS) paths behave identically.
 //
 // Security contract for this filter: docs/security-reviews/INVARIANTS.md — a change
 // that breaks an invariant there is a contract change (see that file's header).

@@ -12,7 +12,7 @@ public struct Destination: Equatable {
     }
 }
 
-// MARK: - HTTP forward proxy (Docker datapath)
+// MARK: - HTTP forward proxy (Apple Container datapath)
 
 /// Parses the first request line a client sends to an HTTP forward proxy. We only
 /// need the destination authority; the rest of the headers are tunneled (CONNECT)
@@ -105,7 +105,7 @@ public enum HTTPProxyRequest {
 /// Minimal SOCKS5 server-side parsing (RFC 1928), no authentication. We only
 /// support CONNECT. The value of SOCKS5 for us is `atyp == domain`: gvproxy
 /// resolved the guest's hostname via the filtering DNS and hands it to us by name,
-/// so we make the same allowlist decision as the Docker CONNECT path.
+/// so we make the same allowlist decision as the HTTP CONNECT path.
 public enum Socks5 {
     public static let version: UInt8 = 0x05
     public static let noAuth: UInt8 = 0x00
