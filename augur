@@ -293,6 +293,26 @@ resolve_api_key() {
     fi
 }
 
+# Reject a resolved secret value that could break out of `export VAR='<value>'` single-quoting
+# in the macOS ~/.augur-env writer, or smuggle control bytes into the guest environment. This is
+# the "C3" validator the auth seam always flagged as future work: a single quote is the only
+# character that can escape a single-quoted shell string, and control bytes (newline/CR/tab/…)
+# have no place in a credential token. Container mode is not shell-exposed (values go to argv),
+# but validating in one place keeps both datapaths safe. Fails closed — a malformed secret must
+# abort `up`, never be injected.
+validate_secret_value() {
+    local name="$1" value="$2"
+    if [[ "$value" == *\'* ]]; then
+        error "Refusing to inject ${name}: value contains a single quote (') and cannot be safely quoted into the guest env."
+        return 1
+    fi
+    if [[ "$value" == *[[:cntrl:]]* ]]; then
+        error "Refusing to inject ${name}: value contains a control character (newline/tab/…)."
+        return 1
+    fi
+    return 0
+}
+
 # Persist a captured Claude subscription token to the host token file augur reads on
 # every `up` (resolve_api_key picks it up as CLAUDE_CODE_OAUTH_TOKEN). Validates the
 # shape and writes it 0600. The host never needs claude installed for this.
@@ -636,6 +656,38 @@ project_resource_value() {
     return 1
 }
 
+# Clamp a guest-writable INTEGER resource value to [min,max]. On anything malformed or out of
+# range, warn (to STDERR — these resolvers' stdout is captured by $(...)) and return the default.
+# Guards against a hostile ./.augur/resources.conf setting an absurd CPU/MEMORY that DoSes the
+# host on the next `augur up`. Only the file-derived value is clamped; an explicit AUGUR_* env
+# override is operator intent and stays unclamped.
+clamp_resource_int() {
+    local v="$1" min="$2" max="$3" def="$4" label="$5"
+    if [[ "$v" =~ ^[0-9]+$ ]] && (( ${#v} <= 15 )) && (( v >= min && v <= max )); then
+        echo "$v"; return
+    fi
+    warn "Ignoring out-of-range ${label}='${v}' in .augur/resources.conf (allowed ${min}-${max}); using ${def}." >&2
+    echo "$def"
+}
+
+# Same idea for the Apple-Container --memory SIZE string (<int>[kKmMgG], optional unit = bytes).
+# Caps total bytes at 128 GiB so a guest-supplied MEMORY=9999g can't over-commit the host.
+clamp_container_memory_value() {
+    local v="$1" num unit bytes max=$((128 * 1024 * 1024 * 1024))
+    if [[ "$v" =~ ^([0-9]{1,15})([kKmMgG]?)$ ]]; then
+        num="${BASH_REMATCH[1]}"; unit="${BASH_REMATCH[2]}"
+        case "$unit" in
+            k|K) bytes=$((num * 1024)) ;;
+            m|M) bytes=$((num * 1024 * 1024)) ;;
+            g|G) bytes=$((num * 1024 * 1024 * 1024)) ;;
+            *)   bytes=$num ;;
+        esac
+        if (( bytes > 0 && bytes <= max )); then echo "$v"; return; fi
+    fi
+    warn "Ignoring out-of-range/invalid MEMORY='${v}' in .augur/resources.conf (max 128g); using 4g." >&2
+    echo "4g"
+}
+
 # Effective Apple-Container memory limit. Precedence: an explicit AUGUR_CONTAINER_MEMORY
 # env var (checked with `+x` so an operator override always wins, even set to something
 # unusual) > ./.augur/resources.conf's MEMORY= (git-tracked, so it travels with the
@@ -647,7 +699,7 @@ resolve_container_memory() {
         return
     fi
     local v
-    v="$(project_resource_value MEMORY)" && [[ -n "$v" ]] && { echo "$v"; return; }
+    v="$(project_resource_value MEMORY)" && [[ -n "$v" ]] && { clamp_container_memory_value "$v"; return; }
     echo "4g"
 }
 
@@ -668,7 +720,7 @@ resolve_macos_vm_cpu() {
         return
     fi
     local v
-    v="$(project_resource_value MACOS_CPU)" && [[ -n "$v" ]] && { echo "$v"; return; }
+    v="$(project_resource_value MACOS_CPU)" && [[ -n "$v" ]] && { clamp_resource_int "$v" 1 64 4 MACOS_CPU; return; }
     echo "4"
 }
 
@@ -678,7 +730,7 @@ resolve_macos_vm_memory_mb() {
         return
     fi
     local v
-    v="$(project_resource_value MACOS_MEMORY_MB)" && [[ -n "$v" ]] && { echo "$v"; return; }
+    v="$(project_resource_value MACOS_MEMORY_MB)" && [[ -n "$v" ]] && { clamp_resource_int "$v" 512 262144 8192 MACOS_MEMORY_MB; return; }
     echo "8192"
 }
 
@@ -930,10 +982,12 @@ verify_egress_locked() {
     # Direct egress (no proxy) must fail. The hostname probe also catches a working resolver,
     # but on the Apple path DNS is closed by --no-dns, so it can pass without proving routing
     # is severed. The IP-LITERAL probes are what actually test raw routing — use several
-    # distinct public anycast addresses on both :443 and :80 so a single blackholed/rerouted
-    # IP can't make a routable network look isolated. ANY success is a leak.
+    # distinct public IPv4 AND IPv6 anycast addresses on both :443 and :80 so a single
+    # blackholed/rerouted IP (or a v6-only leak the v4 probes would miss) can't make a
+    # routable network look isolated. ANY success is a leak.
     local _probe
-    for _probe in https://example.com https://1.1.1.1 https://8.8.8.8 http://1.1.1.1 http://8.8.8.8; do
+    for _probe in https://example.com https://1.1.1.1 https://8.8.8.8 http://1.1.1.1 http://8.8.8.8 \
+                  'https://[2606:4700:4700::1111]' 'http://[2001:4860:4860::8888]'; do
         if eng exec -e HTTP_PROXY= -e HTTPS_PROXY= -e http_proxy= -e https_proxy= -e NO_PROXY="*" \
             "$CONTAINER_NAME" sh -c "curl -s --max-time 6 -o /dev/null ${_probe}" 2>/dev/null; then
             leaked=true; error "Self-test: the container reached ${_probe} directly (not isolated)."
@@ -1133,7 +1187,10 @@ cmd_up() {
     while IFS='|' read -r _genv _henv _hfile _hvalidator; do
         [[ -z "$_genv" ]] && continue
         _aval="$(resolve_api_key "${!_henv:-}" "$_hfile")"
-        [[ -n "$_aval" ]] && run_args+=(-e "${_genv}=${_aval}")
+        if [[ -n "$_aval" ]]; then
+            validate_secret_value "$_genv" "$_aval" || exit 1
+            run_args+=(-e "${_genv}=${_aval}")
+        fi
     done < <(agent_auth_specs)
 
     # Persist ONLY this project's Claude history, not the whole ~/.claude. Claude
@@ -1192,6 +1249,7 @@ cmd_up() {
     local gh_token
     gh_token="$(gh auth token 2>/dev/null || true)"
     if [[ -n "$gh_token" ]]; then
+        validate_secret_value GH_TOKEN "$gh_token" || exit 1
         # GH_TOKEN authenticates gh; the GIT_CONFIG_* env vars add a self-contained
         # git credential helper so HTTPS `git push` works off GH_TOKEN alone — without
         # writing to the read-only ~/.gitconfig and without depending on the host's
@@ -1862,8 +1920,21 @@ cmd_up_macos() {
 
     # Copy git config, and copy .claude.json one-way for onboarding state only (NOT auth — on
     # macOS the OAuth token lives in the Keychain, not in this file; see docs/macos-vm-architecture-review.md).
-    [[ -f "$HOME/.claude.json" ]] && \
-        scp_to_macos "$project_vm" "$HOME/.claude.json" "/Users/${MACOS_SSH_USER}/.claude.json"
+    # Strip host secrets first: ~/.claude.json's `mcpServers` blocks can hold third-party MCP API
+    # keys in their env/args, and `projects` enumerates every repo on the host — neither is needed
+    # guest-side. Prefer jq to drop those keys; if jq is absent (or the file is malformed), fall
+    # back to the same minimal onboarding seed the container image bakes, so a secret is never
+    # copied wholesale.
+    if [[ -f "$HOME/.claude.json" ]]; then
+        local _cj; _cj="$(mktemp)"
+        if command -v jq &>/dev/null && jq 'del(.mcpServers, .projects)' "$HOME/.claude.json" > "$_cj" 2>/dev/null; then
+            :
+        else
+            printf '{"hasCompletedOnboarding":true,"installMethod":"native"}\n' > "$_cj"
+        fi
+        scp_to_macos "$project_vm" "$_cj" "/Users/${MACOS_SSH_USER}/.claude.json"
+        rm -f "$_cj"
+    fi
     [[ -f "$HOME/.gitconfig" ]] && \
         scp_to_macos "$project_vm" "$HOME/.gitconfig" "/Users/${MACOS_SSH_USER}/.gitconfig"
 
@@ -1878,6 +1949,16 @@ cmd_up_macos() {
     # before this point. See docs §4 C3.
     local gh_token _genv _henv _hfile _hvalidator _aval
     gh_token="$(gh auth token 2>/dev/null || true)"
+    # Pre-validate every secret BEFORE writing ~/.augur-env: these values are interpolated into a
+    # SOURCED shell file as `export VAR='<value>'`, so a stray single quote / control byte would
+    # inject shell into every guest session. A validate_secret_value failure inside the pipe below
+    # would only exit the subshell, so gate here where `exit 1` aborts the whole `up` (fail-closed).
+    [[ -n "$gh_token" ]] && { validate_secret_value GH_TOKEN "$gh_token" || exit 1; }
+    while IFS='|' read -r _genv _henv _hfile _hvalidator; do
+        [[ -z "$_genv" ]] && continue
+        _aval="$(resolve_api_key "${!_henv:-}" "$_hfile")"
+        [[ -n "$_aval" ]] && { validate_secret_value "$_genv" "$_aval" || exit 1; }
+    done < <(agent_auth_specs)
     {
         echo '# augur (regenerated at VM startup)'
         echo 'eval "$(/opt/homebrew/bin/brew shellenv)" 2>/dev/null || true'
