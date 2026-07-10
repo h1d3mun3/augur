@@ -82,3 +82,37 @@ attempt that is correctly blocked). The full VM integration (VZFileHandle + gvpr
 + a booted macOS guest) has been **validated end-to-end on Apple Silicon**: an
 allowlisted host is reachable, a non-allowlisted host is blocked, and SSH reaches
 the VM through gvproxy's forward. (It cannot run in a Linux CI sandbox.)
+
+## Staying current with upstream
+
+The base is a pinned upstream commit plus a small patch, so it can silently fall
+behind — and because gvproxy parses attacker-influenced guest frames on the host,
+an upstream hardening fix can be security-relevant to us. Two layers watch for that:
+
+**Automated (primary).** `check-freshness.sh` runs daily via
+`.github/workflows/gvproxy-freshness.yml`. It does NOT build (the real E2E needs an
+Apple Silicon host) — it compares `PIN` against upstream `main`, ignores tooling/docs
+noise, and grades what remains:
+
+| severity | meaning | issue? |
+|---|---|---|
+| `ACTION`  | `augur-egress.patch` no longer applies to `main` | yes |
+| `REVIEW`  | shipped code (`cmd/gvproxy`, `pkg/`) or deps (`go.mod`/`vendor`) moved | yes |
+| `NOISE`   | behind, but only `tools/`/docs/CI churn | no |
+| `CURRENT` | pin is at `main` | closes the issue |
+
+On `REVIEW`/`ACTION` it opens or refreshes a **single** issue labelled
+`gvproxy-freshness` (idempotent — no notification spam); on `CURRENT` it closes it.
+Do not gauge staleness by raw commit count — it is mostly `tools/vendor` churn; the
+signals that matter are "does the patch still apply" and "did shipped code/deps move".
+
+Run it locally any time: `bash gvproxy/check-freshness.sh` (needs an authenticated `gh`).
+
+**Manual (backup).** Watch <https://github.com/containers/gvisor-tap-vsock> →
+**Custom → Releases + Security advisories** so an advisory reaches you even if the
+keyword heuristic misses it. Note that release tags lag `main`: a security fix can sit
+on `main` for weeks before it is tagged, so we pin to a `main` commit, not a release.
+
+**Responding.** Bump `PIN` in `build.sh` to the chosen commit, re-run `build.sh`
+(re-applies the patch), then run the macOS egress E2E on Apple Silicon. If the patch
+conflicted (`ACTION`), rebase it against `main` first.
