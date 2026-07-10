@@ -1,0 +1,64 @@
+name: gvproxy-freshness
+
+# Daily drift check for augur's pinned gvproxy fork. It does NOT build the binary
+# (that needs an Apple Silicon macOS host for the real E2E) — it only asks "has the
+# upstream base moved in a way that matters, and does our patch still apply?", and
+# opens/refreshes a single tracking issue when it has. See gvproxy/check-freshness.sh.
+
+on:
+  schedule:
+    - cron: '0 0 * * *'   # daily, 00:00 UTC (09:00 JST)
+  workflow_dispatch: {}    # allow a manual run from the Actions tab
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: gvproxy-freshness
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run freshness check
+        id: check
+        continue-on-error: true          # non-zero just means "action warranted"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BODY_FILE: ${{ github.workspace }}/gvproxy-freshness-body.md
+        run: bash gvproxy/check-freshness.sh
+
+      - name: Ensure tracking label exists
+        if: steps.check.outputs.severity == 'REVIEW' || steps.check.outputs.severity == 'ACTION'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh label create gvproxy-freshness --color FBCA04 --description "augur gvproxy fork drift" --force
+
+      - name: Open or update tracking issue
+        if: steps.check.outputs.severity == 'REVIEW' || steps.check.outputs.severity == 'ACTION'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TITLE: ${{ steps.check.outputs.title }}
+          BODY_FILE: ${{ github.workspace }}/gvproxy-freshness-body.md
+        run: |
+          num="$(gh issue list --label gvproxy-freshness --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$num" ]; then
+            gh issue edit  "$num" --title "$TITLE" --body-file "$BODY_FILE"
+            echo "updated issue #$num"
+          else
+            gh issue create --label gvproxy-freshness --title "$TITLE" --body-file "$BODY_FILE"
+          fi
+
+      - name: Close tracking issue if caught up
+        if: steps.check.outputs.severity == 'CURRENT'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          num="$(gh issue list --label gvproxy-freshness --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$num" ]; then
+            gh issue close "$num" --comment "gvproxy pin caught up to upstream main; closing automatically."
+          fi
