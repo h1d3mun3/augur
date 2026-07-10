@@ -673,16 +673,20 @@ clamp_resource_int() {
 # Same idea for the Apple-Container --memory SIZE string (<int>[kKmMgG], optional unit = bytes).
 # Caps total bytes at 128 GiB so a guest-supplied MEMORY=9999g can't over-commit the host.
 clamp_container_memory_value() {
-    local v="$1" num unit bytes max=$((128 * 1024 * 1024 * 1024))
+    local v="$1" num unit mult max=$((128 * 1024 * 1024 * 1024))
     if [[ "$v" =~ ^([0-9]{1,15})([kKmMgG]?)$ ]]; then
         num="${BASH_REMATCH[1]}"; unit="${BASH_REMATCH[2]}"
         case "$unit" in
-            k|K) bytes=$((num * 1024)) ;;
-            m|M) bytes=$((num * 1024 * 1024)) ;;
-            g|G) bytes=$((num * 1024 * 1024 * 1024)) ;;
-            *)   bytes=$num ;;
+            k|K) mult=1024 ;;
+            m|M) mult=$((1024 * 1024)) ;;
+            g|G) mult=$((1024 * 1024 * 1024)) ;;
+            *)   mult=1 ;;
         esac
-        if (( bytes > 0 && bytes <= max )); then echo "$v"; return; fi
+        # Compare BEFORE multiplying (num <= max/mult) so num*mult is never computed past the
+        # ceiling — a post-multiply `bytes <= max` check 64-bit-WRAPS for a crafted value like
+        # 17179869185g (2^34+1 GiB -> 2^64+2^30 -> 2^30 bytes) and would slip through. The regex
+        # guarantees num >= 1, so anything within the ceiling is a valid positive size.
+        if (( num <= max / mult )); then echo "$v"; return; fi
     fi
     warn "Ignoring out-of-range/invalid MEMORY='${v}' in .augur/resources.conf (max 128g); using 4g." >&2
     echo "4g"

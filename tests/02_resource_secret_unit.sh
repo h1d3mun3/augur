@@ -40,10 +40,13 @@ conf="$WORK/resources.conf"
 export AUGUR_PROJECT_RESOURCES_CONF="$conf"
 unset AUGUR_CONTAINER_MEMORY AUGUR_MACOS_VM_CPU AUGUR_MACOS_VM_MEMORY_MB
 
-printf 'MEMORY=8g\n'      > "$conf"; eq "$(resolve_container_memory)" "8g"   "valid MEMORY=8g passes through"
-printf 'MEMORY=512m\n'    > "$conf"; eq "$(resolve_container_memory)" "512m" "valid MEMORY=512m passes through"
-printf 'MEMORY=9999g\n'   > "$conf"; eq "$(resolve_container_memory)" "4g"   "MEMORY=9999g (>128g) clamps to default"
-printf 'MEMORY=evil;rm\n' > "$conf"; eq "$(resolve_container_memory)" "4g"   "malformed MEMORY falls back to default"
+printf 'MEMORY=8g\n'            > "$conf"; eq "$(resolve_container_memory)" "8g"   "valid MEMORY=8g passes through"
+printf 'MEMORY=512m\n'          > "$conf"; eq "$(resolve_container_memory)" "512m" "valid MEMORY=512m passes through"
+printf 'MEMORY=128g\n'          > "$conf"; eq "$(resolve_container_memory)" "128g" "MEMORY=128g (exactly the ceiling) passes through"
+printf 'MEMORY=9999g\n'         > "$conf"; eq "$(resolve_container_memory)" "4g"   "MEMORY=9999g (>128g) clamps to default"
+printf 'MEMORY=17179869185g\n'  > "$conf"; eq "$(resolve_container_memory)" "4g"   "MEMORY=17179869185g (64-bit multiply overflow) clamps to default"
+printf 'MEMORY=17592186044417m\n' > "$conf"; eq "$(resolve_container_memory)" "4g" "MEMORY=...m overflow attempt clamps to default"
+printf 'MEMORY=evil;rm\n'       > "$conf"; eq "$(resolve_container_memory)" "4g"   "malformed MEMORY falls back to default"
 
 printf 'MACOS_CPU=8\n'    > "$conf"; eq "$(resolve_macos_vm_cpu)" "8"  "valid MACOS_CPU=8 passes through"
 printf 'MACOS_CPU=9999\n' > "$conf"; eq "$(resolve_macos_vm_cpu)" "4"  "MACOS_CPU=9999 (>64) clamps to default"
