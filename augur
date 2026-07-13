@@ -1381,6 +1381,111 @@ cmd_down() {
     stop_egress
 }
 
+# ── install-cert: trust a custom CA in the guest (edge feature) ───────────────
+# Some users must reach an internal HTTPS endpoint served with a private/self-signed CA.
+# `augur install-cert <cert.crt>` installs that CA into the guest's OS trust store so every
+# TLS client inside (curl/git/gh + Claude Code, which reads the OS store) trusts it. It is a
+# DELIBERATE, explicit command — never part of build/up — because a trusted CA lets its
+# key-holder MITM the guest's TLS to every allowlisted domain. Container mode bakes it into
+# the image; macOS mode adds it to the base VM's System keychain (see cmd_install_cert_macos).
+
+# Validate a host-provided certificate file: it must exist, end in .crt, parse as PEM X.509,
+# and contain EXACTLY ONE certificate (the documented one-cert-per-file contract). Fails
+# closed — a missing openssl or any parse failure refuses the install rather than proceeding.
+validate_cert_file() {
+    local cert="$1"
+    [[ -f "$cert" ]] || { error "Certificate file not found: ${cert}"; return 1; }
+    [[ "$cert" == *.crt ]] || { error "Expected a .crt file (PEM X.509 certificate): ${cert}"; return 1; }
+    command -v openssl &>/dev/null || {
+        error "openssl not found on the host — cannot validate the certificate. Refusing (fail closed)."
+        return 1
+    }
+    openssl x509 -in "$cert" -noout &>/dev/null || {
+        error "Not a valid PEM X.509 certificate: ${cert}"
+        return 1
+    }
+    local n; n="$(grep -c '^-----BEGIN CERTIFICATE-----' "$cert" 2>/dev/null || true)"
+    [[ "${n:-0}" -eq 1 ]] || {
+        error "Expected exactly one certificate in ${cert} (found ${n:-0}). One cert per .crt file."
+        return 1
+    }
+    return 0
+}
+
+# Show the cert's identity and a blast-radius warning, then require explicit approval. Unlike
+# the project-conf/provision TOFU (auto-detected inputs need a first-sight gate), this runs an
+# EXPLICIT operator command, so the "approval" is a per-invocation y/N (no persisted hash).
+# AUGUR_ACCEPT_CERT_INSTALL=1 accepts non-interactively (CI / disposable flows). $2 = target label.
+confirm_cert_install() {
+    local cert="$1" target="$2" subject fpr enddate
+    subject="$(openssl x509 -in "$cert" -noout -subject 2>/dev/null | sed 's/^subject=[[:space:]]*//')"
+    fpr="$(openssl x509 -in "$cert" -noout -fingerprint -sha256 2>/dev/null | sed 's/^.*=//')"
+    enddate="$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null | sed 's/^notAfter=//')"
+    echo ""
+    warn "About to install a custom trusted CA into the ${target}:"
+    echo -e "    Subject:  ${subject:-<unknown>}"
+    echo -e "    SHA-256:  ${fpr:-<unknown>}"
+    echo -e "    Expires:  ${enddate:-<unknown>}"
+    echo ""
+    warn "SECURITY: anyone holding this certificate's private key can silently intercept the"
+    warn "guest's TLS to ${BOLD}every allowlisted domain${RESET} (api.anthropic.com, github.com, …)."
+    warn "Install it only if you fully trust whoever issued it."
+    echo ""
+    if [[ "${AUGUR_ACCEPT_CERT_INSTALL:-}" == "1" ]]; then
+        info "Accepted via AUGUR_ACCEPT_CERT_INSTALL=1."
+        return 0
+    fi
+    if [[ -t 0 && -t 1 ]]; then
+        local yn=""
+        read -rp "$(echo -e "${CYAN}[augur]${RESET} Install this CA? [y/N] ")" yn || true
+        [[ "$yn" == [yY] ]] && return 0
+        error "Declined — no certificate installed."
+        return 1
+    fi
+    error "Refusing to install a CA non-interactively. Re-run in a terminal, or set AUGUR_ACCEPT_CERT_INSTALL=1."
+    return 1
+}
+
+# Container mode: bake the CA into the image via the inert Dockerfile build-arg (see Dockerfile).
+# Reuses the proven `eng build` path (Apple Container's builder pulls FROM the registry base, so
+# a derived FROM-local-image build is deliberately avoided). Existing container-packages
+# provisioning still applies. Single custom root: re-running REPLACES it; a later build/update
+# rebuilds clean and DROPS it (documented — re-run install-cert after those).
+cmd_install_cert() {
+    local cert="${1:-}"
+    [[ -n "$cert" ]] || { error "Usage: augur install-cert <cert.crt>"; exit 1; }
+    # `--macos` selects the VM path, but the global flag parser stops at the first positional, so
+    # `install-cert <cert> --macos` would reach here (container) with --macos as a trailing arg.
+    # Reject it rather than silently baking into the Linux image when the VM was meant.
+    local _a
+    for _a in "$@"; do
+        [[ "$_a" == "--macos" ]] && { error "Put ${BOLD}--macos${RESET} BEFORE the cert path: augur install-cert --macos <cert.crt>"; exit 1; }
+    done
+    require_engine
+    validate_cert_file "$cert" || exit 1
+    # The image tag is shared by EVERY project built on this Swift tag (IMAGE_NAME=augur:swift-<tag>),
+    # so be explicit that the trust is not scoped to the current project.
+    confirm_cert_install "$cert" "container image '${IMAGE_NAME}' (trusted by every project on Swift tag '${SWIFT_IMAGE_TAG}')" || exit 1
+    local b64
+    b64="$(base64 < "$cert" | tr -d '\n')" || { error "Failed to base64-encode the certificate."; exit 1; }
+    info "Baking the custom CA into image '${IMAGE_NAME}' (Swift ${SWIFT_IMAGE_TAG})..."
+    container_provision_prepare
+    local build_args=(--build-arg "SWIFT_VERSION=${SWIFT_IMAGE_TAG}" --build-arg "AUGUR_CA_CERT_B64=${b64}")
+    while IFS= read -r _a; do build_args+=("$_a"); done < <(container_provision_build_args)
+    if ! eng build "${build_args[@]}" -t "$IMAGE_NAME" "$SCRIPT_DIR"; then
+        error "Failed to bake the CA into '${IMAGE_NAME}'."
+        exit 1
+    fi
+    success "Custom CA installed into image '${IMAGE_NAME}'."
+    info "Trusted by OS-store clients: curl, git, wget, gh, and Claude Code. Tools with their OWN"
+    info "trust store need their own knob: Node/npm → ${BOLD}NODE_EXTRA_CA_CERTS${RESET}, Python → ${BOLD}REQUESTS_CA_BUNDLE${RESET}."
+    warn "Single custom root: re-running ${BOLD}install-cert${RESET} REPLACES it (not additive)."
+    warn "A later ${BOLD}augur build${RESET}/${BOLD}update${RESET} rebuilds the image clean and DROPS the CA — re-run install-cert after those."
+    if container_exists; then
+        warn "Recreate the container to pick up the new image: ${BOLD}augur down && augur up${RESET}."
+    fi
+}
+
 # Print the container toolchain WITHOUT building anything — status inspects only what
 # already exists. Prefer the running container (the exact env Claude runs in), fall back
 # to a one-shot run against the built image, and note when nothing is built yet.
@@ -2190,6 +2295,105 @@ cmd_list_macos() {
         fi
         echo -e "  $(printf '%-28s' "$name") ${color}$(printf '%-10s' "$state")${RESET}${ip}"
     done <<< "$rows"
+}
+
+# Best-effort: is the host cert $1 already present in the base VM's System keychain? Matches by
+# SHA-256 fingerprint (colons stripped, upper-cased on both sides). Returns non-zero on ANY doubt
+# (parse failure, ssh error, not found) — callers treat that as "unconfirmed", never a hard error,
+# so a quirk in `security`'s output format can't turn a good manual install into a false failure.
+_cert_present_in_base_vm() {
+    local cert="$1" want
+    want="$(openssl x509 -in "$cert" -noout -fingerprint -sha256 2>/dev/null | sed 's/.*=//; s/://g' | tr 'a-f' 'A-F')"
+    [[ -n "$want" ]] || return 1
+    ssh_macos "$MACOS_BASE_VM" "security find-certificate -a -Z /Library/Keychains/System.keychain 2>/dev/null" 2>/dev/null \
+        | tr -d ':' | tr 'a-f' 'A-F' | grep -q "$want"
+}
+
+# macOS mode: install the CA into the base VM's System keychain, so every cloned project VM
+# inherits it (keychain-consulting clients — curl, git, gh (Go uses Security.framework on
+# darwin), and native Claude Code — then trust it). Modifying System-keychain trust settings
+# needs an interactive GUI authorization that a non-console SSH session cannot obtain (an
+# SSH-invoked `security add-trusted-cert` fails "authorization denied, no user interaction
+# possible" — confirmed on macOS 26). So we boot the base VM WITH a GUI window, copy the cert in,
+# and have the OPERATOR run `security add-trusted-cert` in the VM's own Terminal; augur then
+# verifies it landed. Mirrors cmd_update_macos's boot-base-VM/stop-and-reap shape.
+cmd_install_cert_macos() {
+    local cert="${1:-}"
+    [[ -n "$cert" ]] || { error "Usage: augur install-cert --macos <cert.crt>"; exit 1; }
+    require_vz
+    validate_cert_file "$cert" || exit 1
+    # scp reads "host:path" syntax, so a cert path whose first segment contains a colon (e.g.
+    # "corp:ca.crt", a real local file) would be misread as a remote target. A slash-less path is
+    # anchored to "./" so the colon is unambiguously part of the local filename.
+    [[ "$cert" == */* ]] || cert="./$cert"
+    confirm_cert_install "$cert" "macOS base VM '${MACOS_BASE_VM}' (inherited by every NEW project VM cloned afterward)" || exit 1
+    macos_vm_exists "$MACOS_BASE_VM" || {
+        error "Base VM '${MACOS_BASE_VM}' not found."
+        error "Run: augur build --macos --ipsw <path> --xcode-xip <path>"
+        exit 1
+    }
+    # Stop a stale base VM from a previous interrupted run before booting a fresh one.
+    macos_vm_running "$MACOS_BASE_VM" && "$VM_CLI" stop "$MACOS_BASE_VM" 2>/dev/null || true
+    info "Booting base VM '${MACOS_BASE_VM}' with a GUI window (for the trust prompt)..."
+    # GUI (no --no-graphics) + NAT, backgrounded so we can drive it over SSH.
+    "$VM_CLI" run --net-nat "$MACOS_BASE_VM" &>"$(macos_base_vm_log)" &
+    local vm_pid=$!
+    # CRITICAL: the base VM is now running. Guarantee it is stopped on EVERY exit — including
+    # Ctrl-C at the interactive prompts below. A base VM left running would be cloned in a live,
+    # crash-consistent (possibly inconsistent) state by the next `augur up --macos` (clonefile
+    # does not refuse a running source), silently corrupting that project VM — a failure that
+    # escapes this edge command into the normal `up` path. INT/TERM convert to a normal exit so
+    # the single EXIT trap does the teardown; disarmed only on the clean success path. Mirrors
+    # cmd_build_macos's build-VM trap.
+    # ${vm_pid:-} (not $vm_pid): the EXIT trap fires while the function frame is live on every
+    # abort path here, so the local is normally visible — but tolerate an unbound value so the
+    # teardown degrades to a stop-by-name (stop_and_reap needs only the VM name) instead of a
+    # set -u crash, per this codebase's "traps referencing locals are fragile" rule.
+    trap 'stop_and_reap_macos_vm "$MACOS_BASE_VM" "${vm_pid:-}"' EXIT
+    trap 'exit 130' INT TERM
+    if ! wait_for_macos_ssh "$MACOS_BASE_VM" 300 &>/dev/null; then
+        error "Base VM '${MACOS_BASE_VM}' did not become reachable over SSH in time."
+        error "  VM log: $(macos_base_vm_log)"
+        exit 1
+    fi
+    local remote="/tmp/augur-install-ca.crt"
+    if ! scp_to_macos "$MACOS_BASE_VM" "$cert" "$remote"; then
+        error "Failed to copy the certificate into the base VM."
+        exit 1
+    fi
+    # macOS denies an SSH-invoked System-keychain trust change ("no user interaction possible"),
+    # so we DON'T attempt it over SSH (that only leaks a scary error). The cert is already staged
+    # at $remote in the VM; the operator runs the trust command in the VM's own Terminal — where
+    # the GUI authorization CAN appear — and we verify it landed. Needs an interactive host tty.
+    local manual_cmd="sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ${remote}"
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        error "Trusting a macOS CA must be approved inside the VM, which needs an interactive"
+        error "terminal. Re-run ${BOLD}augur install-cert --macos${RESET} from a real terminal."
+        exit 1
+    fi
+    echo ""
+    warn "macOS only lets you trust a CA from ${BOLD}inside the VM's own session${RESET} (an SSH-driven"
+    warn "attempt is denied 'no user interaction possible'). Finish it in the VM window:"
+    echo -e "    1. The base VM desktop is up (it auto-logs in). Open ${BOLD}Terminal${RESET} there."
+    echo -e "    2. Run:  ${BOLD}${manual_cmd}${RESET}"
+    echo -e "    3. Enter the password ${BOLD}${MACOS_SSH_USER}${RESET} when sudo asks; approve any prompt."
+    echo ""
+    read -rp "$(echo -e "${CYAN}[augur]${RESET} Press Enter once you've run it in the VM (Ctrl-C to abort)... ")" _ || true
+    if _cert_present_in_base_vm "$cert"; then
+        info "Verified the certificate is now in the base VM's System keychain."
+    else
+        error "The certificate is not in the base VM's System keychain — it was not installed."
+        error "Re-run and make sure the command above completes ${BOLD}inside the VM${RESET}."
+        exit 1
+    fi
+    ssh_macos "$MACOS_BASE_VM" "rm -f '${remote}'" 2>/dev/null || true
+    success "Custom CA trusted in base VM '${MACOS_BASE_VM}'."
+    warn "Newly cloned project VMs will trust it. ${BOLD}Existing${RESET} project VMs are NOT updated —"
+    warn "re-clone a project with: ${BOLD}augur destroy --macos && augur up --macos${RESET}."
+    warn "A full ${BOLD}augur build --macos${RESET} (base VM rebuild) drops the CA — re-run install-cert."
+    # Clean success: stop the VM ourselves and disarm the trap so the normal exit doesn't re-stop it.
+    stop_and_reap_macos_vm "$MACOS_BASE_VM" "$vm_pid"
+    trap - EXIT INT TERM
 }
 
 cmd_update_macos() {
@@ -3038,6 +3242,7 @@ cmd_help() {
     echo -e "    augur ${CYAN}claude${RESET}                     Launch Claude Code"
     echo -e "    augur ${CYAN}shell${RESET}                      Open a bash shell"
     echo -e "    augur ${CYAN}setup-token${RESET}                Get a Claude token in the guest, save it on the host"
+    echo -e "    augur ${CYAN}install-cert${RESET} <cert.crt>    Trust a custom CA (PEM X.509) in the guest"
     echo -e "    augur ${CYAN}down${RESET}                       Stop and remove the container"
     echo -e "    augur ${CYAN}status${RESET}                     Check status and toolchain"
     echo -e "    augur ${CYAN}build${RESET}   [--swift VERSION]  Build the container image"
@@ -3051,6 +3256,7 @@ cmd_help() {
     echo -e "    augur ${CYAN}claude${RESET} --macos                                   Launch Claude Code"
     echo -e "    augur ${CYAN}shell${RESET}  --macos                                   Open bash shell"
     echo -e "    augur ${CYAN}setup-token${RESET} --macos                              Get a Claude token in the VM, save it on the host"
+    echo -e "    augur ${CYAN}install-cert${RESET} --macos <cert.crt>                   Trust a custom CA (PEM X.509) in the base VM"
     echo -e "    augur ${CYAN}down${RESET}    --macos                                   Stop the VM (keep the clone)"
     echo -e "    augur ${CYAN}destroy${RESET} --macos                                   Stop and remove the VM clone"
     echo -e "    augur ${CYAN}status${RESET}  --macos                                   Check VM status and toolchain"
@@ -3111,6 +3317,10 @@ cmd_help() {
     echo -e "                          ${BOLD}augur build${RESET} / ${BOLD}augur update${RESET}."
     echo -e "                          ${BOLD}augur init-conf${RESET} scaffolds commented-out templates for both (empty"
     echo -e "                          templates never trigger provisioning on their own)."
+    echo -e "    • ${BOLD}install-cert${RESET}: trust a private/self-signed CA in the guest (edge case). Pass ONE PEM"
+    echo -e "      X.509 cert (${CYAN}.crt${RESET}). Container bakes it into the image (dropped by ${BOLD}build${RESET}/${BOLD}update${RESET} — re-run);"
+    echo -e "      macOS adds it to the base VM's System keychain (approve the prompt in the VM window; new"
+    echo -e "      clones inherit it). A trusted CA can MITM the guest's TLS — install only CAs you trust."
     echo ""
 }
 
@@ -3156,6 +3366,7 @@ if $MACOS_MODE; then
         claude)         cmd_claude_macos ;;
         shell)          cmd_shell_macos ;;
         setup-token)    cmd_setup_token_macos ;;
+        install-cert)   cmd_install_cert_macos "$@" ;;
         down)           cmd_down_macos ;;
         destroy)        cmd_destroy_macos ;;
         status)         cmd_status_macos ;;
@@ -3172,6 +3383,7 @@ else
         claude)         cmd_claude ;;
         shell)          cmd_shell ;;
         setup-token)    cmd_setup_token ;;
+        install-cert)   cmd_install_cert "$@" ;;
         down)           cmd_down ;;
         status)         cmd_status ;;
         init-conf)      cmd_init_conf ;;

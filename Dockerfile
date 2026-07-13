@@ -67,6 +67,28 @@ ENV DISABLE_AUTOUPDATER=1
 RUN mkdir -p /home/dev/.claude/projects \
     && printf '{"hasCompletedOnboarding":true,"installMethod":"native"}\n' > /home/dev/.claude.json
 
+# Optional custom CA certificate, injected by `augur install-cert <cert.crt>` via a build-arg.
+# INERT by default: a normal `augur build`/`augur update` passes no value, so the `if` guard makes
+# this a no-op — the rootfs is unaffected (only empty USER-switch metadata layers are added).
+# `augur install-cert` re-runs this same build with AUGUR_CA_CERT_B64 set to the base64 of a
+# SINGLE host-validated PEM cert (validated + TOFU-approved host-side before it ever reaches this
+# ARG). It is decoded into the system trust store so every OS-store-consuming guest TLS client
+# trusts it: curl, git, wget, gh (Go), and Claude Code (the native installer reads the OS store).
+# NOT covered (they ship their own trust store): Node/npm (NODE_EXTRA_CA_CERTS), Python-requests
+# (REQUESTS_CA_BUNDLE), rustls — set those per-tool if needed. Runs as root (the trust store is
+# root-owned) then drops back to dev, so the container still runs unprivileged. Placed last so
+# toggling the arg only rebuilds this trailing layer, not the heavy apt/gh/claude layers above.
+# SECURITY: a trusted CA lets its key-holder MITM the guest's TLS to every allowlisted domain —
+# this is why augur gates it behind an explicit command with a blast-radius warning.
+# AUGUR_AGENT_SEAM | agent trust store — native Claude Code reads the OS store, so no per-agent env needed.
+ARG AUGUR_CA_CERT_B64=""
+USER root
+RUN if [ -n "$AUGUR_CA_CERT_B64" ]; then \
+      printf '%s' "$AUGUR_CA_CERT_B64" | base64 -d > /usr/local/share/ca-certificates/augur-custom-ca.crt \
+      && update-ca-certificates; \
+    fi
+USER dev
+
 # No WORKDIR: the project is bind-mounted at /workspace-<slug> and the run command
 # sets the working directory via `-w` at runtime, so a baked-in WORKDIR would only
 # create a stray empty directory in the image.
