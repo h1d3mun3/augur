@@ -2312,10 +2312,11 @@ _cert_present_in_base_vm() {
 # macOS mode: install the CA into the base VM's System keychain, so every cloned project VM
 # inherits it (keychain-consulting clients — curl, git, gh (Go uses Security.framework on
 # darwin), and native Claude Code — then trust it). Modifying System-keychain trust settings
-# is blocked headless since Big Sur (and the authorizationdb bypass no longer works on recent
-# macOS), so we boot the base VM WITH a GUI window and the operator approves the trust prompt
-# in it. Mirrors cmd_update_macos's boot-base-VM/stop-and-reap shape; the only difference is the
-# GUI window (no --no-graphics) and the SSH-invoked `security add-trusted-cert`.
+# needs an interactive GUI authorization that a non-console SSH session cannot obtain (an
+# SSH-invoked `security add-trusted-cert` fails "authorization denied, no user interaction
+# possible" — confirmed on macOS 26). So we boot the base VM WITH a GUI window, copy the cert in,
+# and have the OPERATOR run `security add-trusted-cert` in the VM's own Terminal; augur then
+# verifies it landed. Mirrors cmd_update_macos's boot-base-VM/stop-and-reap shape.
 cmd_install_cert_macos() {
     local cert="${1:-}"
     [[ -n "$cert" ]] || { error "Usage: augur install-cert --macos <cert.crt>"; exit 1; }
@@ -2360,42 +2361,31 @@ cmd_install_cert_macos() {
         error "Failed to copy the certificate into the base VM."
         exit 1
     fi
-    # The manual command the operator can run themselves in the VM's Terminal if the SSH-invoked
-    # GUI prompt does not surface (a known macOS pitfall — an SSH security session may be denied
-    # console interaction). Shown up front and again on failure; never torn down before they can use it.
+    # macOS denies an SSH-invoked System-keychain trust change ("no user interaction possible"),
+    # so we DON'T attempt it over SSH (that only leaks a scary error). The cert is already staged
+    # at $remote in the VM; the operator runs the trust command in the VM's own Terminal — where
+    # the GUI authorization CAN appear — and we verify it landed. Needs an interactive host tty.
     local manual_cmd="sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ${remote}"
-    echo ""
-    warn "A trust-authorization prompt will appear ${BOLD}in the VM window${RESET} — approve it there"
-    warn "(the base VM auto-logs in, so a desktop should already be visible). Enter the password"
-    warn "${BOLD}${MACOS_SSH_USER}${RESET} if it asks."
-    echo ""
-    info "Installing the CA into the System keychain (waiting for your approval in the VM)..."
-    local ok=false
-    if ssh_macos "$MACOS_BASE_VM" "echo '${MACOS_SSH_USER}' | sudo -S security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain '${remote}'"; then
-        ok=true
-    else
-        # Do NOT tear down here — the VM window and the copied cert must stay so the operator can
-        # finish it by hand, which is exactly the case this branch exists for.
-        warn "The automated prompt did not complete (declined, or it did not surface over SSH)."
-        warn "Finish it manually — in the VM window open ${BOLD}Terminal${RESET} and run:"
-        warn "  ${manual_cmd}"
-        warn "(enter the password ${BOLD}${MACOS_SSH_USER}${RESET} when sudo asks)."
-        if [[ -t 0 && -t 1 ]]; then
-            read -rp "$(echo -e "${CYAN}[augur]${RESET} Press Enter once you've run it in the VM (Ctrl-C to abort)... ")" _ || true
-            if _cert_present_in_base_vm "$cert"; then
-                ok=true
-                info "Verified the certificate is now in the base VM's System keychain."
-            else
-                warn "Could not confirm the certificate in the System keychain (it may still be fine)."
-                warn "If TLS to your endpoint still fails, re-run ${BOLD}augur install-cert --macos${RESET}."
-                ok=true   # trust the operator's confirmation; the check is best-effort only
-            fi
-        else
-            error "Non-interactive — cannot fall back to a manual prompt. Aborting."
-            exit 1
-        fi
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        error "Trusting a macOS CA must be approved inside the VM, which needs an interactive"
+        error "terminal. Re-run ${BOLD}augur install-cert --macos${RESET} from a real terminal."
+        exit 1
     fi
-    if ! $ok; then error "The CA was not installed."; exit 1; fi
+    echo ""
+    warn "macOS only lets you trust a CA from ${BOLD}inside the VM's own session${RESET} (an SSH-driven"
+    warn "attempt is denied 'no user interaction possible'). Finish it in the VM window:"
+    echo -e "    1. The base VM desktop is up (it auto-logs in). Open ${BOLD}Terminal${RESET} there."
+    echo -e "    2. Run:  ${BOLD}${manual_cmd}${RESET}"
+    echo -e "    3. Enter the password ${BOLD}${MACOS_SSH_USER}${RESET} when sudo asks; approve any prompt."
+    echo ""
+    read -rp "$(echo -e "${CYAN}[augur]${RESET} Press Enter once you've run it in the VM (Ctrl-C to abort)... ")" _ || true
+    if _cert_present_in_base_vm "$cert"; then
+        info "Verified the certificate is now in the base VM's System keychain."
+    else
+        error "The certificate is not in the base VM's System keychain — it was not installed."
+        error "Re-run and make sure the command above completes ${BOLD}inside the VM${RESET}."
+        exit 1
+    fi
     ssh_macos "$MACOS_BASE_VM" "rm -f '${remote}'" 2>/dev/null || true
     success "Custom CA trusted in base VM '${MACOS_BASE_VM}'."
     warn "Newly cloned project VMs will trust it. ${BOLD}Existing${RESET} project VMs are NOT updated —"
