@@ -2027,23 +2027,16 @@ cmd_up_macos() {
     ensure_macos_claude_projects "$project_vm"
     ensure_macos_claude_bin "$project_vm"
 
-    # Copy git config, and copy .claude.json one-way for onboarding state only (NOT auth — on
-    # macOS the OAuth token lives in the Keychain, not in this file; see docs/macos-vm-architecture-review.md).
-    # Strip host secrets first: ~/.claude.json's `mcpServers` blocks can hold third-party MCP API
-    # keys in their env/args, and `projects` enumerates every repo on the host — neither is needed
-    # guest-side. Prefer jq to drop those keys; if jq is absent (or the file is malformed), fall
-    # back to the same minimal onboarding seed the container image bakes, so a secret is never
-    # copied wholesale.
-    if [[ -f "$HOME/.claude.json" ]]; then
-        local _cj; _cj="$(mktemp)"
-        if command -v jq &>/dev/null && jq 'del(.mcpServers, .projects)' "$HOME/.claude.json" > "$_cj" 2>/dev/null; then
-            :
-        else
-            printf '{"hasCompletedOnboarding":true,"installMethod":"native"}\n' > "$_cj"
-        fi
-        scp_to_macos "$project_vm" "$_cj" "/Users/${MACOS_SSH_USER}/.claude.json"
-        rm -f "$_cj"
-    fi
+    # Copy git config, and seed a minimal .claude.json one-way for onboarding state only (NOT auth —
+    # on macOS the OAuth token lives in the Keychain, not in this file; see docs/macos-vm-architecture-review.md).
+    # We deliberately do NOT copy the host's ~/.claude.json (not even a stripped copy): it enumerates
+    # every repo on the host (`projects`) and can hold third-party MCP API keys (`mcpServers`), and the
+    # guest needs none of it. Seed the exact same static onboarding stub the container image bakes
+    # (Dockerfile), independent of the host config and of whether jq is installed.
+    local _cj; _cj="$(mktemp)"
+    printf '{"hasCompletedOnboarding":true,"installMethod":"native"}\n' > "$_cj"
+    scp_to_macos "$project_vm" "$_cj" "/Users/${MACOS_SSH_USER}/.claude.json"
+    rm -f "$_cj"
     [[ -f "$HOME/.gitconfig" ]] && \
         scp_to_macos "$project_vm" "$HOME/.gitconfig" "/Users/${MACOS_SSH_USER}/.gitconfig"
 
