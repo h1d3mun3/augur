@@ -24,6 +24,15 @@ bin="$(resolve_proxy_cli)"
 if ! command -v "$bin" >/dev/null 2>&1 && [[ ! -f "$bin" || ! -x "$bin" ]]; then
   skip "real-proxy bind isolation" "augur-proxy not built (run: bash install, or make unit)"; finish; exit $?
 fi
+# The binary exists and is +x, but that does not mean it can run HERE: a stale cross-arch build
+# (e.g. a macOS Mach-O left in .build/release on a Linux host) passes the -f/-x test yet fails to
+# exec. Running it would make start_proxy fail-closed (`exit 1`) and, because we call start_proxy
+# with output redirected, take this whole script down with no diagnostic. Probe that it actually
+# runs on THIS host (`--help` exits 0 before any bind) and self-skip if it cannot — the same
+# "skip cleanly when the proxy isn't usable here" contract as the build check above.
+if ! "$bin" --help >/dev/null 2>&1; then
+  skip "real-proxy bind isolation" "resolved augur-proxy ($bin) is not runnable on this host (stale or cross-arch build?)"; finish; exit $?
+fi
 
 ADDR_A="127.0.0.1"                         # stands in for macOS VM mode's loopback bind
 ADDR_B="${AUGUR_TEST_ADDR_B:-127.0.0.2}"   # stands in for Apple Container mode's gateway bind
@@ -50,7 +59,11 @@ port="$AUGUR_PROXY_SOCKS_PORT"             # both roles share this port; only th
 
 # ── Bring up the macOS-role proxy (addr A) ────────────────────────────────────────────────────
 MACOS_MODE=true
-if start_proxy "$ADDR_A" >/dev/null 2>&1 && proxy_running && probe "$ADDR_A" "$port"; then
+# Run start_proxy in a subshell: it fails closed with `exit 1` if the proxy never binds, which
+# would otherwise terminate this whole test with no `fail` line. The subshell turns that into a
+# non-zero status the `if` can report (the proxy is backgrounded + disowned, so it survives the
+# subshell exiting and proxy_running still sees its pidfile).
+if ( start_proxy "$ADDR_A" ) >/dev/null 2>&1 && proxy_running && probe "$ADDR_A" "$port"; then
   ok "macOS-role proxy listening on ${ADDR_A}:${port}"
 else
   fail "macOS-role proxy did not come up on ${ADDR_A}:${port}"; finish; exit $?
@@ -58,7 +71,7 @@ fi
 
 # ── Bring up the container-role proxy (addr B), SAME ports, different address ──────────────────
 MACOS_MODE=false
-start_proxy "$ADDR_B" >/dev/null 2>&1
+( start_proxy "$ADDR_B" ) >/dev/null 2>&1     # subshell-contained (see the ADDR_A call above)
 if ! proxy_running || ! probe "$ADDR_B" "$port"; then
   # On Linux this is a real failure (the fix must start a second, separate instance). Elsewhere the
   # address may simply be unbindable — but we already gated non-Linux above, so treat it as a fail.
