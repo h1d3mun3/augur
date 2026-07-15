@@ -1,5 +1,5 @@
 diff --git a/cmd/gvproxy/config.go b/cmd/gvproxy/config.go
-index 8fe3154..36693bc 100644
+index 7055e9e4..836e9f0c 100644
 --- a/cmd/gvproxy/config.go
 +++ b/cmd/gvproxy/config.go
 @@ -12,6 +12,7 @@ import (
@@ -7,10 +7,10 @@ index 8fe3154..36693bc 100644
  	"strings"
  
 +	dnsservice "github.com/containers/gvisor-tap-vsock/pkg/services/dns"
+ 	"github.com/containers/gvisor-tap-vsock/pkg/transport"
  	"github.com/containers/gvisor-tap-vsock/pkg/types"
  	log "github.com/sirupsen/logrus"
- 	yaml "gopkg.in/yaml.v3"
-@@ -47,6 +48,9 @@ type GvproxyArgs struct {
+@@ -48,6 +49,9 @@ type GvproxyArgs struct {
  	logFile            string
  	servicesEndpoint   string
  	ec2MetadataAccess  bool
@@ -20,7 +20,7 @@ index 8fe3154..36693bc 100644
  }
  
  type GvproxyConfig struct {
-@@ -138,6 +142,9 @@ func GvproxyArgParse(flagSet *flag.FlagSet, args *GvproxyArgs, argv []string) (*
+@@ -139,6 +143,9 @@ func GvproxyArgParse(flagSet *flag.FlagSet, args *GvproxyArgs, argv []string) (*
  	flagSet.StringVar(&args.servicesEndpoint, "services", "", "Exposes the same HTTP API as the --listen flag, without the /connect endpoint")
  	flagSet.BoolVar(&args.ec2MetadataAccess, "ec2-metadata-access", false, "Permits access to EC2 Metadata Service and Amazon Time Sync Service")
  	flagSet.StringVar(&args.notificationSocket, "notification", "", "Socket to be used to send network-ready notifications")
@@ -30,7 +30,7 @@ index 8fe3154..36693bc 100644
  	if err := flagSet.Parse(argv); err != nil {
  		return nil, err
  	}
-@@ -274,6 +281,25 @@ func GvproxyConfigure(config *GvproxyConfig, args *GvproxyArgs, version string)
+@@ -275,6 +282,25 @@ func GvproxyConfigure(config *GvproxyConfig, args *GvproxyArgs, version string)
  	if args.vfkitSocket != "" {
  		config.Interfaces.Vfkit = args.vfkitSocket
  	}
@@ -57,7 +57,7 @@ index 8fe3154..36693bc 100644
  		config.Interfaces.VPNKit = args.vpnkitSocket
  	}
 diff --git a/cmd/gvproxy/main.go b/cmd/gvproxy/main.go
-index 2588f02..eaa0bb9 100644
+index 2588f028..eaa0bb9e 100644
 --- a/cmd/gvproxy/main.go
 +++ b/cmd/gvproxy/main.go
 @@ -157,15 +157,20 @@ func run(ctx context.Context, g *errgroup.Group, config *GvproxyConfig) error {
@@ -90,7 +90,7 @@ index 2588f02..eaa0bb9 100644
  	if InDebugMode() {
  		g.Go(func() error {
 diff --git a/pkg/services/dns/dns.go b/pkg/services/dns/dns.go
-index 9f86fe8..2cd329a 100644
+index 9f86fe8c..2cd329ab 100644
 --- a/pkg/services/dns/dns.go
 +++ b/pkg/services/dns/dns.go
 @@ -27,6 +27,7 @@ type dnsHandler struct {
@@ -153,7 +153,7 @@ index 9f86fe8..2cd329a 100644
  
 diff --git a/pkg/services/dns/dns_allowlist.go b/pkg/services/dns/dns_allowlist.go
 new file mode 100644
-index 0000000..a78f51a
+index 00000000..3b38ec12
 --- /dev/null
 +++ b/pkg/services/dns/dns_allowlist.go
 @@ -0,0 +1,172 @@
@@ -331,7 +331,7 @@ index 0000000..a78f51a
 +}
 diff --git a/pkg/services/dns/dns_allowlist_test.go b/pkg/services/dns/dns_allowlist_test.go
 new file mode 100644
-index 0000000..0e9194f
+index 00000000..0e9194fd
 --- /dev/null
 +++ b/pkg/services/dns/dns_allowlist_test.go
 @@ -0,0 +1,82 @@
@@ -418,7 +418,7 @@ index 0000000..0e9194f
 +	}
 +}
 diff --git a/pkg/services/dns/dns_test.go b/pkg/services/dns/dns_test.go
-index a8df249..08bc6ae 100644
+index a8df2491..08bc6aef 100644
 --- a/pkg/services/dns/dns_test.go
 +++ b/pkg/services/dns/dns_test.go
 @@ -24,7 +24,7 @@ var _ = ginkgo.Describe("dns add test", func() {
@@ -450,7 +450,7 @@ index a8df249..08bc6ae 100644
  	}
 diff --git a/pkg/services/forwarder/socks_client.go b/pkg/services/forwarder/socks_client.go
 new file mode 100644
-index 0000000..139a641
+index 00000000..139a641d
 --- /dev/null
 +++ b/pkg/services/forwarder/socks_client.go
 @@ -0,0 +1,93 @@
@@ -548,7 +548,7 @@ index 0000000..139a641
 +	return c, nil
 +}
 diff --git a/pkg/services/forwarder/tcp.go b/pkg/services/forwarder/tcp.go
-index ae18ada..2dd2f5a 100644
+index ae18ada5..2dd2f5a5 100644
 --- a/pkg/services/forwarder/tcp.go
 +++ b/pkg/services/forwarder/tcp.go
 @@ -17,7 +17,12 @@ import (
@@ -592,8 +592,27 @@ index ae18ada..2dd2f5a 100644
  			return
  		}
  
+diff --git a/pkg/tap/switch.go b/pkg/tap/switch.go
+index 96eee3c6..e3d260d3 100644
+--- a/pkg/tap/switch.go
++++ b/pkg/tap/switch.go
+@@ -291,6 +291,14 @@ loop:
+ }
+ 
+ func (e *Switch) rxBuf(_ context.Context, id int, buf []byte) {
++	// augur: drop runt frames (shorter than an Ethernet header). A guest fully
++	// controls each L2 frame it emits over its NIC, and the header.Ethernet
++	// accessors slice fixed offsets (SourceAddress buf[6:12], Type buf[12:14])
++	// with no length check, so a sub-14-byte frame would panic the un-recovered
++	// rx goroutine and take down the whole datapath. Drop it instead.
++	if len(buf) < header.EthernetMinimumSize {
++		return
++	}
+ 	if e.debug {
+ 		packet := gopacket.NewPacket(buf, layers.LayerTypeEthernet, gopacket.Default)
+ 		log.Info(packet.String())
 diff --git a/pkg/types/configuration.go b/pkg/types/configuration.go
-index 0e6a051..3f4a2c0 100644
+index 0e6a051a..ed99c90f 100644
 --- a/pkg/types/configuration.go
 +++ b/pkg/types/configuration.go
 @@ -59,6 +59,19 @@ type Configuration struct {
@@ -617,7 +636,7 @@ index 0e6a051..3f4a2c0 100644
  
  type Protocol string
 diff --git a/pkg/virtualnetwork/services.go b/pkg/virtualnetwork/services.go
-index c7bc35c..d6d01de 100644
+index c7bc35c5..d6d01de2 100644
 --- a/pkg/virtualnetwork/services.go
 +++ b/pkg/virtualnetwork/services.go
 @@ -25,12 +25,18 @@ func addServices(configuration *types.Configuration, s *stack.Stack, ipPool *tap
@@ -653,22 +672,3 @@ index c7bc35c..d6d01de 100644
  	if err != nil {
  		return nil, err
  	}
-diff --git a/pkg/tap/switch.go b/pkg/tap/switch.go
-index 3f57c55..92221e4 100644
---- a/pkg/tap/switch.go
-+++ b/pkg/tap/switch.go
-@@ -280,6 +280,14 @@ loop:
- }
- 
- func (e *Switch) rxBuf(_ context.Context, id int, buf []byte) {
-+	// augur: drop runt frames (shorter than an Ethernet header). A guest fully
-+	// controls each L2 frame it emits over its NIC, and the header.Ethernet
-+	// accessors slice fixed offsets (SourceAddress buf[6:12], Type buf[12:14])
-+	// with no length check, so a sub-14-byte frame would panic the un-recovered
-+	// rx goroutine and take down the whole datapath. Drop it instead.
-+	if len(buf) < header.EthernetMinimumSize {
-+		return
-+	}
- 	if e.debug {
- 		packet := gopacket.NewPacket(buf, layers.LayerTypeEthernet, gopacket.Default)
- 		log.Info(packet.String())
