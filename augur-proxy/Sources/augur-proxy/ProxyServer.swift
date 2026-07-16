@@ -23,12 +23,18 @@ final class ProxyServer {
     /// tunable (--max-connections / AUGUR_PROXY_MAX_CONNECTIONS, see main.swift)
     /// because the right ceiling depends on the host and the workload's concurrency.
     private let connectionCap: DispatchSemaphore
+    /// Observability sibling of `connectionCap` (which is the actual limiter): tracks how
+    /// many handlers are running and logs an edge-triggered line when the ceiling is hit
+    /// or cleared, so a saturated proxy is visible instead of just silently slow.
+    private let gauge: InFlightGauge
 
     init(filter: Filter, log: DecisionLog, publicOnly: Bool, maxConnections: Int = 128) {
         self.filter = filter
         self.log = log
         self.publicOnly = publicOnly
-        self.connectionCap = DispatchSemaphore(value: max(1, maxConnections))
+        let cap = max(1, maxConnections)
+        self.connectionCap = DispatchSemaphore(value: cap)
+        self.gauge = InFlightGauge(ceiling: cap, log: log)
     }
 
     /// Start a listener and dispatch accepted connections to `handler` on threads.
@@ -54,11 +60,13 @@ final class ProxyServer {
                 // HERE. Were the release left to a worker that never ran, the slot would
                 // leak and the accept loop would eventually deadlock on connectionCap.
                 let started = PosixThread.spawnDetached {
-                    defer { s.connectionCap.signal() }
+                    s.gauge.acquired()
+                    defer { s.gauge.released(); s.connectionCap.signal() }
                     handler(cfd, client)
                 }
                 if !started {
-                    s.log.info("could not start handler thread; dropping connection from \(client)")
+                    // Liveness event, not a decision — keep it off the DENY log file.
+                    s.log.status("could not start handler thread; dropping connection from \(client)")
                     close(cfd)
                     s.connectionCap.signal()
                 }
@@ -244,7 +252,18 @@ final class ProxyServer {
         Sock.setKeepAlive(a)
         Sock.setKeepAlive(b)
         let done = DispatchSemaphore(value: 0)
-        Thread.detachNewThread { Sock.splice(from: a, to: b); done.signal() }
+        // Use the CHECKED spawn for the a→b copier. Thread.detachNewThread silently no-ops
+        // when pthread_create hits the per-process thread ceiling (EAGAIN) — done.signal()
+        // would then never fire, this thread would block on done.wait() below forever, and
+        // its connectionCap slot would leak, re-creating the accept-loop deadlock the cap
+        // exists to prevent (just one layer lower). If the copier can't start, tear the
+        // tunnel down: the caller's defers close both fds and the accept loop reclaims the
+        // slot. Nothing is splicing yet (the b→a copy below hasn't started), so returning
+        // here is a clean drop, not a half-open tunnel.
+        guard PosixThread.spawnDetached({ Sock.splice(from: a, to: b); done.signal() }) else {
+            log.status("splice copier could not start under thread pressure; dropping tunnel")
+            return
+        }
         Sock.splice(from: b, to: a)
         done.wait()
     }
@@ -267,5 +286,55 @@ final class ProxyServer {
             }
         }
         return String(cString: buf)
+    }
+}
+
+/// Thread-safe in-flight connection gauge, purely for observability — the actual limiter
+/// is `ProxyServer.connectionCap` (a DispatchSemaphore). It emits ONE stderr-only line when
+/// running handlers reach the ceiling and ONE when the episode clears, so a saturated proxy
+/// is visible to an operator without polluting the greppable DENY log file (both go through
+/// `DecisionLog.status`).
+///
+/// Hysteresis, not a bare edge trigger: once at capacity it stays "latched" until the count
+/// drains to a low-water mark (half the ceiling) before it will log a fresh episode. Without
+/// it, a proxy hovering at the ceiling would thrash the log as the count oscillates across
+/// the boundary by one. The status line is emitted OUTSIDE the lock so the stderr write never
+/// serializes the accept/handler paths.
+final class InFlightGauge {
+    private let lock = NSLock()
+    private var count = 0
+    private var latched = false
+    private let ceiling: Int
+    private let lowWater: Int
+    private let log: DecisionLog
+
+    init(ceiling: Int, log: DecisionLog) {
+        self.ceiling = ceiling
+        self.lowWater = ceiling / 2   // re-arm only after a genuine drain, not a 1-slot dip
+        self.log = log
+    }
+
+    func acquired() {
+        lock.lock()
+        count += 1
+        let announce = count >= ceiling && !latched
+        if announce { latched = true }
+        let now = count
+        lock.unlock()
+        if announce {
+            log.status("reached capacity: \(now)/\(ceiling) connections in-flight; further connections queue on the listen backlog until a slot frees (raise --max-connections / AUGUR_PROXY_MAX_CONNECTIONS if sustained)")
+        }
+    }
+
+    func released() {
+        lock.lock()
+        count -= 1
+        let announce = latched && count <= lowWater
+        if announce { latched = false }
+        let now = count
+        lock.unlock()
+        if announce {
+            log.status("recovered: \(now)/\(ceiling) connections in-flight")
+        }
     }
 }

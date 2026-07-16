@@ -36,6 +36,14 @@ public final class DecisionLog {
         write("INFO  \(message)", onlyStderr: false, skipFile: false)
     }
 
+    /// Operational / liveness lines (capacity, thread pressure). Stderr-only and never
+    /// written to the decision-log file, so they can't pollute the greppable DENY record
+    /// the CLI parses. Mirrors `allow()`'s channel — use this, not `info()`, for anything
+    /// high-frequency or contention-driven.
+    public func status(_ message: String) {
+        write("INFO  \(message)", onlyStderr: true, skipFile: true)
+    }
+
     private func write(_ body: String, onlyStderr: Bool, skipFile: Bool) {
         let line = "\(Self.timestamp()) \(body)\n"
         lock.lock(); defer { lock.unlock() }
