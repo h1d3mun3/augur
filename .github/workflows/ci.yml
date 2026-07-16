@@ -58,6 +58,10 @@ jobs:
           else
             echo "note: could not add 127.0.0.2 loopback alias; skipping real-proxy bind isolation"
           fi
+      # Global connection-cap liveness + capacity gauge against the real binary just built.
+      # Only binds 127.0.0.1 (no loopback alias needed). Self-skips if the binary is missing.
+      - name: Proxy connection cap under load (real binary)
+        run: bash tests/24_proxy_concurrency.sh
 
   # ── Offline seam + command-construction tiers (shimmed container, no runtime) ─
   offline-tests:
