@@ -71,13 +71,16 @@ if [[ -z "$HP" ]]; then
 fi
 ok "real augur-proxy listening on $ADDR:$HP (--max-connections $CAP)"
 
-# one denied CONNECT, bounded so a stuck read can never hang the tier; echoes the status line
+# One denied CONNECT; echoes the proxy's first response line. Bounded with bash's OWN
+# `read -t` (a builtin) rather than GNU `timeout`, which macOS does not ship — so a stuck
+# read still can't hang the tier, and the probe works identically on the Linux and macOS CI.
 one_denied() {
-  timeout 8 bash -c '
-    exec 3<>/dev/tcp/'"$ADDR"'/'"$HP"' || exit 9
-    printf "CONNECT blocked.invalid:443 HTTP/1.1\r\nHost: blocked.invalid:443\r\n\r\n" >&3
-    head -c 30 <&3
-  ' 2>/dev/null
+  local line=""
+  exec 3<>"/dev/tcp/$ADDR/$HP" 2>/dev/null || return 0
+  printf 'CONNECT blocked.invalid:443 HTTP/1.1\r\nHost: blocked.invalid:443\r\n\r\n' >&3
+  IFS= read -t 8 -r line <&3 2>/dev/null
+  exec 3>&- 3<&-
+  printf '%s' "$line"
 }
 
 # ── 1. Liveness: many more simultaneous connections than the cap are all served ──────────────
