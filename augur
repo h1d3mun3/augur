@@ -128,7 +128,7 @@ error()   { echo -e "${RED}[augur]${RESET} $*" >&2; }
 # DESIGN RULE — do not break: the agent side only DECLARES DATA; the sandbox core
 # (cmd_up, the egress/proxy stack, the mount keying, resolve_api_key injection) OWNS
 # and ENFORCES every security mechanism. Adding a second agent must NOT move a control
-# out of the core. See docs/swappable-agent-abstraction-design.md (§5).
+# out of the core. See docs/decisions/0003-swappable-agent-abstraction.md (§5).
 # ────────────────────────────────────────────────────────────────────────────────
 
 # Human-facing product name (info/help text only). DATA.
@@ -143,7 +143,7 @@ agent_cli_name() { echo "claude"; }
 #   metachar/control-byte reject guard and pass argv via printf %q (docs §4 C4). The
 #   container engines pass it as an argv array to `<engine> exec` — safe by construction.
 # NOTE: no argv forwarding is added here for Claude Code's `--worktree` flag — this is a
-#   deliberate non-fix, not an oversight. See docs/claude-worktree-support-design.md.
+#   deliberate non-fix, not an oversight. See docs/decisions/0004-no-special-worktree-support.md.
 agent_launch_argv() { echo "claude"; }
 
 # Credential-capture / login subcommand argv. DATA.
@@ -179,7 +179,7 @@ agent_auth_specs() {
 #   ephemeral (lost on container recreation) — deliberate, not a bug. Mounting the
 #   `~/.claude/projects` parent instead would cover it, but a compromised session in one
 #   leaf would then have filesystem access to every sibling leaf in the same container.
-#   See docs/claude-worktree-support-design.md before "fixing" this.
+#   See docs/decisions/0004-no-special-worktree-support.md before "fixing" this.
 agent_state_host_subdir()        { echo "claude-projects"; }              # dir under $AUGUR_DIR (both modes)
 agent_state_guest_projects_dir() { echo "/home/dev/.claude/projects"; }   # guest parent dir
 agent_state_guest_leaf()         { echo "-workspace-$1"; }                # leaf name from slug ($1)
@@ -403,7 +403,7 @@ require_vz() {
 # host_hist_dir key), not basename alone: two distinct directories that happen to
 # share a basename (e.g. ~/work/myapp and ~/archive/myapp) must never collide onto
 # the same VM/history-dir/egress-config (see
-# docs/claude-worktree-support-design.md §6/§9). Changing this key means any
+# docs/decisions/0004-no-special-worktree-support.md §6/§9). Changing this key means any
 # project VM cloned under the old (basename-only) name is orphaned — a one-time
 # fresh clone on next `up`, not data loss (the old VM/clone is left in place;
 # `augur list --macos` still shows it and it can be removed manually).
@@ -1203,7 +1203,7 @@ cmd_up() {
     # parent (not just that one leaf) so any leaf Claude creates for THIS project —
     # the main checkout, or a `claude --worktree` session run ad hoc via `augur
     # shell` (no augur support for that flag itself; see
-    # docs/claude-worktree-support-design.md §3 Option A / §7-§9) — persists across
+    # docs/decisions/0004-no-special-worktree-support.md §3 Option A / §7-§9) — persists across
     # `down`/`up`. The guest can therefore neither read other projects' transcripts
     # nor tamper with host auth/settings, but CAN read/tamper with a sibling leaf's
     # transcript within this one project — an accepted trade-off, not a new one

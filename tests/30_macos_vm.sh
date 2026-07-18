@@ -23,7 +23,7 @@ section "Tier 2 — per-project VM naming is path-hash keyed, not basename-only 
 # §6/§9 fix: macos_project_vm() used to key purely on basename(WORKSPACE_DIR), so two
 # distinct directories sharing a basename (e.g. ~/work/myapp and ~/archive/myapp) collided
 # onto the same VM name — and therefore the same history dir, egress config, and everything
-# else keyed by that name. See docs/claude-worktree-support-design.md §6/§9.
+# else keyed by that name. See docs/decisions/0004-no-special-worktree-support.md §6/§9.
 project_vm_fns="$(mktemp)"
 work="$(mktemp -d)"
 trap 'rm -f "$project_vm_fns"; rm -rf "$work"' EXIT

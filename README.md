@@ -75,7 +75,7 @@ augur version                   # show augur version
 
 > Auth is env-based in both modes now. If you only ever logged in via the browser, run `augur setup-token` (or set `ANTHROPIC_API_KEY`); see [API keys and authentication](#api-keys-and-authentication). Upgrading from an older augur requires a one-time `augur build` (the image now pre-creates the scoped history dir).
 
-> Claude Code's `--worktree` isn't specially supported (`augur claude --worktree ...` won't forward the flag). If you want it anyway: run `augur shell`, then type `claude --worktree <name>` yourself at the prompt — the worktree's files/git state persist fine, but its conversation history does not survive `augur down && up` (only the main checkout's project leaf is persisted). See `docs/claude-worktree-support-design.md` for the full trade-offs.
+> Claude Code's `--worktree` isn't specially supported (`augur claude --worktree ...` won't forward the flag). If you want it anyway: run `augur shell`, then type `claude --worktree <name>` yourself at the prompt — the worktree's files/git state persist fine, but its conversation history does not survive `augur down && up` (only the main checkout's project leaf is persisted). See `docs/decisions/0004-no-special-worktree-support.md` for the full trade-offs.
 
 ### Requirements
 
@@ -181,7 +181,7 @@ every `up` (the same way it does for the GitHub token):
 > Same caveat as container mode for Claude Code's `--worktree`: not specially supported, but `augur shell --macos` +
 > manually running `claude --worktree <name>` works today. Unlike container mode, its conversation history *does*
 > survive `augur down --macos`/`up --macos` (the VM's disk is stopped, not destroyed, until `augur destroy --macos`).
-> See `docs/claude-worktree-support-design.md`.
+> See `docs/decisions/0004-no-special-worktree-support.md`.
 
 ### Running `xcodebuild test`
 

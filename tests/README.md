@@ -1,6 +1,6 @@
 # augur tests
 
-Automated checks for the **agent ACL seam** (`docs/swappable-agent-abstraction-design.md`).
+Automated checks for the **agent ACL seam** (`docs/decisions/0003-swappable-agent-abstraction.md`).
 They replace the by-hand `chk` runs: the goal is to prove the refactor stays
 **byte-identical** — the seam emits the right data, and augur builds the right
 `container run` / `container exec` / macOS-launch commands from it.

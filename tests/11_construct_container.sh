@@ -4,7 +4,7 @@
 # a shimmed `container` on PATH, then asserts the constructed `container run` / `container
 # exec` argv carries exactly what the agent seam declares: auth env (named-only), the
 # cwd-keyed history mount, the fixed env, and the launch argv. This is the doc's
-# "byte-identical argv" check (docs/swappable-agent-abstraction-design.md §5 DoD) without a
+# "byte-identical argv" check (docs/decisions/0003-swappable-agent-abstraction.md §5 DoD) without a
 # live container.
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/.." && pwd)"
 source "$HERE/lib.sh"
