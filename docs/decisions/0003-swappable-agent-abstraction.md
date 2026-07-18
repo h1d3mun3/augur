@@ -14,7 +14,7 @@
   review of PR#35 / real-agent research / design → adversarial review, 34 findings). The
   load-bearing facts were re-verified by hand with `grep`.
 
-> This document is a sequel to `docs/ollama-llm-endpoint-design.md` (PR#35); its core themes are
+> This document is a sequel to `docs/decisions/0002-per-run-agent-llm-profiles.md` (PR#35); its core themes are
 > "separate the axes" and "the integrity-provenance problem."
 
 ---
@@ -22,7 +22,7 @@
 ## Conclusion (key points)
 
 - **augur's durable asset is the sandbox** (egress allowlist, isolation, no host sudo). Claude Code
-  is a **swappable payload** on top of it — a design insight `docs/ollama-llm-endpoint-design.md`
+  is a **swappable payload** on top of it — a design insight `docs/decisions/0002-per-run-agent-llm-profiles.md`
   already captured correctly.
 - The goal is to insert **one ACL (Anti-Corruption Layer)**: a translation layer that keeps
   Claude-Code-specific concerns from leaking into augur's "domain" (the sandbox: egress, isolation,

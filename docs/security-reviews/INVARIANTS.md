@@ -4,6 +4,12 @@ This is a **contract** (properties that must always hold), not a description of 
 current state. Where a [snapshot](./README.md) **describes** "how it works at a point
 in time," this **prescribes** "what must never break." It changes rarely.
 
+> **Foundational principle — augur is sudo-free.** It never requires root on a production
+> path. That is *why* the invariants below are enforced with unprivileged mechanisms, and
+> why some risks are documented-and-accepted rather than closed by taking privilege. Before
+> proposing "just use sudo/`pf` here," read
+> [`decisions/0001-sudo-free.md`](../decisions/0001-sudo-free.md).
+
 ## Operating rules
 
 - A normal security fix only needs to **keep this contract green** — you do not edit
