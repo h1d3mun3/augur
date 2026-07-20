@@ -31,6 +31,7 @@ Newest on top.
 
 | Date | Scope | File |
 |---|---|---|
+| 2026-07-20 | Current-state review focused on egress control (re-baseline — SOCKS deny-log injection fix (#37), connection-cap slot-leak fix (#36→#101), exfiltration ceiling closed by ADR-0008, `install-cert` confirmed inert to the egress boundary) | [2026-07-20-egress.md](./2026-07-20-egress.md) |
 | 2026-07-10 | Current-state review focused on egress control (re-baseline — Docker removed, two engines; elevates the RW-workspace `.git/hooks` host-reach risk) | [2026-07-10-egress.md](./2026-07-10-egress.md) |
 | 2026-07-08 | Current-state review focused on egress control (re-baseline — covers base-image custom provisioning, PR #78) | [2026-07-08-egress.md](./2026-07-08-egress.md) |
 | 2026-07-02 | Current-state review focused on egress control (re-baseline) | [2026-07-02-egress.md](./2026-07-02-egress.md) |
