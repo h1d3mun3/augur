@@ -42,4 +42,21 @@ final class SecurityTests: XCTestCase {
         return u16(entry.count) + entry
     }
     private func u16(_ v: Int) -> [UInt8] { [UInt8((v >> 8) & 0xff), UInt8(v & 0xff)] }
+
+    // #37 — the SOCKS deny path logs `dest.host` before it's ever validated (that's
+    // why it's denied), so a crafted domain must not be able to forge/split lines in
+    // the append-only decision log.
+    func testDecisionLogSanitizesControlBytesInDeniedHost() throws {
+        let path = NSTemporaryDirectory() + "augur-decision-log-\(UUID().uuidString).log"
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let log = DecisionLog(path: path)
+
+        log.deny(client: "203.0.113.5", host: "evil.com\r\nALLOW client=fake dst=github.com:443 via=forged", port: 443, reason: "not-in-allowlist")
+
+        let contents = try String(contentsOfFile: path, encoding: .utf8)
+        let lines = contents.split(separator: "\n", omittingEmptySubsequences: true)
+        XCTAssertEqual(lines.count, 1, "a single deny() call must produce exactly one log line, not attacker-forged extras")
+        XCTAssertFalse(contents.contains("\r"), "raw CR must never reach the log file")
+        XCTAssertTrue(contents.contains("evil.com\\x0d\\x0aALLOW"), "the injected bytes should survive, escaped, for forensic value")
+    }
 }
