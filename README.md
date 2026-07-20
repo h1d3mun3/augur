@@ -320,7 +320,7 @@ In every mode the proxy decides by domain (the CONNECT host, or the TLS SNI / HT
 
 The host ports the proxy uses are derived per-project so two egress-enabled projects can run at once; override with `AUGUR_PROXY_HTTP_PORT` / `AUGUR_PROXY_SOCKS_PORT` / `AUGUR_SSH_FWD_PORT` if needed.
 
-> **Scope.** This guarantees *"the guest can only reach allowlisted domains."* DNS is gated on the same allowlist (a name resolves only if it's connectable), so the guest can't tunnel data out via DNS queries either. It is still **not** exfiltration-proof: an allowlisted, writable host (e.g. `github.com` with your `GH_TOKEN`) and the shared workspace are intentional channels. See `augur-proxy/README.md` and `gvproxy/README.md`.
+> **Scope.** This guarantees *"the guest can only reach allowlisted domains."* DNS is gated on the same allowlist (a name resolves only if it's connectable), so the guest can't tunnel data out via DNS queries either. It is still **not** exfiltration-proof: an allowlisted, writable host (e.g. `github.com` with your `GH_TOKEN`) and the shared workspace are intentional channels. This is a deliberate, accepted boundary, not a gap augur intends to close — see [`docs/decisions/0008-exfiltration-ceiling-accepted.md`](docs/decisions/0008-exfiltration-ceiling-accepted.md) for why. See also `augur-proxy/README.md` and `gvproxy/README.md`.
 
 ---
 
