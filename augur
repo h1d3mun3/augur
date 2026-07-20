@@ -515,6 +515,43 @@ scp_to_macos() {
         "$src" "${MACOS_SSH_USER}@${host}:${dst}"
 }
 
+# One-time bootstrap SSH into a freshly-built VM whose only credential is the fixed admin
+# password (the SSH key isn't installed yet). OpenSSH's own SSH_ASKPASS + SSH_ASKPASS_REQUIRE=force
+# (OpenSSH >= 8.4; macOS ships 10.x) feed the known password non-interactively — no human prompt and
+# no third-party tool (sshpass would need a non-core Homebrew tap, violating the base-VM build's
+# "no third-party tools" principle). SSH_ASKPASS_REQUIRE=force is the key: it makes askpass answer
+# the *login password* prompt (not just key passphrases) even WITH a controlling TTY and WITHOUT
+# DISPLAY, so no setsid/fake-DISPLAY dance is needed. The askpass helper answers ONLY password
+# prompts; StrictHostKeyChecking=accept-new (as in ssh_macos) means the host-key question never
+# reaches it. Uses the same per-VM known_hosts file as ssh_macos, so the accepted host key carries
+# over to the key-auth calls that follow. Hermetic (-F /dev/null): never forward host env, per ssh_macos.
+ssh_macos_bootstrap() {
+    local vm="$1" host="$2"; shift 2
+    [[ -n "$host" ]] || { error "Cannot resolve SSH host for '${vm}'."; exit 1; }
+    local askpass
+    askpass="$(mktemp "${TMPDIR:-/tmp}/augur-askpass.XXXXXX")" \
+        || { error "Failed to create SSH askpass helper."; exit 1; }
+    chmod 700 "$askpass"
+    # Embed the (already-public) password via %q; reply to password prompts only, else exit 1.
+    printf '#!/bin/bash\ncase "$1" in *[Pp]assword:*) printf "%%s\\n" %q ;; *) exit 1 ;; esac\n' \
+        "$MACOS_SSH_USER" > "$askpass"
+    # Explicit cleanup (not `trap … RETURN`): a RETURN trap is not function-local — it would
+    # persist and re-fire on the caller's return, where $askpass is out of scope (fatal under
+    # `set -u`), and it also wouldn't fire when `set -e` aborts on a failed ssh (leaking the file).
+    # Capture the ssh status, remove the helper on every path, then propagate the status.
+    local rc=0
+    SSH_ASKPASS="$askpass" SSH_ASKPASS_REQUIRE=force \
+    ssh -F /dev/null \
+        -o StrictHostKeyChecking=accept-new \
+        -o UserKnownHostsFile="$(vm_known_hosts_file "$vm")" \
+        -o LogLevel=ERROR \
+        -o ConnectTimeout=10 \
+        -o PreferredAuthentications=password,keyboard-interactive \
+        "${MACOS_SSH_USER}@${host}" "$@" || rc=$?
+    rm -f "$askpass"
+    return $rc
+}
+
 # ── Egress proxy helpers (shared by container and macOS modes) ────────────────
 
 # Resolve the augur-proxy binary: explicit override, PATH, install dir, local build.
@@ -1679,35 +1716,28 @@ cmd_build_macos() {
     # entry so the TOFU check below stores the new key cleanly.
     rm -f "$(vm_known_hosts_file "$MACOS_BUILD_VM")"
 
-    # Configure passwordless sudo so subsequent ssh_macos calls don't need a TTY
-    info "Configuring passwordless sudo..."
-    # Hermetic SSH (-F /dev/null): never forward host env into the VM (see ssh_macos).
-    ssh -F /dev/null \
-        -o StrictHostKeyChecking=accept-new \
-        -o UserKnownHostsFile="$(vm_known_hosts_file "$MACOS_BUILD_VM")" \
-        -o LogLevel=ERROR \
-        -o ConnectTimeout=10 \
-        "${MACOS_SSH_USER}@${vm_ip}" \
-        "echo '${MACOS_SSH_USER}' | sudo -S bash -c \
-            'echo \"${MACOS_SSH_USER} ALL=(ALL) NOPASSWD:ALL\" > /etc/sudoers.d/augur \
-             && chmod 440 /etc/sudoers.d/augur'"
-
-    # Set up SSH key authentication (password only needed this once)
+    # Set up SSH key authentication FIRST. This is the ONLY step that needs the fixed admin
+    # password; augur feeds it non-interactively via SSH_ASKPASS (ssh_macos_bootstrap) — the
+    # operator types nothing here. Installing the key is a plain write to the user's own ~/.ssh
+    # (no sudo), so it can run first; every step after this uses key auth.
     info "Setting up SSH key authentication..."
     if [[ ! -f "$MACOS_SSH_KEY" ]]; then
         mkdir -p "$(dirname "$MACOS_SSH_KEY")"
         ssh-keygen -t ed25519 -f "$MACOS_SSH_KEY" -N "" -C "augur-vm"
     fi
-    # Hermetic SSH (-F /dev/null): never forward host env into the VM (see ssh_macos).
-    ssh -F /dev/null \
-        -o StrictHostKeyChecking=accept-new \
-        -o UserKnownHostsFile="$(vm_known_hosts_file "$MACOS_BUILD_VM")" \
-        -o LogLevel=ERROR \
-        -o ConnectTimeout=10 \
-        "${MACOS_SSH_USER}@${vm_ip}" \
+    ssh_macos_bootstrap "$MACOS_BUILD_VM" "$vm_ip" \
         "mkdir -p ~/.ssh && chmod 700 ~/.ssh && \
          echo '$(cat "${MACOS_SSH_KEY}.pub")' >> ~/.ssh/authorized_keys && \
          chmod 600 ~/.ssh/authorized_keys"
+
+    # Configure passwordless sudo so subsequent ssh_macos calls don't need a TTY. The key is
+    # installed now, so this runs over key auth (no login-password prompt); the sudo password is
+    # still piped via `sudo -S`, and the account is still admin/admin at this point.
+    info "Configuring passwordless sudo..."
+    ssh_macos "$MACOS_BUILD_VM" \
+        "echo '${MACOS_SSH_USER}' | sudo -S -p '' bash -c \
+            'echo \"${MACOS_SSH_USER} ALL=(ALL) NOPASSWD:ALL\" > /etc/sudoers.d/augur \
+             && chmod 440 /etc/sudoers.d/augur'"
 
     # NOTE: the workspace is exposed at ~/workspace-<slug> (a symlink to the virtiofs auto-mount under
     # "/Volumes/My Shared Files/"), created at runtime by ensure_macos_workspace — no
@@ -3011,7 +3041,7 @@ run_base_provisioning() {
     # establishes it fresh in that case). Same fixed admin/admin credential the rest of the
     # build already depends on (see cmd_build_macos Step 3/4).
     ssh_macos_provision "$vm" \
-        "echo '${MACOS_SSH_USER}' | sudo -S bash -c \
+        "echo '${MACOS_SSH_USER}' | sudo -S -p '' bash -c \
             'echo \"${MACOS_SSH_USER} ALL=(ALL) NOPASSWD:ALL\" > /etc/sudoers.d/augur \
              && chmod 440 /etc/sudoers.d/augur'" \
         || provision_fail "Failed to grant temporary sudo for provisioning."

@@ -74,6 +74,67 @@ else
   fail "augur-vm/Sources/augur-vm/Clone.swift present" "not found at $clone_src"
 fi
 
+section "Tier 2 — macOS build SSH bootstrap: no human-typed password (source guard, run anywhere)"
+# The base-VM build's first SSH calls run before key auth exists. They must NOT fall back to an
+# interactive login-password prompt — augur feeds the fixed admin password via OpenSSH's own
+# SSH_ASKPASS (SSH_ASKPASS_REQUIRE=force, ssh_macos_bootstrap), so the operator types nothing
+# after Setup Assistant. The key is installed FIRST, so the sudo-config and everything after run
+# over key auth (a single password-auth connection).
+build_macos="$(awk '/^cmd_build_macos\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
+boot_fn="$(awk '/^ssh_macos_bootstrap\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
+# (1) the build reaches the guest only via the ssh_macos* helpers — never a raw password `ssh`.
+has   "$build_macos" 'ssh_macos_bootstrap' "build installs the SSH key via ssh_macos_bootstrap (askpass), not a raw ssh"
+hasnt "$build_macos" 'ssh -F /dev/null'    "build has no raw password 'ssh -F /dev/null' left (all via ssh_macos* helpers)"
+# (2) the bootstrap helper forces askpass and answers ONLY password prompts.
+has "$boot_fn" 'SSH_ASKPASS_REQUIRE=force'        "bootstrap forces askpass even with a TTY / no DISPLAY (OpenSSH >=8.4)"
+has "$boot_fn" 'StrictHostKeyChecking=accept-new' "bootstrap pre-accepts the fresh host key (keeps the yes/no prompt off askpass)"
+has "$boot_fn" '*[Pp]assword:*'                   "bootstrap askpass replies to password prompts only (never feeds the host-key question)"
+# (3) key install must precede the passwordless-sudo config (so sudo config runs over key auth).
+key_ln="$(printf '%s\n' "$build_macos"  | grep -n 'Setting up SSH key authentication' | head -1 | cut -d: -f1)"
+sudo_ln="$(printf '%s\n' "$build_macos" | grep -n 'Configuring passwordless sudo'      | head -1 | cut -d: -f1)"
+if [[ -n "$key_ln" && -n "$sudo_ln" && "$key_ln" -lt "$sudo_ln" ]]; then
+  ok "build installs the SSH key before configuring passwordless sudo (single password-auth connection)"
+else
+  fail "build orders key-install before sudo-config" "key@${key_ln:-?} sudo@${sudo_ln:-?}"
+fi
+# The helper must clean up explicitly and propagate ssh's status — NOT via a `trap … RETURN`
+# (a RETURN trap isn't function-local: it re-fires on the caller's return where $askpass is out
+# of scope → fatal under `set -u`, and it doesn't fire when `set -e` aborts on a failed ssh).
+has "$boot_fn" 'rm -f "$askpass"' "bootstrap removes the temp askpass helper explicitly (not via RETURN trap)"
+has "$boot_fn" 'return $rc'       "bootstrap propagates ssh's exit status to the caller"
+
+section "Tier 2 — macOS build SSH bootstrap: cleanup + status (execution guard, run anywhere)"
+# Regression guard for the RETURN-trap bug: extract ssh_macos_bootstrap, stub its deps + ssh, and
+# exercise it inside a caller under `set -euo pipefail`. Assert: (success) rc 0, the caller returns
+# cleanly with NO unbound-variable crash, temp helper removed; (failure) status propagates so the
+# build aborts, temp helper still removed.
+boot_src="$(mktemp)"; boot_td="$(mktemp -d)"
+awk '/^ssh_macos_bootstrap\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR" > "$boot_src"
+_stubs='error(){ :; }; vm_known_hosts_file(){ echo /dev/null; }; MACOS_SSH_USER=admin;'
+# success path
+out_s="$(TMPDIR="$boot_td" bash -euo pipefail -c '
+  source "$1"; '"$_stubs"'
+  ssh(){ return 0; }
+  outer(){ ssh_macos_bootstrap vm 1.2.3.4 "true"; echo BANNER; }
+  outer; echo AFTER_OUTER_OK' _ "$boot_src" 2>&1)"; rc_s=$?
+left_s="$(find "$boot_td" -name 'augur-askpass.*' 2>/dev/null | wc -l | tr -d ' ')"
+# failure path
+out_f="$(TMPDIR="$boot_td" bash -euo pipefail -c '
+  source "$1"; '"$_stubs"'
+  ssh(){ return 5; }
+  outer(){ ssh_macos_bootstrap vm 1.2.3.4 "true"; echo SHOULD_NOT_PRINT; }
+  outer; echo SHOULD_NOT_PRINT_MAIN' _ "$boot_src" 2>&1)"; rc_f=$?
+left_f="$(find "$boot_td" -name 'augur-askpass.*' 2>/dev/null | wc -l | tr -d ' ')"
+rm -rf "$boot_src" "$boot_td"
+
+eq "0" "$rc_s" "bootstrap: successful build path exits 0 (no persistent-RETURN-trap crash)"
+has "$out_s" "AFTER_OUTER_OK" "bootstrap: caller returns cleanly after the helper (no unbound-variable abort)"
+eq "0" "$left_s" "bootstrap: temp askpass helper removed on the success path"
+if [[ "$rc_f" -ne 0 ]]; then ok "bootstrap: a failed ssh propagates non-zero (build aborts under set -e)"
+else fail "bootstrap: a failed ssh must propagate non-zero" "got rc=$rc_f"; fi
+hasnt "$out_f" "SHOULD_NOT_PRINT" "bootstrap: set -e aborts the caller when the helper fails"
+eq "0" "$left_f" "bootstrap: temp askpass helper removed on the failure path too"
+
 section "Tier 2 — macOS live smoke (gated)"
 if [[ "$(uname -s)" != "Darwin" ]]; then skip "live macOS checks" "not a macOS host"; finish; exit $?; fi
 if ! command -v augur-vm >/dev/null 2>&1; then skip "live macOS checks" "augur-vm not built (run: bash install)"; finish; exit $?; fi
