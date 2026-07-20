@@ -1477,6 +1477,8 @@ cmd_install_cert() {
         exit 1
     fi
     success "Custom CA installed into image '${IMAGE_NAME}'."
+    # Same rebuild-orphans-the-previous-image effect as `update` — see the comment there.
+    eng image prune
     info "Trusted by OS-store clients: curl, git, wget, gh, and Claude Code. Tools with their OWN"
     info "trust store need their own knob: Node/npm → ${BOLD}NODE_EXTRA_CA_CERTS${RESET}, Python → ${BOLD}REQUESTS_CA_BUNDLE${RESET}."
     warn "Single custom root: re-running ${BOLD}install-cert${RESET} REPLACES it (not additive)."
@@ -1553,6 +1555,10 @@ cmd_update() {
     while IFS= read -r _a; do build_args+=("$_a"); done < <(container_provision_build_args)
     eng build "${build_args[@]}" -t "$IMAGE_NAME" "$SCRIPT_DIR"
     success "Image '${IMAGE_NAME}' updated successfully."
+    # --no-cache retags $IMAGE_NAME onto a freshly built image; the previous generation's
+    # layers lose their tag and become dangling. Without this they'd silently accumulate
+    # on every update (observed: tens of GB after repeated updates).
+    eng image prune
     warn "Existing containers use the old image. Run ${BOLD}augur down && augur up${RESET} to apply."
 }
 
@@ -3310,6 +3316,11 @@ cmd_help() {
     echo -e "                          ${BOLD}augur build${RESET} / ${BOLD}augur update${RESET}."
     echo -e "                          ${BOLD}augur init-conf${RESET} scaffolds commented-out templates for both (empty"
     echo -e "                          templates never trigger provisioning on their own)."
+    echo -e "    • ${BOLD}build${RESET}/${BOLD}update${RESET} reuse the same image tag, so a rebuild orphans the previous generation's"
+    echo -e "      layers as dangling; ${BOLD}update${RESET}/${BOLD}install-cert${RESET} self-prune (${CYAN}container image prune${RESET}) right"
+    echo -e "      after rebuilding, so this no longer accumulates on its own. For manual disk cleanup"
+    echo -e "      beyond that (either mode), see the README's ${BOLD}Disk cleanup${RESET} sections or"
+    echo -e "      ${CYAN}docs/decisions/0005-no-prune-command.md${RESET}."
     echo -e "    • ${BOLD}install-cert${RESET}: trust a private/self-signed CA in the guest (edge case). Pass ONE PEM"
     echo -e "      X.509 cert (${CYAN}.crt${RESET}). Container bakes it into the image (dropped by ${BOLD}build${RESET}/${BOLD}update${RESET} — re-run);"
     echo -e "      macOS adds it to the base VM's System keychain (approve the prompt in the VM window; new"
