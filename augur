@@ -1735,7 +1735,7 @@ cmd_build_macos() {
     # still piped via `sudo -S`, and the account is still admin/admin at this point.
     info "Configuring passwordless sudo..."
     ssh_macos "$MACOS_BUILD_VM" \
-        "echo '${MACOS_SSH_USER}' | sudo -S bash -c \
+        "echo '${MACOS_SSH_USER}' | sudo -S -p '' bash -c \
             'echo \"${MACOS_SSH_USER} ALL=(ALL) NOPASSWD:ALL\" > /etc/sudoers.d/augur \
              && chmod 440 /etc/sudoers.d/augur'"
 
@@ -3041,7 +3041,7 @@ run_base_provisioning() {
     # establishes it fresh in that case). Same fixed admin/admin credential the rest of the
     # build already depends on (see cmd_build_macos Step 3/4).
     ssh_macos_provision "$vm" \
-        "echo '${MACOS_SSH_USER}' | sudo -S bash -c \
+        "echo '${MACOS_SSH_USER}' | sudo -S -p '' bash -c \
             'echo \"${MACOS_SSH_USER} ALL=(ALL) NOPASSWD:ALL\" > /etc/sudoers.d/augur \
              && chmod 440 /etc/sudoers.d/augur'" \
         || provision_fail "Failed to grant temporary sudo for provisioning."
