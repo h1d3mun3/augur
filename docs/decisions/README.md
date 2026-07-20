@@ -34,6 +34,7 @@ An ADR here is none of those: it is the standing *rationale* behind a decision.
 | [0004](./0004-no-special-worktree-support.md) | **No special `--worktree` support** — deliberate non-fix; the history-mount trade-off is documented instead. |
 | [0005](./0005-no-prune-command.md) | **No `prune`/cleanup command** — reclaiming disk beyond automatic self-prune is documented as raw `container`/`augur-vm` commands instead. |
 | [0006](./0006-macos-vm-clone-persistence.md) | **`down --macos` keeps the clone** — macOS VM mode is Xcode-exclusive, so preserving DerivedData/Simulator/SPM-CocoaPods state across restarts outweighs the disposability Container mode's `down` favors. |
+| [0007](./0007-macos-build-fixed-credential.md) | **macOS build keeps fixed `admin`/`admin`** — declines L2's randomize suggestion (keychain-desync footgun on the load-bearing auto-login path vs. an effective-Info gain); instead removes the operator-typed SSH prompt via OpenSSH `SSH_ASKPASS`. |
 
 > Numbering: 0001 is the foundational principle (recorded latest but conceptually first);
-> 0002–0006 follow their original decision dates.
+> 0002–0007 follow their original decision dates.
