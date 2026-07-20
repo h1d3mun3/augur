@@ -76,6 +76,7 @@ Hardcoded in `agent_fixed_env`. Container: `container exec -e DISABLE_AUTOUPDATE
 | `AUGUR_PROXY_HTTP_PORT`, `AUGUR_CONTAINER_GATEWAY` | Host-only gateway IP+port; value embedded in the guest `HTTP_PROXY` string (in `cmd_up` / `egress_proxy_url`) | Value-only (non-secret internal address) |
 | `AUGUR_CONTAINER_MEMORY` | Sets the host-side `--memory` run flag on Apple Container (in `resolve_container_memory`) | No |
 | `AUGUR_PROXY_MAX_CONNECTIONS` | Read by the **host-side** augur-proxy process to size its connection cap (`augur-proxy` `main.swift`) | No (the proxy runs host-side, not in the agent guest) |
+| `AUGUR_PROXY_IDLE_TIMEOUT` | Read by the **host-side** augur-proxy process to size its established-tunnel idle timeout (`augur-proxy` `main.swift`) | No (host-side only) |
 | `AUGUR_VM_BIN`, `AUGUR_PROXY_BIN`, `AUGUR_GVPROXY_BIN` | Host path overrides for the backend binaries | No |
 | `AUGUR_GLOBAL_CONF` | Path to the global egress allowlist; contents merged into a host-side allowlist enforced by the proxy | No |
 | `AUGUR_EGRESS` | Host-side on/off switch for egress filtering | No |

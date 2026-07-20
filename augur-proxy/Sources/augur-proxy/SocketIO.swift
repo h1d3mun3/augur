@@ -133,10 +133,20 @@ enum Sock {
     }
 
     /// Apply a receive timeout (seconds) so a peer that connects but never sends
-    /// can't pin a handler thread forever (used while peeking SNI/Host).
+    /// can't pin a handler thread forever (used while peeking SNI/Host, and as the
+    /// idle-tunnel poll interval in `splice`). `seconds: 0` clears it (block forever).
     static func setReadTimeout(_ fd: Int32, seconds: Int) {
         var tv = timeval(tv_sec: seconds, tv_usec: 0)
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+    }
+
+    /// Apply a send timeout (seconds). Used alongside `setReadTimeout` for the idle-tunnel
+    /// poll in `splice`: without it, a peer that stops draining (e.g. a guest that stopped
+    /// reading, driving our `write()` to block on a zero receive window) would pin a
+    /// connectionCap slot forever, defeating the idle timeout (#101). `seconds: 0` clears it.
+    static func setWriteTimeout(_ fd: Int32, seconds: Int) {
+        var tv = timeval(tv_sec: seconds, tv_usec: 0)
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
     }
 
     /// Enable TCP keepalives so dead peers are detected and stalled splice threads
@@ -177,23 +187,65 @@ enum Sock {
     }
 
     /// Copy bytes one way until EOF, then half-close the destination's write side.
-    static func splice(from src: Int32, to dst: Int32) {
+    ///
+    /// With `idle != nil`, both fds carry `SO_RCVTIMEO`/`SO_SNDTIMEO` (set by the caller), so a
+    /// read/write that times out returns -1/EAGAIN instead of blocking forever. That is NOT an
+    /// EOF: we consult the SHARED idle clock and tear the tunnel down only if BOTH directions
+    /// have been silent past the threshold — otherwise the peer direction is still active and we
+    /// keep going. Activity (bytes read OR written) bumps the shared clock. On idle expiry we
+    /// shut down BOTH fds (not just a half-close) so the peer splice thread's blocked call
+    /// returns promptly instead of stranding and pinning a connectionCap slot (#101).
+    ///
+    /// With `idle == nil` this is byte-for-byte the pre-#101 behavior: no timeout is set, `n < 0`
+    /// is always a genuine error (→ break), and teardown is the original single half-close.
+    ///
+    /// LOAD-BEARING INVARIANT: both fds must be BLOCKING (they are — client fds come from a plain
+    /// `accept()`, upstream fds are restored to blocking after the non-blocking connect). The only
+    /// source of EAGAIN here is therefore the `SO_*TIMEO` we install; if an fd were ever made
+    /// non-blocking, the `.idleTimeout` `continue` would become a hot spin.
+    static func splice(from src: Int32, to dst: Int32, idle: IdleTracker? = nil) {
+        let idleOn = idle != nil
         var buf = [UInt8](repeating: 0, count: 65536)
-        while true {
+        var idleExpired = false
+        reading: while true {
             let n = buf.withUnsafeMutableBytes { Glibc_read(src, $0.baseAddress, $0.count) }
-            if n <= 0 { break }
-            var off = 0
-            var failed = false
-            buf.withUnsafeBytes { raw in
-                while off < n {
-                    let w = Glibc_write(dst, raw.baseAddress!.advanced(by: off), n - off)
-                    if w <= 0 { failed = true; break }
-                    off += w
+            let rWouldBlock = n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)  // read errno immediately
+            switch classifyRead(n: n, wouldBlock: rWouldBlock, idleEnabled: idleOn) {
+            case .eof, .error:
+                break reading
+            case .idleTimeout:
+                if idle!.expired(DispatchTime.now().uptimeNanoseconds) { idleExpired = true; break reading }
+                continue reading   // peer direction still active — keep waiting
+            case .data(let count):
+                idle?.bump(DispatchTime.now().uptimeNanoseconds)
+                var off = 0
+                writing: while off < count {
+                    let w = buf.withUnsafeBytes {
+                        Glibc_write(dst, $0.baseAddress!.advanced(by: off), count - off)
+                    }
+                    let wWouldBlock = w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)  // read errno immediately
+                    switch classifyWrite(w: w, wouldBlock: wWouldBlock, idleEnabled: idleOn) {
+                    case .wrote(let c):
+                        off += c
+                        idle?.bump(DispatchTime.now().uptimeNanoseconds)
+                    case .idleTimeout:
+                        if idle!.expired(DispatchTime.now().uptimeNanoseconds) { idleExpired = true; break reading }
+                        continue writing   // peer within window — keep trying to drain
+                    case .error:
+                        break reading
+                    }
                 }
             }
-            if failed { break }
         }
-        shutdown(dst, shutWrite)
+        if idleExpired {
+            // Joint teardown so the peer splice thread's blocked read/write returns promptly
+            // (EOF) instead of stranding + pinning the slot (#101). Redundant shutdowns from the
+            // two threads are harmless (ENOTCONN, ignored).
+            shutdown(src, shutReadWrite)
+            shutdown(dst, shutReadWrite)
+        } else {
+            shutdown(dst, shutWrite)   // normal EOF/error: original half-close, unchanged
+        }
     }
 
     /// True for any destination that is NOT a globally-routable public address, so
@@ -270,6 +322,7 @@ enum PosixThread {
 #if canImport(Glibc)
 let sockStreamType = Int32(SOCK_STREAM.rawValue)
 let shutWrite = Int32(SHUT_WR)
+let shutReadWrite = Int32(SHUT_RDWR)
 let ipprotoIPV6 = Int32(IPPROTO_IPV6)
 let ipv6V6Only = Int32(IPV6_V6ONLY)
 let Glibc_listen = Glibc.listen
@@ -279,6 +332,7 @@ let Glibc_write = Glibc.write
 #elseif canImport(Darwin)
 let sockStreamType = SOCK_STREAM
 let shutWrite = SHUT_WR
+let shutReadWrite = SHUT_RDWR
 let ipprotoIPV6 = Int32(IPPROTO_IPV6)
 let ipv6V6Only = Int32(IPV6_V6ONLY)
 let Glibc_listen = Darwin.listen

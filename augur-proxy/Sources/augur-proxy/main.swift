@@ -31,6 +31,12 @@ struct Options {
     // per-process thread ceiling; raise for heavy multi-agent workloads. Precedence:
     // --max-connections flag > AUGUR_PROXY_MAX_CONNECTIONS env > default.
     var maxConnections = 128
+    // Tear down an established tunnel after this many seconds with no bytes moving in EITHER
+    // direction, so an idle guest can't pin a connection slot forever (#101). 900s is well
+    // beyond any real streaming gap (SSE tokens flow sub-second; idle keep-alive connections
+    // are closed and transparently reopened) yet bounds the slot-pinning DoS. 0 disables it
+    // (pre-#101 infinite-idle behavior). Precedence: --idle-timeout > AUGUR_PROXY_IDLE_TIMEOUT > default.
+    var idleTimeoutSecs = 900
 }
 
 func parseOptions() -> Options {
@@ -38,6 +44,10 @@ func parseOptions() -> Options {
     if let env = ProcessInfo.processInfo.environment["AUGUR_PROXY_MAX_CONNECTIONS"],
        let v = Int(env), v > 0 {
         o.maxConnections = v
+    }
+    if let env = ProcessInfo.processInfo.environment["AUGUR_PROXY_IDLE_TIMEOUT"],
+       let v = Int(env), v >= 0 {
+        o.idleTimeoutSecs = v
     }
     var args = Array(CommandLine.arguments.dropFirst())
     func next(_ flag: String) -> String {
@@ -52,6 +62,7 @@ func parseOptions() -> Options {
         case "--http-port":   o.httpPort = parsePort(next(a), a)
         case "--socks-port":  o.socksPort = parsePort(next(a), a)
         case "--max-connections": o.maxConnections = parseCount(next(a), a)
+        case "--idle-timeout": o.idleTimeoutSecs = parseNonNegative(next(a), a)
         case "--log":         o.logPath = next(a)
         case "--pidfile":     o.pidfile = next(a)
         case "--allow-private": o.publicOnly = false
@@ -66,8 +77,8 @@ func printUsage() {
     FileHandle.standardError.write(Data("""
     usage: augur-proxy --allowlist <path> [--listen 127.0.0.1]
                        [--http-port N] [--socks-port N]
-                       [--max-connections N] [--log <path>] [--pidfile <path>]
-                       [--allow-private]
+                       [--max-connections N] [--idle-timeout SECONDS]
+                       [--log <path>] [--pidfile <path>] [--allow-private]
     \n
     """.utf8))
 }
@@ -84,6 +95,11 @@ func parsePort(_ s: String, _ flag: String) -> UInt16 {
 
 func parseCount(_ s: String, _ flag: String) -> Int {
     guard let v = Int(s), v > 0 else { die("bad value for \(flag): \(s) (expected a positive integer)") }
+    return v
+}
+
+func parseNonNegative(_ s: String, _ flag: String) -> Int {
+    guard let v = Int(s), v >= 0 else { die("bad value for \(flag): \(s) (expected a non-negative integer)") }
     return v
 }
 
@@ -105,8 +121,9 @@ guard let initialList = loadAllowlist(opts.allowlist) else {
 let log = DecisionLog(path: opts.logPath, alsoStderr: opts.logPath == nil)
 let filter = Filter(allowlist: initialList)
 let server = ProxyServer(filter: filter, log: log, publicOnly: opts.publicOnly,
-                         maxConnections: opts.maxConnections)
+                         maxConnections: opts.maxConnections, idleTimeoutSecs: opts.idleTimeoutSecs)
 log.info("max concurrent connections: \(opts.maxConnections) (≈\(opts.maxConnections * 2) threads)")
+log.info("idle tunnel timeout: \(opts.idleTimeoutSecs == 0 ? "disabled" : "\(opts.idleTimeoutSecs)s")")
 
 if initialList.isEmpty {
     log.info("allowlist is empty — all egress will be DENIED")

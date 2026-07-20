@@ -62,6 +62,11 @@ jobs:
       # Only binds 127.0.0.1 (no loopback alias needed). Self-skips if the binary is missing.
       - name: Proxy connection cap under load (real binary)
         run: bash tests/24_proxy_concurrency.sh
+      # Idle-timeout on established tunnels (#101): an idle tunnel is reclaimed, a low-traffic
+      # stream survives, --idle-timeout 0 disables. Uses a loopback perl sink as the upstream
+      # (both ship on the runner); only binds 127.0.0.1. Self-skips if the binary or perl is absent.
+      - name: Proxy idle-timeout on established tunnels (real binary)
+        run: bash tests/25_proxy_idle_timeout.sh
 
   # ── Offline seam + command-construction tiers (shimmed container, no runtime) ─
   offline-tests:
