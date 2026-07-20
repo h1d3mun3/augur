@@ -75,6 +75,8 @@ augur version                   # show augur version
 
 > Auth is env-based in both modes now. If you only ever logged in via the browser, run `augur setup-token` (or set `ANTHROPIC_API_KEY`); see [API keys and authentication](#api-keys-and-authentication). Upgrading from an older augur requires a one-time `augur build` (the image now pre-creates the scoped history dir).
 
+> **The read/write workspace mount includes `.git` — treat it as attacker-controlled.** A prompt-injected agent running inside the container can write `.git/hooks/pre-commit` (or `post-checkout`, `post-merge`, …) into the mounted repo. Git runs repo-local hooks with no trust prompt, so the next `git` command *you* run on the **host** in that repo executes guest-authored code at your full host-user privilege — a complete escape of both the container boundary and the egress allowlist. This isn't a bug augur can close in software: it's inherent to mounting a repo read-write so an agent can edit it. Review diffs before trusting them, and treat `.git/hooks` (and anything else the host later runs unreviewed, e.g. a `Makefile` or `.envrc`) in an augur-touched repo as attacker-controlled until inspected. See `docs/security-reviews/2026-07-10-egress.md` §6 item 12.
+
 > Claude Code's `--worktree` isn't specially supported (`augur claude --worktree ...` won't forward the flag). If you want it anyway: run `augur shell`, then type `claude --worktree <name>` yourself at the prompt — the worktree's files/git state persist fine, but its conversation history does not survive `augur down && up` (only the main checkout's project leaf is persisted). See `docs/decisions/0004-no-special-worktree-support.md` for the full trade-offs.
 
 ### Disk cleanup
@@ -198,6 +200,10 @@ every `up` (the same way it does for the GitHub token):
 > The macOS guest auto-mounts the shared directory under `/Volumes/My Shared Files/workspace-<project>`; augur
 > symlinks it to `~/workspace-<project>`. The sealed system volume can't host a symlink at `/workspace`, so the
 > per-project `~/workspace-<project>` path is used in the VM (container mode uses `/workspace-<project>`).
+
+> Same `.git/hooks` host-code-execution risk as container mode: the workspace mount here is read/write too, so a
+> prompt-injected agent can plant a hook that runs on the host at your privilege the next time you `git` in this
+> repo. See the note in [Container mode's File access](#file-access) section.
 
 > Same caveat as container mode for Claude Code's `--worktree`: not specially supported, but `augur shell --macos` +
 > manually running `claude --worktree <name>` works today. Unlike container mode, its conversation history *does*
