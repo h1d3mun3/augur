@@ -35,6 +35,7 @@ An ADR here is none of those: it is the standing *rationale* behind a decision.
 | [0005](./0005-no-prune-command.md) | **No `prune`/cleanup command** — reclaiming disk beyond automatic self-prune is documented as raw `container`/`augur-vm` commands instead. |
 | [0006](./0006-macos-vm-clone-persistence.md) | **`down --macos` keeps the clone** — macOS VM mode is Xcode-exclusive, so preserving DerivedData/Simulator/SPM-CocoaPods state across restarts outweighs the disposability Container mode's `down` favors. |
 | [0007](./0007-macos-build-fixed-credential.md) | **macOS build keeps fixed `admin`/`admin`** — declines L2's randomize suggestion (keychain-desync footgun on the load-bearing auto-login path vs. an effective-Info gain); instead removes the operator-typed SSH prompt via OpenSSH `SSH_ASKPASS`. |
+| [0008](./0008-exfiltration-ceiling-accepted.md) | **The egress allowlist's exfiltration ceiling is accepted, not mitigated** — declines TLS MITM/DLP, per-service authorization, and even opt-in least-privilege helpers (`--no-token`, read-only mount); that need belongs outside augur (dedicated security tooling), not inside it. |
 
 > Numbering: 0001 is the foundational principle (recorded latest but conceptually first);
-> 0002–0007 follow their original decision dates.
+> 0002–0008 follow their original decision dates.
