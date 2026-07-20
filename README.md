@@ -77,6 +77,27 @@ augur version                   # show augur version
 
 > Claude Code's `--worktree` isn't specially supported (`augur claude --worktree ...` won't forward the flag). If you want it anyway: run `augur shell`, then type `claude --worktree <name>` yourself at the prompt — the worktree's files/git state persist fine, but its conversation history does not survive `augur down && up` (only the main checkout's project leaf is persisted). See `docs/decisions/0004-no-special-worktree-support.md` for the full trade-offs.
 
+### Disk cleanup
+
+`augur update`/`augur install-cert` rebuild the image and self-prune the previous generation
+right after (`container image prune`), so normal use doesn't accumulate. For anything beyond
+that — a stray stopped container from a crash mid-`up`, or reclaiming the shared builder's
+own resources — use Apple Container's own commands directly:
+
+```bash
+container prune              # remove stopped containers
+container image prune --all  # remove dangling AND unused tagged base images
+container builder stop       # stop the shared BuildKit builder (see note above), or:
+container builder delete     # delete it outright — also clears its own build cache
+                              # (~/Library/Application Support/com.apple.container/build)
+```
+
+`augur` deliberately doesn't wrap these in a command of its own — they're already one-liners
+in Apple's CLI, and disk cleanup beyond the automatic self-prune is rare enough not to carry
+as a maintained wrapper. `container builder delete` is machine-wide, not scoped to this
+project: it aborts any build in flight anywhere else on the Mac. See
+`docs/decisions/0005-no-prune-command.md`.
+
 ### Requirements
 
 - **Apple Container** (`container`) on macOS 26+
@@ -204,6 +225,25 @@ NSUnbufferedIO=YES xcodebuild test \
 
 If builds are flaky from the shared mount (virtiofs is not tuned for heavy I/O — occasional
 "project is damaged" errors), copy the project to local disk first: `rsync -a ~/workspace-<project>/ ~/Developer/<app>/`.
+
+### Disk cleanup
+
+`augur destroy --macos` removes the *current* project's VM clone — but augur names a clone
+from its project directory, so if that directory is later renamed or moved, the old clone
+becomes unreachable by `destroy` (it's still on disk, just under a name `destroy` no longer
+computes). `augur list --macos` still shows it; remove it directly:
+
+```bash
+augur list --macos       # every VM the store knows about, by name — not just this project's
+augur-vm stop <name>     # if it's running
+augur-vm delete <name>   # remove that VM/clone
+```
+
+Same story for `~/.augur/claude-projects/<vm>/` — a per-clone Claude-history directory that
+`destroy --macos` doesn't touch either; it's plain files, safe to `rm -rf` once you know the
+clone is gone for good. Both are accepted, documented trade-offs, not oversights — see
+`docs/decisions/0004-no-special-worktree-support.md` (§9, "What actually shipped") and
+`docs/decisions/0005-no-prune-command.md`.
 
 ### Requirements
 

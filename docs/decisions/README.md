@@ -32,6 +32,7 @@ An ADR here is none of those: it is the standing *rationale* behind a decision.
 | [0002](./0002-per-run-agent-llm-profiles.md) | **Per-run agent/LLM profiles (local Ollama)** — explored, *not* shipped; kept as a design + SSRF-guard lessons record. |
 | [0003](./0003-swappable-agent-abstraction.md) | **Swappable-agent ACL seam** — do *not* add a second agent now; insert an anti-corruption seam so Claude Code can be peeled off later. |
 | [0004](./0004-no-special-worktree-support.md) | **No special `--worktree` support** — deliberate non-fix; the history-mount trade-off is documented instead. |
+| [0005](./0005-no-prune-command.md) | **No `prune`/cleanup command** — reclaiming disk beyond automatic self-prune is documented as raw `container`/`augur-vm` commands instead. |
 
 > Numbering: 0001 is the foundational principle (recorded latest but conceptually first);
-> 0002–0004 follow their original decision dates.
+> 0002–0005 follow their original decision dates.
