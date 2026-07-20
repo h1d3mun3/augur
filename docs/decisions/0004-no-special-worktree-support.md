@@ -326,7 +326,9 @@ this way, for two independent reasons — either alone would already close gap 2
    (`macos_vm_exists "$project_vm" || ... clone`). So anything written to the VM's own
    filesystem survives an ordinary `down`/`up` cycle. **This reason turns out to be moot
    for `~/.claude/projects` specifically** — see the correction below; item 2 is what
-   actually governs it.
+   actually governs it. (The *reason* the clone is kept at all — independent of the
+   `--worktree`/history question this section is about — is recorded separately in
+   [`0006-macos-vm-clone-persistence.md`](./0006-macos-vm-clone-persistence.md).)
 2. **`~/.claude/projects` is shared as a whole directory, not one pinned leaf.**
    `ensure_macos_claude_projects` symlinks the VM's entire `~/.claude/projects` to
    `/Volumes/My Shared Files/claude-projects`, a virtiofs share backed by a host-side

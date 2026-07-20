@@ -33,6 +33,7 @@ An ADR here is none of those: it is the standing *rationale* behind a decision.
 | [0003](./0003-swappable-agent-abstraction.md) | **Swappable-agent ACL seam** — do *not* add a second agent now; insert an anti-corruption seam so Claude Code can be peeled off later. |
 | [0004](./0004-no-special-worktree-support.md) | **No special `--worktree` support** — deliberate non-fix; the history-mount trade-off is documented instead. |
 | [0005](./0005-no-prune-command.md) | **No `prune`/cleanup command** — reclaiming disk beyond automatic self-prune is documented as raw `container`/`augur-vm` commands instead. |
+| [0006](./0006-macos-vm-clone-persistence.md) | **`down --macos` keeps the clone** — macOS VM mode is Xcode-exclusive, so preserving DerivedData/Simulator/SPM-CocoaPods state across restarts outweighs the disposability Container mode's `down` favors. |
 
 > Numbering: 0001 is the foundational principle (recorded latest but conceptually first);
-> 0002–0005 follow their original decision dates.
+> 0002–0006 follow their original decision dates.
