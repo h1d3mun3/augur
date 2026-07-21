@@ -27,14 +27,20 @@ final class ProxyServer {
     /// many handlers are running and logs an edge-triggered line when the ceiling is hit
     /// or cleared, so a saturated proxy is visible instead of just silently slow.
     private let gauge: InFlightGauge
+    /// Tear down an established tunnel after this many seconds with no bytes moving in EITHER
+    /// direction, so an idle guest can't pin a `connectionCap` slot forever (#101). `0` disables
+    /// it (pre-#101 infinite-idle behavior). Tunable via --idle-timeout / AUGUR_PROXY_IDLE_TIMEOUT.
+    private let idleTimeoutSecs: Int
 
-    init(filter: Filter, log: DecisionLog, publicOnly: Bool, maxConnections: Int = 128) {
+    init(filter: Filter, log: DecisionLog, publicOnly: Bool, maxConnections: Int = 128,
+         idleTimeoutSecs: Int = 0) {
         self.filter = filter
         self.log = log
         self.publicOnly = publicOnly
         let cap = max(1, maxConnections)
         self.connectionCap = DispatchSemaphore(value: cap)
         self.gauge = InFlightGauge(ceiling: cap, log: log)
+        self.idleTimeoutSecs = max(0, idleTimeoutSecs)
     }
 
     /// Start a listener and dispatch accepted connections to `handler` on threads.
@@ -246,7 +252,20 @@ final class ProxyServer {
 
     /// Bidirectional copy: one direction on this thread, the other on a new one.
     private func spliceBoth(_ a: Int32, _ b: Int32) {
-        Sock.setReadTimeout(a, seconds: 0)   // established tunnel: no read timeout
+        let poll = idlePollSecs(idleTimeoutSecs: idleTimeoutSecs)
+        let idle: IdleTracker?
+        if poll > 0 {
+            // Idle timeout on: bound BOTH read-idle (SO_RCVTIMEO) and write-stall (SO_SNDTIMEO)
+            // on BOTH fds, and share one clock across the two splice directions so a byte moving
+            // either way keeps both alive (SSE/long-poll survive; a truly idle tunnel is reaped).
+            Sock.setReadTimeout(a, seconds: poll);  Sock.setWriteTimeout(a, seconds: poll)
+            Sock.setReadTimeout(b, seconds: poll);  Sock.setWriteTimeout(b, seconds: poll)
+            idle = IdleTracker(idleNanos: UInt64(idleTimeoutSecs) * 1_000_000_000,
+                               now: DispatchTime.now().uptimeNanoseconds)
+        } else {
+            Sock.setReadTimeout(a, seconds: 0)   // disabled: established tunnel blocks forever (as before)
+            idle = nil
+        }
         // Keepalives detect dead peers (crashed host, network partition) so stalled
         // splice threads unblock instead of holding their slot in connectionCap forever.
         Sock.setKeepAlive(a)
@@ -260,11 +279,11 @@ final class ProxyServer {
         // tunnel down: the caller's defers close both fds and the accept loop reclaims the
         // slot. Nothing is splicing yet (the b→a copy below hasn't started), so returning
         // here is a clean drop, not a half-open tunnel.
-        guard PosixThread.spawnDetached({ Sock.splice(from: a, to: b); done.signal() }) else {
+        guard PosixThread.spawnDetached({ Sock.splice(from: a, to: b, idle: idle); done.signal() }) else {
             log.status("splice copier could not start under thread pressure; dropping tunnel")
             return
         }
-        Sock.splice(from: b, to: a)
+        Sock.splice(from: b, to: a, idle: idle)
         done.wait()
     }
 
