@@ -2,8 +2,10 @@
 # Tier 0 — egress allowlist hardening (pure functions, runs anywhere).
 # Invariant I7 (docs/security-reviews/INVARIANTS.md): a guest-writable ./.augur/allowlist.conf
 # cannot widen the egress policy — every project line is validated (conf_line_valid),
-# only sanitized LDH patterns reach the MERGED allowlist, and that allowlist is written
-# HOST-SIDE (under ~/.augur), never inside the project tree.
+# only sanitized LDH patterns reach the MERGED allowlist, that allowlist is written
+# HOST-SIDE (under ~/.augur), never inside the project tree, AND the merge honors only the
+# domains SNAPSHOTTED at approval time (never a fresh read of the live mounted conf), so a
+# post-approval mutation cannot be honored (TOCTOU).
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/.." && pwd)"
 source "$HERE/lib.sh"
 AUGUR="$REPO/augur"
@@ -15,11 +17,22 @@ WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 # 30_macos_vm.sh's `awk` function slicing.
 helpers="$WORK/helpers.sh"
 grep -E '^proxy_allowlist\(\) \{' "$AUGUR" > "$helpers"          # one-liner
-for f in write_merged_allowlist conf_line_valid project_conf_domains project_conf_invalid_count; do
+for f in write_merged_allowlist conf_line_valid project_conf_domains project_conf_invalid_count \
+         project_conf_hash project_conf_hash_file check_project_conf_approved; do
   awk -v n="$f" 'index($0, n"()")==1 {f=1} f{print} f&&/^}/{exit}' "$AUGUR" >> "$helpers"
   echo >> "$helpers"
 done
-workspace_slug() { echo testslug; }   # stub the only external call the helpers make
+
+# Stubs for the few externals the extracted helpers reference.
+workspace_slug()      { echo testslug; }
+workspace_path_hash() { echo testpathhash; }
+warn()    { :; }
+info()    { :; }
+success() { :; }
+error()   { echo "ERROR: $*" >&2; }
+BOLD=""; YELLOW=""; RESET=""; CYAN=""; GREEN=""; RED=""
+
+AUGUR_DIR="$WORK/augur-home"
 AUGUR_PROXY_DIR="$WORK/proxy"
 AUGUR_BASELINE_CONF="$WORK/baseline.conf"
 AUGUR_GLOBAL_CONF="$WORK/global.conf"
@@ -58,20 +71,43 @@ hasnt "$domains" "bad;rm"            "drops a line with shell metacharacters"
 hasnt "$domains" "under_score"       "drops a non-LDH line"
 eq "4" "$(project_conf_invalid_count)" "invalid-line count is surfaced (for the approval red flag)"
 
-section "Tier 0 — merged allowlist is host-side and sanitized"
+section "Tier 0 — merged allowlist is host-side, and honors only the APPROVED snapshot"
 printf 'baseline.example.com\n' > "$AUGUR_BASELINE_CONF"
 printf 'global.example.com\n'   > "$AUGUR_GLOBAL_CONF"
 al="$(proxy_allowlist)"
 has   "$al" "$AUGUR_PROXY_DIR" "allowlist path is under the host-side proxy dir (~/.augur)"
 hasnt "$al" "$WORK/project"    "allowlist path is NOT inside the project tree"
+
+# Before approval there is no snapshot → the project block is omitted (fail closed).
+merged="$(cat "$(write_merged_allowlist 2>/dev/null)")"
+hasnt "$merged" "good.example.com" "an UNAPPROVED project conf is not honored (no snapshot → fail closed)"
+
+# Approve the current conf (non-interactive) — writes the host-side hash + domain snapshot.
+AUGUR_ACCEPT_PROJECT_CONF=1 check_project_conf_approved >/dev/null 2>&1
 out="$(write_merged_allowlist)"
 eq "$al" "$out" "write_merged_allowlist writes to the host-side path"
 merged="$(cat "$out")"
 has   "$merged" "baseline.example.com" "baseline domain present"
 has   "$merged" "global.example.com"   "global domain present"
-has   "$merged" "good.example.com"     "sanitized project domain present"
+has   "$merged" "good.example.com"     "approved project domain present"
 hasnt "$merged" "bad;rm"               "guest junk never reaches the merged policy"
 hasnt "$merged" "under_score"          "non-LDH guest line never reaches the merged policy"
 hasnt "$merged" "evil .com"            "spaced guest line never reaches the merged policy"
+
+section "Tier 0 — TOCTOU: a post-approval mutation of the live conf is NOT honored (I7)"
+# The guest appends a grammar-VALID domain AFTER approval. The merge must still emit only the
+# approved snapshot, so a re-read of the mutated live file can never widen the honored policy.
+printf 'evil-injected.example.com\n' >> "$AUGUR_PROJECT_CONF"
+merged="$(cat "$(write_merged_allowlist)")"
+hasnt "$merged" "evil-injected.example.com" "a domain added after approval is NOT honored (snapshot, not live re-read)"
+has   "$merged" "good.example.com"          "the approved domains remain honored after the mutation"
+# And the tamper is detectable on the next check: the hash changed, so a non-interactive run
+# (no auto-accept) fails closed rather than silently re-approving. Run in a subshell so its
+# `exit 1` can't abort the test.
+if ( check_project_conf_approved ) </dev/null >/dev/null 2>&1; then
+  fail "post-approval change detected" "check silently approved a changed conf non-interactively"
+else
+  ok "post-approval change is detected on the next check (non-interactive fails closed)"
+fi
 
 finish
