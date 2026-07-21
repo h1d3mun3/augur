@@ -111,14 +111,18 @@ open_tunnel() {
 }
 close_tunnel() { { exec 3>&- 3<&-; } 2>/dev/null; }
 
-# Is the tunnel on fd 3 still OPEN? The sink never sends data, so a bounded read that returns means
-# EOF (proxy closed the tunnel); a read that times out means still-open. $1 = INTEGER seconds
-# (macOS CI runs bash 3.2, whose `read -t` takes whole seconds only). Echoes "open"/"closed".
+# Did the tunnel on fd 3 stay OPEN for at least $1 whole seconds? The sink never sends data, so the
+# read only returns early on EOF (the proxy closed the tunnel); otherwise it blocks. We measure by
+# ELAPSED time, NOT read's exit code — bash 3.2 (macOS CI) returns a different `read -t` timeout
+# status than bash 4+, so `rc > 128` is not portable; elapsed time is. The read cap is $1+3, three
+# seconds ABOVE the compare threshold, so a genuinely-open tunnel always measures >= $1 despite
+# `SECONDS`' one-second granularity (a full block can't come up short). "open" iff elapsed >= $1
+# (stayed up at least $1s); "closed" iff it EOF'd earlier. Pick $1 so the real close time sits
+# clear of $1 (>=2s below for the expect-closed calls; the expect-open calls survive well past $1).
 tunnel_state() {
-  local dummy rc
-  IFS= read -t "$1" -d '' -r dummy <&3 2>/dev/null; rc=$?
-  # bash `read` exits >128 on timeout, and 1 on EOF-with-no-delimiter. >128 => still open.
-  if (( rc > 128 )); then echo open; else echo closed; fi
+  local t0=$SECONDS
+  IFS= read -t "$(( $1 + 3 ))" -d '' -r _ <&3 2>/dev/null
+  if (( SECONDS - t0 >= $1 )); then echo open; else echo closed; fi
 }
 
 # NOTE: the write-stall path (SO_SNDTIMEO: a guest that stops READING must not pin a slot via a
@@ -144,7 +148,7 @@ state="$(tunnel_state 12)"                  # idle 3s + poll 3s → expect close
 elapsed=$(( SECONDS - start ))
 close_tunnel
 eq "closed" "$state" "cycle 1: the idle tunnel was torn down (not held open forever)"
-if (( elapsed <= 10 )); then ok "cycle 1: torn down promptly (${elapsed}s, within the ~idle+poll window)"; else fail "idle teardown too slow (${elapsed}s)"; fi
+if (( elapsed <= 11 )); then ok "cycle 1: torn down promptly (${elapsed}s, within the ~idle+poll window)"; else fail "idle teardown too slow (${elapsed}s)"; fi
 # Two more reclaim cycles through the SAME single slot: each open can only get 200 if the prior
 # idle teardown actually released the slot — a leaked/stranded slot would hang the next CONNECT.
 for c in 2 3; do
@@ -155,18 +159,20 @@ done
 reap "$proxy_pid"; proxy_pid=""
 
 # ── B. a low-traffic stream survives the window, then closes when it goes quiet ───────────────
+# Idle window 5s (poll = min(5,30) = 5s) gives the "still open" probe a wide, slow-CI-proof margin.
 section "B. a low-traffic (SSE-style) stream is preserved, then reclaimed when it stops"
-if ! start_proxy 3 proxyB; then
+if ! start_proxy 5 proxyB; then
   fail "proxy (B) did not come up" "last stderr: $(tail -3 "$TMPD/proxyB.err" 2>/dev/null)"; finish; exit $?
 fi
-ok "real augur-proxy listening on $ADDR:$HP (--idle-timeout 3)"
+ok "real augur-proxy listening on $ADDR:$HP (--idle-timeout 5)"
 open_tunnel; has "$STATUS" "200" "tunnel establishes"
-# ~5s of 1-byte/s activity — longer than the 3s idle window, so a working shared clock is the only
-# reason it survives. `sleep` THEN `printf` so the last byte is fresh when we probe (full margin).
-for _ in 1 2 3 4 5; do sleep 1; printf 'x' >&3 2>/dev/null; done
-state_active="$(tunnel_state 1)"           # last activity <1s ago, window 3s → must still be open
-eq "open" "$state_active" "the tunnel stayed open through 5s of low-traffic activity (shared clock reset by either direction)"
-state_quiet="$(tunnel_state 12)"           # now silent → reclaimed within the window
+# ~6s of 1-byte/s activity — longer than the 5s idle window, so a working shared clock is the only
+# reason it survives (a per-direction clock would expire the silent upstream→client half mid-way).
+# `sleep` THEN `printf` so the last byte is fresh when we probe (a full window of margin remains).
+for _ in 1 2 3 4 5 6; do sleep 1; printf 'x' >&3 2>/dev/null; done
+state_active="$(tunnel_state 2)"           # open iff it stays up ≥2s more (window ~5s left) — huge margin
+eq "open" "$state_active" "the tunnel stayed open through 6s of low-traffic activity (shared clock reset by either direction)"
+state_quiet="$(tunnel_state 15)"           # now silent → reclaimed (EOF) well before 15s → closed
 close_tunnel
 eq "closed" "$state_quiet" "once the stream went quiet, the idle tunnel was reclaimed"
 reap "$proxy_pid"; proxy_pid=""
@@ -178,7 +184,7 @@ if ! start_proxy 0 proxyC; then
 fi
 ok "real augur-proxy listening on $ADDR:$HP (--idle-timeout 0)"
 open_tunnel; has "$STATUS" "200" "tunnel establishes with idle timeout disabled"
-state0="$(tunnel_state 7)"                   # a 3s-window tunnel would be long closed by now
+state0="$(tunnel_state 3)"                   # disabled: stays open the full read cap (6s) → open; any live window would have EOF'd
 close_tunnel
 eq "open" "$state0" "an idle tunnel stays open when --idle-timeout 0 (byte-for-byte pre-#101 behavior)"
 reap "$proxy_pid"; proxy_pid=""
