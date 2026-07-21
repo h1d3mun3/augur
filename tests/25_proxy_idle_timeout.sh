@@ -143,12 +143,12 @@ if ! start_proxy 3 proxyAD 1; then
 fi
 ok "real augur-proxy listening on $ADDR:$HP (--idle-timeout 3, --max-connections 1)"
 open_tunnel; has "$STATUS" "200" "cycle 1: CONNECT localhost:$UP establishes (the one slot is free)"
-start=$SECONDS
-state="$(tunnel_state 12)"                  # idle 3s + poll 3s → expect close within ~6s
-elapsed=$(( SECONDS - start ))
+# tunnel_state blocks until EOF, so "closed" already means "reclaimed within the ~12s window"
+# (idle 3 + poll 3 ≈ 6s nominal). It IS the promptness check — a slow-to-reclaim tunnel would read
+# as "open" and fail here — so there's no separate elapsed gate to contradict it on a loaded runner.
+state="$(tunnel_state 12)"
 close_tunnel
-eq "closed" "$state" "cycle 1: the idle tunnel was torn down (not held open forever)"
-if (( elapsed <= 11 )); then ok "cycle 1: torn down promptly (${elapsed}s, within the ~idle+poll window)"; else fail "idle teardown too slow (${elapsed}s)"; fi
+eq "closed" "$state" "cycle 1: the idle tunnel was torn down within the window (not held open forever)"
 # Two more reclaim cycles through the SAME single slot: each open can only get 200 if the prior
 # idle teardown actually released the slot — a leaked/stranded slot would hang the next CONNECT.
 for c in 2 3; do
