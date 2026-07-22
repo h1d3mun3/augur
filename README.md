@@ -469,8 +469,9 @@ gh api -X PUT repos/h1d3mun3/augur/branches/release/protection --input - <<'JSON
 JSON
 
 # 2. Create a fine-grained PAT scoped to this repo with ONLY "Commit statuses: write",
-#    and store it in the login Keychain (once):
-security add-generic-password -s augur-release-gate -a "$USER" -w <TOKEN>
+#    then store it in the login Keychain. Pass -w with NO value so the token is typed at a
+#    hidden prompt (never in shell history or `ps`); -U lets you re-run this to rotate it:
+security add-generic-password -U -a "$USER" -s augur-release-gate -w
 ```
 
 **Releasing:**

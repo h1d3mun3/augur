@@ -14,8 +14,9 @@
 # ONE-TIME SETUP (human — see README "Cutting a release"):
 #   1. Create a fine-grained PAT (or GitHub App token) scoped to THIS repo whose ONLY
 #      permission is "Commit statuses: read and write".
-#   2. Store it in the login Keychain, once (it never touches disk in plaintext):
-#        security add-generic-password -s augur-release-gate -a "$USER" -w <TOKEN>
+#   2. Store it in the login Keychain. Pass -w with NO value so the token is entered at a
+#      hidden prompt (never in shell history or `ps`); -U lets you re-run this to rotate it:
+#        security add-generic-password -U -a "$USER" -s augur-release-gate -w
 #
 # USAGE (from a clean checkout of the exact commit you intend to release):
 #   scripts/release-gate.sh
