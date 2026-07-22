@@ -65,11 +65,25 @@ final class AddressPolicyTests: XCTestCase {
         XCTAssertTrue(AddressPolicy.isPrivateV6(v6([0xfc, 0x00])))      // fc00::/7 ULA
         XCTAssertTrue(AddressPolicy.isPrivateV6(v6([0xfd, 0x00])))      // fd00::/8 ULA
         XCTAssertTrue(AddressPolicy.isPrivateV6(v6([0xff, 0x02])))      // multicast
+        // Transition / deprecated forms that would otherwise fall through to "public".
+        XCTAssertTrue(AddressPolicy.isPrivateV6(v6([0x20, 0x02, 127, 0, 0, 1]))) // 2002:7f00:0001:: 6to4-wrapped loopback
+        XCTAssertTrue(AddressPolicy.isPrivateV6(v6([0x20, 0x02, 10, 0, 0, 1])))  // 6to4-wrapped RFC1918
+        XCTAssertTrue(AddressPolicy.isPrivateV6(v6([0x20, 0x02, 169, 254, 169, 254]))) // 6to4-wrapped cloud metadata
+        XCTAssertTrue(AddressPolicy.isPrivateV6(v6([0x20, 0x01, 0x00, 0x00]))) // 2001:0::/32 Teredo
+        XCTAssertTrue(AddressPolicy.isPrivateV6(v6([0xfe, 0xc0])))      // fec0::/10 site-local (deprecated)
+        XCTAssertTrue(AddressPolicy.isPrivateV6(v6([0xfe, 0xff])))      // fec0::/10 upper boundary
     }
 
     func testV6Public() {
         XCTAssertFalse(AddressPolicy.isPrivateV6(v6([0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0,
                                                      0, 0, 0, 0, 0, 0, 0x88, 0x88]))) // 2001:4860:4860::8888
         XCTAssertFalse(AddressPolicy.isPrivateV6(mapped(8, 8, 8, 8))) // mapped PUBLIC stays public
+        // 6to4 wrapping a PUBLIC v4 must stay public — the fix classifies by embedded v4, it does
+        // NOT blanket-deny 2002::/16 (so legitimate 6to4-to-public is never over-blocked).
+        XCTAssertFalse(AddressPolicy.isPrivateV6(v6([0x20, 0x02, 8, 8, 8, 8]))) // 2002:0808:0808:: (6to4 → 8.8.8.8)
+        // The Teredo check is the EXACT 2001:0::/32, not the broad 2001::/16 — real global unicast
+        // under 2001:: (e.g. 2001:4860:: Google) must remain public.
+        XCTAssertFalse(AddressPolicy.isPrivateV6(v6([0x20, 0x01, 0x48, 0x60]))) // 2001:4860:: real global unicast
+        XCTAssertFalse(AddressPolicy.isPrivateV6(v6([0x20, 0x01, 0x0d, 0xb8]))) // 2001:db8:: doc prefix (not Teredo)
     }
 }

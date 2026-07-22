@@ -43,6 +43,14 @@ public enum AddressPolicy {
         if b[0] == 0xfe && (b[1] & 0xc0) == 0x80 { return true } // fe80::/10 link-local
         if (b[0] & 0xfe) == 0xfc { return true } // fc00::/7 ULA
         if b[0] == 0xff { return true } // multicast
+        // Transition / deprecated forms that embed or alias an IPv4: without these they would
+        // fall through to "public" and let an allowlisted name that resolves to e.g. a 6to4-wrapped
+        // 127.0.0.1 slip past the SSRF guard. Classify 6to4 by its embedded v4 (so a 6to4-wrapped
+        // PUBLIC v4 stays public — no over-blocking); Teredo and deprecated site-local carry no
+        // legitimate reachable destination, so deny outright.
+        if b[0] == 0x20 && b[1] == 0x02 { return isPrivateV4(b[2], b[3], b[4], b[5]) } // 2002::/16 6to4
+        if b[0] == 0x20 && b[1] == 0x01 && b[2] == 0x00 && b[3] == 0x00 { return true } // 2001:0::/32 Teredo
+        if b[0] == 0xfe && (b[1] & 0xc0) == 0xc0 { return true } // fec0::/10 site-local (deprecated, RFC 3879)
         return false
     }
 }
