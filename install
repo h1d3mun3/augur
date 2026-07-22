@@ -19,8 +19,9 @@ success() { echo -e "${GREEN}[install]${RESET} $*"; }
 warn()    { echo -e "${YELLOW}[install]${RESET} $*"; }
 error()   { echo -e "${RED}[install]${RESET} $*" >&2; }
 
-# Validate source files exist
-for f in augur Dockerfile .dockerignore; do
+# Validate source files exist. VERSION is required: it is the single source of truth for
+# the version number (`augur version`), so a checkout missing it is a broken install source.
+for f in augur Dockerfile .dockerignore VERSION; do
     if [[ ! -f "$SCRIPT_DIR/$f" ]]; then
         error "$f not found in $SCRIPT_DIR"
         exit 1
@@ -37,15 +38,21 @@ cp "$SCRIPT_DIR/Dockerfile" "$INSTALL_DIR/Dockerfile"
 cp "$SCRIPT_DIR/.dockerignore" "$INSTALL_DIR/.dockerignore"
 chmod +x "$INSTALL_DIR/augur"
 
-# Stamp the installed version. The running ~/.augur/augur has no git context, so record
-# what we built from here: `git describe` gives a tag-relative name when tags exist, else
-# the short commit; --dirty flags an install from a modified working tree. Falls back to
-# "unknown" when installing outside a git checkout (e.g. an extracted tarball).
-if _ver="$(git -C "$SCRIPT_DIR" describe --tags --always --dirty 2>/dev/null)" && [[ -n "$_ver" ]]; then
-    printf '%s (installed %s)\n' "$_ver" "$(date +%F)" > "$INSTALL_DIR/VERSION"
-else
-    printf 'unknown (installed %s)\n' "$(date +%F)" > "$INSTALL_DIR/VERSION"
+# Stamp the installed version. The NUMBER comes from the committed VERSION file (single
+# source of truth — never derived from git tags). Git only adds dev-build traceability,
+# mirroring augur_version(): a checkout whose HEAD is exactly the release tag records the
+# bare number; any other checkout records <version>-dev+<sha>; a tarball (no git) records
+# the number as-is. The running ~/.augur/augur has no git context, so we bake it in now.
+ver="$(cat "$SCRIPT_DIR/VERSION" 2>/dev/null || true)"
+if [[ -z "$ver" ]]; then
+    ver="unknown"
+elif [[ -e "$SCRIPT_DIR/.git" ]] \
+     && git -C "$SCRIPT_DIR" rev-parse --git-dir >/dev/null 2>&1 \
+     && ! git -C "$SCRIPT_DIR" describe --exact-match --tags HEAD 2>/dev/null | grep -qx "v$ver"; then
+    ver="$ver-dev+$(git -C "$SCRIPT_DIR" rev-parse --short HEAD)"
 fi
+printf '%s\n' "$ver" > "$INSTALL_DIR/VERSION"
+info "Recorded version $ver in $INSTALL_DIR/VERSION."
 
 # Egress allowlist (three layers):
 #   - augur.conf.default : augur-managed baseline. ALWAYS refreshed, so shipped domain

@@ -1,0 +1,55 @@
+name: Release
+
+# Fires when a version-bumped commit lands on `release` (model B: the gate-passage branch).
+# It is NEVER triggered by a tag push — tags are the OUTPUT of this job, not its input, so
+# the version can only come from the committed VERSION file. This job boots NO VM: the heavy
+# macOS-VM E2E is enforced upstream by branch protection on `release` (required status check
+# e2e/macos-vm), posted locally by scripts/release-gate.sh. See README "Cutting a release".
+on:
+  push:
+    branches: [release]
+
+permissions:
+  contents: write   # push the tag + create the GitHub Release. Nothing else.
+
+concurrency:
+  group: release
+  cancel-in-progress: false   # never abort a half-finished tag/release
+
+jobs:
+  release:
+    name: Tag & release if VERSION bumped
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history for `gh release --generate-notes` and tag creation
+
+      - name: Tag and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # VERSION is the single source of truth. Validate it is a bare x.y[.z] number so a
+          # stray edit can never mint a garbage tag.
+          raw="$(tr -d '[:space:]' < VERSION)"
+          if ! printf '%s' "$raw" | grep -Eqx '[0-9]+\.[0-9]+(\.[0-9]+)?'; then
+            echo "refusing: VERSION '$raw' is not a bare x.y[.z] number" >&2
+            exit 1
+          fi
+          v="v$raw"
+
+          # Collision guard: pushing to `release` without bumping VERSION (or a follow-up
+          # commit that keeps the same VERSION) is a deliberate no-op, not an error.
+          if [ -n "$(git ls-remote --tags origin "refs/tags/$v")" ]; then
+            echo "tag $v already exists — nothing to release (no-op)"
+            exit 0
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$v" -m "$v"
+          git push origin "$v"
+          gh release create "$v" --generate-notes --title "$v"
+          echo "released $v"
