@@ -438,7 +438,9 @@ because it needs Apple-signed IPSW/XIP that can't live in CI.
 ### Cutting a release (structural gate)
 
 The `make e2e` gate above can't run in CI, so instead of *trusting* a human to remember it,
-the release is **structurally** blocked until it passes. The pieces:
+the release is **structurally** blocked until it passes. The *rationale* for these choices
+(branch model, `VERSION`-not-tags, linear history off, accepted admin-bypass) lives in
+[ADR-0009](docs/decisions/0009-release-gate.md); the operator flow is below. The pieces:
 
 - **`VERSION`** (repo root) is the single source of truth for the version number. `augur
   version` reads it; **tags are the *output* of a release, never the input.** A checkout

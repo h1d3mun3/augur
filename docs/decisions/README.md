@@ -36,6 +36,7 @@ An ADR here is none of those: it is the standing *rationale* behind a decision.
 | [0006](./0006-macos-vm-clone-persistence.md) | **`down --macos` keeps the clone** — macOS VM mode is Xcode-exclusive, so preserving DerivedData/Simulator/SPM-CocoaPods state across restarts outweighs the disposability Container mode's `down` favors. |
 | [0007](./0007-macos-build-fixed-credential.md) | **macOS build keeps fixed `admin`/`admin`** — declines L2's randomize suggestion (keychain-desync footgun on the load-bearing auto-login path vs. an effective-Info gain); instead removes the operator-typed SSH prompt via OpenSSH `SSH_ASKPASS`. |
 | [0008](./0008-exfiltration-ceiling-accepted.md) | **The egress allowlist's exfiltration ceiling is accepted, not mitigated** — declines TLS MITM/DLP, per-service authorization, and even opt-in least-privilege helpers (`--no-token`, read-only mount); that need belongs outside augur (dedicated security tooling), not inside it. |
+| [0009](./0009-release-gate.md) | **The pre-release macOS-VM E2E is a structural gate, and `VERSION` is the source of truth** — enforcement is server-side (branch protection on `release` requires the `e2e/macos-vm` status), execution is local (`make e2e` can't run in CI); tags are the *output* of a gated release, never the input. Linear history is off (merge-commit `main`); admin bypass is accepted. |
 
 > Numbering: 0001 is the foundational principle (recorded latest but conceptually first);
-> 0002–0008 follow their original decision dates.
+> 0002–0009 follow their original decision dates.
