@@ -448,7 +448,8 @@ the release is **structurally** blocked until it passes. The *rationale* for the
   `<VERSION>-dev+<sha>`.
 - **Branches** (model B): `main` is the everyday branch (all existing CI runs here). The
   `release` branch is gate-passage-only and protected — a commit cannot reach it without a
-  green `e2e/macos-vm` status.
+  green `e2e/macos-vm` status (on it, or carried over from a merged-in parent — see the note
+  below the steps).
 - **`scripts/release-gate.sh`** runs `make e2e` on your Mac and posts its result as the
   `e2e/macos-vm` commit status. The status is issued **only** on exit 0, so it can't be
   faked or skipped.
@@ -477,21 +478,24 @@ security add-generic-password -U -a "$USER" -s augur-release-gate -w
 **Releasing:**
 
 ```bash
-# 1. Bump VERSION on main via a normal PR (e.g. 0.9.0 -> 0.10.0), get it merged.
-# 2. On your Mac, from a clean checkout of that main commit, prove the E2E:
+# 1. Bump VERSION on main via a normal PR (e.g. 0.10.0 -> 0.10.1), get it merged.
+# 2. On your Mac, check out the EXACT merged commit, then prove the E2E on it — so the status
+#    lands on the commit that will be tagged (not on the pre-merge bump commit):
+git checkout main && git pull --ff-only
 scripts/release-gate.sh                 # runs `make e2e`; posts e2e/macos-vm=success on green
-# 3. Fast-forward release to that (now-green) commit. Branch protection permits the push
-#    only because the SHA carries the green status, so the tested SHA == the tagged SHA:
+# 3. Fast-forward release to that (now-green) commit:
 git fetch origin && git push origin origin/main:release
-# release.yml then tags v0.10.0 and cuts the GitHub Release. Done.
+# release.yml then tags v0.10.1 and cuts the GitHub Release. Done.
 ```
 
-The fast-forward push moves `release` to the *exact* commit that carried the green
-`e2e/macos-vm` status, and branch protection only accepts a tip that carries that status, so
-**the tested SHA is identical to the SHA the tag points at** — you can never tag something
-the E2E didn't actually run against. (`required_linear_history` is deliberately **off**:
-`main` is integrated with merge commits, which that rule would reject on the fast-forward,
-and it buys nothing here — the exact-SHA push already gives the tested==tagged guarantee.)
+Branch protection only lets a commit onto `release` if a green `e2e/macos-vm` status is satisfied
+for it, so **you can't ship something the E2E never ran against.** One subtlety: GitHub carries
+that satisfaction **through merge commits** — a merge commit whose merged-in parent has the status
+is accepted even though the merge commit itself has none. So if you gate the *pre-merge* bump
+commit (as `v0.10.1` was), the tagged merge commit is a *different* SHA — content-identical for a
+clean merge, but not literally the tested one. Gating the **post-merge `main` tip** (step 2) keeps
+the tag pointing at the exact commit that was tested. (`required_linear_history` is deliberately
+**off**: `main` uses merge commits, which that rule would reject on the fast-forward.)
 
 > **⚠️ Never hand-cut tags.** `git tag vX.Y.Z && git push origin vX.Y.Z` bypasses the gate
 > completely: `release.yml` only fires on push to `release` (not on tags), and branch

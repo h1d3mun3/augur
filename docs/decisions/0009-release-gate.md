@@ -16,9 +16,10 @@ on a Mac**, instead of trusting a human to remember it before tagging. Concretel
 - **`VERSION` (repo root) is the single source of truth for the version number.** `augur version`
   and `install` read it; git is used only to *append* a dev suffix (`<v>-dev+<sha>`) when HEAD is
   not exactly the release tag. **A tag is the OUTPUT of a release, never its input.**
-- **A protected `release` branch is the gate.** Branch protection requires the `e2e/macos-vm`
-  commit status before any commit can land there, and applies to admins too (`enforce_admins:
-  true`). `main` stays the everyday branch.
+- **A protected `release` branch is the gate.** Branch protection requires a green `e2e/macos-vm`
+  status on any commit that lands there (the status may be *carried over from a merged-in parent* —
+  see "tested vs tagged SHA" in the rationale), and applies to admins too (`enforce_admins: true`).
+  `main` stays the everyday branch.
 - **`scripts/release-gate.sh` runs `make e2e` locally and posts the status** (`success` only on
   exit 0). **`.github/workflows/release.yml`** then fires on push to `release`, reads `VERSION`,
   and creates the annotated tag `v<VERSION>` + a GitHub Release — idempotently (a collision guard
@@ -76,13 +77,23 @@ extra branch; the cost of A is churn across the whole existing setup.
 
 **`required_linear_history` is deliberately OFF.** `main` is integrated with merge commits, so a
 linear-history rule on `release` would reject the fast-forward release push *every cycle* — the
-pushed range carries merge commits. The property that matters, "the tested SHA is the tagged SHA,"
-is delivered instead by fast-forwarding `release` to the *exact* status-carrying commit plus the
-required status check: only a commit that carries the green `e2e/macos-vm` status can become the
-tip, and `release.yml` tags that tip. Linear history would break releases while adding nothing
-that the FF-of-the-exact-SHA discipline doesn't already give. (An adversarial review of PR #108
-caught this before it shipped — the first draft copied a linear-history rule that would have
-dead-locked every release.)
+pushed range carries merge commits. Enforcement comes from the required status check instead: **a
+commit cannot become the `release` tip unless a green `e2e/macos-vm` status is satisfied for it**
+(empirically verified — a no-status commit is rejected with `GH006: Required status check
+"e2e/macos-vm" is expected`). Linear history would break releases while adding nothing here. (An
+adversarial review of PR #108 caught this before it shipped — the first draft copied a
+linear-history rule that would have dead-locked every release.)
+
+**"Tested SHA == tagged SHA" holds only if the gate runs on the *exact* commit that ships.**
+GitHub carries required-check satisfaction **through merge commits**: a merge commit whose
+merged-in parent has the green status is accepted even though the merge commit itself has none
+(empirically verified — and it is how `v0.10.1` shipped: `scripts/release-gate.sh` ran on the bump
+commit, which became the parent of the merge commit that got tagged). So the *tagged* SHA can
+differ from the *tested* SHA. For augur's clean (conflict-free) release merges the two have
+identical trees, so the shipped *content* is still exactly what was tested — but to make the
+guarantee literal (and to close the theoretical case of a merge that resolves conflicts with new,
+untested changes), **run `release-gate.sh` on the post-merge `main` tip** (`git checkout main && git
+pull`) so the status lands on the commit `release.yml` actually tags.
 
 **`release` doubles as the stable install channel; packaging is deferred, not rejected.** augur
 is built from source (Swift/Go), so a git ref *is* the version selector: `git clone -b release`
@@ -110,6 +121,10 @@ That is why the README carries a "never hand-cut tags" warning instead of a mach
 - The README "Cutting a release" section documents the operator flow (`VERSION` bump on `main` →
   `scripts/release-gate.sh` on a Mac → fast-forward `release` → automatic tag/Release) and points
   here for the reasoning — the same README-points-to-ADR pattern ADR-0008 established.
+- Run the gate on the **post-merge `main` tip**, not a pre-merge branch commit, so the tag points
+  at the exact commit tested. Doing otherwise does *not* bypass the gate (GitHub carries the check
+  through the merge), but the tag then points at a content-identical merge commit rather than the
+  literally-tested SHA.
 - One-time human setup that cannot be automated: a fine-grained PAT scoped to **only** "Commit
   statuses: write", stored in the login Keychain as `augur-release-gate`. The `release` branch and
   its protection (required check `e2e/macos-vm`, `enforce_admins`, `required_linear_history:
