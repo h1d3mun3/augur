@@ -1599,17 +1599,30 @@ cmd_update() {
     warn "Existing containers use the old image. Run ${BOLD}augur down && augur up${RESET} to apply."
 }
 
-# Report the installed version: the commit augur was installed from, stamped into
-# ~/.augur/VERSION by `install` (`git describe` — a tag-relative name if tags exist,
-# else the short commit, with -dirty for a modified tree). Falls back to a live
-# describe when run straight from a checkout (uninstalled), then to "unknown".
+# Report augur's version. The NUMBER is the single source of truth in the committed VERSION
+# file next to this script — it is NEVER derived from git tags (a tag is the OUTPUT of a
+# release, not its input). Git only adds dev-build traceability:
+#   • installed tree (~/.augur, no .git): print what `install` stamped into VERSION.
+#   • a checkout whose HEAD is exactly the release tag v<VERSION>: the bare number.
+#   • any other checkout (work in progress toward the next release): <VERSION>-dev+<sha>.
+# A missing/empty VERSION degrades to "unknown" rather than aborting (augur runs set -e).
 augur_version() {
-    if [[ -f "$AUGUR_DIR/VERSION" ]]; then
-        cat "$AUGUR_DIR/VERSION"
-    elif _v="$(git -C "$SCRIPT_DIR" describe --tags --always --dirty 2>/dev/null)" && [[ -n "$_v" ]]; then
-        echo "$_v (uninstalled)"
+    local v
+    if ! v="$(cat "$SCRIPT_DIR/VERSION" 2>/dev/null)" || [[ -z "$v" ]]; then
+        echo "unknown"; return
+    fi
+    # Only a checkout — a .git *directly* in the script dir — earns a live dev suffix. Gate on
+    # $SCRIPT_DIR/.git, NOT `git rev-parse` alone: rev-parse discovers a repo in any ANCESTOR, so
+    # an installed ~/.augur nested under a git-tracked $HOME would otherwise be misread as a
+    # checkout and print a bogus -dev suffix instead of the stamped number.
+    if [[ -e "$SCRIPT_DIR/.git" ]] && git -C "$SCRIPT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+        if git -C "$SCRIPT_DIR" describe --exact-match --tags HEAD 2>/dev/null | grep -qx "v$v"; then
+            echo "$v"                                              # released commit
+        else
+            echo "$v-dev+$(git -C "$SCRIPT_DIR" rev-parse --short HEAD)"
+        fi
     else
-        echo "unknown"
+        echo "$v"                                                 # installed (git-less) tree
     fi
 }
 

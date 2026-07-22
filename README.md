@@ -427,3 +427,58 @@ reachability, optionally runs **`xcodebuild test`** inside the VM, and re-proves
 **egress fail-closed** guarantee for the VM datapath (the macOS-VM variant of the
 `container-e2e` assertions). It's local-only for the nested-virtualization reason above, and
 because it needs Apple-signed IPSW/XIP that can't live in CI.
+
+### Cutting a release (structural gate)
+
+The `make e2e` gate above can't run in CI, so instead of *trusting* a human to remember it,
+the release is **structurally** blocked until it passes. The pieces:
+
+- **`VERSION`** (repo root) is the single source of truth for the version number. `augur
+  version` reads it; **tags are the *output* of a release, never the input.** A checkout
+  whose HEAD is exactly `v<VERSION>` reports the bare number; any other checkout reports
+  `<VERSION>-dev+<sha>`.
+- **Branches** (model B): `main` is the everyday branch (all existing CI runs here). The
+  `release` branch is gate-passage-only and protected — a commit cannot reach it without a
+  green `e2e/macos-vm` status.
+- **`scripts/release-gate.sh`** runs `make e2e` on your Mac and posts its result as the
+  `e2e/macos-vm` commit status. The status is issued **only** on exit 0, so it can't be
+  faked or skipped.
+- **`.github/workflows/release.yml`** fires on push to `release`, reads `VERSION`, and — if
+  no tag `v<VERSION>` exists yet — creates the annotated tag and a GitHub Release. Bumping
+  nothing, or a follow-up commit, is a safe **no-op** (collision guard). It boots no VM.
+
+**One-time setup (human, admin):**
+
+```bash
+# 1. Create the gate-passage branch at the current released commit, then protect it.
+git push origin main:refs/heads/release
+gh api -X PUT repos/h1d3mun3/augur/branches/release/protection --input - <<'JSON'
+{ "required_status_checks": { "strict": true, "contexts": ["e2e/macos-vm"] },
+  "enforce_admins": true, "required_pull_request_reviews": null,
+  "restrictions": null, "required_linear_history": false,
+  "allow_force_pushes": false, "allow_deletions": false }
+JSON
+
+# 2. Create a fine-grained PAT scoped to this repo with ONLY "Commit statuses: write",
+#    and store it in the login Keychain (once):
+security add-generic-password -s augur-release-gate -a "$USER" -w <TOKEN>
+```
+
+**Releasing:**
+
+```bash
+# 1. Bump VERSION on main via a normal PR (e.g. 0.9.0 -> 0.10.0), get it merged.
+# 2. On your Mac, from a clean checkout of that main commit, prove the E2E:
+scripts/release-gate.sh                 # runs `make e2e`; posts e2e/macos-vm=success on green
+# 3. Fast-forward release to that (now-green) commit. Branch protection permits the push
+#    only because the SHA carries the green status, so the tested SHA == the tagged SHA:
+git fetch origin && git push origin origin/main:release
+# release.yml then tags v0.10.0 and cuts the GitHub Release. Done.
+```
+
+The fast-forward push moves `release` to the *exact* commit that carried the green
+`e2e/macos-vm` status, and branch protection only accepts a tip that carries that status, so
+**the tested SHA is identical to the SHA the tag points at** — you can never tag something
+the E2E didn't actually run against. (`required_linear_history` is deliberately **off**:
+`main` is integrated with merge commits, which that rule would reject on the fast-forward,
+and it buys nothing here — the exact-SHA push already gives the tested==tagged guarantee.)
