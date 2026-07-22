@@ -3,14 +3,17 @@ name: Release
 # Fires when a version-bumped commit lands on `release` (model B: the gate-passage branch).
 # It is NEVER triggered by a tag push — tags are the OUTPUT of this job, not its input, so
 # the version can only come from the committed VERSION file. This job boots NO VM: the heavy
-# macOS-VM E2E is enforced upstream by branch protection on `release` (required status check
-# e2e/macos-vm), posted locally by scripts/release-gate.sh. See README "Cutting a release".
+# macOS-VM E2E is enforced two ways: branch protection on `release` blocks a no-status push, AND
+# this job re-checks the e2e/macos-vm status on the tag-target commit itself before tagging (branch
+# protection carries the check over a merge commit from a parent — this closes that gap). The
+# status is posted locally by scripts/release-gate.sh. See README "Cutting a release" / ADR-0009.
 on:
   push:
     branches: [release]
 
 permissions:
-  contents: write   # push the tag + create the GitHub Release. Nothing else.
+  contents: write   # push the tag + create the GitHub Release
+  statuses: read    # verify the e2e/macos-vm pre-release gate ran on THIS commit (see below)
 
 concurrency:
   group: release
@@ -45,6 +48,18 @@ jobs:
           if [ -n "$(git ls-remote --tags origin "refs/tags/$v")" ]; then
             echo "tag $v already exists — nothing to release (no-op)"
             exit 0
+          fi
+
+          # Gate: the pre-release macOS-VM E2E must have passed on THIS exact commit. Branch
+          # protection blocks a no-status push but carries the check over a merge commit from a
+          # parent — so require the status on the tag-target commit itself. This forces
+          # release-gate.sh to run on the post-merge tip, not a pre-merge bump commit. See ADR-0009.
+          state="$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/status" \
+            --jq '[.statuses[] | select(.context=="e2e/macos-vm")][0].state // "missing"')"
+          if [ "$state" != "success" ]; then
+            echo "refusing: e2e/macos-vm on $GITHUB_SHA is '$state' (need success on THIS commit)." >&2
+            echo "Run scripts/release-gate.sh on the post-merge main tip (git checkout main && git pull), then push again." >&2
+            exit 1
           fi
 
           git config user.name  "github-actions[bot]"
