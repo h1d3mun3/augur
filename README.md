@@ -453,9 +453,10 @@ the release is **structurally** blocked until it passes. The *rationale* for the
 - **`scripts/release-gate.sh`** runs `make e2e` on your Mac and posts its result as the
   `e2e/macos-vm` commit status. The status is issued **only** on exit 0, so it can't be
   faked or skipped.
-- **`.github/workflows/release.yml`** fires on push to `release`, reads `VERSION`, and — if
-  no tag `v<VERSION>` exists yet — creates the annotated tag and a GitHub Release. Bumping
-  nothing, or a follow-up commit, is a safe **no-op** (collision guard). It boots no VM.
+- **`.github/workflows/release.yml`** fires on push to `release`, reads `VERSION`, **verifies the
+  `e2e/macos-vm` status on the tag-target commit** (refusing to tag otherwise), and — if no tag
+  `v<VERSION>` exists yet — creates the annotated tag and a GitHub Release. Bumping nothing, or a
+  follow-up commit, is a safe **no-op** (collision guard). It boots no VM.
 
 **One-time setup (human, admin):**
 
@@ -493,9 +494,10 @@ for it, so **you can't ship something the E2E never ran against.** One subtlety:
 that satisfaction **through merge commits** — a merge commit whose merged-in parent has the status
 is accepted even though the merge commit itself has none. So if you gate the *pre-merge* bump
 commit (as `v0.10.1` was), the tagged merge commit is a *different* SHA — content-identical for a
-clean merge, but not literally the tested one. Gating the **post-merge `main` tip** (step 2) keeps
-the tag pointing at the exact commit that was tested. (`required_linear_history` is deliberately
-**off**: `main` uses merge commits, which that rule would reject on the fast-forward.)
+clean merge, but not literally the tested one. So **`release.yml` re-checks the `e2e/macos-vm`
+status on the tag-target commit itself and refuses to tag otherwise** — you must gate the
+**post-merge `main` tip** (step 2), or the release fails loudly. (`required_linear_history` is
+deliberately **off**: `main` uses merge commits, which that rule would reject on the fast-forward.)
 
 > **⚠️ Never hand-cut tags.** `git tag vX.Y.Z && git push origin vX.Y.Z` bypasses the gate
 > completely: `release.yml` only fires on push to `release` (not on tags), and branch
