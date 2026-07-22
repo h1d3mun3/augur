@@ -489,3 +489,12 @@ The fast-forward push moves `release` to the *exact* commit that carried the gre
 the E2E didn't actually run against. (`required_linear_history` is deliberately **off**:
 `main` is integrated with merge commits, which that rule would reject on the fast-forward,
 and it buys nothing here — the exact-SHA push already gives the tested==tagged guarantee.)
+
+> **⚠️ Never hand-cut tags.** `git tag vX.Y.Z && git push origin vX.Y.Z` bypasses the gate
+> completely: `release.yml` only fires on push to `release` (not on tags), and branch
+> protection doesn't cover tag refs — so a manual tag ships **without** the `e2e/macos-vm`
+> proof. Worse, it *shadows* the automated path — the next gated release carrying that
+> `VERSION` hits the collision guard and no-ops, so that version can never be cut properly.
+> A tag is the gate's **output**, never something you create by hand. Always release through
+> the `release` branch (the flow above). (An admin can of course still bypass any protection
+> deliberately; the gate's job is to stop an *accidental* skip, not a conscious override.)
