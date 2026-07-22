@@ -60,7 +60,7 @@ shellcheck:
 	    echo "release binary from https://github.com/koalaman/shellcheck/releases onto PATH, then re-run."; \
 	    exit 1; }; }
 	@echo "== shellcheck (errors fail, across all shell) =="
-	shellcheck --severity=error augur install tests/*.sh tests/shims/*
+	shellcheck --severity=error augur install scripts/*.sh tests/*.sh tests/shims/*
 	@echo "== shellcheck (strict on the new test harness) =="
 	SHELLCHECK_OPTS='-e SC1090 -e SC1091' shellcheck --severity=warning tests/22_egress_failclosed.sh tests/e2e_macos_vm.sh
 
