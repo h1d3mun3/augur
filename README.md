@@ -31,17 +31,23 @@ The container is hosted by **Apple Container** (`container`, github.com/apple/co
 ### Setup
 
 ```bash
-# 1. Run the install script
+# 1. Get augur — the `release` branch is the gated stable channel
+git clone -b release https://github.com/h1d3mun3/augur.git
+cd augur
+
+# 2. Run the install script
 bash install
 
-# 2. Reload shell config
+# 3. Reload shell config
 source ~/.zshrc  # or source ~/.bashrc
 
-# 3. Build the image
+# 4. Build the image
 augur build
 ```
 
 The install script copies `Dockerfile` and `augur` to `~/.augur/` and configures `PATH`. Safe to re-run.
+
+> **Stable vs. bleeding-edge.** Cloning `-b release` installs the latest release that passed the full macOS-VM E2E gate — `augur version` then reports a bare `X.Y.Z`. To follow development instead, clone `main` (the default branch); `augur version` reports `X.Y.Z-dev+<sha>` so you can always tell the two apart. Pin an exact version with `git clone --branch vX.Y.Z`. See [Cutting a release](#cutting-a-release-structural-gate).
 
 > **Apple Container only:** `augur build`/`augur update` implicitly starts a BuildKit "builder" VM (~2 CPU/2GiB) that keeps running after the build finishes, to speed up the next one. It's a single instance shared by every `container build` on the machine — not scoped to a project — so augur deliberately never stops it for you (doing so from one project's `down`/`build` could kill another project's in-flight build). If you want to free the RAM/CPU, run `container builder stop` yourself once you're sure nothing else is building.
 
@@ -121,6 +127,7 @@ Apple's Virtualization.framework — no third-party tools required.
 
 ```bash
 # on the macOS host (needs the Xcode / Swift toolchain)
+git clone -b release https://github.com/h1d3mun3/augur.git && cd augur   # `-b release` = stable; drop -b for dev (main)
 bash install        # builds & installs augur-vm into ~/.augur
 ```
 
