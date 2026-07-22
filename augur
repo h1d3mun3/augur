@@ -665,6 +665,8 @@ project_conf_domains() {
         [[ -n "$line" ]] || continue
         conf_line_valid "$line" && printf '%s\n' "$line"
     done < "$f"
+    return 0   # never inherit the last conf_line_valid result: a trailing invalid line would
+               # otherwise make this return 1 and abort callers that run it under `set -e`.
 }
 
 # Count of ./.augur/allowlist.conf non-comment, non-blank lines that conf_line_valid REJECTED (i.e.
@@ -683,6 +685,13 @@ project_conf_invalid_count() {
         conf_line_valid "$line" && valid=$((valid + 1))
     done < "$f"
     echo $((total - valid))
+}
+
+# Write an approved-domain snapshot ($1, the output of project_conf_domains) to file $2,
+# preserving "no valid domains => empty file" so write_merged_allowlist emits the project block
+# exactly as before (a bare `printf '%s\n'` on empty input would inject a spurious blank line).
+write_project_snapshot() {
+    if [[ -n "$1" ]]; then printf '%s\n' "$1" > "$2"; else : > "$2"; fi
 }
 
 # Read KEY from ./.augur/resources.conf ("KEY=value" lines, '#' comments, blanks
@@ -855,14 +864,22 @@ check_project_conf_approved() {
         error "Could not fingerprint ./.augur/allowlist.conf (no sha256sum/shasum?). Refusing to continue (fail closed)."
         exit 1
     fi
+    # Derive everything from the stable copy up front — the sanitized domain snapshot and the
+    # dropped-line count — then delete the copy immediately. The TOCTOU capture is complete here,
+    # and nothing below reads the file, so no later exit path (including Ctrl-C at the approval
+    # prompt) can leak it. Explicit rm, not a `trap` — see ssh_macos_bootstrap for the rationale.
+    local snap_content dropped
+    snap_content="$(project_conf_domains "$stable")"
+    dropped="$(project_conf_invalid_count "$stable")"
+    rm -f "$stable"
+
     recorded=""
     [[ -f "$hash_file" ]] && recorded="$(cat "$hash_file" 2>/dev/null || true)"
 
     if [[ "$cur" == "$recorded" ]]; then
         # Already approved: (re)write the snapshot from the SAME bytes we just hashed — healing an
         # approval made before snapshots existed, or a snapshot removed out from under us.
-        project_conf_domains "$stable" > "$snap_file"
-        rm -f "$stable"
+        write_project_snapshot "$snap_content" "$snap_file"
         return 0
     fi
 
@@ -872,19 +889,18 @@ check_project_conf_approved() {
         # printf %s (NOT echo -e) on the guest-derived domain; conf_line_valid already
         # guarantees a clean LDH pattern, so the approval list cannot be spoofed by
         # embedded terminal-escape bytes (addendum A1).
+        [[ -n "$d" ]] || continue
         printf '    %b+ %s%b\n' "$YELLOW" "$d" "$RESET"; had=1
-    done < <(project_conf_domains "$stable")
+    done <<< "$snap_content"
     [[ "$had" == 1 ]] || printf '    %s\n' "(no valid domain patterns)"
-    local _dropped; _dropped="$(project_conf_invalid_count "$stable")"
-    [[ "${_dropped:-0}" -gt 0 ]] && \
-        warn "Ignored ${_dropped} line(s) that are not valid domain patterns (possible obfuscation — inspect ./.augur/allowlist.conf)."
+    [[ "${dropped:-0}" -gt 0 ]] && \
+        warn "Ignored ${dropped} line(s) that are not valid domain patterns (possible obfuscation — inspect ./.augur/allowlist.conf)."
 
     # Persist BOTH the hash and the approved-domain snapshot from the stable copy, so the honored
     # policy is byte-identical to what was shown here.
     if [[ "${AUGUR_ACCEPT_PROJECT_CONF:-}" == "1" ]]; then
-        project_conf_domains "$stable" > "$snap_file"
+        write_project_snapshot "$snap_content" "$snap_file"
         echo "$cur" > "$hash_file"
-        rm -f "$stable"
         info "Accepted via AUGUR_ACCEPT_PROJECT_CONF=1."
         return 0
     fi
@@ -893,18 +909,15 @@ check_project_conf_approved() {
         local yn=""
         read -rp "$(echo -e "${CYAN}[augur]${RESET} Accept these domains for this project? [y/N] ")" yn || true
         if [[ "$yn" == [yY] ]]; then
-            project_conf_domains "$stable" > "$snap_file"
+            write_project_snapshot "$snap_content" "$snap_file"
             echo "$cur" > "$hash_file"
-            rm -f "$stable"
             success "Approved — won't ask again until .augur/allowlist.conf changes."
             return 0
         fi
-        rm -f "$stable"
         error "Declined. Edit ./.augur/allowlist.conf or approve it to continue."
         exit 1
     fi
 
-    rm -f "$stable"
     error "Project ./.augur/allowlist.conf is unapproved and augur is non-interactive."
     error "Re-run in a terminal to review it, or set AUGUR_ACCEPT_PROJECT_CONF=1 to accept."
     exit 1

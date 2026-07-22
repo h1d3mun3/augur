@@ -18,7 +18,7 @@ WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 helpers="$WORK/helpers.sh"
 grep -E '^proxy_allowlist\(\) \{' "$AUGUR" > "$helpers"          # one-liner
 for f in write_merged_allowlist conf_line_valid project_conf_domains project_conf_invalid_count \
-         project_conf_hash project_conf_hash_file check_project_conf_approved; do
+         write_project_snapshot project_conf_hash project_conf_hash_file check_project_conf_approved; do
   awk -v n="$f" 'index($0, n"()")==1 {f=1} f{print} f&&/^}/{exit}' "$AUGUR" >> "$helpers"
   echo >> "$helpers"
 done
@@ -108,6 +108,21 @@ if ( check_project_conf_approved ) </dev/null >/dev/null 2>&1; then
   fail "post-approval change detected" "check silently approved a changed conf non-interactively"
 else
   ok "post-approval change is detected on the next check (non-interactive fails closed)"
+fi
+
+section "Tier 0 — a conf ending in an invalid line does not abort approval (set -e regression)"
+# Regression: project_conf_domains used to inherit its trailing while-loop's status, so a conf
+# whose LAST line is invalid made it return 1. The three `project_conf_domains > snap` call sites
+# then aborted augur under `set -euo pipefail` (augur:7) — a guest-triggerable startup DoS plus an
+# upgrade regression for repos whose conf legitimately ends in a dropped line. This harness runs
+# WITHOUT `set -e`, so assert BOTH the function's status AND a real `set -e` approval run.
+printf 'good.example.com\n*\n' > "$AUGUR_PROJECT_CONF"   # ends with a bare '*' (invalid but tolerated)
+project_conf_domains "$AUGUR_PROJECT_CONF" >/dev/null; rc=$?
+eq "0" "$rc" "project_conf_domains returns 0 when the conf's last line is invalid"
+if ( set -e; AUGUR_ACCEPT_PROJECT_CONF=1 check_project_conf_approved ) >/dev/null 2>&1; then
+  ok "approval of a conf ending in an invalid line completes under set -e (no mid-gate abort)"
+else
+  fail "approval under set -e" "check_project_conf_approved aborted (project_conf_domains returned non-zero)"
 fi
 
 finish
