@@ -92,10 +92,12 @@ are container-create-time and re-applied by `start`; the allowlist is host-side)
   other projects on the same image tag need their own `augur destroy && augur up`.
 - Credentials are re-fingerprinted, so a rotated token recreates the container on the next `up`
   rather than being silently stale.
+- The keep-alive PID 1 traps SIGTERM (`sh -c 'trap "exit 0" TERM; sleep infinity & wait'`) so
+  `container stop` exits it at once instead of waiting the full grace period then SIGKILL — a bare
+  `sleep infinity` PID 1 ignores SIGTERM (the kernel only delivers PID 1 signals it has a handler
+  for), which made `down` take ~5s. The writable layer persists either way.
 - Follow-ups not taken here (noted for later):
   - a container-mode `list` verb (enumeration across projects is still Apple-CLI-only, per ADR-0005);
-  - a SIGTERM-handling PID 1 so `container stop` doesn't wait its grace period (`sleep infinity`
-    ignores SIGTERM today — `down` is correspondingly slower than the old `delete --force`);
   - re-keying the per-project egress **network name / subnet / ports** off `workspace_path_hash`
     (still basename-derived). Two consequences, both bounded and pre-existing-in-spirit: a
     same-basename `augur destroy` deletes the shared `augur-<slug>-net` a *different* project's kept

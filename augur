@@ -1476,10 +1476,15 @@ cmd_up() {
     fi
 
     # Keep-alive PID 1 so the container stays up (detached) for repeated `exec` (augur
-    # claude/shell). A bare `bash` exits immediately on Apple Container (no stdin) and stops
-    # the container; `sleep infinity` with no TTY (see -d above) keeps both engines up
-    # identically. The agent/shell still run via `<engine> exec -it`, not PID 1.
-    run_args+=("$IMAGE_NAME" sleep infinity)
+    # claude/shell). A bare `bash` exits immediately on Apple Container (no stdin) and stops the
+    # container; the backgrounded-and-`wait`ed `sleep infinity` keeps it up with no TTY (see -d
+    # above). The `trap … TERM` is what makes `augur down` fast: the kernel only delivers PID 1 a
+    # signal it has a HANDLER for, so a bare `sleep infinity` ignores `container stop`'s SIGTERM
+    # and stop must wait its full grace period, then SIGKILL (~5s observed). With the handler,
+    # SIGTERM exits PID 1 cleanly (0) at once; the writable layer persists either way. The
+    # agent/shell still run via `<engine> exec -it`, not PID 1. (Verified: dash and bash both keep
+    # running and exit 0 within ms of SIGTERM.)
+    run_args+=("$IMAGE_NAME" sh -c 'trap "exit 0" TERM; sleep infinity & wait')
 
     if ! eng "${run_args[@]}" &>/dev/null; then
         error "Failed to start the container."
@@ -1581,8 +1586,8 @@ cmd_down() {
         info "Stopping container '${CONTAINER_NAME}' (keeping it for a fast restart)..."
         # STOP, don't delete: the container's writable layer (caches and tool state OUTSIDE the
         # bind-mounted workspace) survives so the next `up` resumes fast. `augur destroy` removes
-        # it. NOTE: PID 1 is `sleep infinity`, which ignores SIGTERM, so `container stop` waits its
-        # grace period then SIGKILLs — the writable layer still persists across that.
+        # it. PID 1 traps SIGTERM (see cmd_up's keep-alive), so `container stop` exits it promptly
+        # instead of waiting its grace period then SIGKILL.
         # Keep the `|| true` (a stop failure must NOT abort before stop_proxy below), but re-check
         # the real state instead of reporting success unconditionally, so a rare stop failure is
         # surfaced rather than mislabeled as a clean stop.

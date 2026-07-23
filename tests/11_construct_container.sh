@@ -33,6 +33,7 @@ if [[ -f "$run" ]]; then
   cname="$(awk 'p{print;exit} $0=="--name"{p=1}' "$run")"
   eq  "run" "$(head -n1 "$run")"                               "up: invokes the engine 'run' subcommand"
   grep -qxF -- '-d' "$run" && ok "up: detached (-d, no keep-alive TTY)" || fail "up: not detached (-d missing)"
+  has "$body" 'trap "exit 0" TERM'                             "up: keep-alive PID 1 traps SIGTERM (fast down, not bare sleep infinity)"
   has "$cname" "augur-${slug}-"                                 "up: container name derived from slug"
   if grep -Eq "^augur-${slug}-[0-9a-f]{12}-swift-" <<<"$cname"; then ok "up: container name keyed on full-path hash (cross-project isolation)"
   else fail "up: container name not keyed on path hash" "got: $cname"; fi
