@@ -22,14 +22,20 @@ slug="myproj"
 
 # ── augur up: capture the constructed `container run` ────────────────────────
 export AUGUR_TEST_CONTAINER_RUNNING=0
-( cd "$proj" && bash "$AUGUR" up --no-egress ) >/dev/null 2>&1 || true
+# HOME here has no ~/.gitconfig — a regression guard for the pipefail/set -e class where
+# write_container_fingerprint returned non-zero and aborted cmd_up before finish_up (skipping the
+# I1 self-test). up MUST exit 0 here.
+( cd "$proj" && bash "$AUGUR" up --no-egress ) >/dev/null 2>&1; up_rc=$?
+eq "0" "$up_rc" "up: exits 0 on a host without ~/.gitconfig (fingerprint write must not abort cmd_up)"
 run="$AUGUR_TEST_SHIMLOG.run"
 if [[ -f "$run" ]]; then
   body="$(cat "$run")"
   cname="$(awk 'p{print;exit} $0=="--name"{p=1}' "$run")"
   eq  "run" "$(head -n1 "$run")"                               "up: invokes the engine 'run' subcommand"
   grep -qxF -- '-d' "$run" && ok "up: detached (-d, no keep-alive TTY)" || fail "up: not detached (-d missing)"
-  has "$cname" "augur-${slug}-swift-"                           "up: container name derived from slug"
+  has "$cname" "augur-${slug}-"                                 "up: container name derived from slug"
+  if grep -Eq "^augur-${slug}-[0-9a-f]{12}-swift-" <<<"$cname"; then ok "up: container name keyed on full-path hash (cross-project isolation)"
+  else fail "up: container name not keyed on path hash" "got: $cname"; fi
   has "$body" "ANTHROPIC_API_KEY=sk-ant-test123"               "up: injects ANTHROPIC_API_KEY (auth seam)"
   hasnt "$body" "CLAUDE_CODE_OAUTH_TOKEN"                       "up: omits the unset oauth token (named-only auth)"
   has "$body" "claude-projects/${slug}-"                        "up: host history under claude-projects/<slug>-… (state seam)"
@@ -58,6 +64,26 @@ if [[ -n "$host_hist_dir" && -d "$leaf_dir" ]]; then
 else
   fail "up: could not locate host_hist_dir to test migration" "looked under $HOME/.augur/claude-projects/${slug}-*"
 fi
+
+# ── Reconcile: a persisted (stopped) container is REUSED (start) when config is unchanged ──
+# The up above wrote a fingerprint (egress off, ANTHROPIC_API_KEY=…, default memory). With the
+# same config and a stopped container present, cmd_up must `container start` it — NOT rebuild.
+export AUGUR_TEST_CONTAINER_RUNNING=0
+export AUGUR_TEST_CONTAINER_STOPPED=1
+rm -f "$AUGUR_TEST_SHIMLOG.trace"
+( cd "$proj" && bash "$AUGUR" up --no-egress ) >/dev/null 2>&1 || true
+trace="$(cat "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null)"
+has   "$trace" "container start"    "up: reuses (starts) the stopped container when config is unchanged"
+hasnt "$trace" "container run"      "up: does NOT rebuild a matching persisted container"
+hasnt "$trace" "delete --force"     "up: does NOT remove a matching persisted container"
+
+# ── Reconcile: a config change (here: memory) forces a clean RECREATE (delete + run) ──
+rm -f "$AUGUR_TEST_SHIMLOG.trace"
+( cd "$proj" && AUGUR_CONTAINER_MEMORY=6g bash "$AUGUR" up --no-egress ) >/dev/null 2>&1 || true
+trace="$(cat "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null)"
+has "$trace" "delete --force"       "up: removes the stale container when baked config changed (memory)"
+has "$trace" "container run"        "up: recreates the container from the image on config drift"
+unset AUGUR_TEST_CONTAINER_STOPPED
 
 # ── augur claude: capture the constructed `container exec ... claude` ────────
 export AUGUR_TEST_CONTAINER_RUNNING=1

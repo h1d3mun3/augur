@@ -60,7 +60,8 @@ augur up [--swift VERSION]      # start the container
 augur claude                    # launch Claude Code
 augur shell                     # open a bash shell (for debugging)
 augur setup-token               # get a Claude subscription token (runs in the guest, saves on the host)
-augur down                      # stop and remove the container
+augur down                      # stop the container (kept for a fast, cache-preserving restart)
+augur destroy                   # stop and remove the container entirely (+ its egress network)
 augur status                    # show status, toolchain, and auth info
 augur build [--swift VERSION]   # build the container image
 augur update [--swift VERSION]  # rebuild image with latest tool versions
@@ -83,14 +84,20 @@ augur version                   # show augur version
 
 > **The read/write workspace mount includes `.git` — treat it as attacker-controlled.** A prompt-injected agent running inside the container can write `.git/hooks/pre-commit` (or `post-checkout`, `post-merge`, …) into the mounted repo. Git runs repo-local hooks with no trust prompt, so the next `git` command *you* run on the **host** in that repo executes guest-authored code at your full host-user privilege — a complete escape of both the container boundary and the egress allowlist. This isn't a bug augur can close in software: it's inherent to mounting a repo read-write so an agent can edit it. Review diffs before trusting them, and treat `.git/hooks` (and anything else the host later runs unreviewed, e.g. a `Makefile` or `.envrc`) in an augur-touched repo as attacker-controlled until inspected. See `docs/security-reviews/2026-07-10-egress.md` §6 item 12.
 
-> Claude Code's `--worktree` isn't specially supported (`augur claude --worktree ...` won't forward the flag). If you want it anyway: run `augur shell`, then type `claude --worktree <name>` yourself at the prompt — the worktree's files/git state persist fine, but its conversation history does not survive `augur down && up` (only the main checkout's project leaf is persisted). See `docs/decisions/0004-no-special-worktree-support.md` for the full trade-offs.
+> Claude Code's `--worktree` isn't specially supported (`augur claude --worktree ...` won't forward the flag). If you want it anyway: run `augur shell`, then type `claude --worktree <name>` yourself at the prompt — the worktree's files/git state persist fine, and its conversation history survives `augur down && up` too — `cmd_up` mounts the whole `~/.claude/projects` parent to a per-project host dir, so every cwd-keyed leaf under this project (the main checkout **and** any worktree) is stored host-side and persists (only `augur destroy` plus deleting the host history dir removes it). See `docs/decisions/0004-no-special-worktree-support.md` for the full trade-offs.
 
 ### Disk cleanup
 
-`augur update`/`augur install-cert` rebuild the image and self-prune the previous generation
-right after (`container image prune`), so normal use doesn't accumulate. For anything beyond
-that — a stray stopped container from a crash mid-`up`, or reclaiming the shared builder's
-own resources — use Apple Container's own commands directly:
+`augur down` now **stops** the container and keeps it (like `augur down --macos` keeps its VM
+clone) so the next `augur up` restarts it fast, preserving the writable layer's caches and tool
+state that live outside the mounted workspace. **`augur destroy`** removes *this project's*
+container and its egress network when you're done with it (or to force a clean, from-scratch
+container). `augur update`/`augur install-cert` rebuild the image, self-prune the previous
+generation (`container image prune`), and remove this project's container so the new image takes
+effect on the next `up` — other projects on the same image tag need their own `augur destroy &&
+augur up`. For anything beyond that — stopped containers from projects you're finished with, or
+reclaiming the shared builder's own resources — use `augur destroy` per project, or Apple
+Container's own commands directly:
 
 ```bash
 container prune              # remove stopped containers

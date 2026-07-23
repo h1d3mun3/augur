@@ -234,7 +234,12 @@ workspace_slug() {
 }
 
 make_container_name() {
-    echo "augur-$(workspace_slug)-swift-${SWIFT_IMAGE_TAG//./-}"
+    # Include the full-path hash (not just the basename slug) so two projects that share a
+    # basename (~/work/app vs ~/archive/app) never resolve to the SAME container. This matters
+    # now that `down` KEEPS the container: without the hash, project B's `up`/`claude` could
+    # re-attach to project A's persisted container — with A's mounts, credentials, and any
+    # foothold a prior session left behind. Mirrors the macOS project-VM name (macos_project_vm).
+    echo "augur-$(workspace_slug)-$(workspace_path_hash)-swift-${SWIFT_IMAGE_TAG//./-}"
 }
 
 # In-container mount/workdir, suffixed with the project slug so each project gets
@@ -268,19 +273,6 @@ ensure_image() {
     if ! eng image inspect "$IMAGE_NAME" &>/dev/null; then
         info "$(engine_label) image '${IMAGE_NAME}' not found. Building..."
         cmd_build
-    fi
-}
-
-ensure_running() {
-    if ! container_running; then
-        if container_exists; then
-            info "Container exists but is stopped. Starting it..."
-            eng start "$CONTAINER_NAME" &>/dev/null
-        else
-            warn "No container found for this directory."
-            warn "Run ${BOLD}augur up${RESET} first."
-            exit 1
-        fi
     fi
 }
 
@@ -1081,23 +1073,29 @@ verify_egress_locked() {
     # distinct public IPv4 AND IPv6 anycast addresses on both :443 and :80 so a single
     # blackholed/rerouted IP (or a v6-only leak the v4 probes would miss) can't make a
     # routable network look isolated. ANY success is a leak.
+    # Pin PATH to system dirs (excluding the dev-writable ~/.local/bin, which is FIRST in the image
+    # PATH) for every probe below: with the container now PERSISTED across down/up, a prior guest
+    # session (uid 1001, no root) could plant ~/.local/bin/curl|getent stubs that fake the isolated
+    # answers and pass this self-test on the reuse path. curl/getent/sh all live in /usr/bin//bin, so
+    # this can never cause a "not found" false failure — it only stops the tripwire being shadowed.
+    local _probe_path="/usr/bin:/bin:/usr/local/bin"
     local _probe
     for _probe in https://example.com https://1.1.1.1 https://8.8.8.8 http://1.1.1.1 http://8.8.8.8 \
                   'https://[2606:4700:4700::1111]' 'http://[2001:4860:4860::8888]'; do
-        if eng exec -e HTTP_PROXY= -e HTTPS_PROXY= -e http_proxy= -e https_proxy= -e NO_PROXY="*" \
+        if eng exec -e PATH="$_probe_path" -e HTTP_PROXY= -e HTTPS_PROXY= -e http_proxy= -e https_proxy= -e NO_PROXY="*" \
             "$CONTAINER_NAME" sh -c "curl -s --max-time 6 -o /dev/null ${_probe}" 2>/dev/null; then
             leaked=true; error "Self-test: the container reached ${_probe} directly (not isolated)."
         fi
     done
     # External DNS must fail closed (--no-dns leaves the guest no external resolver).
-    if eng exec "$CONTAINER_NAME" sh -c 'getent hosts dns-leak-probe.example' &>/dev/null; then
+    if eng exec -e PATH="$_probe_path" "$CONTAINER_NAME" sh -c 'getent hosts dns-leak-probe.example' &>/dev/null; then
         leaked=true; error "Self-test: the container resolved an external name (DNS not fail-closed)."
     fi
     # The proxy MUST be reachable: a request through it (even a 403 deny) must return an HTTP
     # status, not a connection failure. curl prints 000 (and exits nonzero) on failure, so
     # `|| true` keeps the failure on the fail-closed branch below instead of aborting under set -e.
     local pcode
-    pcode="$(eng exec "$CONTAINER_NAME" sh -c \
+    pcode="$(eng exec -e PATH="$_probe_path" "$CONTAINER_NAME" sh -c \
         "curl -s -o /dev/null -w '%{http_code}' --max-time 8 -x '${purl}' http://egress-proxy-probe.invalid/" 2>/dev/null || true)"
     if [[ -z "$pcode" || "$pcode" == "000" ]]; then
         leaked=true
@@ -1208,6 +1206,106 @@ cmd_build() {
     while IFS= read -r _a; do build_args+=("$_a"); done < <(container_provision_build_args)
     eng build "${build_args[@]}" -t "$IMAGE_NAME" "$SCRIPT_DIR"
     success "Image '${IMAGE_NAME}' built successfully."
+    invalidate_persisted_container "the new image"
+}
+
+# A rebuilt image only reaches the guest through a FRESH container — a persisted (stopped)
+# container keeps the old image's filesystem, and `container start` never re-derives it. Remove
+# THIS project's container (if any) so the next `augur up` recreates it from the new image; the
+# workspace and Claude history are bind-mounted, so only the throwaway writable layer is dropped.
+# Only this project's container is reachable by name here; the fingerprint does not track image
+# content, so OTHER projects on the same image tag need their own `augur destroy && augur up`.
+invalidate_persisted_container() {
+    local why="$1"
+    if container_exists; then
+        info "Removing this project's container so ${why} takes effect on next ${BOLD}augur up${RESET}..."
+        engine_rm_force "$CONTAINER_NAME" &>/dev/null || true
+        rm -f "$(container_fingerprint_file)" 2>/dev/null || true
+    fi
+}
+
+# ── Persisted-container reconcile (Apple Container mode keeps the container across `down`) ──
+# `down` STOPS the container instead of deleting it, so the next `up` can restart it for a fast,
+# cache-preserving resume. But a container's egress wiring, credentials, memory and mounts are
+# baked once at `container run` and are NOT re-evaluated by `container start` — so reusing a
+# container whose inputs have since changed would silently run stale/wrong config (a rotated
+# token, a flipped egress mode, a resized memory limit). The fingerprint records exactly those
+# baked inputs; `up` reuses the container only on an exact match and otherwise recreates it clean.
+container_fingerprint_file() {
+    mkdir -p "$AUGUR_DIR/container-state"
+    # Key on the FULL container name (which already includes the Swift tag) so a project persisted
+    # across multiple --swift versions keeps ONE fingerprint PER container. A tag-agnostic key could
+    # match one tag's container while describing another tag's baked config → stale-credential reuse.
+    echo "$AUGUR_DIR/container-state/${CONTAINER_NAME}.fingerprint"
+}
+
+# Hash of everything cmd_up bakes into the container at `run` time and cannot change without
+# recreating it. NOTE: image CONTENT is handled separately — build/update/install-cert remove
+# this project's container so a rebuilt image always takes effect (a persisted container keeps
+# the old image's filesystem). Reads the resolved secret VALUES so a rotated token forces a
+# recreate; the digest is written host-side 0600, never in the project tree.
+container_fingerprint() {
+    local gh_token egress_state egress_wiring _genv _henv _hfile _hvalidator _aval
+    gh_token="$(gh auth token 2>/dev/null || true)"
+    if egress_enabled; then
+        egress_state="on"
+        # Fingerprint the STABLE inputs that DETERMINE the baked HTTP_PROXY (subnet → gateway, an
+        # explicit gateway override, and the proxy PORT) — NOT the live-inspected gateway. The live
+        # value needs the network to exist at compare time and its computed fallback ignores a
+        # custom subnet, both of which cause false mismatches; these three fully pin the proxy URL
+        # cmd_up bakes into HTTP_PROXY, including the port the bare gateway omitted.
+        egress_wiring="subnet=${AUGUR_INTERNAL_SUBNET} gw=${AUGUR_CONTAINER_GATEWAY:-} port=${AUGUR_PROXY_HTTP_PORT}"
+    else
+        egress_state="off"; egress_wiring="-"
+    fi
+    {
+        echo "egress=${egress_state}"
+        echo "wiring=${egress_wiring}"
+        echo "memory=$(resolve_container_memory)"
+        echo "workspace=${WORKSPACE_DIR}"
+        echo "mount=${WORKSPACE_MOUNT}"
+        # AUGUR_AGENT_SEAM | fingerprint the resolved auth values (named-only, same source as the
+        # -e injection) so a rotated/added/removed credential recreates the container on next up.
+        while IFS='|' read -r _genv _henv _hfile _hvalidator; do
+            [[ -z "$_genv" ]] && continue
+            _aval="$(resolve_api_key "${!_henv:-}" "$_hfile")"
+            echo "auth:${_genv}=${_aval}"
+        done < <(agent_auth_specs)
+        echo "gh_token=${gh_token}"
+        # else-less `if`, NOT `[[ -f ]] && echo`: the &&-form returns 1 when no ~/.gitconfig, and
+        # under `set -o pipefail` that 1 becomes the pipeline's (hence the function's) exit status,
+        # which would abort the STANDALONE write_container_fingerprint call under `set -e` — skipping
+        # finish_up and its I1 boot self-test on a fresh up. An else-less if with a false test returns 0.
+        if [[ -f "$HOME/.gitconfig" ]]; then echo "gitconfig=present"; fi
+    } | { if command -v sha256sum &>/dev/null; then sha256sum; else shasum -a 256; fi; } | awk '{print $1}'
+}
+
+# True iff a persisted container's stored fingerprint still matches the current config.
+container_fingerprint_matches() {
+    local f; f="$(container_fingerprint_file)"
+    [[ -f "$f" ]] || return 1
+    [[ "$(cat "$f" 2>/dev/null)" == "$(container_fingerprint)" ]]
+}
+
+write_container_fingerprint() {
+    local f; f="$(container_fingerprint_file)"
+    ( umask 077; container_fingerprint > "$f" )
+}
+
+# Shared tail of `up` (both the fresh-create and the reuse path): bring the host egress proxy up
+# now that the container has attached, run the boot self-test (I1's tripwire — runs on EVERY up,
+# never cached from a prior boot), and print the ready banner.
+finish_up() {
+    if egress_enabled; then
+        start_egress_proxy
+        verify_egress_locked
+    fi
+    success "Container '${CONTAINER_NAME}' is up."
+    echo ""
+    echo -e "  ${BOLD}augur claude${RESET}  → Launch Claude Code"
+    echo -e "  ${BOLD}augur shell${RESET}   → Open bash shell"
+    echo -e "  ${BOLD}augur down${RESET}    → Stop (kept for a fast restart)"
+    echo -e "  ${BOLD}augur destroy${RESET} → Remove the container entirely"
 }
 
 cmd_up() {
@@ -1223,8 +1321,26 @@ cmd_up() {
     # starting the proxy (only relevant when egress filtering is on).
     if egress_enabled; then check_project_conf_approved; fi
 
+    # Reconcile: `down` now STOPS (keeps) the container, so if a persisted one exists AND the
+    # config it was created with is unchanged (see container_fingerprint), reuse it — start it,
+    # bring egress up, and return. A reused container re-applies its ORIGINAL egress wiring,
+    # credentials, memory and mounts (baked once at `run`), so ANY drift must instead force a
+    # clean recreate below; the boot self-test in finish_up still gates the reuse.
+    if container_exists && container_fingerprint_matches; then
+        info "Reusing stopped container '${CONTAINER_NAME}' (config unchanged; fast restart)..."
+        # The internal egress network is kept across `down`; ensure it still exists (idempotent)
+        # so the container can re-attach.
+        if egress_enabled; then start_egress; fi
+        if eng start "$CONTAINER_NAME" &>/dev/null; then
+            finish_up
+            return 0
+        fi
+        warn "Could not start the existing container; recreating it clean..."
+    fi
+
+    # Recreate: drop any existing container (its config drifted, or it wouldn't start), then
+    # build a fresh one from the image below.
     if container_exists; then
-        info "Removing stale container '${CONTAINER_NAME}'..."
         engine_rm_force "$CONTAINER_NAME" &>/dev/null
     fi
 
@@ -1371,26 +1487,23 @@ cmd_up() {
         if egress_enabled; then stop_egress; fi
         exit 1
     fi
+    # Record the config this fresh container was created with, so the next `up` can tell whether
+    # the persisted container is still reusable or must be recreated (see the reconcile above).
+    write_container_fingerprint
 
     # The agent container has now ATTACHED to the network — the host's host-only gateway
-    # interface comes up at that point, so start the host proxy now. The container is idle
-    # `bash` until `augur claude`, so nothing egresses in the gap before the proxy is up —
-    # and the self-test gates it.
-    if egress_enabled; then
-        start_egress_proxy
-        verify_egress_locked
-    fi
-
-    success "Container '${CONTAINER_NAME}' is up."
-    echo ""
-    echo -e "  ${BOLD}augur claude${RESET}  → Launch Claude Code"
-    echo -e "  ${BOLD}augur shell${RESET}   → Open bash shell"
-    echo -e "  ${BOLD}augur down${RESET}    → Stop and remove"
+    # interface comes up at that point, so finish_up starts the host proxy and runs the boot
+    # self-test. Shared with the reuse path above (the datapath is rebuilt on EVERY up).
+    finish_up
 }
 
 cmd_claude() {
     require_engine
-    ensure_running
+    # Not running? Go through the FULL `up` (reconcile + egress bring-up + boot self-test), not a
+    # bare `container start`. With a persisted container, `down`(stop) then `claude` is a normal
+    # reuse path; a bare start would re-attach the guest with NO proxy re-established and NO
+    # self-test — silently bypassing egress. Mirrors macOS `cmd_claude_macos` (running || up).
+    container_running || cmd_up
     info "Launching $(agent_display_name) in '${CONTAINER_NAME}'..."
     # AUGUR_AGENT_SEAM | interactive launch (engine `exec`: argv array — safe by construction)
     local _env=() _argv=() kv
@@ -1402,7 +1515,9 @@ cmd_claude() {
 
 cmd_shell() {
     require_engine
-    ensure_running
+    # Same as cmd_claude: route a stopped/absent container through the full `up` so egress is
+    # re-established and self-tested, never a bare `container start`.
+    container_running || cmd_up
     info "Opening bash shell in '${CONTAINER_NAME}'..."
     eng exec -it "$CONTAINER_NAME" bash
 }
@@ -1413,18 +1528,19 @@ cmd_shell() {
 # headless: it prints a URL to open in any browser; paste the code back here.
 cmd_setup_token() {
     require_engine
-    # Auto-start a container if none is running, and tear it back down afterward, so
-    # this command leaves no stray container/proxy. The token is saved to the host
-    # for future `up`s regardless; an already-running container is left untouched.
+    # Auto-start a container if none is running, and stop it again afterward (kept, like any
+    # `down`), so the token flow doesn't leave a RUNNING container/proxy behind. The token is
+    # saved to the host for future `up`s regardless; an already-running container is left untouched.
     local started_here=false
     if ! container_running; then cmd_up; started_here=true; fi
     # A2: the guest can overwrite its own (uid 1001-owned) claude binary, and setup-token
-    # attaches that binary to the operator's TTY. Refuse if it differs from the image's
-    # pristine copy — a freshly-upped container matches; a reused one tampered with by a
-    # prior session does not (recreate to get a clean binary).
+    # attaches that binary to the operator's TTY. Refuse if it differs from the image's pristine
+    # copy — a freshly-CREATED container matches; a reused one tampered with by a prior session
+    # does not. Now that `down` only STOPS (the tampered filesystem persists), the clean-binary
+    # remedy is `augur destroy` (full removal) followed by `augur up`, NOT `down && up`.
     if ! agent_verify_integrity_engine; then
         error "The claude binary in '${CONTAINER_NAME}' differs from the image — it may have been modified by the guest."
-        error "Recreate a clean container first: ${BOLD}augur down && augur up${RESET}, then re-run setup-token."
+        error "Recreate a clean container first: ${BOLD}augur destroy && augur up${RESET}, then re-run setup-token."
         if $started_here; then cmd_down; fi
         return 1
     fi
@@ -1462,14 +1578,45 @@ cmd_setup_token() {
 cmd_down() {
     require_engine
     if container_exists; then
-        info "Stopping and removing container '${CONTAINER_NAME}'..."
-        engine_rm_force "$CONTAINER_NAME" &>/dev/null
-        success "Container '${CONTAINER_NAME}' has been stopped and removed."
+        info "Stopping container '${CONTAINER_NAME}' (keeping it for a fast restart)..."
+        # STOP, don't delete: the container's writable layer (caches and tool state OUTSIDE the
+        # bind-mounted workspace) survives so the next `up` resumes fast. `augur destroy` removes
+        # it. NOTE: PID 1 is `sleep infinity`, which ignores SIGTERM, so `container stop` waits its
+        # grace period then SIGKILLs — the writable layer still persists across that.
+        # Keep the `|| true` (a stop failure must NOT abort before stop_proxy below), but re-check
+        # the real state instead of reporting success unconditionally, so a rare stop failure is
+        # surfaced rather than mislabeled as a clean stop.
+        eng stop "$CONTAINER_NAME" &>/dev/null || true
+        if container_running; then
+            warn "Container '${CONTAINER_NAME}' did not stop cleanly (still running)."
+            warn "Force-remove it with ${BOLD}augur destroy${RESET} if needed."
+        else
+            success "Container '${CONTAINER_NAME}' stopped (kept; CoW writable layer preserved)."
+            echo -e "  ${BOLD}augur up${RESET}       → restart it (fast, reuses the container)"
+            echo -e "  ${BOLD}augur destroy${RESET}  → remove it entirely"
+        fi
     else
         warn "No container found for this directory (${CONTAINER_NAME})."
     fi
-    # Always tear down egress (safe no-ops if it was never enabled) so a stranded
-    # proxy/network from a crashed or out-of-band-removed container is cleaned up.
+    # Stop the host-side egress proxy, but KEEP the internal network so the persisted container
+    # can re-attach on the next up (destroy removes the network). Safe no-op if egress was off.
+    stop_proxy
+}
+
+# Fully remove this project's container and its egress network — the counterpart to `down`'s
+# keep-it behavior (mirrors `augur destroy --macos`). Use it to reclaim disk, or to force a
+# from-scratch container (e.g. after a suspected guest compromise, or to pick up a rebuilt image).
+cmd_destroy() {
+    require_engine
+    if container_exists; then
+        info "Stopping and removing container '${CONTAINER_NAME}'..."
+        engine_rm_force "$CONTAINER_NAME" &>/dev/null
+        success "Container '${CONTAINER_NAME}' has been removed."
+    else
+        warn "No container found for this directory (${CONTAINER_NAME})."
+    fi
+    # Drop the reconcile fingerprint and tear down the whole egress datapath (proxy + network).
+    rm -f "$(container_fingerprint_file)" 2>/dev/null || true
     stop_egress
 }
 
@@ -1575,9 +1722,8 @@ cmd_install_cert() {
     info "trust store need their own knob: Node/npm → ${BOLD}NODE_EXTRA_CA_CERTS${RESET}, Python → ${BOLD}REQUESTS_CA_BUNDLE${RESET}."
     warn "Single custom root: re-running ${BOLD}install-cert${RESET} REPLACES it (not additive)."
     warn "A later ${BOLD}augur build${RESET}/${BOLD}update${RESET} rebuilds the image clean and DROPS the CA — re-run install-cert after those."
-    if container_exists; then
-        warn "Recreate the container to pick up the new image: ${BOLD}augur down && augur up${RESET}."
-    fi
+    invalidate_persisted_container "the newly-trusted CA (baked into the image)"
+    warn "Other projects on this image tag: ${BOLD}augur destroy && augur up${RESET} to pick up the CA."
 }
 
 # Print the container toolchain WITHOUT building anything — status inspects only what
@@ -1651,7 +1797,8 @@ cmd_update() {
     # layers lose their tag and become dangling. Without this they'd silently accumulate
     # on every update (observed: tens of GB after repeated updates).
     eng image prune
-    warn "Existing containers use the old image. Run ${BOLD}augur down && augur up${RESET} to apply."
+    invalidate_persisted_container "the updated image"
+    warn "Other projects' containers still use the old image — run ${BOLD}augur destroy && augur up${RESET} in each to update."
 }
 
 # Report augur's version. The NUMBER is the single source of truth in the committed VERSION
@@ -3340,7 +3487,8 @@ cmd_help() {
     echo -e "    augur ${CYAN}shell${RESET}                      Open a bash shell"
     echo -e "    augur ${CYAN}setup-token${RESET}                Get a Claude token in the guest, save it on the host"
     echo -e "    augur ${CYAN}install-cert${RESET} <cert.crt>    Trust a custom CA (PEM X.509) in the guest"
-    echo -e "    augur ${CYAN}down${RESET}                       Stop and remove the container"
+    echo -e "    augur ${CYAN}down${RESET}                       Stop the container (kept for a fast restart)"
+    echo -e "    augur ${CYAN}destroy${RESET}                    Stop and remove the container entirely"
     echo -e "    augur ${CYAN}status${RESET}                     Check status and toolchain"
     echo -e "    augur ${CYAN}build${RESET}   [--swift VERSION]  Build the container image"
     echo -e "    augur ${CYAN}update${RESET}  [--swift VERSION]  Rebuild image with latest versions"
@@ -3487,6 +3635,7 @@ else
         setup-token)    cmd_setup_token ;;
         install-cert)   cmd_install_cert "$@" ;;
         down)           cmd_down ;;
+        destroy)        cmd_destroy ;;
         status)         cmd_status ;;
         init-conf)      cmd_init_conf ;;
         update)         cmd_update ;;
