@@ -45,6 +45,13 @@ if [[ -f "$run" ]]; then
   hasnt "$body" ":/home/dev/.claude/projects/-workspace-${slug}" "up: no leftover leaf-scoped mount target"
   if grep -Eq "claude-projects/${slug}-[0-9a-f]{12}:" "$run"; then ok "up: history host dir keyed on full-path hash (A3/C7)"
   else fail "up: history host dir not keyed on path hash"; fi
+  # User-level subagent defs (~/.claude/agents): same per-project, path-hash-keyed, outside-host-~/.claude
+  # persistence as history — so `/agents` created in the guest survive down/up AND destroy/recreate.
+  has "$body" "claude-agents/${slug}-"                          "up: host agents dir under claude-agents/<slug>-… (state seam)"
+  if grep -Eq ":/home/dev/\.claude/agents$" "$run"; then ok "up: mounts ~/.claude/agents (user-level subagent defs persist)"
+  else fail "up: does not mount ~/.claude/agents" "expected a line ending exactly in :/home/dev/.claude/agents"; fi
+  if grep -Eq "claude-agents/${slug}-[0-9a-f]{12}:" "$run"; then ok "up: agents host dir keyed on full-path hash (A3/C7)"
+  else fail "up: agents host dir not keyed on path hash"; fi
 else
   cname="augur-${slug}"
   fail "up: no container run captured" "trace: $(cat "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null)"

@@ -34,16 +34,21 @@ if [[ -z "$img" ]]; then finish; exit $?; fi
 # Full lifecycle in a throwaway project (egress off to avoid the host proxy datapath).
 proj="$(mktemp -d)"
 slug="$(basename "$proj" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]' '-' | sed 's/^-//;s/-$//')"
+# WORKSPACE_DIR="$(pwd)" inside the `cd "$proj"` subshells, so this matches augur's workspace_path_hash.
+phash="$(printf '%s' "$proj" | { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; } | cut -c1-12)"
+augur_dir="${AUGUR_DIR:-$HOME/.augur}"
 # destroy (not down): down now only STOPS the container (persistence), so the test must fully
-# remove it on exit to avoid leaking a stopped container + its egress network.
-cleanup() { ( cd "$proj" && bash "$REPO/augur" destroy --no-egress ) >/dev/null 2>&1; rm -rf "$proj"; }
+# remove it on exit. Also remove the per-project HOST state dirs this test created under ~/.augur
+# (history + agents) — destroy deliberately does NOT touch them, so clean them up here.
+cleanup() {
+  ( cd "$proj" && bash "$REPO/augur" destroy --no-egress ) >/dev/null 2>&1
+  rm -rf "$proj" "$augur_dir/claude-projects/${slug}-${phash}" "$augur_dir/claude-agents/${slug}-${phash}"
+}
 trap cleanup EXIT
 
 if ( cd "$proj" && bash "$REPO/augur" up --no-egress ) >/dev/null 2>&1; then
   ok "augur up brought a container online"
-  # Container name now embeds the workspace path hash (cross-project isolation), so derive it
-  # the same way augur does: augur-<slug>-<sha256(pwd)[:12]>-swift-<tag>. WORKSPACE_DIR="$(pwd)".
-  phash="$(printf '%s' "$proj" | { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; } | cut -c1-12)"
+  # Container name embeds the workspace path hash (cross-project isolation): augur-<slug>-<hash>-swift-<tag>.
   cont="augur-${slug}-${phash}-swift-$(printf '%s' "${SWIFT_VERSION:-latest}" | tr '.' '-')"
   cver="$(container exec "$cont" sh -lc 'claude --version' 2>/dev/null || true)"
   if [[ -n "$cver" ]]; then ok "agent runs inside the live container ($cont)"; else fail "agent did not run inside '$cont'"; fi
@@ -62,6 +67,21 @@ if ( cd "$proj" && bash "$REPO/augur" up --no-egress ) >/dev/null 2>&1; then
   ( cd "$proj" && bash "$REPO/augur" up --no-egress ) >/dev/null 2>&1
   survived="$(container exec "$cont" sh -lc "cat '$marker' 2>/dev/null" 2>/dev/null || true)"
   if [[ "$survived" == "alive" ]]; then ok "up reused the container — writable-layer state survived down/up"; else fail "up did not reuse the container (marker lost)"; fi
+
+  # ── Agent-config persistence: user-level /agents survive DESTROY+up (host-mounted, #113) ──
+  # Write a user-level subagent def into ~/.claude/agents (the newly bind-mounted host dir), then
+  # DESTROY (removes the container + its writable layer) and up (a fresh container). Unlike the
+  # writable-layer marker above, this MUST survive: ~/.claude/agents is a host mount that `destroy`
+  # never touches — exactly the reported gap (augur up → /agents → destroy → up used to lose it).
+  agentdef="/home/dev/.claude/agents/augur-test-agent.md"
+  container exec "$cont" sh -lc "mkdir -p ~/.claude/agents && printf '%s\n' '---' 'name: augur-test-agent' '---' 'probe' > '$agentdef'" >/dev/null 2>&1 || true
+  ( cd "$proj" && bash "$REPO/augur" destroy --no-egress ) >/dev/null 2>&1
+  ( cd "$proj" && bash "$REPO/augur" up --no-egress ) >/dev/null 2>&1
+  if container exec "$cont" sh -lc "grep -q augur-test-agent '$agentdef'" >/dev/null 2>&1; then
+    ok "user-level subagent def survived destroy+up (~/.claude/agents is host-persisted)"
+  else
+    fail "subagent def lost across destroy+up" "~/.claude/agents did not persist (expected host mount)"
+  fi
 
   # ── destroy removes it ──
   ( cd "$proj" && bash "$REPO/augur" destroy --no-egress ) >/dev/null 2>&1
