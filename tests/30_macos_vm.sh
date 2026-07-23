@@ -18,6 +18,10 @@ has "$claude_macos" '${_rargv}'          "macOS launch interpolates the seam lau
 # The per-VM history share name must equal agent_state_host_subdir (A3/C7 contract).
 up_macos="$(awk '/^cmd_up_macos\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
 has "$up_macos" 'agent_state_host_subdir' "macOS history share dir name comes from agent_state_host_subdir (A3/C7)"
+# The per-VM user-level subagent-defs share (#113) mirrors history: share name from the seam, and
+# the guest ~/.claude/agents symlink wired via ensure_macos_claude_agents.
+has "$up_macos" 'agent_state_agents_host_subdir' "macOS agents share dir name comes from agent_state_agents_host_subdir (A3/C7)"
+has "$up_macos" 'ensure_macos_claude_agents'     "macOS up wires ~/.claude/agents (ensure_macos_claude_agents)"
 
 section "Tier 2 — per-project VM naming is path-hash keyed, not basename-only (run anywhere)"
 # §6/§9 fix: macos_project_vm() used to key purely on basename(WORKSPACE_DIR), so two

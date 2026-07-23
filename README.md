@@ -75,12 +75,13 @@ augur version                   # show augur version
 |------|-------------|
 | Current directory | mounted at `/workspace-<project>` (read/write), named after the directory |
 | `~/.claude/projects/-workspace-<project>` | **only this project's** Claude history is shared (read/write) — not the rest of `~/.claude`, so other projects' transcripts and host auth/settings stay invisible |
+| `~/.claude/agents/` | **this project's** user-level custom subagent definitions (`/agents`) are persisted (read/write), keyed per-project under `~/.augur/claude-agents/<project>` — so they survive `augur down`/`up` **and** `destroy`/recreate. Isolated per project (not the host's global `~/.claude/agents`), so a guest can't plant a subagent read by another project. Project-level `.claude/agents/` in the repo work too, via the workspace mount. |
 | `~/.config/gh/` | mounted **read-only** (the container can read but not rewrite it; the token is injected via `GH_TOKEN`) |
 | `~/.gitconfig` | mounted read-only |
 | Claude auth | injected via env (`CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY`) — the host's credential store is never mounted |
 | Everything else | **not visible to the container** |
 
-> Auth is env-based in both modes now. If you only ever logged in via the browser, run `augur setup-token` (or set `ANTHROPIC_API_KEY`); see [API keys and authentication](#api-keys-and-authentication). Upgrading from an older augur requires a one-time `augur build` (the image now pre-creates the scoped history dir).
+> Auth is env-based in both modes now. If you only ever logged in via the browser, run `augur setup-token` (or set `ANTHROPIC_API_KEY`); see [API keys and authentication](#api-keys-and-authentication). Upgrading from an older augur requires a one-time `augur build` (the image now pre-creates the scoped history dir). To activate `~/.claude/agents` persistence on a container/VM that already exists, recreate it once — `augur destroy && augur up` (or `augur down --macos && augur up --macos`); new containers/VMs get it automatically.
 
 > **The read/write workspace mount includes `.git` — treat it as attacker-controlled.** A prompt-injected agent running inside the container can write `.git/hooks/pre-commit` (or `post-checkout`, `post-merge`, …) into the mounted repo. Git runs repo-local hooks with no trust prompt, so the next `git` command *you* run on the **host** in that repo executes guest-authored code at your full host-user privilege — a complete escape of both the container boundary and the egress allowlist. This isn't a bug augur can close in software: it's inherent to mounting a repo read-write so an agent can edit it. Review diffs before trusting them, and treat `.git/hooks` (and anything else the host later runs unreviewed, e.g. a `Makefile` or `.envrc`) in an augur-touched repo as attacker-controlled until inspected. See `docs/security-reviews/2026-07-10-egress.md` §6 item 12.
 

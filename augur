@@ -183,6 +183,14 @@ agent_auth_specs() {
 agent_state_host_subdir()        { echo "claude-projects"; }              # dir under $AUGUR_DIR (both modes)
 agent_state_guest_projects_dir() { echo "/home/dev/.claude/projects"; }   # guest parent dir
 agent_state_guest_leaf()         { echo "-workspace-$1"; }                # leaf name from slug ($1)
+# User-level custom subagent definitions (`~/.claude/agents/*.md`, the `/agents` UI). DATA only;
+# the CORE keys the host source on slug+path-hash and keeps it OUTSIDE the host's own ~/.claude,
+# exactly like history above (A3/C7) — a compromised guest can therefore plant an agent def only
+# into ITS OWN project's dir, never the host's real ~/.claude/agents nor another project's. That
+# is why we persist a PER-PROJECT dir, not the host's global ~/.claude/agents (a global RW mount
+# would let a guest inject a subagent read by every future session in every project).
+agent_state_agents_host_subdir() { echo "claude-agents"; }                # dir under $AUGUR_DIR (both modes)
+agent_state_guest_agents_dir()   { echo "/home/dev/.claude/agents"; }     # guest user-level subagent-defs dir
 # Integrity gate (agent_verify_integrity_engine/_macos), save_oauth_token,
 # setup_token_security_notice and the macOS state/install helpers are tagged
 # AUGUR_AGENT_SEAM in place. Egress baseline is file-based: see augur.conf.
@@ -1450,6 +1458,17 @@ cmd_up() {
     fi
     run_args+=(-v "${host_hist_dir}:$(agent_state_guest_projects_dir)")
 
+    # AUGUR_AGENT_SEAM | user-level subagent defs (~/.claude/agents) — SAME keying/scope as the
+    # history mount above: a per-project host dir (slug + path hash), kept OUTSIDE the host's own
+    # ~/.claude, so a compromised guest can plant subagent defs only into its OWN project's dir,
+    # never the host's real ~/.claude/agents nor another project's. This persists user-level
+    # subagents created in the guest via `/agents` across down/up AND destroy/recreate (the host
+    # dir is untouched by down/destroy), matching how this project's history already persists.
+    local host_agents_dir
+    host_agents_dir="$AUGUR_DIR/$(agent_state_agents_host_subdir)/$(workspace_slug)-$(workspace_path_hash)"
+    mkdir -p "$host_agents_dir"
+    run_args+=(-v "${host_agents_dir}:$(agent_state_guest_agents_dir)")
+
     [[ -f "$HOME/.gitconfig" ]] && run_args+=(-v "${HOME}/.gitconfig:/home/dev/.gitconfig:ro")
 
     # gh config is mounted READ-ONLY: the guest may read it but cannot rewrite the
@@ -2150,6 +2169,29 @@ ensure_macos_claude_projects() {
     '
 }
 
+# Point the guest's ~/.claude/agents at the per-VM host share so user-level subagent defs created
+# in the VM via `/agents` persist across down/up AND destroy/re-clone (the share is host-side,
+# under $AUGUR_DIR — untouched by `vm delete`). Mirrors ensure_macos_claude_projects; the share
+# name here ("claude-agents") must match the --dir= share cmd_up_macos adds.
+# AUGUR_AGENT_SEAM | macOS user-level subagent-defs persistence (share name = agent_state_agents_host_subdir)
+ensure_macos_claude_agents() {
+    local vm="$1"
+    ssh_macos "$vm" '
+        set -e
+        # Only wire the symlink once the host share is actually MOUNTED (it appears only after a
+        # `vm run` with the --dir). Guards a VM booted BEFORE this share existed (upgrade-in-place):
+        # without this, the claude/shell paths would rm -rf a real VM-local ~/.claude/agents and leave
+        # a DANGLING symlink until the next up. Skipping here leaves it untouched; `down --macos &&
+        # up --macos` re-runs `vm run` with the --dir and self-heals. ensure_macos_claude_projects needs
+        # no such guard — its share predates this change, so a running VM always already has it.
+        [ -d "/Volumes/My Shared Files/claude-agents" ] || exit 0
+        mkdir -p "$HOME/.claude"
+        # VM-local agents dir is throwaway (lost on clone); replace a non-symlink with the share.
+        [ -L "$HOME/.claude/agents" ] || rm -rf "$HOME/.claude/agents"
+        ln -sfn "/Volumes/My Shared Files/claude-agents" "$HOME/.claude/agents"
+    '
+}
+
 # AUGUR_AGENT_SEAM | macOS agent install / self-heal (official installer into ~/.local/bin).
 ensure_macos_claude_bin() {
     local vm="$1"
@@ -2213,6 +2255,9 @@ cmd_up_macos() {
     # guest only ever sees its own project's transcripts, never other projects'.
     # AUGUR_AGENT_SEAM | per-VM history parent (share dir name = agent_state_host_subdir)
     mkdir -p "$AUGUR_DIR/$(agent_state_host_subdir)/$project_vm"
+    # AUGUR_AGENT_SEAM | per-VM user-level subagent-defs share (dir name = agent_state_agents_host_subdir):
+    # a host-side dir so `/agents` created in the VM persist across down/up AND destroy/re-clone.
+    mkdir -p "$AUGUR_DIR/$(agent_state_agents_host_subdir)/$project_vm"
     info "Starting VM '${project_vm}'..."
     info "Mounting: ${BOLD}${WORKSPACE_DIR}${RESET} → ~/${MACOS_SHARE}"
     # A GUI window (--gui) and headless mode build the same VM (same NAT networking and
@@ -2246,6 +2291,7 @@ cmd_up_macos() {
         --dir="${MACOS_SHARE}:${WORKSPACE_DIR}" \
         --dir="gh-config:${HOME}/.config/gh:ro" \
         --dir="$(agent_state_host_subdir):${AUGUR_DIR}/$(agent_state_host_subdir)/${project_vm}" \
+        --dir="$(agent_state_agents_host_subdir):${AUGUR_DIR}/$(agent_state_agents_host_subdir)/${project_vm}" \
         "$project_vm" &>"$(macos_vm_log)" &
     disown
 
@@ -2281,6 +2327,7 @@ cmd_up_macos() {
 
     ensure_macos_workspace "$project_vm"
     ensure_macos_claude_projects "$project_vm"
+    ensure_macos_claude_agents "$project_vm"
     ensure_macos_claude_bin "$project_vm"
 
     # Copy git config, and seed a minimal .claude.json one-way for onboarding state only (NOT auth —
@@ -2353,6 +2400,7 @@ cmd_claude_macos() {
     macos_vm_running "$project_vm" || cmd_up_macos
     ensure_macos_workspace "$project_vm"
     ensure_macos_claude_projects "$project_vm"
+    ensure_macos_claude_agents "$project_vm"
     ensure_macos_claude_bin "$project_vm"
     info "Launching $(agent_display_name) in '${project_vm}'..."
     # AUGUR_AGENT_SEAM | interactive launch (macOS: interpolated into SSH string — see C4 on agent_launch_argv)
@@ -2368,6 +2416,7 @@ cmd_shell_macos() {
     macos_vm_running "$project_vm" || cmd_up_macos
     ensure_macos_workspace "$project_vm"
     ensure_macos_claude_projects "$project_vm"
+    ensure_macos_claude_agents "$project_vm"
     info "Opening shell in '${project_vm}'..."
     ssh_macos "$project_vm" -t "cd ~/${MACOS_SHARE} && exec zsh -l"
 }
