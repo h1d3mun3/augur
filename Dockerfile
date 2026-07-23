@@ -63,6 +63,10 @@ ENV DISABLE_AUTOUPDATER=1
 # ~/.claude.json skips onboarding WITHOUT copying the host's real config (which
 # enumerates every project on the host). Auth is injected via env
 # (CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY), never mounted.
+# The seed is intentionally GENERIC (no workspace-trust entry): this image is SHARED by every
+# project on the Swift tag (augur:swift-<tag>), so the per-project folder-trust flag can't be
+# baked here. augur's `cmd_up` adds it per container at create time (seed_workspace_trust; the
+# macOS peer seeds it in cmd_up_macos). See ADR-0011.
 # AUGUR_AGENT_SEAM | agent state seed — pre-create the per-project history parent + minimal config.
 RUN mkdir -p /home/dev/.claude/projects \
     && printf '{"hasCompletedOnboarding":true,"installMethod":"native"}\n' > /home/dev/.claude.json

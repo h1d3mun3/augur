@@ -83,6 +83,16 @@ if ( cd "$proj" && bash "$REPO/augur" up --no-egress ) >/dev/null 2>&1; then
     fail "subagent def lost across destroy+up" "~/.claude/agents did not persist (expected host mount)"
   fi
 
+  # ── Folder-trust seed: the FRESH (post-destroy) container is pre-trusted (ADR-0011) ──
+  # The destroy+up above recreated the container from the image, so seed_workspace_trust must have
+  # re-marked the workspace cwd (/workspace-<slug>) trusted in the guest's ~/.claude.json. Without
+  # it Claude Code would treat the folder as untrusted and hide user-level /agents until re-trusted.
+  if container exec "$cont" sh -lc "jq -e '.projects[\"/workspace-${slug}\"].hasTrustDialogAccepted == true' ~/.claude.json" >/dev/null 2>&1; then
+    ok "workspace pre-trusted in the guest after destroy+up (/agents surfaces immediately)"
+  else
+    fail "workspace not trusted after destroy+up" "expected hasTrustDialogAccepted for /workspace-${slug} in ~/.claude.json"
+  fi
+
   # ── destroy removes it ──
   ( cd "$proj" && bash "$REPO/augur" destroy --no-egress ) >/dev/null 2>&1
   if container inspect "$cont" >/dev/null 2>&1; then fail "destroy left the container behind"; else ok "destroy removed the container"; fi

@@ -22,6 +22,9 @@ eq "claude --version"      "$(agent_version_cmd)"             "agent_version_cmd
 eq "claude-projects"       "$(agent_state_host_subdir)"       "agent_state_host_subdir"
 eq "/home/dev/.claude/projects" "$(agent_state_guest_projects_dir)" "agent_state_guest_projects_dir"
 eq "-workspace-myproj"     "$(agent_state_guest_leaf myproj)" "agent_state_guest_leaf (slug interpolation)"
+eq "claude-agents"         "$(agent_state_agents_host_subdir)" "agent_state_agents_host_subdir"
+eq "/home/dev/.claude/agents" "$(agent_state_guest_agents_dir)" "agent_state_guest_agents_dir"
+eq "/home/dev/.claude.json" "$(agent_state_guest_config_file)"  "agent_state_guest_config_file (folder-trust seed target)"
 
 # auth_specs: two lines, HOME-relative file paths, ANTHROPIC precedence first.
 specs="$(HOME=/h agent_auth_specs | tr '\n' ';')"
