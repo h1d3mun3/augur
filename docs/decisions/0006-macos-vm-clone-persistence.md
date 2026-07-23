@@ -55,8 +55,13 @@ just delete it on `down` like Container mode" doesn't have to re-derive this fro
 
 - `cmd_down_macos` is unchanged: `vm stop`, clone kept, `augur destroy --macos` remains the
   explicit full-removal command.
-- No action needed on Container mode's `down` either — its full-delete behavior is correct for
-  its own, different, reason (cheap recreate, no toolchain-state cost worth preserving).
+- ~~No action needed on Container mode's `down` either — its full-delete behavior is correct for
+  its own, different, reason (cheap recreate, no toolchain-state cost worth preserving).~~
+  **Superseded by [`0010`](./0010-container-persistence.md) (2026-07-23):** Container mode's
+  `down` now also keeps the container (stop, with `destroy` for removal and reconcile-on-`up`).
+  The reversal rests on writable-layer cache reuse being a worthwhile convenience *and* on the
+  fact that persistence can be done safely by mirroring this mode's reconcile-on-`up` machinery —
+  see 0010. This macOS half of the ADR (keep the clone) is unchanged.
 - If macOS VM mode is ever extended beyond Xcode-exclusive use, this rationale should be
   revisited — the calculus assumes the DerivedData/Simulator/SPM-CocoaPods cost is the norm, not
   an edge case.
