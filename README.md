@@ -339,7 +339,11 @@ The host ports the proxy uses are derived per-project so two egress-enabled proj
 
 ---
 
-## Container memory (`.augur/resources.conf`)
+## Container & VM resources (`.augur/resources.conf`)
+
+Both modes size their guest from the same file — `MEMORY=` for container mode, `MACOS_CPU=`/`MACOS_MEMORY_MB=` for macOS VM mode — so one `.augur/resources.conf`, committed to the project, covers whichever mode(s) you use.
+
+### Container memory
 
 Apple Container's per-container default memory (~1 GB) is too tight for running an agent, so augur passes `--memory 4g` by default.
 
@@ -350,7 +354,23 @@ augur init-conf                   # or by hand: mkdir -p .augur
 echo "MEMORY=8g" > .augur/resources.conf
 ```
 
-Precedence: an `AUGUR_CONTAINER_MEMORY` environment variable (if set) overrides `.augur/resources.conf`, which overrides the built-in `4g` default. `augur status` shows the effective value. Like `.augur/allowlist.conf`, this file is guest-writable (it lives inside the mounted workspace) — but unlike the allowlist, it carries **no approval gate**: a guest requesting more or less memory for itself isn't a containment breach the way widening egress is, so it just takes effect on the next `augur up`.
+Precedence: an `AUGUR_CONTAINER_MEMORY` environment variable (if set) overrides `.augur/resources.conf`, which overrides the built-in `4g` default. `augur status` shows the effective value.
+
+### macOS VM sizing
+
+The macOS VM defaults to 4 vCPU / 8192 MB regardless of host power. Set `MACOS_CPU=`/`MACOS_MEMORY_MB=` in the same `.augur/resources.conf`:
+
+```bash
+augur init-conf                   # or by hand: mkdir -p .augur
+cat >> .augur/resources.conf <<'EOF'
+MACOS_CPU=8
+MACOS_MEMORY_MB=16384
+EOF
+```
+
+Precedence: `AUGUR_MACOS_VM_CPU`/`AUGUR_MACOS_VM_MEMORY_MB` environment variables (if set) override `.augur/resources.conf`, which overrides the built-in 4 vCPU / 8192 MB default. Applied on every `augur up --macos` — no destroy/re-clone needed. `augur status --macos` shows the effective values.
+
+Like `.augur/allowlist.conf`, this file is guest-writable (it lives inside the mounted workspace) — but unlike the allowlist, it carries **no approval gate**: a guest requesting more or less memory/CPU for itself isn't a containment breach the way widening egress is, so it just takes effect on the next `augur up`.
 
 ---
 
