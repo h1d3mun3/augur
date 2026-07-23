@@ -22,6 +22,13 @@ has "$up_macos" 'agent_state_host_subdir' "macOS history share dir name comes fr
 # the guest ~/.claude/agents symlink wired via ensure_macos_claude_agents.
 has "$up_macos" 'agent_state_agents_host_subdir' "macOS agents share dir name comes from agent_state_agents_host_subdir (A3/C7)"
 has "$up_macos" 'ensure_macos_claude_agents'     "macOS up wires ~/.claude/agents (ensure_macos_claude_agents)"
+# Folder-trust seed (ADR-0011): the static .claude.json stub pre-trusts the mounted workspace so
+# /agents surfaces user-level subagents without a prompt — the macOS peer of seed_workspace_trust.
+# Claude keys trust on the RESOLVED cwd, and ~/<share> symlinks into /Volumes/My Shared Files, so
+# BOTH path templates must be seeded (a wrong %s order or a dropped key would ship silently).
+has "$up_macos" 'hasTrustDialogAccepted'         "macOS up pre-trusts the workspace in the .claude.json stub (ADR-0011)"
+has "$up_macos" '/Users/%s/%s'                   "macOS trust seed includes the symlinked cwd path (~/<share>)"
+has "$up_macos" '/Volumes/My Shared Files/%s'    "macOS trust seed includes the resolved share path (what Claude keys on)"
 
 section "Tier 2 — per-project VM naming is path-hash keyed, not basename-only (run anywhere)"
 # §6/§9 fix: macos_project_vm() used to key purely on basename(WORKSPACE_DIR), so two
