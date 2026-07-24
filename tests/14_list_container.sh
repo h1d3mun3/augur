@@ -18,19 +18,20 @@ AUGUR="$REPO/augur"
 # ── augur + non-augur containers present ────────────────────────────────────────────
 out="$( cd "$proj" && bash "$AUGUR" list 2>&1 )"; rc=$?
 eq   "0" "$rc"                                       "list: exits 0"
-has  "$out" "NAME"                                   "list: prints a header row"
+grep -Eq 'NAME .*STATE .*IP' <<<"$out" && ok "list: prints a NAME/STATE/IP header row" \
+  || fail "list: header row missing or mislabeled" "$(head -1 <<<"$out")"
 has  "$out" "augur-alpha-0011aabbccdd-swift-latest"  "list: shows a running augur container"
 has  "$out" "augur-beta-eeff22334455-swift-6-0"      "list: shows a stopped augur container"
 hasnt "$out" "nginx-sidecar"                         "list: filters out non-augur containers"
 
-# STATE and ADDR are bound to the RIGHT row IN THE RIGHT ORDER (state, then addr). cmd_list maps
-# columns by HEADER LABEL precisely so STATE and ADDR can't silently swap; a swap would reorder
+# STATE and IP are bound to the RIGHT row IN THE RIGHT ORDER (state, then IP). cmd_list maps
+# columns by HEADER LABEL precisely so STATE and IP can't silently swap; a swap would reorder
 # these on the line, so an order-bound grep — not a position-agnostic substring — is what actually
 # guards it. `.*` absorbs the interleaved ANSI color codes between the two fields.
-if grep -Eq 'augur-alpha-0011aabbccdd-swift-latest.*running.*192\.168\.64\.3' <<<"$out"; then
-  ok "list: alpha binds running-state before its ADDR (no STATE/ADDR mismap)"
+if grep -Eq 'augur-alpha-0011aabbccdd-swift-latest.*running.*172\.31\.38\.210' <<<"$out"; then
+  ok "list: alpha binds running-state before its IP (no STATE/IP mismap)"
 else
-  fail "list: alpha STATE/ADDR mismapped or out of order" "$(grep alpha <<<"$out")"
+  fail "list: alpha STATE/IP mismapped or out of order" "$(grep alpha <<<"$out")"
 fi
 has "$out" "stopped"                                 "list: reports the stopped state"
 
@@ -41,13 +42,18 @@ green=$'\033[0;32m'; yellow=$'\033[1;33m'
 has "$out" "${green}running"                         "list: running state painted green"
 has "$out" "${yellow}stopped"                        "list: stopped state painted yellow"
 
-# A stopped container has a BLANK trailing ADDR in real Apple output; cmd_list must degrade that
-# to "-". The shim's beta row emits exactly that blank field, so this exercises the fallback.
+# A stopped container has a BLANK IP in real Apple output, and the trailing CPUS/MEMORY columns
+# shift left into the IP slot. cmd_list must NOT print that shifted CPU count — a stopped row's IP
+# degrades to "-". This is the exact field-shift bug the running-guard defends against.
 if grep 'augur-beta-eeff22334455-swift-6-0' <<<"$out" | grep -Eq -- '-[[:space:]]*$'; then
-  ok "list: stopped container's blank ADDR degrades to '-'"
+  ok "list: stopped container's blank IP degrades to '-' (no CPU-count leak)"
 else
-  fail "list: blank ADDR not degraded to '-'" "$(grep beta <<<"$out")"
+  fail "list: stopped IP not degraded to '-'" "$(grep beta <<<"$out")"
 fi
+# Belt-and-braces: the shifted CPU/MEMORY values must never surface as an IP on the beta line.
+grep 'augur-beta-eeff22334455-swift-6-0' <<<"$out" | grep -Eq '4096|MB' \
+  && fail "list: stopped row leaked CPUS/MEMORY into the IP column" "$(grep beta <<<"$out")" \
+  || ok "list: stopped row does not leak CPUS/MEMORY into the IP column"
 
 # ── no augur containers, but the host still has others ───────────────────────────────
 outE="$( cd "$proj" && AUGUR_TEST_LIST_EMPTY=1 bash "$AUGUR" list 2>&1 )"; rcE=$?
