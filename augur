@@ -2625,6 +2625,63 @@ cmd_status_macos() {
     echo ""
 }
 
+# Container mode: list every augur-OWNED container across all projects, with run state and
+# address — the container-mode analogue of cmd_list_macos. `container list` shows EVERY
+# container on the host (other tools, other projects); we filter to the `augur-` prefix that
+# make_container_name always mints, so a user sees only THEIR augur containers. `--all` is
+# required: Apple `container list` hides stopped containers by default, but `augur down` KEEPS
+# a stopped container — so a listing that omitted them would hide exactly the ones a user is
+# most likely hunting for (finished projects to reclaim).
+#
+# Parsing note: this runs on the HOST (macOS), where jq is NOT assumed (mirrors
+# container_running, which greps rather than parses). Apple `container list` has no Go-template
+# --format, and its exact COLUMN ORDER is version-dependent — not something augur can pin. So
+# rather than hard-code field positions (which would SILENTLY mis-map name/state/addr if Apple
+# reordered the columns), we read the header row and locate the ID/STATE/ADDR columns BY LABEL.
+# A stopped container with a blank trailing ADDR degrades to "-".
+cmd_list() {
+    require_engine
+    local rows
+    rows="$(eng list --all 2>/dev/null | awk '
+        NR == 1 {
+            for (i = 1; i <= NF; i++) {
+                u = toupper($i)
+                if (u == "ID" || u == "NAME")                        nc = i
+                else if (u == "STATE" || u == "STATUS")              sc = i
+                else if (u == "ADDR" || u == "ADDRESS" || u == "IP") ac = i
+            }
+            if (nc == 0) nc = 1   # first column is the identifier if the header is unlabeled
+            next
+        }
+        $nc ~ /^augur-/ {
+            state = (sc && $sc != "") ? $sc : "-"
+            addr  = (ac && $ac != "") ? $ac : "-"
+            print $nc, state, addr
+        }
+    ')"
+    if [[ -z "$rows" ]]; then
+        info "No augur containers found."
+        echo -e "  Create one with: ${BOLD}augur up${RESET}"
+        return
+    fi
+
+    # Width the NAME column to the longest actual name: container names
+    # (augur-<slug>-<hash>-swift-<tag>) run far longer than macOS VM names, so a fixed width
+    # like cmd_list_macos's %-28s would wrap. Never narrower than the "NAME" header itself.
+    local name state addr width=4
+    while read -r name state addr; do
+        [[ ${#name} -gt $width ]] && width=${#name}
+    done <<< "$rows"
+
+    echo -e "  ${BOLD}$(printf "%-${width}s %-10s %s" NAME STATE ADDR)${RESET}"
+    local color
+    while read -r name state addr; do
+        [[ -z "$name" ]] && continue
+        if [[ "$state" == "running" ]]; then color="$GREEN"; else color="$YELLOW"; fi
+        echo -e "  $(printf "%-${width}s" "$name") ${color}$(printf '%-10s' "$state")${RESET} ${addr}"
+    done <<< "$rows"
+}
+
 cmd_list_macos() {
     require_vz
     local rows
@@ -3599,6 +3656,7 @@ cmd_help() {
     echo -e "    augur ${CYAN}down${RESET}                       Stop the container (kept for a fast restart)"
     echo -e "    augur ${CYAN}destroy${RESET}                    Stop and remove the container entirely"
     echo -e "    augur ${CYAN}status${RESET}                     Check status and toolchain"
+    echo -e "    augur ${CYAN}list${RESET}                       List all augur containers and their state"
     echo -e "    augur ${CYAN}build${RESET}   [--swift VERSION]  Build the container image"
     echo -e "    augur ${CYAN}update${RESET}  [--swift VERSION]  Rebuild image with latest versions"
     echo -e "    augur ${CYAN}version${RESET}                    Show augur version"
@@ -3747,6 +3805,7 @@ else
         destroy)        cmd_destroy ;;
         status)         cmd_status ;;
         init-conf)      cmd_init_conf ;;
+        list)           cmd_list ;;
         update)         cmd_update ;;
         version)        cmd_version ;;
         build)          cmd_build ;;

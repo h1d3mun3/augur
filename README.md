@@ -63,6 +63,7 @@ augur setup-token               # get a Claude subscription token (runs in the g
 augur down                      # stop the container (kept for a fast, cache-preserving restart)
 augur destroy                   # stop and remove the container entirely (+ its egress network)
 augur status                    # show status, toolchain, and auth info
+augur list                      # list all augur containers across projects, with state + address
 augur build [--swift VERSION]   # build the container image
 augur update [--swift VERSION]  # rebuild image with latest tool versions
 augur init-conf                 # scaffold ./.augur/{allowlist,resources}.conf
@@ -98,7 +99,9 @@ generation (`container image prune`), and remove this project's container so the
 effect on the next `up` — other projects on the same image tag need their own `augur destroy &&
 augur up`. For anything beyond that — stopped containers from projects you're finished with, or
 reclaiming the shared builder's own resources — use `augur destroy` per project, or Apple
-Container's own commands directly:
+Container's own commands directly. `augur list` shows every augur container across projects
+(filtered to the `augur-` prefix, unlike raw `container list`), so you can spot finished ones by
+their project slug first:
 
 ```bash
 container prune              # remove stopped containers

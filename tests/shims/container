@@ -48,7 +48,25 @@ case "${1:-}" in
       inspect) exit 1 ;;
       *)       exit 0 ;;
     esac ;;
+  list)
+    # Fake `container list [--all]` table for cmd_list. Header labels mirror Apple's macOS 26
+    # layout (ID IMAGE OS ARCH STATE ADDR); cmd_list locates columns BY LABEL, not position,
+    # so a canned table exercises the real filter/parse. Two augur- rows plus a NON-augur row
+    # that must be filtered out. The running row carries an ADDR; the stopped row has NO trailing
+    # ADDR token (a genuinely BLANK last field — how real Apple output renders a stopped
+    # container), so cmd_list's `$ac == "" → "-"` degradation branch is actually exercised.
+    # AUGUR_TEST_LIST_EMPTY=1 drops the augur- rows so only the non-augur row remains — the
+    # augur- filter then yields nothing, driving cmd_list's empty-state branch even though the
+    # host still has (unrelated) containers.
+    printf '%s\n' 'ID                                       IMAGE               OS     ARCH   STATE     ADDR'
+    if [[ "${AUGUR_TEST_LIST_EMPTY:-0}" != 1 ]]; then
+      printf '%s\n' 'augur-alpha-0011aabbccdd-swift-latest    augur:swift-latest  linux  arm64  running   192.168.64.3'
+      printf '%s\n' 'augur-beta-eeff22334455-swift-6-0        augur:swift-6-0     linux  arm64  stopped'
+    fi
+    printf '%s\n' 'nginx-sidecar                            nginx:latest        linux  arm64  running   192.168.64.9'
+    exit 0 ;;
   *)
-    # build / start / delete / list / etc. — construction already captured; just succeed.
+    # build / start / delete / etc. — construction already captured; just succeed. (`list` has
+    # its own case above.)
     exit 0 ;;
 esac
