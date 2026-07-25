@@ -103,14 +103,21 @@ read-only *because* it is host-global — every project on the machine reads it,
 write there would plant a hook or command for all of them. That is the same attack the per-project
 keying of the `agents/` mount already refuses.
 
-**Two mechanisms on purpose.** The directories are symlinked, so a host-side edit is live on the
-next `claude` with no container recreate. The three files are copied and
-refreshed every time augur wires the guest — `up` in both modes, plus each `claude`/`shell` in macOS
-mode, where those verbs re-provision a running VM — because Claude Code **writes** user-scope
-`settings.json` (model selection and several `/config` toggles land there) and a symlink into a
-read-only mount would turn that into an error. The profile is their source of truth — but augur only
-ever writes a name that actually **exists** in the profile, so an operator who ships no
-`settings.json` never has one written.
+**Two mechanisms on purpose.** The directories are symlinked, so editing a file *inside* an
+already-wired one needs no augur action — it's a live mount. The three files are copied, and both
+the copies and any *structural* directory change (an entry added, removed, or replaced, as opposed
+to a file changed inside one already wired) need the wiring itself to re-run. That happens on
+**every** `up`/`claude`/`shell` in both modes, not only when the container transitions
+stopped→running: `cmd_up` short-circuits to a no-op when the container is already running (the
+common case — repeated `claude`/`shell` calls with no intervening `down`), which would otherwise
+skip the wiring entirely, so `cmd_claude`/`cmd_shell` (and their macOS equivalents) call it directly
+too. Found live rather than by inspection: a profile entry added while the container stayed running
+was invisible until an explicit `down`, contradicting the "next `claude` picks it up" promise the
+directories make for in-place edits. The copy exists in the first place because Claude Code
+**writes** user-scope `settings.json` (model selection and several `/config` toggles land there) and
+a symlink into a read-only mount would turn that into an error. The profile is their source of
+truth — but augur only ever writes a name that actually **exists** in the profile, so an operator
+who ships no `settings.json` never has one written.
 
 **Wiring is non-destructive.** A real `~/.claude/commands` or `~/.claude/skills` the *guest* created
 before the profile existed is moved aside to `<name>.pre-profile`, never deleted (an empty one is

@@ -125,10 +125,11 @@ export AUGUR_TEST_CONTAINER_NAME="$cname"
 rm -f "$AUGUR_TEST_SHIMLOG.trace"
 ( cd "$proj" && bash "$AUGUR" claude ) >/dev/null 2>&1 || true
 ex="$AUGUR_TEST_SHIMLOG.exec"
-# `cmd_claude` issues MORE than one exec now: the interactive launch, then the prompt-history
-# snapshot on the way out (save_guest_history, while the container is still running). The shim's
-# .exec file keeps only the LAST argv, so pull the launch line out of the cumulative trace rather
-# than assuming it was last — otherwise these assertions silently follow whichever exec ran last.
+# `cmd_claude` issues MORE than one exec now: apply_guest_profile (re-wiring, since cmd_up short-
+# circuits to a no-op when the container is ALREADY running and would otherwise skip finish_up —
+# see the augur comment at the call site), the interactive launch, then the prompt-history snapshot
+# on the way out. The shim's .exec file keeps only the LAST argv, so pull the launch line (the ONE
+# `-it` exec) out of the cumulative trace rather than assuming position.
 launch_line="$(grep -E '^container exec -it ' "$AUGUR_TEST_SHIMLOG.trace" | tail -n1)"
 if [[ -f "$ex" && -n "$launch_line" ]]; then
   body="$launch_line"
@@ -136,12 +137,21 @@ if [[ -f "$ex" && -n "$launch_line" ]]; then
   has "$body" "DISABLE_AUTOUPDATER=1"   "claude: fixed env DISABLE_AUTOUPDATER=1 (fixed-env seam)"
   has "$body" "$cname"                  "claude: targets this project's container"
   eq  "claude" "${body##* }"            "claude: launch argv is exactly 'claude' (launch seam, last token)"
-  # The interactive launch must come FIRST — a snapshot taken before it would capture stale history.
-  first_exec="$(grep -E '^container exec ' "$AUGUR_TEST_SHIMLOG.trace" | head -n1)"
-  case "$first_exec" in
-    *"exec -it"*) ok "claude: the interactive launch runs before the history snapshot";;
-    *)            fail "claude: launch is not the first exec" "first: $first_exec";;
-  esac
+  full_trace="$(cat "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null)"
+  eq "1" "$(printf '%s\n' "$full_trace" | grep -cE '^container exec -it ')" \
+     "claude: exactly ONE interactive (-it) exec — apply_guest_profile/save_guest_history are non-interactive"
+  # Position, by LINE NUMBER (not just "first"/"last"): profile re-wiring runs BEFORE the launch
+  # (the guest should already be wired when the session starts), and the history snapshot runs
+  # AFTER it (a snapshot taken before the session would capture stale history).
+  launch_at="$(printf '%s\n' "$full_trace" | grep -n '^container exec -it ' | head -n1 | cut -d: -f1)"
+  profile_at="$(printf '%s\n' "$full_trace" | grep -n 'AUGUR_PROFILE_SRC=' | head -n1 | cut -d: -f1)"
+  history_at="$(printf '%s\n' "$full_trace" | grep -n 'AUGUR_HIST=' | head -n1 | cut -d: -f1)"
+  if [[ -n "$profile_at" && "$profile_at" -lt "$launch_at" ]]
+  then ok "claude: re-wires the operator profile BEFORE the interactive session starts (profile@$profile_at < launch@$launch_at)"
+  else fail "claude: profile wiring is not before the launch" "profile@$profile_at launch@$launch_at"; fi
+  if [[ -n "$history_at" && "$history_at" -gt "$launch_at" ]]
+  then ok "claude: the interactive launch runs before the history snapshot (launch@$launch_at < history@$history_at)"
+  else fail "claude: launch is not before the history snapshot" "launch@$launch_at history@$history_at"; fi
 else
   fail "claude: no container exec captured" "trace: $(cat "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null)"
 fi
@@ -328,9 +338,37 @@ besteffort="$(AUGUR_CARRY_TD="$ctd" bash -c '
 ' _ "$AUGUR" 2>/dev/null)"
 has "$besteffort" "REACHED_NEXT_STATEMENT" "carry-over: a failing snapshot never aborts the caller under set -euo pipefail"
 
+# ── Re-wiring while the container is ALREADY running (real bug, found in live testing) ──────
+# cmd_up short-circuits to a no-op ("already running") without ever calling finish_up when the
+# container is already up — the common case of repeated `claude`/`shell` calls with no intervening
+# `down`. That skipped apply_guest_profile entirely, so a STRUCTURAL profile change (an entry
+# added/removed/replaced) was invisible until the operator ran `down` first, contradicting the
+# documented "the next `augur claude` picks it up." Assert cmd_claude/cmd_shell wire the profile
+# themselves, not only via cmd_up, by driving them with the container already RUNNING.
+section "Tier 1 — profile re-wiring when the container is already running (the live-testing bug)"
+export AUGUR_TEST_CONTAINER_RUNNING=1
+rm -f "$AUGUR_TEST_SHIMLOG.trace"
+( cd "$proj" && bash "$AUGUR" claude ) >/dev/null 2>&1 || true
+has "$(cat "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null)" "AUGUR_PROFILE_SRC=" \
+    "claude: re-wires the profile even when the container was ALREADY running (no cmd_up call)"
+
+rm -f "$AUGUR_TEST_SHIMLOG.trace"
+( cd "$proj" && bash "$AUGUR" shell ) >/dev/null 2>&1 || true
+shell_trace="$(cat "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null)"
+has "$shell_trace" "AUGUR_PROFILE_SRC=" \
+    "shell: re-wires the profile even when the container was ALREADY running (no cmd_up call)"
+# Same ordering requirement as claude: wiring before the interactive bash, not after.
+shell_launch_at="$(printf '%s\n' "$shell_trace" | grep -n '^container exec -it ' | head -n1 | cut -d: -f1)"
+shell_profile_at="$(printf '%s\n' "$shell_trace" | grep -n 'AUGUR_PROFILE_SRC=' | head -n1 | cut -d: -f1)"
+if [[ -n "$shell_profile_at" && -n "$shell_launch_at" && "$shell_profile_at" -lt "$shell_launch_at" ]]
+then ok "shell: re-wires the operator profile BEFORE the interactive bash starts"
+else fail "shell: profile wiring is not before the launch" "profile@$shell_profile_at launch@$shell_launch_at"; fi
+
 # Source guards for the lifecycle wiring — behaviour above cannot see WHERE these are called.
 claude_body="$(awk '/^cmd_claude\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
 shell_body="$(awk '/^cmd_shell\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
+has "$claude_body" 'apply_guest_profile' "carry-over: cmd_claude re-wires the profile directly (not only via cmd_up)"
+has "$shell_body"  'apply_guest_profile' "carry-over: cmd_shell re-wires the profile directly (not only via cmd_up)"
 has "$claude_body" 'save_guest_history' "carry-over: cmd_claude snapshots on the way out"
 has "$shell_body"  'save_guest_history' "carry-over: cmd_shell snapshots on the way out"
 # Both must preserve the interactive exit status rather than returning the snapshot's.

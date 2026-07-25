@@ -1544,8 +1544,12 @@ finish_up() {
         verify_egress_locked
     fi
     # Both paths (fresh create and fast reuse) land here, so a host-side profile edit is picked up on
-    # the next `up` without recreating the container. Best-effort; never aborts `up`. Runs AFTER the
-    # egress self-test so it can never delay or mask that tripwire.
+    # a container transitioning stopped→running without a recreate. This is NOT sufficient on its
+    # own, though: `cmd_up` short-circuits to a no-op when the container is ALREADY running, so
+    # cmd_claude/cmd_shell also call apply_guest_profile directly — see those call sites (found live,
+    # not by inspection: a profile entry added/removed while the container stayed running was
+    # invisible until an explicit `down`). Best-effort; never aborts `up`. Runs AFTER the egress
+    # self-test so it can never delay or mask that tripwire.
     apply_guest_profile
     success "Container '${CONTAINER_NAME}' is up."
     echo ""
@@ -1783,6 +1787,14 @@ cmd_claude() {
     # reuse path; a bare start would re-attach the guest with NO proxy re-established and NO
     # self-test — silently bypassing egress. Mirrors macOS `cmd_claude_macos` (running || up).
     container_running || cmd_up
+    # `cmd_up` short-circuits to a no-op when the container is ALREADY running (the common case:
+    # repeated `claude`/`shell` calls without an intervening `down`), so its finish_up — and the
+    # apply_guest_profile inside it — never runs on that path. Call it here too, matching macOS
+    # mode's ensure_macos_claude_profile (already called from cmd_claude_macos/cmd_shell_macos
+    # unconditionally). Content edits inside an already-symlinked entry are live via the mount with
+    # no re-wiring needed; this is for STRUCTURAL changes — an entry added, removed, or replaced in
+    # the profile since the guest was last wired — which only apply_guest_profile can pick up.
+    apply_guest_profile
     info "Launching $(agent_display_name) in '${CONTAINER_NAME}'..."
     # AUGUR_AGENT_SEAM | interactive launch (engine `exec`: argv array — safe by construction)
     local _env=() _argv=() kv
@@ -1802,6 +1814,10 @@ cmd_shell() {
     # Same as cmd_claude: route a stopped/absent container through the full `up` so egress is
     # re-established and self-tested, never a bare `container start`.
     container_running || cmd_up
+    # Same reasoning as cmd_claude: `cmd_up` no-ops when already running, so re-wire the profile
+    # here too — otherwise a structural profile change (an entry added/removed/replaced) is
+    # invisible until an intervening `down`.
+    apply_guest_profile
     info "Opening bash shell in '${CONTAINER_NAME}'..."
     local _rc=0
     eng exec -it "$CONTAINER_NAME" bash || _rc=$?

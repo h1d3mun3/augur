@@ -111,14 +111,19 @@ What you get instead is a directory you populate on purpose:
 - **Host-global, read-only.** One profile for every project on the machine: personal tooling is not
   project-scoped. Read-only *because* it is shared — a guest able to write there would plant a hook
   or command for every project.
-- **The directories are live.** Edit a slash command on the host and the next
-  `augur claude` picks it up — no rebuild, no `destroy`. (Claude Code only scans a top-level
-  `skills/`/`commands/` directory that existed at session start, so the *first* time you create one
-  mid-session, exit and relaunch.)
-- **The three JSON/markdown files are copies**, refreshed every time augur wires the guest —
-  `augur up` in both modes, and additionally each `augur claude`/`shell` in `--macos` mode — because
-  Claude Code writes user-scope `settings.json` and a read-only symlink would make that an error.
-  The profile is their source of truth: if you ship one, guest-side edits to it do not survive.
+- **The directories are live**, in two senses. Editing a file *inside* an already-wired directory
+  (adding a command to `commands/` that's already there) needs no augur action at all — you're
+  editing the live mount, and the next `augur claude` sees it. Adding/removing/replacing a whole
+  entry (populating `commands/` for the first time, or deleting it) needs augur to re-run the
+  wiring, which happens on **every** `augur claude`/`shell`/`up`, not just when the container
+  happens to restart — a container left running across many `claude` calls still re-wires on each
+  one. (Claude Code itself only *scans* a top-level `skills/`/`commands/` directory that existed
+  when its session started, so the very first time you populate one, exit and relaunch `claude`
+  once — that part isn't augur's to fix.)
+- **The three JSON/markdown files are copies**, refreshed on that same every-`claude`/`shell`/`up`
+  cadence, because Claude Code writes user-scope `settings.json` and a read-only symlink would make
+  that an error. The profile is their source of truth: if you ship one, guest-side edits to it do
+  not survive the next wiring.
 - **Your own files are never deleted.** If the guest already had a real `~/.claude/commands` or
   `~/.claude/skills` when you first populate the profile, augur moves it aside to
   `<name>.pre-profile` rather than replacing it (an empty one is simply dropped).
