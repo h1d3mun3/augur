@@ -110,9 +110,13 @@ What you get instead is a directory you populate on purpose:
   `augur claude` picks it up — no rebuild, no `destroy`. (Claude Code only scans a top-level
   `skills/`/`commands/` directory that existed at session start, so the *first* time you create one
   mid-session, exit and relaunch.)
-- **`settings.json` and `CLAUDE.md` are copies**, refreshed on every `augur up`, because Claude Code
-  writes user-scope `settings.json` and a read-only symlink would make that an error. The profile is
-  their source of truth: if you ship one, guest-side edits to it do not survive a restart.
+- **`settings.json` and `CLAUDE.md` are copies**, refreshed every time augur wires the guest —
+  `augur up` in both modes, and additionally each `augur claude`/`shell` in `--macos` mode — because
+  Claude Code writes user-scope `settings.json` and a read-only symlink would make that an error.
+  The profile is their source of truth: if you ship one, guest-side edits to it do not survive.
+- **Your own files are never deleted.** If the guest already had a real `~/.claude/commands` or
+  `~/.claude/skills` when you first populate the profile, augur moves it aside to
+  `<name>.pre-profile` rather than replacing it (an empty one is simply dropped).
 - Works the same in `--macos` mode (shared read-only into the VM).
 
 Your **repository's** own `.claude/settings.json`, `CLAUDE.md`, `.claude/commands/`,

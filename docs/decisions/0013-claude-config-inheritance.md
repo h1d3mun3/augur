@@ -94,10 +94,18 @@ keying of the `agents/` mount already refuses.
 
 **Two mechanisms on purpose.** `commands/` and `skills/` are symlinked, so a host-side edit is live
 on the next `claude` with no container recreate. `settings.json` and `CLAUDE.md` are copied and
-refreshed on every `up`, because Claude Code **writes** user-scope `settings.json` (model selection
-and several `/config` toggles land there) and a symlink into a read-only mount would turn that into
-an error. The profile is their source of truth — but augur only ever writes a name that actually
-**exists** in the profile, so an operator who ships no `settings.json` never has one written.
+refreshed every time augur wires the guest — `up` in both modes, plus each `claude`/`shell` in macOS
+mode, where those verbs re-provision a running VM — because Claude Code **writes** user-scope
+`settings.json` (model selection and several `/config` toggles land there) and a symlink into a
+read-only mount would turn that into an error. The profile is their source of truth — but augur only
+ever writes a name that actually **exists** in the profile, so an operator who ships no
+`settings.json` never has one written.
+
+**Wiring is non-destructive.** A real `~/.claude/commands` or `~/.claude/skills` the *guest* created
+before the profile existed is moved aside to `<name>.pre-profile`, never deleted (an empty one is
+dropped, and if the rescue name is already taken the entry is left unwired rather than either copy
+destroyed). Silently deleting the guest's own work to make room for the operator's is not a trade
+the operator asked for.
 
 **Inert by default**: no directory, or an empty one, and augur wires nothing.
 
@@ -212,9 +220,13 @@ Checked against the official documentation on 2026-07-25 (`code.claude.com/docs/
 - **Category 3 content is operator-supplied and executed in the guest.** augur does not validate it.
   That is the same trust level as the repo's own `.claude/`, and strictly better than the host's
   `~/.claude` would be, because the operator opted in per file.
-- **Category 1's carry-over is prompt text only** — no credential, no permission grant, no trust
-  flag. Stored `0600` under `$AUGUR_DIR`, outside the host's own `~/.claude`, so the host's Claude
-  Code never enumerates it. `destroy` removes it.
+- **Category 1's carry-over is the guest's own history file, verbatim** — no credential, no
+  permission grant, no trust flag, and nothing from any other file. It is guest-*written* content,
+  so it is guest-controlled text: augur bounds and shape-filters it (whole `{…}` records only) but
+  does not otherwise validate it, and it is replayed into nothing but the next guest's own history
+  file. Created under `umask 077` (not `chmod`-after, which would leave a readable window) beneath
+  `$AUGUR_DIR`, outside the host's own `~/.claude`, so the host's Claude Code never enumerates it.
+  `destroy` removes it.
 - **Category 4 is a real control in Container mode** (root-owned, agent runs unprivileged) and a
   **policy default only** on macOS: that base VM's account is the published `admin`/`admin`
   ([`0007`](./0007-macos-build-fixed-credential.md)), so anyone with the password can rewrite it.

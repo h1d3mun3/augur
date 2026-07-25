@@ -1275,9 +1275,10 @@ invalidate_persisted_container() {
     local why="$1"
     if container_exists; then
         # `build`/`update`/`install-cert` reach here with the container possibly still RUNNING, and
-        # they are about to discard its writable layer. Snapshot the prompt history first — this is
-        # one of the four sites that destroy the layer, and the only other one with a live container
-        # is `down`. No-ops when it is already stopped.
+        # they are about to discard its writable layer. Snapshot the prompt history first. (Not the
+        # only other live-container teardown — verify_egress_locked also force-removes a running
+        # container when the boot self-test trips — but that one is a leak tripwire deliberately
+        # producing a clean guest, so it is left alone.) No-ops when already stopped.
         save_guest_history
         info "Removing this project's container so ${why} takes effect on next ${BOLD}augur up${RESET}..."
         engine_rm_force "$CONTAINER_NAME" &>/dev/null || true
@@ -1396,10 +1397,20 @@ apply_guest_profile() {
             mkdir -p "$AUGUR_PROFILE_DST"
             for d in $AUGUR_PROFILE_LINKS; do
                 if [ -d "$AUGUR_PROFILE_SRC/$d" ]; then
-                    # Clear a REAL directory left by the image or a profile-less run. `rm -rf` on a
-                    # symlink removes the link and not its target, but guard anyway so the intent is
-                    # explicit and a future edit cannot start deleting through into the RO mount.
-                    [ -L "$AUGUR_PROFILE_DST/$d" ] || rm -rf "$AUGUR_PROFILE_DST/$d"
+                    # A REAL directory sits where the link goes. NEVER rm -rf it: the guest may have
+                    # created commands/skills of its own before the operator populated the profile,
+                    # and silently deleting them is data loss the operator never asked for. Empty is
+                    # free to drop; anything else is moved aside once, and if that name is taken we
+                    # leave the entry unwired rather than destroy either copy.
+                    if [ ! -L "$AUGUR_PROFILE_DST/$d" ] && [ -e "$AUGUR_PROFILE_DST/$d" ]; then
+                        if rmdir "$AUGUR_PROFILE_DST/$d" 2>/dev/null; then
+                            :                                   # was empty — nothing to preserve
+                        elif [ ! -e "$AUGUR_PROFILE_DST/$d.pre-profile" ]; then
+                            mv "$AUGUR_PROFILE_DST/$d" "$AUGUR_PROFILE_DST/$d.pre-profile"
+                        else
+                            continue                            # already rescued once; do not touch
+                        fi
+                    fi
                     ln -sfn "$AUGUR_PROFILE_SRC/$d" "$AUGUR_PROFILE_DST/$d"
                 elif [ -L "$AUGUR_PROFILE_DST/$d" ]; then
                     # The operator REMOVED this entry from the profile. Drop the link we made rather
@@ -1445,10 +1456,11 @@ AUGUR_HISTORY_MAX_BYTES="${AUGUR_HISTORY_MAX_BYTES:-65536}"
 guest_carryover_dir() {
     local d
     d="$AUGUR_DIR/$(agent_state_carryover_host_subdir)/$(workspace_slug)-$(workspace_path_hash)"
-    mkdir -p "$d"
-    # Guest-written data kept OUTSIDE the host's own ~/.claude (the same A3 discipline as the
-    # history/agents mounts) and readable only by this user.
-    chmod 700 "$d" 2>/dev/null || true
+    # `umask 077` in a subshell, NOT mkdir-then-chmod: this holds guest-written data, and the
+    # chmod-after form leaves a window where it is group/world readable. Same shape as
+    # write_container_fingerprint. Kept OUTSIDE the host's own ~/.claude (the A3 discipline the
+    # history/agents mounts follow). Failure is non-fatal — every caller is best-effort.
+    ( umask 077; mkdir -p "$d" ) 2>/dev/null || true
     echo "$d"
 }
 
@@ -1458,22 +1470,29 @@ guest_carryover_dir() {
 save_guest_history() {
     container_running || return 0
     local d; d="$(guest_carryover_dir)"
-    # tail -n bounds the entries, tail -c bounds the bytes, and the awk drops a first line that the
-    # byte cut may have sliced in half (every entry is one JSON object, so a kept line starts `{`).
-    if eng exec \
-        -e "AUGUR_HIST=$(agent_state_guest_history_file)" \
-        -e "AUGUR_N=${AUGUR_HISTORY_MAX_LINES}" \
-        -e "AUGUR_B=${AUGUR_HISTORY_MAX_BYTES}" \
-        "$CONTAINER_NAME" sh -c 'tail -n "$AUGUR_N" "$AUGUR_HIST" | tail -c "$AUGUR_B" | awk "NR>1 || /^\\{/"' \
-        >"$d/history.jsonl.tmp" 2>/dev/null && [[ -s "$d/history.jsonl.tmp" ]]
+    [[ -d "$d" ]] || return 0
+    # tail -n bounds the entries, tail -c bounds the bytes. The byte cut can only slice the FIRST
+    # line (it trims from the left), so the awk keeps line 1 only when it still looks like a whole
+    # record — `{`…`}` — and keeps every later line untouched.
+    # The awk PROGRAM travels as an env var, never interpolated into the shell string — the same
+    # discipline the rest of this file uses for jq programs, and it keeps the regex escaping out of
+    # two nested quoting layers (POSIX sh does not re-expand a variable's value).
+    if ( umask 077; eng exec \
+            -e "AUGUR_HIST=$(agent_state_guest_history_file)" \
+            -e "AUGUR_N=${AUGUR_HISTORY_MAX_LINES}" \
+            -e "AUGUR_B=${AUGUR_HISTORY_MAX_BYTES}" \
+            -e 'AUGUR_AWK=NR>1 || (/^\{/ && /\}$/)' \
+            "$CONTAINER_NAME" sh -c 'tail -n "$AUGUR_N" "$AUGUR_HIST" | tail -c "$AUGUR_B" | awk "$AUGUR_AWK"' \
+            >"$d/history.jsonl.tmp" ) 2>/dev/null && [[ -s "$d/history.jsonl.tmp" ]]
     then
-        chmod 600 "$d/history.jsonl.tmp" 2>/dev/null || true
-        # Keep one generation. A restore that failed leaves the fresh container with no history, and
-        # the next save would otherwise overwrite a good snapshot with that emptier one for good.
-        [[ -f "$d/history.jsonl" ]] && cp "$d/history.jsonl" "$d/history.jsonl.prev" 2>/dev/null
-        mv "$d/history.jsonl.tmp" "$d/history.jsonl"
+        # EVERY mutation below is guarded. This function runs on the way out of `claude`/`shell`, in
+        # `down` before the stop, and in invalidate_persisted_container — under `set -e` a bare `mv`
+        # that failed (full disk, bad perms) would abort the operator's ACTUAL command, skipping the
+        # stop or the container removal. Best-effort has to mean it.
+        cp "$d/history.jsonl" "$d/history.jsonl.prev" 2>/dev/null || true   # keep one generation
+        mv "$d/history.jsonl.tmp" "$d/history.jsonl" 2>/dev/null || rm -f "$d/history.jsonl.tmp"
     else
-        rm -f "$d/history.jsonl.tmp"
+        rm -f "$d/history.jsonl.tmp" 2>/dev/null || true
     fi
     return 0
 }
@@ -1481,6 +1500,10 @@ save_guest_history() {
 # Push the snapshot into a freshly CREATED container. Best-effort.
 restore_guest_history() {
     local d f; d="$(guest_carryover_dir)"; f="$d/history.jsonl"
+    # Fall back to the previous generation when the current snapshot is missing or empty — that is
+    # the case save_guest_history keeps `.prev` FOR (a failed restore leaves the guest with no
+    # history, and the next save would otherwise replace a good snapshot with that emptier one).
+    [[ -s "$f" ]] || f="$d/history.jsonl.prev"
     [[ -s "$f" ]] || return 0
     # Re-check the byte bound on the way IN as well: the file on disk could predate a lowered cap,
     # or have been edited by hand. Better to skip than to blow the env-string limit mid-`up`.
@@ -2470,7 +2493,18 @@ ensure_macos_claude_profile() {
         mkdir -p \"\$HOME/.claude\"
         for d in $(agent_profile_link_dirs); do
             if [ -d \"\$src/\$d\" ]; then
-                [ -L \"\$HOME/.claude/\$d\" ] || rm -rf \"\$HOME/.claude/\$d\"
+                # Same non-destructive rule as the container peer: never rm -rf a real directory the
+                # guest may have created. Empty is free to drop; otherwise move it aside once, and
+                # if that name is taken leave the entry unwired rather than destroy either copy.
+                if [ ! -L \"\$HOME/.claude/\$d\" ] && [ -e \"\$HOME/.claude/\$d\" ]; then
+                    if rmdir \"\$HOME/.claude/\$d\" 2>/dev/null; then
+                        :
+                    elif [ ! -e \"\$HOME/.claude/\$d.pre-profile\" ]; then
+                        mv \"\$HOME/.claude/\$d\" \"\$HOME/.claude/\$d.pre-profile\"
+                    else
+                        continue
+                    fi
+                fi
                 ln -sfn \"\$src/\$d\" \"\$HOME/.claude/\$d\"
             elif [ -L \"\$HOME/.claude/\$d\" ]; then
                 rm -f \"\$HOME/.claude/\$d\"

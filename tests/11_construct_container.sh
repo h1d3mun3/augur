@@ -173,7 +173,11 @@ ptd="$work/profile"; mkdir -p "$ptd/src/commands" "$ptd/src/skills" "$ptd/dst"
 echo 'hi'            > "$ptd/src/commands/foo.md"
 echo '{"model":"x"}' > "$ptd/src/settings.json"
 echo '# mem'         > "$ptd/src/CLAUDE.md"
-mkdir -p "$ptd/dst/commands"; echo stale > "$ptd/dst/commands/old.md"   # a REAL dir at the target
+# A REAL, NON-EMPTY directory at the link target — i.e. commands the GUEST created before the
+# operator populated the profile. Wiring the profile must never silently delete those.
+mkdir -p "$ptd/dst/commands"; echo stale > "$ptd/dst/commands/old.md"
+# And a REAL but EMPTY one, which is free to drop.
+mkdir -p "$ptd/dst/skills"
 prof_run "$ptd" >/dev/null 2>&1
 
 [[ -L "$ptd/dst/commands" ]] && ok "profile: commands/ is a symlink (host edits go live, no recreate)" \
@@ -182,7 +186,12 @@ prof_run "$ptd" >/dev/null 2>&1
 eq "$ptd/src/commands" "$(readlink "$ptd/dst/commands")" "profile: commands/ points at the read-only mount"
 has "$(cat "$ptd/dst/commands/foo.md" 2>/dev/null)" "hi"  "profile: linked command is readable in the guest"
 [[ -e "$ptd/src/commands/foo.md" ]] && ok "profile: replacing the target did not delete through into the profile" \
-                                    || fail "profile: rm -rf deleted through the symlink into the read-only mount"
+                                    || fail "profile: deleted through the symlink into the read-only mount"
+# The guest's own pre-existing commands must be MOVED ASIDE, never destroyed.
+has "$(cat "$ptd/dst/commands.pre-profile/old.md" 2>/dev/null)" "stale" \
+    "profile: a NON-EMPTY guest dir at the target is preserved as <name>.pre-profile, not deleted"
+[[ -e "$ptd/dst/skills.pre-profile" ]] && fail "profile: rescued an EMPTY dir needlessly" "empty dirs should just be dropped" \
+                                       || ok "profile: an EMPTY dir at the target is simply dropped (nothing to preserve)"
 [[ -f "$ptd/dst/settings.json" && ! -L "$ptd/dst/settings.json" ]] \
   && ok "profile: settings.json is a real copy, not a symlink (Claude rewrites it at user scope)" \
   || fail "profile: settings.json is not a plain copy"
@@ -272,7 +281,16 @@ carry_run restore >/dev/null
 [[ -e "$ctd/guest/.claude/history.jsonl" ]] && fail "carry-over: restored an oversized snapshot" "should refuse past the byte cap" \
                                             || ok "carry-over: refuses to restore past the byte cap"
 
+# `.prev` is a real fallback, not dead code: when the current snapshot is gone, restore uses it.
+rm -f "$ctd/guest/.claude/history.jsonl" "$snapdir/history.jsonl"
+printf '{"display":"from-prev"}\n' > "$snapdir/history.jsonl.prev"
+carry_run restore >/dev/null
+has "$(cat "$ctd/guest/.claude/history.jsonl" 2>/dev/null)" 'from-prev' \
+    "carry-over: restore falls back to the previous generation when the current snapshot is gone"
+rm -f "$snapdir/history.jsonl.prev" "$ctd/guest/.claude/history.jsonl"
+
 # `destroy` means clean: the snapshot must go, or the next `up` feeds guest data forward.
+printf '{"display":"x"}\n' > "$snapdir/history.jsonl"
 carry_run drop >/dev/null
 [[ -e "$snapdir/history.jsonl" ]] && fail "carry-over: destroy left the snapshot behind" "clean-guest guarantee broken" \
                                   || ok "carry-over: destroy drops the snapshot (clean guest stays clean)"
