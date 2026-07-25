@@ -71,6 +71,37 @@ ENV DISABLE_AUTOUPDATER=1
 RUN mkdir -p /home/dev/.claude/projects \
     && printf '{"hasCompletedOnboarding":true,"installMethod":"native"}\n' > /home/dev/.claude.json
 
+# Managed settings — the ONE layer a repository cannot override. Claude Code's documented
+# precedence is managed > CLI args > .claude/settings.local.json > .claude/settings.json >
+# ~/.claude/settings.json, so a user-scope operator profile is the LOWEST layer and loses to any
+# repo. augur is the isolation boundary, so its own policy belongs at the top of that stack.
+#
+# The payload is deliberately ONE key, and the bar for a second is high: augur must actually be
+# able to back the assertion, and it must not already be enforced by a stronger layer. Almost
+# everything security-relevant here IS already stronger — egress by the proxy/netstack and
+# `--no-dns`, the filesystem by read-only root-owned mounts — so restating it in a config file
+# would be theatre. Pinning a repo's `permissions`/`hooks` was considered and rejected: ADR-0012
+# just decided that Claude Code's own folder-trust dialog is the right gate for those, and
+# overriding it here would re-litigate that decision through the back door.
+#
+# What IS left, and what this pins: the ENV above disables the autoupdater *because the integrity
+# gate depends on it* — it keeps the on-disk binary byte-identical to the image. But a settings-file
+# `env` block outranks the process environment, so a repository could re-enable the updater and
+# swap out the very binary augur verifies. Managed scope is the only layer that closes that.
+#
+# `env` here carries this ONE variable and must never carry anything else: a credential placed in
+# this file would be baked into a SHARED image (augur:swift-<tag>) that every project on the host
+# runs. Auth stays a per-container runtime injection. Note also that Claude Code silently strips
+# managed entries that fail schema validation, so a typo degrades to inert rather than loud — the
+# seam tier asserts these bytes exactly, and asserts they match the macOS copy.
+# Root-owned and outside $HOME so the unprivileged `dev` user the agent runs as cannot rewrite it.
+# AUGUR_AGENT_SEAM | agent managed policy (mirror agent_managed_settings_json).
+USER root
+RUN mkdir -p /etc/claude-code \
+    && printf '{"env":{"DISABLE_AUTOUPDATER":"1"}}\n' > /etc/claude-code/managed-settings.json \
+    && chmod 644 /etc/claude-code/managed-settings.json
+USER dev
+
 # Optional custom CA certificate, injected by `augur install-cert <cert.crt>` via a build-arg.
 # INERT by default: a normal `augur build`/`augur update` passes no value, so the `if` guard makes
 # this a no-op — the rootfs is unaffected (only empty USER-switch metadata layers are added).

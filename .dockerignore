@@ -7,9 +7,18 @@
 # VM disk images under ~/.augur/vms (tens of GB) get swept in, ballooning the context to
 # 17 GB+. Excluding augur's runtime state and build artifacts keeps it to a few hundred bytes.
 
-# augur runtime state (installed layout under ~/.augur)
+# augur runtime state (installed layout under ~/.augur). Everything the guest accumulates or the
+# operator drops in here is state, never build input — the Dockerfile has no COPY/ADD at all. Note
+# these are not only about size: claude-carryover/ holds guest-written prompt text and
+# claude-profile/ holds the operator's personal commands and settings, and neither belongs in a
+# build context that gets tarred up and shipped to the builder.
 vms/
 claude-projects/
+claude-agents/
+claude-carryover/
+claude-profile/
+container-state/
+known_hosts/
 proxy/
 *.img
 

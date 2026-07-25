@@ -191,6 +191,59 @@ agent_state_guest_leaf()         { echo "-workspace-$1"; }                # leaf
 # would let a guest inject a subagent read by every future session in every project).
 agent_state_agents_host_subdir() { echo "claude-agents"; }                # dir under $AUGUR_DIR (both modes)
 agent_state_guest_agents_dir()   { echo "/home/dev/.claude/agents"; }     # guest user-level subagent-defs dir
+# Up-arrow prompt recall. DATA only; the CORE owns the snapshot lifecycle (save_guest_history).
+# Verified against the official docs (`/docs/en/claude-directory`, 2026-07-25): "history.jsonl —
+# Every prompt you've typed, with timestamp and project path. Used for up-arrow recall." It lives
+# directly in ~/.claude, so unlike projects/ and agents/ it is NOT covered by a mount and dies with
+# the container's writable layer. NOTE for anyone touching this: prompt history is HERE, not in
+# ~/.claude.json — a mix-up worth stating because the two are easy to confuse.
+agent_state_carryover_host_subdir() { echo "claude-carryover"; }          # dir under $AUGUR_DIR
+agent_state_guest_history_file()    { echo "/home/dev/.claude/history.jsonl"; }
+# Opt-in operator profile — the operator's OWN Claude Code assets (personal slash commands, skills,
+# a user-level CLAUDE.md, user-scope settings.json) carried into the guest. DATA only; the CORE
+# owns the mechanism (host dir mounted/shared READ-ONLY, wired by apply_guest_profile /
+# ensure_macos_claude_profile).
+#
+# This is deliberately NOT the host's real ~/.claude, which augur never reads. That tree is
+# EXECUTABLE config: a RW mount would let a compromised guest plant a hook/skill/command that every
+# future host-side session runs in every project — the same attack the per-project keying of
+# agent_state_agents_host_subdir already refuses, and it lands harder here because a hook runs
+# unconditionally while a subagent runs only when invoked. A separate, explicitly-populated
+# directory also means the operator placing a file there IS the assertion that it was written for
+# the GUEST, so augur owes no sanitizer for host-absolute hook/statusLine paths, apiKeyHelper, or
+# secrets in `env`. INERT by default: an empty (or absent) profile wires nothing.
+agent_profile_host_subdir()  { echo "claude-profile"; }             # dir under $AUGUR_DIR (both modes)
+agent_profile_guest_mount()  { echo "/home/dev/.augur-profile"; }   # read-only mount point (container)
+agent_profile_guest_dir()    { echo "/home/dev/.claude"; }          # where the wired entries land
+# SYMLINKED to the read-only mount: Claude only ever READS these, so a host-side edit is live on the
+# next `claude` with no container recreate. This is the full set of user-scope directories the
+# official `.claude` directory reference lists as operator-authored content — personal commands,
+# skills, topic rules, output styles, dynamic workflows and themes. Two user-scope directories are
+# deliberately NOT here: `agents/` (already a per-project RW mount — category 1) and `agent-memory/`
+# (Claude WRITES it, so it is guest-generated state, not operator input).
+agent_profile_link_dirs()    { echo "commands skills rules output-styles workflows themes"; }
+# COPIED instead of symlinked: these are the user-scope FILES Claude Code may rewrite in place —
+# settings.json (model selection and several /config toggles land there), CLAUDE.md (/memory can
+# edit it), keybindings.json (the TUI owns it) — and a symlink into a READ-ONLY mount would turn
+# any of those writes into an error rather than a feature.
+agent_profile_copy_files()   { echo "settings.json CLAUDE.md keybindings.json"; }
+# Managed policy — the ONE settings layer a repository cannot override. Claude Code's documented
+# precedence is managed > CLI args > .claude/settings.local.json > .claude/settings.json >
+# ~/.claude/settings.json, so a user-scope profile (above) is the LOWEST layer and loses to any
+# repo. augur is the isolation boundary, so its own policy belongs at the TOP of that stack.
+# DATA only; the CORE installs it (Dockerfile for the image, install_macos_managed_settings for the
+# base VM).
+#
+# Deliberately ONE key. The Dockerfile already pins DISABLE_AUTOUPDATER as an ENV *because the
+# integrity gate depends on it* ("keeps the on-disk binary byte-identical to the image ... and
+# removes the binary's ability to rewrite itself"). But a settings-file `env` block outranks the
+# process environment, so a repo could re-enable the updater and swap the very binary augur
+# verifies. Managed scope is the only layer that closes that.
+#
+# MUST stay byte-identical to the Dockerfile's payload — Claude Code strips managed entries that
+# fail validation WITHOUT failing loudly, so drift here is silent. Tests assert both copies.
+# NEVER add a credential: this is baked into the SHARED augur:swift-<tag> image.
+agent_managed_settings_json() { printf '{"env":{"DISABLE_AUTOUPDATER":"1"}}\n'; }
 # Integrity gate (agent_verify_integrity_engine/_macos), save_oauth_token,
 # setup_token_security_notice and the macOS state/install helpers are tagged
 # AUGUR_AGENT_SEAM in place. Egress baseline is file-based: see augur.conf.
@@ -461,6 +514,15 @@ macos_ssh_port() {
 vm_known_hosts_file() {
     mkdir -p "$AUGUR_DIR/known_hosts"
     echo "$AUGUR_DIR/known_hosts/${1}"
+}
+
+# Per-VM marker recording the last time this VM booted with a FRESH view of the operator profile.
+# Written by cmd_up_macos (a `vm run` rebuilds the virtiofs device, so the guest's view is current
+# at that moment) and compared against the host profile's mtimes by warn_if_macos_profile_stale.
+# See that function for why this exists at all. Removed by `destroy --macos`.
+macos_profile_marker_file() {
+    mkdir -p "$AUGUR_DIR/vm-state"
+    echo "$AUGUR_DIR/vm-state/${1}.profile-seen"
 }
 
 ssh_macos() {
@@ -1226,6 +1288,12 @@ cmd_build() {
 invalidate_persisted_container() {
     local why="$1"
     if container_exists; then
+        # `build`/`update`/`install-cert` reach here with the container possibly still RUNNING, and
+        # they are about to discard its writable layer. Snapshot the prompt history first. (Not the
+        # only other live-container teardown — verify_egress_locked also force-removes a running
+        # container when the boot self-test trips — but that one is a leak tripwire deliberately
+        # producing a clean guest, so it is left alone.) No-ops when already stopped.
+        save_guest_history
         info "Removing this project's container so ${why} takes effect on next ${BOLD}augur up${RESET}..."
         engine_rm_force "$CONTAINER_NAME" &>/dev/null || true
         rm -f "$(container_fingerprint_file)" 2>/dev/null || true
@@ -1272,6 +1340,14 @@ container_fingerprint() {
         echo "memory=$(resolve_container_memory)"
         echo "workspace=${WORKSPACE_DIR}"
         echo "mount=${WORKSPACE_MOUNT}"
+        # The operator-profile mount is baked at `run` like any other -v, so it belongs here by this
+        # function's own contract. Only the MOUNT PATH is hashed, never the profile's CONTENT:
+        # commands/ and skills/ are symlinked live and settings.json/CLAUDE.md are re-copied on every
+        # `up`, so hashing content would throw away the writable layer on every slash-command tweak
+        # for no gain. Its one upgrade effect is deliberate — a container created before the profile
+        # existed has no such mount, and hashing the path recreates it once so the feature is
+        # actually present rather than silently missing until the operator happens to `destroy`.
+        echo "profile_mount=$(agent_profile_guest_mount)"
         # AUGUR_AGENT_SEAM | fingerprint the resolved auth values (named-only, same source as the
         # -e injection) so a rotated/added/removed credential recreates the container on next up.
         while IFS='|' read -r _genv _henv _hfile _hvalidator; do
@@ -1300,6 +1376,174 @@ write_container_fingerprint() {
     ( umask 077; container_fingerprint > "$f" )
 }
 
+# AUGUR_AGENT_SEAM | wire the opt-in operator profile into the guest's ~/.claude. Runs from
+# finish_up, so on EVERY `up` — create AND reuse — which is what lets a host-side profile edit land
+# without a container recreate.
+#
+# Two mechanisms, on purpose (see the agent_profile_* accessors):
+#   • commands/ + skills/ are SYMLINKED at the read-only mount. Claude only reads them, so a host
+#     edit is live on the next `claude` and costs nothing.
+#   • settings.json + CLAUDE.md are COPIED. Claude Code rewrites settings.json at user scope, and a
+#     symlink into a READ-ONLY mount would make that a write error rather than a feature.
+#
+# The copy overwrites on every `up`. That is ownership, not carelessness: a file the operator put in
+# the profile is DECLARED host-owned, so the host is its source of truth. augur only ever writes a
+# name that actually EXISTS in the profile, so an operator who ships no settings.json never has one
+# written and sees no behavior change at all.
+#
+# ~/.claude/agents and ~/.claude/projects are deliberately absent from both lists: they are
+# per-project RW mounts, and wiring them here would fight those mounts.
+#
+# STRICTLY best-effort: never aborts `up` (we run under `set -e`). Worst case nothing is wired,
+# which is exactly the no-profile behavior.
+apply_guest_profile() {
+    # Paths and the entry lists travel as env vars, never interpolated into the shell program, so an
+    # odd value cannot break quoting (POSIX sh does not re-expand a variable's value).
+    if eng exec \
+        -e "AUGUR_PROFILE_SRC=$(agent_profile_guest_mount)" \
+        -e "AUGUR_PROFILE_DST=$(agent_profile_guest_dir)" \
+        -e "AUGUR_PROFILE_LINKS=$(agent_profile_link_dirs)" \
+        -e "AUGUR_PROFILE_COPIES=$(agent_profile_copy_files)" \
+        "$CONTAINER_NAME" sh -c '
+            set -eu
+            # No mount at all (a container created before the profile existed): leave the guest alone.
+            [ -d "$AUGUR_PROFILE_SRC" ] || exit 0
+            mkdir -p "$AUGUR_PROFILE_DST"
+            for d in $AUGUR_PROFILE_LINKS; do
+                if [ -d "$AUGUR_PROFILE_SRC/$d" ]; then
+                    # A REAL directory sits where the link goes. NEVER rm -rf it: the guest may have
+                    # created commands/skills of its own before the operator populated the profile,
+                    # and silently deleting them is data loss the operator never asked for. Empty is
+                    # free to drop; anything else is moved aside once, and if that name is taken we
+                    # leave the entry unwired rather than destroy either copy.
+                    if [ ! -L "$AUGUR_PROFILE_DST/$d" ] && [ -e "$AUGUR_PROFILE_DST/$d" ]; then
+                        if rmdir "$AUGUR_PROFILE_DST/$d" 2>/dev/null; then
+                            :                                   # was empty — nothing to preserve
+                        elif [ ! -e "$AUGUR_PROFILE_DST/$d.pre-profile" ]; then
+                            mv "$AUGUR_PROFILE_DST/$d" "$AUGUR_PROFILE_DST/$d.pre-profile"
+                        else
+                            continue                            # already rescued once; do not touch
+                        fi
+                    fi
+                    ln -sfn "$AUGUR_PROFILE_SRC/$d" "$AUGUR_PROFILE_DST/$d"
+                elif [ -L "$AUGUR_PROFILE_DST/$d" ]; then
+                    # The operator REMOVED this entry from the profile. Drop the link we made rather
+                    # than leaving it dangling — but only ever a symlink, never a real directory the
+                    # guest owns.
+                    rm -f "$AUGUR_PROFILE_DST/$d"
+                fi
+            done
+            for f in $AUGUR_PROFILE_COPIES; do
+                [ -f "$AUGUR_PROFILE_SRC/$f" ] || continue
+                cp "$AUGUR_PROFILE_SRC/$f" "$AUGUR_PROFILE_DST/$f"
+            done
+        ' >/dev/null 2>&1
+    then
+        return 0
+    fi
+    warn "Could not wire the operator profile into the guest; continuing without it."
+    return 0
+}
+
+# ── Prompt-history carry-over (Container mode) ───────────────────────────────────────────────
+# augur recreates the container for its OWN reasons — a rotated credential, an egress toggle, a
+# memory change, `build`/`update`/`install-cert`, or any other fingerprint drift. Each of those
+# discards the writable layer, and ~/.claude/history.jsonl (up-arrow prompt recall) lives directly
+# in ~/.claude rather than under one of the mounts, so it goes with it.
+#
+# Scope is deliberately JUST the prompt history. augur does not snapshot ~/.claude.json: ADR-0012
+# removed the last per-container write to that file on purpose, and its per-project entry carries
+# folder trust and tool permissions — replaying those across a recreate would quietly re-grant
+# approvals the operator gave to a container that no longer exists, which is the decision 0012 just
+# made the other way.
+#
+# `destroy` DROPS the snapshot rather than feeding it forward: it is the clean-guest button (the A2
+# integrity remedy), and carrying guest-written data across it would defeat the guarantee asked for.
+#
+# BOUNDED twice over — by lines AND by bytes. The only in-guest write mechanism this codebase has
+# proven is `eng exec` with the payload in `-e` env vars (augur never uses `container cp`), and
+# Linux caps a SINGLE env string at 128 KiB. A line cap alone would not hold: one pathological
+# prompt can be arbitrarily long.
+AUGUR_HISTORY_MAX_LINES="${AUGUR_HISTORY_MAX_LINES:-200}"
+AUGUR_HISTORY_MAX_BYTES="${AUGUR_HISTORY_MAX_BYTES:-65536}"
+
+guest_carryover_dir() {
+    local d
+    d="$AUGUR_DIR/$(agent_state_carryover_host_subdir)/$(workspace_slug)-$(workspace_path_hash)"
+    # `umask 077` in a subshell, NOT mkdir-then-chmod: this holds guest-written data, and the
+    # chmod-after form leaves a window where it is group/world readable. Same shape as
+    # write_container_fingerprint. Kept OUTSIDE the host's own ~/.claude (the A3 discipline the
+    # history/agents mounts follow). Failure is non-fatal — every caller is best-effort.
+    ( umask 077; mkdir -p "$d" ) 2>/dev/null || true
+    echo "$d"
+}
+
+# Snapshot the guest's prompt history. Only ever called where the container is RUNNING (`exec` needs
+# it): on the way out of an interactive session, and in `down` before the stop. Best-effort — a
+# failed snapshot must never fail the command the operator actually asked for.
+save_guest_history() {
+    container_running || return 0
+    local d; d="$(guest_carryover_dir)"
+    [[ -d "$d" ]] || return 0
+    # tail -n bounds the entries, tail -c bounds the bytes. The byte cut can only slice the FIRST
+    # line (it trims from the left), so the awk keeps line 1 only when it still looks like a whole
+    # record — `{`…`}` — and keeps every later line untouched.
+    # The awk PROGRAM travels as an env var, never interpolated into the shell string — the same
+    # discipline the rest of this file uses for jq programs, and it keeps the regex escaping out of
+    # two nested quoting layers (POSIX sh does not re-expand a variable's value).
+    if ( umask 077; eng exec \
+            -e "AUGUR_HIST=$(agent_state_guest_history_file)" \
+            -e "AUGUR_N=${AUGUR_HISTORY_MAX_LINES}" \
+            -e "AUGUR_B=${AUGUR_HISTORY_MAX_BYTES}" \
+            -e 'AUGUR_AWK=NR>1 || (/^\{/ && /\}$/)' \
+            "$CONTAINER_NAME" sh -c 'tail -n "$AUGUR_N" "$AUGUR_HIST" | tail -c "$AUGUR_B" | awk "$AUGUR_AWK"' \
+            >"$d/history.jsonl.tmp" ) 2>/dev/null && [[ -s "$d/history.jsonl.tmp" ]]
+    then
+        # EVERY mutation below is guarded. This function runs on the way out of `claude`/`shell`, in
+        # `down` before the stop, and in invalidate_persisted_container — under `set -e` a bare `mv`
+        # that failed (full disk, bad perms) would abort the operator's ACTUAL command, skipping the
+        # stop or the container removal. Best-effort has to mean it.
+        cp "$d/history.jsonl" "$d/history.jsonl.prev" 2>/dev/null || true   # keep one generation
+        mv "$d/history.jsonl.tmp" "$d/history.jsonl" 2>/dev/null || rm -f "$d/history.jsonl.tmp"
+    else
+        rm -f "$d/history.jsonl.tmp" 2>/dev/null || true
+    fi
+    return 0
+}
+
+# Push the snapshot into a freshly CREATED container. Best-effort.
+restore_guest_history() {
+    local d f; d="$(guest_carryover_dir)"; f="$d/history.jsonl"
+    # Fall back to the previous generation when the current snapshot is missing or empty — that is
+    # the case save_guest_history keeps `.prev` FOR (a failed restore leaves the guest with no
+    # history, and the next save would otherwise replace a good snapshot with that emptier one).
+    [[ -s "$f" ]] || f="$d/history.jsonl.prev"
+    [[ -s "$f" ]] || return 0
+    # Re-check the byte bound on the way IN as well: the file on disk could predate a lowered cap,
+    # or have been edited by hand. Better to skip than to blow the env-string limit mid-`up`.
+    local bytes; bytes="$(wc -c < "$f" 2>/dev/null | tr -d ' ')"
+    if [[ -z "$bytes" || "$bytes" -gt "$AUGUR_HISTORY_MAX_BYTES" ]]; then
+        warn "Carried-over prompt history is too large to restore; skipping it."
+        return 0
+    fi
+    eng exec \
+        -e "AUGUR_HIST=$(agent_state_guest_history_file)" \
+        -e "AUGUR_HIST_BODY=$(cat "$f")" \
+        "$CONTAINER_NAME" sh -c '
+            set -eu
+            mkdir -p "$(dirname "$AUGUR_HIST")"
+            printf "%s\n" "$AUGUR_HIST_BODY" > "$AUGUR_HIST"
+        ' >/dev/null 2>&1 \
+        || warn "Could not restore prompt history into the guest."
+    return 0
+}
+
+# `destroy` means clean. Drop the snapshot so the next `up` starts from nothing.
+drop_guest_history() {
+    rm -rf "$AUGUR_DIR/$(agent_state_carryover_host_subdir)/$(workspace_slug)-$(workspace_path_hash)" 2>/dev/null || true
+    return 0
+}
+
 # Shared tail of `up` (both the fresh-create and the reuse path): bring the host egress proxy up
 # now that the container has attached, run the boot self-test (I1's tripwire — runs on EVERY up,
 # never cached from a prior boot), and print the ready banner.
@@ -1308,6 +1552,14 @@ finish_up() {
         start_egress_proxy
         verify_egress_locked
     fi
+    # Both paths (fresh create and fast reuse) land here, so a host-side profile edit is picked up on
+    # a container transitioning stopped→running without a recreate. This is NOT sufficient on its
+    # own, though: `cmd_up` short-circuits to a no-op when the container is ALREADY running, so
+    # cmd_claude/cmd_shell also call apply_guest_profile directly — see those call sites (found live,
+    # not by inspection: a profile entry added/removed while the container stayed running was
+    # invisible until an explicit `down`). Best-effort; never aborts `up`. Runs AFTER the egress
+    # self-test so it can never delay or mask that tripwire.
+    apply_guest_profile
     success "Container '${CONTAINER_NAME}' is up."
     echo ""
     echo -e "  ${BOLD}augur claude${RESET}  → Launch Claude Code"
@@ -1469,6 +1721,17 @@ cmd_up() {
     mkdir -p "$host_agents_dir"
     run_args+=(-v "${host_agents_dir}:$(agent_state_guest_agents_dir)")
 
+    # AUGUR_AGENT_SEAM | opt-in operator profile — READ-ONLY, host-global. Always created and always
+    # mounted, so a profile populated LATER needs no container recreate; an empty dir wires nothing
+    # (apply_guest_profile skips every absent entry). Unlike the two mounts above this is
+    # host-GLOBAL rather than per-project, which is exactly why it must be read-only: a compromised
+    # guest must not be able to write a hook/command/skill back into a directory that every project
+    # on this host reads. augur still never touches the host's ~/.claude.
+    local host_profile_dir
+    host_profile_dir="$AUGUR_DIR/$(agent_profile_host_subdir)"
+    mkdir -p "$host_profile_dir"
+    run_args+=(-v "${host_profile_dir}:$(agent_profile_guest_mount):ro")
+
     [[ -f "$HOME/.gitconfig" ]] && run_args+=(-v "${HOME}/.gitconfig:/home/dev/.gitconfig:ro")
 
     # gh config is mounted READ-ONLY: the guest may read it but cannot rewrite the
@@ -1515,6 +1778,11 @@ cmd_up() {
     # the persisted container is still reusable or must be recreated (see the reconcile above).
     write_container_fingerprint
 
+    # Carry this project's prompt history into the fresh container (create path only; the reuse path
+    # above kept it in its writable layer). `destroy` drops the snapshot, so a deliberate clean
+    # slate stays clean. Best-effort.
+    restore_guest_history
+
     # The agent container has now ATTACHED to the network — the host's host-only gateway
     # interface comes up at that point, so finish_up starts the host proxy and runs the boot
     # self-test. Shared with the reuse path above (the datapath is rebuilt on EVERY up).
@@ -1528,13 +1796,26 @@ cmd_claude() {
     # reuse path; a bare start would re-attach the guest with NO proxy re-established and NO
     # self-test — silently bypassing egress. Mirrors macOS `cmd_claude_macos` (running || up).
     container_running || cmd_up
+    # `cmd_up` short-circuits to a no-op when the container is ALREADY running (the common case:
+    # repeated `claude`/`shell` calls without an intervening `down`), so its finish_up — and the
+    # apply_guest_profile inside it — never runs on that path. Call it here too, matching macOS
+    # mode's ensure_macos_claude_profile (already called from cmd_claude_macos/cmd_shell_macos
+    # unconditionally). Content edits inside an already-symlinked entry are live via the mount with
+    # no re-wiring needed; this is for STRUCTURAL changes — an entry added, removed, or replaced in
+    # the profile since the guest was last wired — which only apply_guest_profile can pick up.
+    apply_guest_profile
     info "Launching $(agent_display_name) in '${CONTAINER_NAME}'..."
     # AUGUR_AGENT_SEAM | interactive launch (engine `exec`: argv array — safe by construction)
     local _env=() _argv=() kv
     for kv in $(agent_fixed_env); do _env+=(-e "$kv"); done
     read -ra _argv <<< "$(agent_launch_argv)"
     # empty-safe expansion (bash 3.2 + set -u) so a future agent_fixed_env="" can't crash this
-    eng exec -it ${_env[@]+"${_env[@]}"} "$CONTAINER_NAME" ${_argv[@]+"${_argv[@]}"}
+    local _rc=0
+    eng exec -it ${_env[@]+"${_env[@]}"} "$CONTAINER_NAME" ${_argv[@]+"${_argv[@]}"} || _rc=$?
+    # Snapshot on the way out, while the container is still running — the freshest moment for the
+    # prompt history a later recreate would otherwise discard. Never changes the agent's own status.
+    save_guest_history
+    return "$_rc"
 }
 
 cmd_shell() {
@@ -1542,8 +1823,17 @@ cmd_shell() {
     # Same as cmd_claude: route a stopped/absent container through the full `up` so egress is
     # re-established and self-tested, never a bare `container start`.
     container_running || cmd_up
+    # Same reasoning as cmd_claude: `cmd_up` no-ops when already running, so re-wire the profile
+    # here too — otherwise a structural profile change (an entry added/removed/replaced) is
+    # invisible until an intervening `down`.
+    apply_guest_profile
     info "Opening bash shell in '${CONTAINER_NAME}'..."
-    eng exec -it "$CONTAINER_NAME" bash
+    local _rc=0
+    eng exec -it "$CONTAINER_NAME" bash || _rc=$?
+    # Same snapshot-on-exit as cmd_claude: a `claude` run ad hoc from this shell writes the same
+    # history file, and the container is still running here.
+    save_guest_history
+    return "$_rc"
 }
 
 # Generate a long-lived Claude subscription token by running `claude setup-token`
@@ -1602,6 +1892,8 @@ cmd_setup_token() {
 cmd_down() {
     require_engine
     if container_exists; then
+        # Snapshot before the stop: `exec` needs a RUNNING container. No-ops if already stopped.
+        save_guest_history
         info "Stopping container '${CONTAINER_NAME}' (keeping it for a fast restart)..."
         # STOP, don't delete: the container's writable layer (caches and tool state OUTSIDE the
         # bind-mounted workspace) survives so the next `up` resumes fast. `augur destroy` removes
@@ -1641,6 +1933,10 @@ cmd_destroy() {
     fi
     # Drop the reconcile fingerprint and tear down the whole egress datapath (proxy + network).
     rm -f "$(container_fingerprint_file)" 2>/dev/null || true
+    # `destroy` is the clean-guest button (the A2 integrity remedy), so the carried-over prompt
+    # history goes too. Feeding guest-written data forward across an explicit destroy would defeat
+    # exactly the guarantee the operator asked for. A drift-recreate inside `up` keeps it.
+    drop_guest_history
     stop_egress
 }
 
@@ -2076,6 +2372,10 @@ cmd_build_macos() {
     info "Scrubbing any accumulated Claude Code account state from the base VM..."
     ssh_macos "$MACOS_BUILD_VM" "rm -f ~/.claude.json"
 
+    # augur's managed Claude Code policy — the one settings layer a repo cannot override. Must land
+    # before the sudo revoke below, and before the base VM is frozen, since /Library is root-owned.
+    install_macos_managed_settings "$MACOS_BUILD_VM"
+
     # Step 7: Save as base VM
     # Revoke the build-time NOPASSWD sudo grant before saving. Project VMs are cloned from
     # this base, so leaving the grant in place would give the AI agent root access.
@@ -2201,6 +2501,123 @@ ensure_macos_claude_agents() {
     '
 }
 
+# AUGUR_AGENT_SEAM | macOS peer of apply_guest_profile — wire the opt-in operator profile from the
+# READ-ONLY host share into the VM's ~/.claude. The share name here must match the --dir=
+# cmd_up_macos adds (agent_profile_host_subdir). Same split as the container path: symlink what
+# Claude only reads, copy what Claude may rewrite. Unlike the history/agents shares this one is
+# host-GLOBAL (no per-VM subdir) — personal tooling is not project-scoped — which is exactly why the
+# share is mounted read-only. Idempotent; runs on every `up`.
+ensure_macos_claude_profile() {
+    local vm="$1" src
+    src="/Volumes/My Shared Files/$(agent_profile_host_subdir)"
+    # The seam lists expand HOST-side into plain word lists (`commands skills`); every remote
+    # variable stays escaped so it is the guest's shell that expands it.
+    ssh_macos "$vm" "
+        set -eu
+        src='${src}'
+        # Only wire once the share is actually MOUNTED (it appears only after a \`vm run\` with the
+        # --dir). Guards a VM booted BEFORE this share existed (upgrade-in-place): without it the
+        # loop below would replace a real ~/.claude/commands with a DANGLING symlink. Skipping
+        # leaves the guest untouched; \`down --macos && up --macos\` re-runs \`vm run\` and self-heals.
+        [ -d \"\$src\" ] || exit 0
+        mkdir -p \"\$HOME/.claude\"
+        for d in $(agent_profile_link_dirs); do
+            if [ -d \"\$src/\$d\" ]; then
+                # Same non-destructive rule as the container peer: never rm -rf a real directory the
+                # guest may have created. Empty is free to drop; otherwise move it aside once, and
+                # if that name is taken leave the entry unwired rather than destroy either copy.
+                if [ ! -L \"\$HOME/.claude/\$d\" ] && [ -e \"\$HOME/.claude/\$d\" ]; then
+                    if rmdir \"\$HOME/.claude/\$d\" 2>/dev/null; then
+                        :
+                    elif [ ! -e \"\$HOME/.claude/\$d.pre-profile\" ]; then
+                        mv \"\$HOME/.claude/\$d\" \"\$HOME/.claude/\$d.pre-profile\"
+                    else
+                        continue
+                    fi
+                fi
+                ln -sfn \"\$src/\$d\" \"\$HOME/.claude/\$d\"
+            elif [ -L \"\$HOME/.claude/\$d\" ]; then
+                rm -f \"\$HOME/.claude/\$d\"
+            fi
+        done
+        for f in $(agent_profile_copy_files); do
+            [ -f \"\$src/\$f\" ] || continue
+            cp \"\$src/\$f\" \"\$HOME/.claude/\$f\"
+        done
+    " || warn "Could not wire the operator profile into the VM; continuing without it."
+    return 0
+}
+
+# Warn when the host profile has changed since this VM booted, because in macOS mode the guest will
+# NOT see that change: a read-only virtiofs share serves the macOS guest stale content for minutes
+# (issue #124 — verified not to be a `readOnly` problem; an Apple Container guest reading the same
+# host directory over an equally read-only virtiofs mount is live, so the variable is the guest-side
+# virtiofs client). Without this the failure is SILENT — the operator edits a slash command, runs
+# `augur claude --macos`, and simply gets the old behaviour with no error to explain it.
+#
+# Entirely host-side by design: it compares mtimes on the host's own filesystem against a marker
+# written at boot, so the stale share cannot influence the check that reports the stale share.
+#
+# Called from `claude`/`shell` only, never from `up` — `up` is what refreshes the view, and
+# cmd_up_macos re-stamps the marker after wiring, so a freshly booted VM never warns.
+warn_if_macos_profile_stale() {
+    local vm="$1" marker profile
+    marker="$(macos_profile_marker_file "$vm")"
+    profile="$AUGUR_DIR/$(agent_profile_host_subdir)"
+    # No marker: this VM was booted by an augur that predates the marker, so we cannot tell when its
+    # view was taken. Say nothing rather than guess — a false alarm here trains people to ignore it.
+    [[ -f "$marker" ]] || return 0
+    [[ -d "$profile" ]] || return 0
+    # `find -newer` rather than parsing timestamps: no clock arithmetic, and it catches a change
+    # anywhere in the tree (a new command file, a rewritten skill) rather than just the top level.
+    # The command substitution's status is discarded by `[[ -n ]]`, so `head` closing the pipe early
+    # cannot trip `set -o pipefail`.
+    [[ -n "$(find "$profile" -newer "$marker" -print 2>/dev/null | head -n1)" ]] || return 0
+    warn "The operator profile changed since this VM booted — the guest will NOT see it yet."
+    warn "macOS mode reaches the profile over a virtiofs share that serves stale content for"
+    warn "minutes (see issue #124). To apply it now: ${BOLD}augur down --macos && augur up --macos${RESET}"
+    return 0
+}
+
+# AUGUR_AGENT_SEAM | agent managed policy (macOS peer of the Dockerfile's /etc/claude-code block).
+# Installed into the BASE VM, never a project clone: /Library is root-owned and project VMs
+# deliberately have no sudo grant (build revokes it before the base is saved), so this is the only
+# place it can be written. Every clone then inherits it.
+#
+# Run from BOTH cmd_build_macos and cmd_update_macos so a base VM built before this existed
+# self-heals on the next routine update instead of needing a full rebuild — the same reasoning
+# ADR-0012 used to put its ~/.claude.json scrub in both.
+#
+# HONEST SCOPE: the base VM's account is the published admin/admin (ADR-0007), so this is a policy
+# DEFAULT, not a tamper-proof control — anyone with that password can rewrite it. It still does the
+# job it is here for: stopping a repository's own settings from re-enabling the auto-updater and
+# swapping out the binary the integrity gate verifies. In Container mode the same file IS
+# root-owned against an unprivileged agent.
+macos_managed_settings_path() { echo "/Library/Application Support/ClaudeCode/managed-settings.json"; }
+install_macos_managed_settings() {
+    local vm="$1" dst parent staged
+    dst="$(macos_managed_settings_path)"; parent="$(dirname "$dst")"
+    staged="/Users/${MACOS_SSH_USER}/.augur-managed-settings.json"
+    info "Installing augur's managed Claude Code policy into the base VM..."
+    # Two calls on purpose. The payload travels over STDIN because it contains double quotes that
+    # would terminate the host-side quoted string if interpolated — and `sudo -S` reads the PASSWORD
+    # from stdin, so the transfer and the privileged move cannot share one invocation.
+    agent_managed_settings_json | ssh_macos "$vm" "cat > '${staged}'" || {
+        warn "Could not stage the managed Claude Code policy in the VM; skipping."
+        return 0
+    }
+    # `sudo -S` works whether or not the build-time NOPASSWD grant is still present, which is what
+    # lets `update --macos` reach a base VM that no longer has it. The password is the documented
+    # fixed one (ADR-0007) — no privilege here that augur's build does not already take.
+    ssh_macos "$vm" "echo '${MACOS_SSH_USER}' | sudo -S -p '' sh -c '
+        mkdir -p \"${parent}\" &&
+        mv \"${staged}\" \"${dst}\" &&
+        chown root:wheel \"${dst}\" &&
+        chmod 644 \"${dst}\"'" \
+        || warn "Could not install the managed Claude Code policy in the VM; continuing without it."
+    return 0
+}
+
 # AUGUR_AGENT_SEAM | macOS agent install / self-heal (official installer into ~/.local/bin).
 ensure_macos_claude_bin() {
     local vm="$1"
@@ -2269,6 +2686,10 @@ cmd_up_macos() {
     # AUGUR_AGENT_SEAM | per-VM user-level subagent-defs share (dir name = agent_state_agents_host_subdir):
     # a host-side dir so `/agents` created in the VM persist across down/up AND destroy/re-clone.
     mkdir -p "$AUGUR_DIR/$(agent_state_agents_host_subdir)/$project_vm"
+    # AUGUR_AGENT_SEAM | opt-in operator profile share. Host-GLOBAL — no per-VM subdir, unlike the
+    # two above — and shared READ-ONLY, so a compromised guest cannot write a hook/command/skill
+    # back into a directory every project on this host reads.
+    mkdir -p "$AUGUR_DIR/$(agent_profile_host_subdir)"
     info "Starting VM '${project_vm}'..."
     info "Mounting: ${BOLD}${WORKSPACE_DIR}${RESET} → ~/${MACOS_SHARE}"
     # A GUI window (--gui) and headless mode build the same VM (same NAT networking and
@@ -2303,6 +2724,7 @@ cmd_up_macos() {
         --dir="gh-config:${HOME}/.config/gh:ro" \
         --dir="$(agent_state_host_subdir):${AUGUR_DIR}/$(agent_state_host_subdir)/${project_vm}" \
         --dir="$(agent_state_agents_host_subdir):${AUGUR_DIR}/$(agent_state_agents_host_subdir)/${project_vm}" \
+        --dir="$(agent_profile_host_subdir):${AUGUR_DIR}/$(agent_profile_host_subdir):ro" \
         "$project_vm" &>"$(macos_vm_log)" &
     disown
 
@@ -2339,6 +2761,7 @@ cmd_up_macos() {
     ensure_macos_workspace "$project_vm"
     ensure_macos_claude_projects "$project_vm"
     ensure_macos_claude_agents "$project_vm"
+    ensure_macos_claude_profile "$project_vm"
     ensure_macos_claude_bin "$project_vm"
 
     # Copy git config, and seed a minimal .claude.json one-way for onboarding state only (NOT auth —
@@ -2411,11 +2834,18 @@ cmd_up_macos() {
             "git config --global 'credential.https://github.com.helper' '!f() { test \"\$1\" = get && echo username=x-access-token && echo password=\$GH_TOKEN; }; f'"
     fi
 
+    # This `up` ran `vm run`, which rebuilds the virtiofs device, so the guest's view of the profile
+    # is current as of now. Stamp the marker so warn_if_macos_profile_stale has a baseline — and
+    # stamp it AFTER the wiring above, so an edit made while the VM was booting is not misread as
+    # already-seen. Best-effort: a failed stamp only costs a missed warning later.
+    touch "$(macos_profile_marker_file "$project_vm")" 2>/dev/null || true
+
     success "VM '${project_vm}' is up."
     echo ""
-    echo -e "  ${BOLD}augur claude --macos${RESET} → Launch Claude Code"
-    echo -e "  ${BOLD}augur shell --macos${RESET}  → Open bash shell"
-    echo -e "  ${BOLD}augur down --macos${RESET}   → Stop and remove"
+    echo -e "  ${BOLD}augur claude --macos${RESET}  → Launch Claude Code"
+    echo -e "  ${BOLD}augur shell --macos${RESET}   → Open bash shell"
+    echo -e "  ${BOLD}augur down --macos${RESET}    → Stop (clone kept for a fast restart)"
+    echo -e "  ${BOLD}augur destroy --macos${RESET} → Remove the VM clone entirely"
 }
 
 cmd_claude_macos() {
@@ -2426,6 +2856,8 @@ cmd_claude_macos() {
     ensure_macos_workspace "$project_vm"
     ensure_macos_claude_projects "$project_vm"
     ensure_macos_claude_agents "$project_vm"
+    ensure_macos_claude_profile "$project_vm"
+    warn_if_macos_profile_stale "$project_vm"
     ensure_macos_claude_bin "$project_vm"
     info "Launching $(agent_display_name) in '${project_vm}'..."
     # AUGUR_AGENT_SEAM | interactive launch (macOS: interpolated into SSH string — see C4 on agent_launch_argv)
@@ -2442,6 +2874,8 @@ cmd_shell_macos() {
     ensure_macos_workspace "$project_vm"
     ensure_macos_claude_projects "$project_vm"
     ensure_macos_claude_agents "$project_vm"
+    ensure_macos_claude_profile "$project_vm"
+    warn_if_macos_profile_stale "$project_vm"
     info "Opening shell in '${project_vm}'..."
     ssh_macos "$project_vm" -t "cd ~/${MACOS_SHARE} && exec zsh -l"
 }
@@ -2525,6 +2959,10 @@ cmd_destroy_macos() {
     # Drop the pinned SSH host key so the next clone (which will have a new key) is
     # not rejected against this project's fixed 127.0.0.1:<fwd-port> egress target.
     rm -f "$(vm_known_hosts_file "$project_vm")"
+    # Drop the profile-freshness marker too: leaving it would make the next VM's first
+    # `claude`/`shell` compare against a boot that no longer exists, warning about a staleness that
+    # the re-clone has already resolved.
+    rm -f "$(macos_profile_marker_file "$project_vm")"
     success "VM '${project_vm}' has been removed."
 }
 
@@ -2867,6 +3305,11 @@ cmd_update_macos() {
     # nor this update step ever runs `claude` interactively); running this on every update makes
     # that self-healing instead of requiring a full rebuild to notice and fix.
     ssh_macos "$MACOS_BASE_VM" "rm -f ~/.claude.json"
+
+    # Same reasoning as the scrub above: re-assert augur's managed policy on every update, so a base
+    # VM built before this existed self-heals on routine maintenance instead of needing a full
+    # rebuild. Idempotent (it overwrites the same file with the same bytes).
+    install_macos_managed_settings "$MACOS_BASE_VM"
 
     stop_and_reap_macos_vm "$MACOS_BASE_VM" "$vm_pid"
     success "CLI tools updated in '${MACOS_BASE_VM}'."
@@ -3696,8 +4139,13 @@ cmd_help() {
     echo -e "    • macOS VM mode:  current directory exposed at ~/workspace-<project> (macOS VM)"
     echo -e "    • macOS VM mode requires: augur-vm (the bundled Swift VM backend)"
     echo -e "      build it on macOS with: bash install   (or augur-vm/scripts/build.sh)"
-    echo -e "    • Container mode shares ~/.claude, ~/.config/gh, ~/.gitconfig; macOS mode injects"
+    echo -e "    • The host's ~/.claude tree and ~/.claude.json are NEVER read, copied or mounted."
+    echo -e "      Shared instead: this project's Claude history + subagent defs (read/write, kept"
+    echo -e "      under ~/.augur), ~/.config/gh and ~/.gitconfig (read-only). macOS mode injects"
     echo -e "      Claude/GitHub credentials via env (see ENVIRONMENT) and copies ~/.gitconfig"
+    echo -e "    • Operator profile: drop personal commands/, skills/, CLAUDE.md or settings.json in"
+    echo -e "      ${CYAN}~/.augur/claude-profile/${RESET} and augur wires them read-only into the guest's"
+    echo -e "      ~/.claude. Opt-in — an absent or empty directory wires nothing (ADR-0013)"
     echo -e "    • macOS VM mode IPSW + XIP must be downloaded from Apple directly:"
     echo -e "      IPSW: https://ipsw.me or System Preferences > Software Update"
     echo -e "      XIP:  https://developer.apple.com/download/all/"
