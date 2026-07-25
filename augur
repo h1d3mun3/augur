@@ -873,6 +873,69 @@ workspace_path_hash() {
     echo "${h:0:12}"
 }
 
+# Refuse to share a workspace that CONTAINS augur's own control plane.
+#
+# $WORKSPACE_DIR is mounted READ-WRITE into the guest — `-v "${WORKSPACE_DIR}:…"` in
+# container mode, `--dir="${MACOS_SHARE}:${WORKSPACE_DIR}"` in macOS mode — so anything
+# under it is guest-writable. That is accepted for a project checkout
+# (docs/security-reviews/2026-07-23-egress.md §6 item 12: the guest can attack the repo you
+# gave it). It is NOT acceptable for $HOME or $AUGUR_DIR, because `~/.augur` holds the
+# host-executed binaries `install` puts FIRST on the host's PATH (install:150) — augur,
+# augur-proxy, augur-gvproxy, augur-vm — which resolve_proxy_cli/resolve_gvproxy then run as
+# the host user on every `up`. A guest that can write there owns the host account, and it can
+# also edit the merged allowlist `augur-proxy` hot-reloads on mtime change every ~2s, which
+# is a direct I7 violation ("written host-side … outside the project tree").
+# See docs/decisions/0014-workspace-must-not-contain-augur.md.
+#
+# Reads $WORKSPACE_DIR / $HOME / $AUGUR_DIR as globals at call time so a test can set them.
+# Compares PHYSICAL paths: $WORKSPACE_DIR is `$(pwd)` — the LOGICAL path — so `cd ~/link`
+# where link → $HOME would otherwise pass a string that isn't $HOME while the engine happily
+# shares $HOME. The physical forms are local to this function on purpose: $WORKSPACE_DIR
+# itself must NOT change, because workspace_path_hash feeds container/VM names, the TOFU
+# approval key and every per-project state dir — re-basing it on `pwd -P` would silently
+# rename all of that for anyone whose path crosses a symlink.
+require_safe_workspace() {
+    local ws home augur_dir ad_parent
+    ws="$(cd "$WORKSPACE_DIR" 2>/dev/null && pwd -P)" || ws="$WORKSPACE_DIR"
+    [[ -n "$ws" ]] || ws="$WORKSPACE_DIR"
+    home="$(cd "$HOME" 2>/dev/null && pwd -P)"        || home="$HOME"
+    [[ -n "$home" ]] || home="$HOME"
+    # $AUGUR_DIR need not exist yet (first run), so resolve its PARENT and re-append the leaf
+    # rather than cd'ing into it. An unresolvable parent falls back to the literal path — a
+    # guard that cannot resolve a path must still compare something, never "".
+    ad_parent="$(cd "$(dirname "$AUGUR_DIR")" 2>/dev/null && pwd -P)" || ad_parent=""
+    if [[ -n "$ad_parent" ]]; then
+        augur_dir="${ad_parent%/}/$(basename "$AUGUR_DIR")"
+    else
+        augur_dir="$AUGUR_DIR"
+    fi
+
+    local why=""
+    # R1 needs its own branch: "$ws"/* is //* when ws=/ and matches nothing.
+    if [[ "$ws" == "/" ]]; then
+        why="it is the filesystem root"
+    elif [[ "$ws" == "$home" ]]; then
+        why="it is your home directory"
+    elif [[ "$home" == "$ws"/* ]]; then
+        why="it contains your home directory"
+    elif [[ "$ws" == "$augur_dir" || "$augur_dir" == "$ws"/* || "$ws" == "$augur_dir"/* ]]; then
+        why="it is, contains, or lives inside augur's own directory ($augur_dir)"
+    else
+        return 0
+    fi
+
+    error "Refusing to share ${BOLD}${ws}${RESET} with the guest: ${why}."
+    error "The workspace is mounted ${BOLD}read-write${RESET}, so the guest could rewrite augur's"
+    error "own binaries in ${augur_dir} — which the host then executes as you — and the egress"
+    error "allowlist that confines it."
+    error ""
+    error "Instead:"
+    error "  • ${BOLD}cd${RESET} into a subdirectory holding just the project you want the agent to see, or"
+    error "  • run ${BOLD}augur destroy${RESET} here first if an older augur already made a container/VM"
+    error "    from this directory, then re-run from that subdirectory."
+    exit 1
+}
+
 # Host-side record of approved project-conf fingerprints (TOFU). Under ~/.augur — NEVER the
 # project tree or a mounted share — so the guest cannot forge its own approval. Keyed on the
 # FULL workspace path (slug + path hash), so a hostile repo that shares a basename with a
@@ -4216,6 +4279,21 @@ WORKSPACE_MOUNT="$(make_workspace_mount)"
 # "/Volumes/My Shared Files/<name>", which is the path Claude actually records as cwd (it resolves
 # the ~/workspace-<slug> symlink), so a per-project name keeps each project's history under a distinct slug.
 MACOS_SHARE="workspace-$(workspace_slug)"
+
+# ONE containment gate for BOTH modes, deliberately here in the shared dispatch tail rather
+# than inside cmd_up/cmd_up_macos. Two reasons:
+#   • Structural: a single site makes it impossible to fix one mode and forget the other.
+#   • Correctness: cmd_claude/cmd_shell only call cmd_up when the guest is NOT already
+#     running (`container_running || cmd_up`, `macos_vm_running … || cmd_up_macos`), so a
+#     check inside `up` would be skipped entirely when attaching to a guest a pre-fix augur
+#     had already created from $HOME — exactly the case that needs refusing.
+# It also runs BEFORE require_vz (called from inside the macOS cmd_* functions), so the
+# refusal names the workspace rather than the host OS.
+# NOT gated, on purpose (see the ADR): down/destroy/list/status must keep working here so a
+# container/VM a pre-fix augur made in $HOME can still be cleaned up; init-conf/build/update/
+# install-cert/version/help never hand this directory to a guest (`build` uses $SCRIPT_DIR as
+# its context).
+case "$COMMAND" in up|claude|shell|setup-token) require_safe_workspace ;; esac
 
 if $MACOS_MODE; then
     case "$COMMAND" in
