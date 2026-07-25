@@ -52,17 +52,33 @@ if [[ -f "$run" ]]; then
   else fail "up: does not mount ~/.claude/agents" "expected a line ending exactly in :/home/dev/.claude/agents"; fi
   if grep -Eq "claude-agents/${slug}-[0-9a-f]{12}:" "$run"; then ok "up: agents host dir keyed on full-path hash (A3/C7)"
   else fail "up: agents host dir not keyed on path hash"; fi
+  # Opt-in operator profile. Host-GLOBAL — the one mount NOT keyed on the project — which is exactly
+  # why it must be read-only: every project on this host reads it, so a guest able to write here
+  # would plant a hook/command/skill for all of them.
+  if grep -Eq ":/home/dev/\.augur-profile:ro$" "$run"; then ok "up: mounts the operator profile READ-ONLY"
+  else fail "up: operator profile not mounted read-only" "expected a line ending exactly in :/home/dev/.augur-profile:ro"; fi
+  if grep -Eq "claude-profile:/home/dev/\.augur-profile:ro$" "$run"; then ok "up: profile source is \$AUGUR_DIR/claude-profile (host-global)"
+  else fail "up: profile source path unexpected"; fi
+  if grep -Eq "claude-profile/${slug}" "$run"; then fail "up: profile must NOT be per-project" "found a slug-keyed profile path"
+  else ok "up: profile is not slug-keyed (personal tooling is not project-scoped)"; fi
+  if grep -Eq ":/home/dev/\.claude:ro$" "$run"; then fail "up: profile must not shadow ~/.claude" "found a RO mount at /home/dev/.claude"
+  else ok "up: profile does not shadow the guest ~/.claude"; fi
 else
   cname="augur-${slug}"
   fail "up: no container run captured" "trace: $(cat "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null)"
 fi
 
 # ── No folder-trust seed: augur no longer pre-trusts the mounted workspace (ADR-0012, reverses
-#    ADR-0011) — a fresh create issues no `container exec` at all under --no-egress (the egress
-#    self-test, the only other exec caller, doesn't run without egress). ──
+#    ADR-0011). The blanket "no exec at all" check this used to make no longer holds — finish_up
+#    now wires the operator profile via one exec on every up — so assert the thing that actually
+#    matters instead: nothing on the create path writes trust, or touches ~/.claude.json at all. ──
 create_trace="$(cat "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null)"
 hasnt "$create_trace" "hasTrustDialogAccepted"                "up: does NOT seed folder-trust in the guest on create"
-hasnt "$create_trace" "exec"                                  "up: create path issues no container exec under --no-egress (no trust seed left)"
+hasnt "$create_trace" ".claude.json"                          "up: create path never writes the guest ~/.claude.json (ADR-0012)"
+hasnt "$create_trace" "jq"                                    "up: no jq config merge left on the create path"
+# The execs it DOES issue must be exactly the profile wiring (history restore no-ops with no
+# snapshot). A new exec appearing here should force whoever added it to justify it in this test.
+has   "$create_trace" "AUGUR_PROFILE_SRC=/home/dev/.augur-profile" "up: create path wires the operator profile"
 
 # ── augur up (again): pre-Option-A flat layout migrates into the new leaf subdir ──
 host_hist_dir="$(find "$HOME/.augur/claude-projects" -maxdepth 1 -type d -name "${slug}-*" 2>/dev/null | head -1)"
@@ -103,16 +119,174 @@ unset AUGUR_TEST_CONTAINER_STOPPED
 # ── augur claude: capture the constructed `container exec ... claude` ────────
 export AUGUR_TEST_CONTAINER_RUNNING=1
 export AUGUR_TEST_CONTAINER_NAME="$cname"
+rm -f "$AUGUR_TEST_SHIMLOG.trace"
 ( cd "$proj" && bash "$AUGUR" claude ) >/dev/null 2>&1 || true
 ex="$AUGUR_TEST_SHIMLOG.exec"
-if [[ -f "$ex" ]]; then
-  body="$(cat "$ex")"
+# `cmd_claude` issues MORE than one exec now: the interactive launch, then the prompt-history
+# snapshot on the way out (save_guest_history, while the container is still running). The shim's
+# .exec file keeps only the LAST argv, so pull the launch line out of the cumulative trace rather
+# than assuming it was last — otherwise these assertions silently follow whichever exec ran last.
+launch_line="$(grep -E '^container exec -it ' "$AUGUR_TEST_SHIMLOG.trace" | tail -n1)"
+if [[ -f "$ex" && -n "$launch_line" ]]; then
+  body="$launch_line"
   eq  "exec" "$(head -n1 "$ex")"        "claude: invokes the engine 'exec' subcommand"
   has "$body" "DISABLE_AUTOUPDATER=1"   "claude: fixed env DISABLE_AUTOUPDATER=1 (fixed-env seam)"
   has "$body" "$cname"                  "claude: targets this project's container"
-  eq  "claude" "$(tail -n1 "$ex")"      "claude: launch argv is exactly 'claude' (launch seam, last token)"
+  eq  "claude" "${body##* }"            "claude: launch argv is exactly 'claude' (launch seam, last token)"
+  # The interactive launch must come FIRST — a snapshot taken before it would capture stale history.
+  first_exec="$(grep -E '^container exec ' "$AUGUR_TEST_SHIMLOG.trace" | head -n1)"
+  case "$first_exec" in
+    *"exec -it"*) ok "claude: the interactive launch runs before the history snapshot";;
+    *)            fail "claude: launch is not the first exec" "first: $first_exec";;
+  esac
 else
   fail "claude: no container exec captured" "trace: $(cat "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null)"
 fi
+
+# ── Operator profile wiring ──────────────────────────────────────────────────
+# apply_guest_profile ships a pure-POSIX-sh program to the guest over env vars, so the REAL program
+# can be exercised against temp dirs with a stand-in `eng`. This is the risky half of the feature:
+# symlink-vs-copy, replacing a real dir at the link target, un-wiring a removed entry, and never
+# deleting THROUGH a symlink into the read-only mount.
+section "Tier 1 — apply_guest_profile in-guest wiring (real program, fake engine)"
+prof_run() {                       # prof_run <tmpdir>; caller populates <tmpdir>/src beforehand
+  AUGUR_PROF_TD="$1" bash -c '
+    AUGUR_SOURCE_ONLY=1 source "$1"
+    set +e +u
+    TD="$AUGUR_PROF_TD"; CONTAINER_NAME=fake
+    # Point ONLY the two path accessors at temp dirs — the wiring program itself is the shipped one.
+    agent_profile_guest_mount() { echo "$TD/src"; }
+    agent_profile_guest_dir()   { echo "$TD/dst"; }
+    # Stand in for the engine: run the sh program locally with exactly the -e vars it was handed.
+    eng() {
+      shift                                   # drop `exec`
+      local envs=()
+      while [ "${1:-}" = "-e" ]; do envs+=("$2"); shift 2; done
+      shift 3                                 # drop NAME, `sh`, `-c` → $1 is the program
+      env "${envs[@]}" sh -c "$1"
+    }
+    apply_guest_profile
+  ' _ "$AUGUR" 2>&1
+}
+
+ptd="$work/profile"; mkdir -p "$ptd/src/commands" "$ptd/src/skills" "$ptd/dst"
+echo 'hi'            > "$ptd/src/commands/foo.md"
+echo '{"model":"x"}' > "$ptd/src/settings.json"
+echo '# mem'         > "$ptd/src/CLAUDE.md"
+mkdir -p "$ptd/dst/commands"; echo stale > "$ptd/dst/commands/old.md"   # a REAL dir at the target
+prof_run "$ptd" >/dev/null 2>&1
+
+[[ -L "$ptd/dst/commands" ]] && ok "profile: commands/ is a symlink (host edits go live, no recreate)" \
+                             || fail "profile: commands/ is not a symlink"
+[[ -L "$ptd/dst/skills" ]]   && ok "profile: skills/ is a symlink" || fail "profile: skills/ is not a symlink"
+eq "$ptd/src/commands" "$(readlink "$ptd/dst/commands")" "profile: commands/ points at the read-only mount"
+has "$(cat "$ptd/dst/commands/foo.md" 2>/dev/null)" "hi"  "profile: linked command is readable in the guest"
+[[ -e "$ptd/src/commands/foo.md" ]] && ok "profile: replacing the target did not delete through into the profile" \
+                                    || fail "profile: rm -rf deleted through the symlink into the read-only mount"
+[[ -f "$ptd/dst/settings.json" && ! -L "$ptd/dst/settings.json" ]] \
+  && ok "profile: settings.json is a real copy, not a symlink (Claude rewrites it at user scope)" \
+  || fail "profile: settings.json is not a plain copy"
+[[ -f "$ptd/dst/CLAUDE.md" && ! -L "$ptd/dst/CLAUDE.md" ]] \
+  && ok "profile: CLAUDE.md is a real copy, not a symlink" || fail "profile: CLAUDE.md is not a plain copy"
+if echo 'rewritten' > "$ptd/dst/settings.json" 2>/dev/null; then ok "profile: the copied settings.json is writable in the guest"
+else fail "profile: copied settings.json is not writable" "a read-only settings.json breaks user-scope writes"; fi
+
+# Removing an entry from the profile must UN-wire it, not leave a dangling symlink forever.
+rm -rf "$ptd/src/commands"
+prof_run "$ptd" >/dev/null 2>&1
+[[ -e "$ptd/dst/commands" || -L "$ptd/dst/commands" ]] \
+  && fail "profile: a removed entry left a dangling symlink" "operator deleted commands/ but the link survived" \
+  || ok "profile: removing an entry from the profile un-wires it"
+
+# Inert by default: an EMPTY profile must wire nothing at all (the no-opt-in path).
+etd="$work/profile-empty"; mkdir -p "$etd/src" "$etd/dst"
+prof_run "$etd" >/dev/null 2>&1
+eq "" "$(ls -A "$etd/dst")" "profile: an empty profile wires nothing (inert by default)"
+
+# A profile shipping only commands/ must not fabricate a settings.json.
+ptd2="$work/profile-partial"; mkdir -p "$ptd2/src/commands" "$ptd2/dst"
+echo x > "$ptd2/src/commands/a.md"
+prof_run "$ptd2" >/dev/null 2>&1
+[[ -e "$ptd2/dst/settings.json" ]] && fail "profile: fabricated a settings.json the operator never shipped" \
+                                   || ok "profile: only entries present in the profile are wired"
+
+# ── Prompt-history carry-over ────────────────────────────────────────────────
+# The snapshot is what makes up-arrow recall survive an augur-initiated recreate. Drive the REAL
+# save/restore against a fake guest filesystem with a stand-in engine.
+section "Tier 1 — prompt-history carry-over (real programs, fake engine)"
+ctd="$work/carry"; mkdir -p "$ctd/proj"
+carry_run() {   # carry_run <phase>
+  AUGUR_CARRY_TD="$ctd" AUGUR_CARRY_PHASE="$1" bash -c '
+    AUGUR_SOURCE_ONLY=1 source "$1"
+    set +e +u
+    TD="$AUGUR_CARRY_TD"; CONTAINER_NAME=fake
+    WORKSPACE_DIR="$TD/proj"; AUGUR_DIR="$TD/augur"
+    agent_state_guest_history_file() { echo "$TD/guest/.claude/history.jsonl"; }
+    container_running() { [ "${AUGUR_CARRY_RUNNING:-1}" = 1 ]; }
+    eng() {
+      [ "${1:-}" = exec ] || return 0
+      shift
+      local envs=()
+      while [ "${1:-}" = "-e" ]; do envs+=("$2"); shift 2; done
+      shift 3
+      env "${envs[@]}" sh -c "$1"
+    }
+    case "$AUGUR_CARRY_PHASE" in
+      save)         save_guest_history ;;
+      save-stopped) AUGUR_CARRY_RUNNING=0 save_guest_history ;;
+      restore)      restore_guest_history ;;
+      drop)         drop_guest_history ;;
+    esac
+    guest_carryover_dir     # echo the resolved dir so assertions need not recompute the hash
+  ' _ "$AUGUR" 2>/dev/null | tail -n1
+}
+
+mkdir -p "$ctd/guest/.claude"
+i=1; while [ $i -le 300 ]; do printf '{"display":"prompt-%d"}\n' "$i" >> "$ctd/guest/.claude/history.jsonl"; i=$((i+1)); done
+snapdir="$(carry_run save)"
+if [[ -n "$snapdir" && -s "$snapdir/history.jsonl" ]]; then
+  eq "200" "$(wc -l < "$snapdir/history.jsonl" | tr -d ' ')" "carry-over: history capped to the tail (env-arg size bound)"
+  has   "$(cat "$snapdir/history.jsonl")" 'prompt-300' "carry-over: the tail kept is the NEWEST prompts"
+  hasnt "$(cat "$snapdir/history.jsonl")" '"prompt-1"' "carry-over: the oldest prompts are dropped, not the newest"
+  eq "600" "$(stat -c '%a' "$snapdir/history.jsonl" 2>/dev/null || stat -f '%Lp' "$snapdir/history.jsonl")" \
+     "carry-over: snapshot is mode 0600 (guest-written data living on the host)"
+else
+  fail "carry-over: save produced no snapshot" "dir=$snapdir"
+fi
+
+# A stopped container cannot be exec'd — save must no-op rather than truncate a good snapshot.
+before="$(cat "$snapdir/history.jsonl" 2>/dev/null)"
+carry_run save-stopped >/dev/null
+eq "$before" "$(cat "$snapdir/history.jsonl" 2>/dev/null)" "carry-over: save no-ops (and preserves the snapshot) when the container is stopped"
+
+# Recreate: wipe the fake guest, then restore.
+rm -rf "$ctd/guest"; mkdir -p "$ctd/guest/.claude"
+carry_run restore >/dev/null
+eq "200" "$(wc -l < "$ctd/guest/.claude/history.jsonl" 2>/dev/null | tr -d ' ')" "carry-over: restore repopulates prompt history in a fresh container"
+has "$(cat "$ctd/guest/.claude/history.jsonl" 2>/dev/null)" 'prompt-300' "carry-over: restored history is the snapshotted tail"
+
+# A byte-oversized snapshot must be SKIPPED, not blown into the env-arg limit mid-`up`.
+rm -f "$ctd/guest/.claude/history.jsonl"
+head -c 200000 /dev/zero | tr '\0' 'x' > "$snapdir/history.jsonl"
+carry_run restore >/dev/null
+[[ -e "$ctd/guest/.claude/history.jsonl" ]] && fail "carry-over: restored an oversized snapshot" "should refuse past the byte cap" \
+                                            || ok "carry-over: refuses to restore past the byte cap"
+
+# `destroy` means clean: the snapshot must go, or the next `up` feeds guest data forward.
+carry_run drop >/dev/null
+[[ -e "$snapdir/history.jsonl" ]] && fail "carry-over: destroy left the snapshot behind" "clean-guest guarantee broken" \
+                                  || ok "carry-over: destroy drops the snapshot (clean guest stays clean)"
+
+# Source guards for the lifecycle wiring — behaviour above cannot see WHERE these are called.
+up_body="$(awk '/^cmd_up\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
+down_body="$(awk '/^cmd_down\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
+destroy_body="$(awk '/^cmd_destroy\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
+inval_body="$(awk '/^invalidate_persisted_container\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
+has   "$up_body"      'restore_guest_history' "carry-over: cmd_up restores on the create path"
+has   "$down_body"    'save_guest_history'    "carry-over: cmd_down snapshots before stopping"
+has   "$destroy_body" 'drop_guest_history'    "carry-over: cmd_destroy drops the snapshot"
+hasnt "$destroy_body" 'save_guest_history'    "carry-over: cmd_destroy never snapshots (destroy is the clean-guest button)"
+# build/update/install-cert all discard the writable layer through here, possibly while RUNNING.
+has   "$inval_body"   'save_guest_history'    "carry-over: build/update/install-cert snapshot before discarding the layer"
 
 finish

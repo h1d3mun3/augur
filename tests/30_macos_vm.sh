@@ -33,6 +33,45 @@ has "$up_macos" 'hasCompletedOnboarding'         "macOS up still seeds the onboa
 # a fresh project VM gets the stub even if the base VM's own disk has accumulated a stale
 # `.claude.json` between builds — an existence check alone would silently inherit that instead.
 has "$up_macos" '_fresh_clone'                   "macOS .claude.json seed is gated on having just cloned, not on file absence"
+
+# ── Opt-in operator profile: a host-GLOBAL, READ-ONLY share wired into the VM's ~/.claude.
+#    Host-global is exactly why :ro is load-bearing — every project on this host reads it. ──
+has "$up_macos" 'agent_profile_host_subdir'      "macOS profile share dir name comes from agent_profile_host_subdir"
+has "$up_macos" 'ensure_macos_claude_profile'    "macOS up wires the operator profile"
+if grep -Eq -- '--dir="\$\(agent_profile_host_subdir\):\$\{AUGUR_DIR\}/\$\(agent_profile_host_subdir\):ro"' "$AUGUR"
+then ok "macOS profile share is mounted READ-ONLY"
+else fail "macOS profile share is not read-only" "expected a --dir=…:ro for the profile"; fi
+hasnt "$up_macos" 'agent_profile_host_subdir)/${project_vm}' "macOS profile share is NOT per-VM (personal tooling is not project-scoped)"
+# `claude`/`shell` can attach to an already-running VM, so they must wire it too, not just `up`.
+claude_macos_body="$(awk '/^cmd_claude_macos\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
+shell_macos_body="$(awk '/^cmd_shell_macos\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
+has "$claude_macos_body" 'ensure_macos_claude_profile' "macOS claude wires the operator profile"
+has "$shell_macos_body"  'ensure_macos_claude_profile' "macOS shell wires the operator profile"
+profile_fn="$(awk '/^ensure_macos_claude_profile\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
+has "$profile_fn" '|| exit 0'                    "macOS profile wiring skips a VM whose share is not mounted (upgrade guard)"
+has "$profile_fn" 'agent_profile_link_dirs'      "macOS profile wiring reads the link list from the seam"
+has "$profile_fn" 'agent_profile_copy_files'     "macOS profile wiring reads the copy list from the seam"
+has "$profile_fn" 'cp '                          "macOS profile copies the files Claude rewrites (never symlinks them)"
+# Best-effort like its container peer: a guest-side failure must not abort the operator's up.
+has "$profile_fn" '|| warn'                      "macOS profile wiring is best-effort (never aborts up/claude/shell)"
+
+# ── Managed policy: installed into the BASE VM, from BOTH build and update. /Library is
+#    root-owned and project VMs have no sudo grant, so the base VM is the only place it can go —
+#    and doing it in update too is what lets a base VM built before this self-heal. ──
+build_macos_body="$(awk '/^cmd_build_macos\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
+update_macos_body="$(awk '/^cmd_update_macos\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
+has "$build_macos_body"  'install_macos_managed_settings' "macOS build installs the managed policy into the base VM"
+has "$update_macos_body" 'install_macos_managed_settings' "macOS update re-installs it (self-heals a base VM built before this)"
+managed_fn="$(awk '/^install_macos_managed_settings\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
+has "$managed_fn" 'agent_managed_settings_json |' "macOS managed policy is piped over stdin (its JSON quotes would break interpolation)"
+hasnt "$managed_fn" '$(agent_managed_settings_json)' "macOS managed policy is never interpolated into the remote command"
+has "$managed_fn" 'chown root:wheel'             "macOS managed policy is root-owned"
+has "$managed_fn" 'sudo -S'                      "macOS managed policy uses a one-shot sudo (works with or without the build-time grant)"
+# It must land BEFORE cmd_build_macos revokes the build-time sudo grant, or it silently fails.
+m_at="$(printf '%s\n' "$build_macos_body" | grep -n '^    install_macos_managed_settings ' | head -n1 | cut -d: -f1)"
+r_at="$(printf '%s\n' "$build_macos_body" | grep -n 'sudo rm -f /etc/sudoers.d/augur' | head -n1 | cut -d: -f1)"
+if [[ -n "$m_at" && -n "$r_at" && "$m_at" -lt "$r_at" ]]; then ok "macOS managed policy installed BEFORE the sudo revoke (install@$m_at < revoke@$r_at)"
+else fail "macOS managed policy installed after the sudo revoke" "install@$m_at revoke@$r_at"; fi
 has "$up_macos" 'if $_fresh_clone; then'         "macOS .claude.json seed overwrites unconditionally on a fresh clone"
 
 # Base-VM account-state scrub (ADR-0012 follow-up, found via live testing): the base VM is

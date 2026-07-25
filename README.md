@@ -77,10 +77,60 @@ augur version                   # show augur version
 | Current directory | mounted at `/workspace-<project>` (read/write), named after the directory |
 | `~/.claude/projects/-workspace-<project>` | **only this project's** Claude history is shared (read/write) — not the rest of `~/.claude`, so other projects' transcripts and host auth/settings stay invisible |
 | `~/.claude/agents/` | **this project's** user-level custom subagent definitions (`/agents`) are persisted (read/write), keyed per-project under `~/.augur/claude-agents/<project>` — so they survive `augur down`/`up` **and** `destroy`/recreate. Isolated per project (not the host's global `~/.claude/agents`), so a guest can't plant a subagent read by another project. Project-level `.claude/agents/` in the repo work too, via the workspace mount. |
+| `~/.augur/claude-profile/` | **opt-in** operator profile, mounted **read-only** — your personal `commands/`, `skills/`, `CLAUDE.md` and user-scope `settings.json` are wired into the guest's `~/.claude/`. Absent or empty (the default) wires nothing. See [Operator profile](#operator-profile). |
 | `~/.config/gh/` | mounted **read-only** (the container can read but not rewrite it; the token is injected via `GH_TOKEN`) |
 | `~/.gitconfig` | mounted read-only |
 | Claude auth | injected via env (`CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY`) — the host's credential store is never mounted |
-| Everything else | **not visible to the container** |
+| Everything else | **not visible to the container** — including the rest of `~/.claude` and the host's `~/.claude.json`, which augur never reads, copies, or mounts ([ADR-0013](docs/decisions/0013-claude-config-inheritance.md)) |
+
+#### Operator profile
+
+augur **never mirrors your host `~/.claude`** — that tree is executable config (hooks, skills,
+commands), it is full of host-absolute paths that break in a Linux guest, and its permission set was
+written for a world with no sandbox. The full reasoning is in
+[ADR-0013](docs/decisions/0013-claude-config-inheritance.md).
+
+What you get instead is a directory you populate on purpose:
+
+```
+~/.augur/claude-profile/
+├── settings.json     → guest ~/.claude/settings.json   (copied — Claude rewrites it at user scope)
+├── CLAUDE.md         → guest ~/.claude/CLAUDE.md       (copied)
+├── commands/         → guest ~/.claude/commands/       (symlinked — host edits are live)
+└── skills/           → guest ~/.claude/skills/         (symlinked — host edits are live)
+```
+
+- **Opt-in and inert by default.** No directory, or an empty one, and augur wires nothing. Only
+  names that actually exist in the profile are ever written into the guest — ship no
+  `settings.json` and augur never touches yours.
+- **Host-global, read-only.** One profile for every project on the machine: personal tooling is not
+  project-scoped. Read-only *because* it is shared — a guest able to write there would plant a hook
+  or command for every project.
+- **`commands/` and `skills/` are live.** Edit a slash command on the host and the next
+  `augur claude` picks it up — no rebuild, no `destroy`. (Claude Code only scans a top-level
+  `skills/`/`commands/` directory that existed at session start, so the *first* time you create one
+  mid-session, exit and relaunch.)
+- **`settings.json` and `CLAUDE.md` are copies**, refreshed on every `augur up`, because Claude Code
+  writes user-scope `settings.json` and a read-only symlink would make that an error. The profile is
+  their source of truth: if you ship one, guest-side edits to it do not survive a restart.
+- Works the same in `--macos` mode (shared read-only into the VM).
+
+Your **repository's** own `.claude/settings.json`, `CLAUDE.md`, `.claude/commands/`,
+`.claude/skills/` and `.mcp.json` already work with no setup — they arrive inside the workspace
+mount. The profile is for what a repo cannot supply because it is yours, not the project's.
+
+#### Prompt history across a recreate
+
+augur recreates the container for its own reasons — a rotated credential, an egress toggle, a memory
+change, `augur build`/`update`/`install-cert`. That discards the writable layer, and your up-arrow
+prompt history (`~/.claude/history.jsonl`) lives there rather than on a mount. So augur keeps a
+small, capped snapshot of just that file under `~/.augur/claude-carryover/<project>` (mode `0600`) —
+taken when you exit `augur claude`/`shell`, on `augur down`, and before `build`/`update` throw the
+layer away — and restores it into the fresh container.
+
+It carries **prompt text only**: no credentials, no tool permissions, no trust state. And
+**`augur destroy` deletes it**, so the clean-guest button stays a clean-guest button. Container mode
+only — the macOS clone already survives `down`.
 
 > Auth is env-based in both modes now. If you only ever logged in via the browser, run `augur setup-token` (or set `ANTHROPIC_API_KEY`); see [API keys and authentication](#api-keys-and-authentication). Upgrading from an older augur requires a one-time `augur build` (the image now pre-creates the scoped history dir). To activate `~/.claude/agents` persistence on a container/VM that already exists, recreate it once — `augur destroy && augur up` (or `augur down --macos && augur up --macos`); new containers/VMs get it automatically.
 
