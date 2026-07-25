@@ -2067,6 +2067,15 @@ cmd_build_macos() {
     # hook.sh) — no-op unless the operator created those files. See run_base_provisioning.
     run_base_provisioning "$MACOS_BUILD_VM" "$vm_pid"
 
+    # Scrub any ~/.claude.json this base VM has accumulated (e.g. a manual `claude` login during
+    # Setup Assistant / manual verification) before it's frozen into the base image. augur never
+    # seeds this file with real account state on purpose (ADR-0012) — a leaked account here would
+    # otherwise be inherited by every `augur up --macos` clone forever. Neither this build script
+    # nor run_base_provisioning invokes `claude` interactively, so this is normally a no-op; it
+    # exists to guarantee the invariant even when a human has poked at the VM by hand.
+    info "Scrubbing any accumulated Claude Code account state from the base VM..."
+    ssh_macos "$MACOS_BUILD_VM" "rm -f ~/.claude.json"
+
     # Step 7: Save as base VM
     # Revoke the build-time NOPASSWD sudo grant before saving. Project VMs are cloned from
     # this base, so leaving the grant in place would give the AI agent root access.
@@ -2845,6 +2854,13 @@ cmd_update_macos() {
     # in sync with the base VM on every update too, not just at first build. No-op unless
     # the operator created those files. See run_base_provisioning.
     run_base_provisioning "$MACOS_BASE_VM" "$vm_pid"
+
+    # Same scrub as cmd_build_macos (ADR-0012): re-assert the no-account-state invariant on every
+    # update too, not just at build. The base VM is long-lived and mutable, so a human can log
+    # into `claude` by hand between updates (the actual leak vector — neither build's provisioning
+    # nor this update step ever runs `claude` interactively); running this on every update makes
+    # that self-healing instead of requiring a full rebuild to notice and fix.
+    ssh_macos "$MACOS_BASE_VM" "rm -f ~/.claude.json"
 
     stop_and_reap_macos_vm "$MACOS_BASE_VM" "$vm_pid"
     success "CLI tools updated in '${MACOS_BASE_VM}'."

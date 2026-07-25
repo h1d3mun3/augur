@@ -88,6 +88,32 @@ booting for the first time (fresh clone, or a `destroy --macos` re-clone) gets t
 subsequent `up` on the same persisted clone is a no-op for this file, and whatever the guest or the
 operator has since written to it survives restarts.
 
+### A second bug this surfaced: the base VM itself can leak a real account
+
+Live testing on macOS turned up a related problem one level up the chain: `cmd_up_macos`'s
+existence check only asks "does *this clone* already have a `.claude.json`?" — it says nothing
+about whether the **base VM's disk**, which every clone inherits verbatim, was clean to begin with.
+In practice it wasn't: the base VM in use had a real, authenticated `~/.claude.json` (an actual
+`userID`/`machineID`, `firstStartTime`, no `hasCompletedOnboarding` key at all) baked into its
+disk, most likely from a human running `claude` interactively inside it at some point (Setup
+Assistant verification, manual debugging) — neither `cmd_build_macos` nor `cmd_update_macos` ever
+invokes `claude` interactively themselves. Every project clone made from that base silently
+inherited a stranger's account instead of a clean slate, which is what actually caused the
+onboarding stub to appear absent during testing (the existence check correctly found *a* file — it
+just wasn't ours).
+
+Because the leak vector is "a human touched the long-lived, mutable base VM by hand," it isn't
+bounded to right after `build`: it can happen again at any point in the base VM's life. Both code
+paths that legitimately touch the base VM as part of normal operation therefore scrub
+`~/.claude.json` unconditionally before finishing:
+
+- `cmd_build_macos`, right after `run_base_provisioning` and before the base VM is saved.
+- `cmd_update_macos`, right after `run_base_provisioning` and before the VM is stopped.
+
+Fixing only `build` would leave the invariant to decay until the next full rebuild (rare — base
+VMs are rebuilt far less often than they're updated); putting the same scrub in `update` makes it
+self-healing on every routine maintenance run instead.
+
 ## Security
 
 - **Net change: strictly narrower.** Folder-trust in the guest now behaves exactly as it does on
@@ -100,6 +126,10 @@ operator has since written to it survives restarts.
   first** — a smaller, not larger, attack surface than before.
 - **The macOS fix has no security-negative effect**: it only stops overwriting guest state the
   operator or Claude Code itself produced; it does not change what is or isn't trusted.
+- **The base-VM scrub is a privacy fix, not just a test-hygiene one.** A leaked account
+  (`userID`/`machineID`) baked into the base VM was previously inherited by every project clone —
+  every guest, and by extension the agent running in it, silently shared one human's real Claude
+  account identity. Scrubbing it in `build`/`update` closes that regardless of how it got there.
 
 ## Consequences
 
@@ -111,6 +141,9 @@ operator has since written to it survives restarts.
   AGENT_SEAM; there is no remaining per-container write to the guest's `~/.claude.json`.
 - macOS mode's `.claude.json` seed becomes a true one-time write (gated on absence), fixing the
   clobber bug described above as a side effect of removing the path-specific trust payload.
+- `cmd_build_macos` and `cmd_update_macos` both now scrub `~/.claude.json` from the base VM before
+  finishing, so a base VM the operator has ever touched by hand cannot leak a real account into
+  future project clones — self-healing on the next `update`, not just at the next full `build`.
 - ADR-0011 remains on record for its rationale and is superseded, not deleted, per this
   repository's ADR convention (see [`0010`](./0010-container-persistence.md) superseding
   [`0006`](./0006-macos-vm-clone-persistence.md) for precedent).

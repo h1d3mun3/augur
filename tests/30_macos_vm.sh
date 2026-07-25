@@ -31,6 +31,18 @@ has "$up_macos" 'hasCompletedOnboarding'         "macOS up still seeds the onboa
 # state on every restart. The seed must be wrapped in an existence check, not written unconditionally.
 has "$up_macos" 'test -f'                        "macOS .claude.json seed is gated on the file's absence (no per-up clobber)"
 
+# Base-VM account-state scrub (ADR-0012 follow-up, found via live testing): the base VM is
+# long-lived and mutable, so a human can log into `claude` by hand at any point in its life
+# (Setup Assistant testing, manual debugging) and leak a real account (userID/machineID) into
+# every future project clone via `up`'s clone step. Both the code paths that legitimately touch
+# the base VM as part of normal operation — build (creates it) and update (refreshes it) — must
+# scrub ~/.claude.json, not just build: update is the ONLY other path that boots the base VM
+# automatically, so it is the natural self-healing checkpoint between builds.
+build_macos="$(awk '/^cmd_build_macos\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
+update_macos="$(awk '/^cmd_update_macos\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
+has "$build_macos"  'rm -f ~/.claude.json' "macOS build scrubs any accumulated ~/.claude.json before saving the base VM"
+has "$update_macos" 'rm -f ~/.claude.json' "macOS update scrubs any accumulated ~/.claude.json (self-healing between builds)"
+
 section "Tier 2 — per-project VM naming is path-hash keyed, not basename-only (run anywhere)"
 # §6/§9 fix: macos_project_vm() used to key purely on basename(WORKSPACE_DIR), so two
 # distinct directories sharing a basename (e.g. ~/work/myapp and ~/archive/myapp) collided
