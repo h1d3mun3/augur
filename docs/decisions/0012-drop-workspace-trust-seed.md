@@ -82,37 +82,46 @@ entries, caches, and (under ADR-0011) any trust the operator had granted since.
 
 Dropping the trust key removes the only reason the stub needed to be path-specific (it encoded the
 workspace's absolute path), which makes the fix immediate: the stub is now a fixed, generic
-constant, so `cmd_up_macos` writes it **only if `~/.claude.json` does not already exist** in the
-guest (checked over SSH, no jq required guest-side) and otherwise leaves the file untouched. A VM
-booting for the first time (fresh clone, or a `destroy --macos` re-clone) gets the stub; every
-subsequent `up` on the same persisted clone is a no-op for this file, and whatever the guest or the
-operator has since written to it survives restarts.
+constant that `cmd_up_macos` writes **only when this `up` just cloned the VM** — i.e. gated on the
+same `if ! macos_vm_exists "$project_vm"` branch that decides whether to `clone` in the first
+place, tracked in a `_fresh_clone` flag — and never touches the file on the reuse path. A VM
+booting for the first time (fresh clone, or a `destroy --macos` re-clone) gets the stub
+unconditionally; every subsequent `up` on the same persisted clone is a no-op for this file, and
+whatever the guest or the operator has since written to it survives restarts.
+
+An earlier version of this fix keyed the write on the file's *absence* (`ssh_macos ... test -f`)
+rather than on having just cloned. That is a weaker check masquerading as the same thing: it
+assumes the base VM's disk is always clean, so "no file yet" and "freshly cloned" happen to
+coincide. Live testing broke that assumption (see below) and reproduced the exact "stub missing"
+symptom through a different path — the existence check found *a* file on the fresh clone and
+correctly declined to overwrite it, except that file wasn't ours. Keying on `_fresh_clone` instead
+removes the dependency on base-VM hygiene entirely: a brand-new project VM is guaranteed the
+correct stub regardless of what the inherited disk happens to contain, while a reused VM is still
+never touched.
 
 ### A second bug this surfaced: the base VM itself can leak a real account
 
-Live testing on macOS turned up a related problem one level up the chain: `cmd_up_macos`'s
-existence check only asks "does *this clone* already have a `.claude.json`?" — it says nothing
-about whether the **base VM's disk**, which every clone inherits verbatim, was clean to begin with.
-In practice it wasn't: the base VM in use had a real, authenticated `~/.claude.json` (an actual
-`userID`/`machineID`, `firstStartTime`, no `hasCompletedOnboarding` key at all) baked into its
-disk, most likely from a human running `claude` interactively inside it at some point (Setup
-Assistant verification, manual debugging) — neither `cmd_build_macos` nor `cmd_update_macos` ever
-invokes `claude` interactively themselves. Every project clone made from that base silently
-inherited a stranger's account instead of a clean slate, which is what actually caused the
-onboarding stub to appear absent during testing (the existence check correctly found *a* file — it
-just wasn't ours).
+Live testing on macOS turned up the problem that motivated the fix above: the base VM in use had a
+real, authenticated `~/.claude.json` (an actual `userID`/`machineID`, `firstStartTime`, no
+`hasCompletedOnboarding` key at all) baked into its disk, most likely from a human running `claude`
+interactively inside it at some point (Setup Assistant verification, manual debugging) — neither
+`cmd_build_macos` nor `cmd_update_macos` ever invokes `claude` interactively themselves. Every
+project clone made from that base was silently inheriting a stranger's account instead of a clean
+slate.
 
-Because the leak vector is "a human touched the long-lived, mutable base VM by hand," it isn't
-bounded to right after `build`: it can happen again at any point in the base VM's life. Both code
-paths that legitimately touch the base VM as part of normal operation therefore scrub
-`~/.claude.json` unconditionally before finishing:
+The `_fresh_clone` fix above makes any new project clone immune to this regardless of the base
+VM's state, but the base VM carrying a real account on disk is a problem in its own right (see
+*Security*), so both code paths that legitimately touch it as part of normal operation also scrub
+`~/.claude.json` unconditionally before finishing, as defense in depth:
 
 - `cmd_build_macos`, right after `run_base_provisioning` and before the base VM is saved.
 - `cmd_update_macos`, right after `run_base_provisioning` and before the VM is stopped.
 
-Fixing only `build` would leave the invariant to decay until the next full rebuild (rare — base
-VMs are rebuilt far less often than they're updated); putting the same scrub in `update` makes it
-self-healing on every routine maintenance run instead.
+Because the leak vector is "a human touched the long-lived, mutable base VM by hand," it isn't
+bounded to right after `build` — it can happen again at any point in the base VM's life. Fixing
+only `build` would leave that base-VM-level invariant to decay until the next full rebuild (rare —
+base VMs are rebuilt far less often than they're updated); putting the same scrub in `update` makes
+it self-healing on every routine maintenance run instead.
 
 ## Security
 

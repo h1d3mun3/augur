@@ -2240,7 +2240,9 @@ cmd_up_macos() {
     # (only relevant when egress filtering is on).
     if egress_enabled; then check_project_conf_approved; fi
 
+    local _fresh_clone=false
     if ! macos_vm_exists "$project_vm"; then
+        _fresh_clone=true
         info "Cloning base VM to '${project_vm}'..."
         "$VM_CLI" clone "$MACOS_BASE_VM" "$project_vm"
         # A fresh clone gets a fresh SSH host key. The egress SSH target is a fixed
@@ -2347,13 +2349,17 @@ cmd_up_macos() {
     # guest needs none of it. Seed the exact same static onboarding stub the container image bakes
     # (Dockerfile), independent of the host config and of whether jq is installed.
     #
-    # WRITE-ONCE, gated on the file's absence. `down --macos` keeps the clone (ADR-0006/ADR-0010), so
-    # unlike a throwaway VM this file accumulates real guest state after the first boot — prompt
-    # history, guest-side MCP servers, caches, whatever folder-trust decision the operator made. An
-    # unconditional overwrite on every `up` would silently destroy all of that on every restart. A
-    # VM that has ever booted already has SOME `.claude.json` (this seed, or one Claude Code wrote
-    # itself), so checking existence — not a specific key — is sufficient and needs no jq guest-side.
-    if ! ssh_macos "$project_vm" "test -f /Users/${MACOS_SSH_USER}/.claude.json" 2>/dev/null; then
+    # WRITE-ONCE, gated on `_fresh_clone` (this `up` just created the VM above) — NOT on the
+    # file's absence. `down --macos` keeps the clone (ADR-0006/ADR-0010), so unlike a throwaway VM
+    # this file accumulates real guest state after the first boot — prompt history, guest-side MCP
+    # servers, caches, whatever folder-trust decision the operator made — and an unconditional
+    # overwrite on a REUSED VM would silently destroy all of that. A fresh clone gets the opposite
+    # treatment: overwrite unconditionally, regardless of whether the inherited disk already has
+    # some `.claude.json`. Keying off "did we just clone" rather than "does the file exist" matters
+    # because the base VM is a long-lived, mutable disk that can itself accumulate a stale/real
+    # `.claude.json` between builds (see cmd_build_macos/cmd_update_macos's scrub and ADR-0012) —
+    # an existence check alone would silently inherit that into every new project clone again.
+    if $_fresh_clone; then
         local _cj; _cj="$(mktemp)"
         printf '{"hasCompletedOnboarding":true,"installMethod":"native"}\n' > "$_cj"
         scp_to_macos "$project_vm" "$_cj" "/Users/${MACOS_SSH_USER}/.claude.json"

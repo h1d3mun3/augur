@@ -26,10 +26,14 @@ has "$up_macos" 'ensure_macos_claude_agents'     "macOS up wires ~/.claude/agent
 # workspace on macOS either — a regression guard against re-introducing the per-workspace key.
 hasnt "$up_macos" 'hasTrustDialogAccepted'       "macOS up does NOT pre-trust the workspace in the .claude.json stub"
 has "$up_macos" 'hasCompletedOnboarding'         "macOS up still seeds the onboarding-only stub"
-# Write-once, gated on absence (the macOS clobber-bug fix, ADR-0012): `down --macos` keeps the
-# clone (ADR-0006/ADR-0010), so an unconditional scp on every `up` would destroy accumulated guest
-# state on every restart. The seed must be wrapped in an existence check, not written unconditionally.
-has "$up_macos" 'test -f'                        "macOS .claude.json seed is gated on the file's absence (no per-up clobber)"
+# Write-once, gated on "did we just clone this VM" — NOT the file's absence (the macOS
+# clobber-bug fix, ADR-0012, hardened after live testing). `down --macos` keeps the clone
+# (ADR-0006/ADR-0010), so an unconditional scp on every `up` would destroy accumulated guest
+# state on every restart of a REUSED VM. Keying off "just cloned" instead of "file missing" means
+# a fresh project VM gets the stub even if the base VM's own disk has accumulated a stale
+# `.claude.json` between builds — an existence check alone would silently inherit that instead.
+has "$up_macos" '_fresh_clone'                   "macOS .claude.json seed is gated on having just cloned, not on file absence"
+has "$up_macos" 'if $_fresh_clone; then'         "macOS .claude.json seed overwrites unconditionally on a fresh clone"
 
 # Base-VM account-state scrub (ADR-0012 follow-up, found via live testing): the base VM is
 # long-lived and mutable, so a human can log into `claude` by hand at any point in its life
