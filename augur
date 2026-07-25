@@ -215,13 +215,18 @@ agent_state_guest_history_file()    { echo "/home/dev/.claude/history.jsonl"; }
 agent_profile_host_subdir()  { echo "claude-profile"; }             # dir under $AUGUR_DIR (both modes)
 agent_profile_guest_mount()  { echo "/home/dev/.augur-profile"; }   # read-only mount point (container)
 agent_profile_guest_dir()    { echo "/home/dev/.claude"; }          # where the wired entries land
-# SYMLINKED to the read-only mount: Claude only ever reads these, so a host-side edit to a slash
-# command or skill is live on the next `claude` with no container recreate.
-agent_profile_link_dirs()    { echo "commands skills"; }
-# COPIED instead of symlinked: Claude Code rewrites settings.json at user scope (model selection and
-# several /config toggles land there), which a symlink into a READ-ONLY mount would turn into a
-# write error. CLAUDE.md is copied for the same reason (/memory can rewrite it).
-agent_profile_copy_files()   { echo "settings.json CLAUDE.md"; }
+# SYMLINKED to the read-only mount: Claude only ever READS these, so a host-side edit is live on the
+# next `claude` with no container recreate. This is the full set of user-scope directories the
+# official `.claude` directory reference lists as operator-authored content — personal commands,
+# skills, topic rules, output styles, dynamic workflows and themes. Two user-scope directories are
+# deliberately NOT here: `agents/` (already a per-project RW mount — category 1) and `agent-memory/`
+# (Claude WRITES it, so it is guest-generated state, not operator input).
+agent_profile_link_dirs()    { echo "commands skills rules output-styles workflows themes"; }
+# COPIED instead of symlinked: these are the user-scope FILES Claude Code may rewrite in place —
+# settings.json (model selection and several /config toggles land there), CLAUDE.md (/memory can
+# edit it), keybindings.json (the TUI owns it) — and a symlink into a READ-ONLY mount would turn
+# any of those writes into an error rather than a feature.
+agent_profile_copy_files()   { echo "settings.json CLAUDE.md keybindings.json"; }
 # Managed policy — the ONE settings layer a repository cannot override. Claude Code's documented
 # precedence is managed > CLI args > .claude/settings.local.json > .claude/settings.json >
 # ~/.claude/settings.json, so a user-scope profile (above) is the LOWEST layer and loses to any

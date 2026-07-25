@@ -45,11 +45,14 @@ esac
 eq "claude-profile"          "$(agent_profile_host_subdir)"  "agent_profile_host_subdir"
 eq "/home/dev/.augur-profile" "$(agent_profile_guest_mount)" "agent_profile_guest_mount"
 eq "/home/dev/.claude"       "$(agent_profile_guest_dir)"    "agent_profile_guest_dir"
-eq "commands skills"         "$(agent_profile_link_dirs)"    "agent_profile_link_dirs (read-only → symlink)"
-eq "settings.json CLAUDE.md" "$(agent_profile_copy_files)"   "agent_profile_copy_files (Claude rewrites these → copy)"
+eq "commands skills rules output-styles workflows themes" "$(agent_profile_link_dirs)" \
+   "agent_profile_link_dirs (every operator-authored user-scope dir → symlink)"
+eq "settings.json CLAUDE.md keybindings.json" "$(agent_profile_copy_files)" \
+   "agent_profile_copy_files (the user-scope files Claude rewrites → copy)"
 # The profile must never claim an entry another category already owns: agents/ and projects/ are
-# per-project RW mounts, and wiring them here would fight those mounts.
-for _owned in agents projects; do
+# per-project RW mounts, and agent-memory/ is written BY Claude (guest-generated state, category 1),
+# so wiring any of them read-only here would fight the mount or break a write.
+for _owned in agents projects agent-memory; do
   case " $(agent_profile_link_dirs) $(agent_profile_copy_files) " in
     *" $_owned "*) fail "profile does not claim '$_owned' (owned by the per-project state mounts)" "found in a profile list";;
     *)             ok   "profile does not claim '$_owned' (owned by the per-project state mounts)";;

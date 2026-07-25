@@ -77,7 +77,7 @@ augur version                   # show augur version
 | Current directory | mounted at `/workspace-<project>` (read/write), named after the directory |
 | `~/.claude/projects/-workspace-<project>` | **only this project's** Claude history is shared (read/write) — not the rest of `~/.claude`, so other projects' transcripts and host auth/settings stay invisible |
 | `~/.claude/agents/` | **this project's** user-level custom subagent definitions (`/agents`) are persisted (read/write), keyed per-project under `~/.augur/claude-agents/<project>` — so they survive `augur down`/`up` **and** `destroy`/recreate. Isolated per project (not the host's global `~/.claude/agents`), so a guest can't plant a subagent read by another project. Project-level `.claude/agents/` in the repo work too, via the workspace mount. |
-| `~/.augur/claude-profile/` | **opt-in** operator profile, mounted **read-only** — your personal `commands/`, `skills/`, `CLAUDE.md` and user-scope `settings.json` are wired into the guest's `~/.claude/`. Absent or empty (the default) wires nothing. See [Operator profile](#operator-profile). |
+| `~/.augur/claude-profile/` | **opt-in** operator profile, mounted **read-only** — your personal `commands/`, `skills/`, `rules/`, `output-styles/`, `workflows/`, `themes/`, `CLAUDE.md`, `settings.json` and `keybindings.json` are wired into the guest's `~/.claude/`. Absent or empty (the default) wires nothing. See [Operator profile](#operator-profile). |
 | `~/.config/gh/` | mounted **read-only** (the container can read but not rewrite it; the token is injected via `GH_TOKEN`) |
 | `~/.gitconfig` | mounted read-only |
 | Claude auth | injected via env (`CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY`) — the host's credential store is never mounted |
@@ -94,10 +94,15 @@ What you get instead is a directory you populate on purpose:
 
 ```
 ~/.augur/claude-profile/
-├── settings.json     → guest ~/.claude/settings.json   (copied — Claude rewrites it at user scope)
-├── CLAUDE.md         → guest ~/.claude/CLAUDE.md       (copied)
-├── commands/         → guest ~/.claude/commands/       (symlinked — host edits are live)
-└── skills/           → guest ~/.claude/skills/         (symlinked — host edits are live)
+├── settings.json      → copied     (Claude rewrites it at user scope)
+├── CLAUDE.md          → copied     (/memory can edit it)
+├── keybindings.json   → copied     (the TUI owns it)
+├── commands/          → symlinked  (host edits are live)
+├── skills/            → symlinked
+├── rules/             → symlinked
+├── output-styles/     → symlinked
+├── workflows/         → symlinked
+└── themes/            → symlinked
 ```
 
 - **Opt-in and inert by default.** No directory, or an empty one, and augur wires nothing. Only
@@ -106,11 +111,11 @@ What you get instead is a directory you populate on purpose:
 - **Host-global, read-only.** One profile for every project on the machine: personal tooling is not
   project-scoped. Read-only *because* it is shared — a guest able to write there would plant a hook
   or command for every project.
-- **`commands/` and `skills/` are live.** Edit a slash command on the host and the next
+- **The directories are live.** Edit a slash command on the host and the next
   `augur claude` picks it up — no rebuild, no `destroy`. (Claude Code only scans a top-level
   `skills/`/`commands/` directory that existed at session start, so the *first* time you create one
   mid-session, exit and relaunch.)
-- **`settings.json` and `CLAUDE.md` are copies**, refreshed every time augur wires the guest —
+- **The three JSON/markdown files are copies**, refreshed every time augur wires the guest —
   `augur up` in both modes, and additionally each `augur claude`/`shell` in `--macos` mode — because
   Claude Code writes user-scope `settings.json` and a read-only symlink would make that an error.
   The profile is their source of truth: if you ship one, guest-side edits to it do not survive.

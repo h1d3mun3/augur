@@ -35,6 +35,8 @@ never enumerates guest-written files.
 
 - `~/.claude/projects/` — transcripts → `$AUGUR_DIR/claude-projects/<slug>-<hash>` (mount)
 - `~/.claude/agents/` — user-level subagent definitions → `$AUGUR_DIR/claude-agents/<slug>-<hash>` (mount)
+- `~/.claude/projects/<project>/memory/` — auto-memory Claude maintains per project. Already covered
+  by the `projects/` mount above, which carries every leaf under it, not just the transcripts.
 - `~/.claude/history.jsonl` — up-arrow prompt recall. **Not** on a mount, so Container mode keeps a
   bounded **carry-over snapshot** under `$AUGUR_DIR/claude-carryover/<slug>-<hash>` (mode `0600`).
 
@@ -74,17 +76,18 @@ exactly as they would on any other machine.
 
 ### Category 3 — opt-in operator profile
 
-The operator's *personal* Claude Code assets — custom slash commands, skills, a user-level
-`CLAUDE.md`, user-scope `settings.json`. A repository cannot supply these (they are personal, not
+The operator's *personal* Claude Code assets — every user-scope surface the official `.claude`
+directory reference lists as operator-authored: slash commands, skills, topic rules, output styles,
+dynamic workflows, themes, a user-level `CLAUDE.md`, `settings.json` and `keybindings.json`.
+A repository cannot supply these (they are personal, not
 project-scoped), and they must not come from the host's `~/.claude` (see *Context*). So augur reads
 a **separate, explicitly-populated directory**:
 
 ```
 ~/.augur/claude-profile/
-├── settings.json     → guest ~/.claude/settings.json   (copied)
-├── CLAUDE.md         → guest ~/.claude/CLAUDE.md       (copied)
-├── commands/         → guest ~/.claude/commands/       (symlinked into the read-only mount)
-└── skills/           → guest ~/.claude/skills/         (symlinked into the read-only mount)
+settings.json · CLAUDE.md · keybindings.json   → copied    (Claude may rewrite these)
+commands/ · skills/ · rules/ · output-styles/
+workflows/ · themes/                           → symlinked (read-only, host edits are live)
 ```
 
 **Host-global and read-only.** Host-global because personal tooling is not project-scoped;
@@ -92,8 +95,8 @@ read-only *because* it is host-global — every project on the machine reads it,
 write there would plant a hook or command for all of them. That is the same attack the per-project
 keying of the `agents/` mount already refuses.
 
-**Two mechanisms on purpose.** `commands/` and `skills/` are symlinked, so a host-side edit is live
-on the next `claude` with no container recreate. `settings.json` and `CLAUDE.md` are copied and
+**Two mechanisms on purpose.** The directories are symlinked, so a host-side edit is live on the
+next `claude` with no container recreate. The three files are copied and
 refreshed every time augur wires the guest — `up` in both modes, plus each `claude`/`shell` in macOS
 mode, where those verbs re-provision a running VM — because Claude Code **writes** user-scope
 `settings.json` (model selection and several `/config` toggles land there) and a symlink into a
