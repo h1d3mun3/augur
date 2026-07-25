@@ -140,12 +140,18 @@ longer reach the host directory at all), and the same staleness plausibly affect
 `gh-config` read-only share**, which has had this property since `:ro` support landed (2026-06-28,
 `213aa24`) without anyone noticing — that share's content simply changes too rarely to surface it.
 
-**UNVERIFIED and load-bearing for any future fix:** whether `readOnly: true` is the causal variable
-at all. No test has compared a read-write virtiofs share in the *same VM* against a read-only one.
-The read-write shares (workspace, `claude-projects`, `claude-agents`) are *presumed* live — strongly
-so, since a stale workspace would mean the agent reads stale source code, which macOS-mode users
-would have noticed — but presumption is not verification. An idle/time-based staleness affecting
-every share, read-only or not, has not been ruled out.
+**`readOnly: true` is NOT the cause — the guest OS is.** Verified directly: an Apple Container guest
+on the same host, reading the same directory over a mount that is *also* `virtiofs (ro,relatime)`,
+sees current content live, including the exact write the macOS guest could not see for minutes.
+Both modes are virtiofs and both are read-only, so what differs is the **guest-side virtiofs
+client** — the Linux kernel's versus macOS's. Anyone fixing this should not go looking for a
+`readOnly`-related knob.
+
+**Still UNVERIFIED and load-bearing:** whether a *read-write* virtiofs share in a **macOS** guest is
+live. The read-write shares (workspace, `claude-projects`, `claude-agents`) are *presumed* live —
+strongly so, since a stale workspace would mean the agent reads stale source code, which macOS-mode
+users would have noticed — but presumption is not verification. If they are also stale, the impact
+is far wider than the operator profile. See issue #124.
 
 **Wiring is non-destructive.** A real `~/.claude/commands` or `~/.claude/skills` the *guest* created
 before the profile existed is moved aside to `<name>.pre-profile`, never deleted (an empty one is
