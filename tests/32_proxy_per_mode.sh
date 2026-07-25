@@ -198,4 +198,53 @@ else
 fi
 [[ -f "$legacy_pidfile" ]] && fail "legacy pidfile not cleaned up" || ok "legacy pidfile removed"
 
+# Second generation: a proxy started by a pre-path-hash augur wrote "<slug>-<role>.pid". It is
+# invisible to today's "<slug>-<hash>-<role>.pid", so without this reap it survives every `down`
+# and the next same-address `up` collides with it.
+sleep 60 & role_legacy_proc=$!
+MACOS_MODE=true; role_legacy_pidfile="$AUGUR_PROXY_DIR/$(workspace_slug)-$(proxy_role).pid"
+echo "$role_legacy_proc" > "$role_legacy_pidfile"
+# The OTHER role's pre-hash pidfile must survive: the migration inherits the per-role split rather
+# than undoing it (a `down --macos` still may not kill the container mode's proxy).
+sleep 60 & role_legacy_other=$!
+MACOS_MODE=false; other_legacy_pidfile="$AUGUR_PROXY_DIR/$(workspace_slug)-$(proxy_role).pid"
+echo "$role_legacy_other" > "$other_legacy_pidfile"
+MACOS_MODE=true; stop_proxy >/dev/null 2>&1
+if kill -0 "$role_legacy_proc" 2>/dev/null; then
+  fail "down --macos did not reap the legacy (<slug>-<role>.pid) proxy" "would collide on the next up"
+else
+  ok "down reaps a proxy left under the legacy pre-path-hash, per-role pidfile"
+fi
+[[ -f "$role_legacy_pidfile" ]] && fail "legacy per-role pidfile not cleaned up" \
+                                || ok "legacy per-role pidfile removed"
+if kill -0 "$role_legacy_other" 2>/dev/null && [[ -f "$other_legacy_pidfile" ]]; then
+  ok "the OTHER role's legacy pidfile survives (the migration keeps the per-role split)"
+else
+  fail "down --macos reaped the container role's legacy pidfile" "the per-role split must survive the migration"
+fi
+rm -f "$other_legacy_pidfile"   # the process itself is reaped by the EXIT trap, like the others
+
+section "Tier 1 — upgrade migration: down --macos reaps a legacy gvproxy and its socket"
+
+# stop_gvproxy had NO migration block at all. gvproxy_running only ever consults the CURRENT
+# pidfile, so a gvproxy started by a pre-path-hash augur ("<slug>.gvproxy.pid", holding
+# "<slug>.vfkit.sock") was invisible to every augur command — an orphan owning a live vfkit socket
+# with nothing that finds it.
+sleep 60 & legacy_gvp=$!
+legacy_gvp_pidfile="$AUGUR_PROXY_DIR/$(workspace_slug).gvproxy.pid"
+legacy_gvp_sock="$AUGUR_PROXY_DIR/$(workspace_slug).vfkit.sock"
+echo "$legacy_gvp" > "$legacy_gvp_pidfile"
+: > "$legacy_gvp_sock"
+MACOS_MODE=true; stop_gvproxy >/dev/null 2>&1
+if kill -0 "$legacy_gvp" 2>/dev/null; then
+  fail "down --macos did not reap the legacy gvproxy" "orphan gvproxy holding a vfkit socket, unreachable by any command"
+else
+  ok "down --macos reaps a gvproxy left under the legacy pidfile"
+fi
+[[ -f "$legacy_gvp_pidfile" ]] && fail "legacy gvproxy pidfile not cleaned up" \
+                               || ok "legacy gvproxy pidfile removed"
+[[ -e "$legacy_gvp_sock" ]] && fail "legacy vfkit socket not unlinked" \
+                                    "start_gvproxy's -S wait would accept this stale file" \
+                            || ok "legacy vfkit socket unlinked"
+
 finish

@@ -1124,14 +1124,22 @@ stop_proxy() {
         kill "$(cat "$pidfile")" 2>/dev/null || true
     fi
     rm -f "$pidfile" 2>/dev/null || true
-    # Migration: reap a proxy left running under the pre-role pidfile ("<slug>.pid") by a
-    # version of augur before the per-role split. It is invisible to the role-keyed
-    # proxy_running above, so without this the next same-address `up` would collide with it.
-    local legacy; legacy="$AUGUR_PROXY_DIR/$(workspace_slug).pid"
-    if [[ -f "$legacy" ]]; then
-        kill "$(cat "$legacy" 2>/dev/null)" 2>/dev/null || true
-        rm -f "$legacy" 2>/dev/null || true
-    fi
+    # Migration: reap a proxy left running under an OLDER pidfile name, in the two generations
+    # this file has had. Both are invisible to the current proxy_running above, so without this
+    # they survive every `down` and the next same-address `up` collides with them:
+    #   • "<slug>.pid"        — before the per-role split (proxy_role).
+    #   • "<slug>-<role>.pid" — before the path-hash keying (this change). NOTE: on a
+    #     same-basename pair this name was SHARED, so whichever project runs `down` first reaps
+    #     it. That is correct — the process it points at is serving a basename, not a project,
+    #     and it is exactly the shared instance this change abolishes.
+    local legacy
+    for legacy in "$AUGUR_PROXY_DIR/$(workspace_slug).pid" \
+                  "$AUGUR_PROXY_DIR/$(workspace_slug)-$(proxy_role).pid"; do
+        if [[ -f "$legacy" ]]; then
+            kill "$(cat "$legacy" 2>/dev/null)" 2>/dev/null || true
+            rm -f "$legacy" 2>/dev/null || true
+        fi
+    done
 }
 
 # ── Container egress topology (no host sudo) ──────────────────────────────────
@@ -1150,6 +1158,9 @@ stop_proxy() {
 # old network still present by name and keep its old subnet while the new offset expects a
 # different one, i.e. a gateway the proxy never binds.
 egress_network_name() { echo "augur-$(workspace_slug)-$(workspace_path_hash)-net"; }
+# Pre-hash name, kept ONLY so the teardown path can still reap a network an older augur created
+# for this project. Never used to create or look up a network.
+legacy_egress_network_name() { echo "augur-$(workspace_slug)-net"; }
 
 # The agent's --internal "host-only" network (host reachable, internet severed).
 ensure_egress_network() {
@@ -1226,6 +1237,12 @@ start_egress_proxy() {
 stop_egress() {
     stop_proxy
     engine_network_rm "$(egress_network_name)" &>/dev/null || true
+    # Migration: also reap the pre-hash name (augur-<slug>-net) an older augur created for this
+    # project. It is no longer looked up anywhere, so nothing else would ever remove it and
+    # `destroy` would leave its subnet allocated for good. Best-effort, same as above: on a
+    # same-basename pair the sibling project may own that name, and `network delete` refuses a
+    # network with attached containers — which is exactly the right outcome there.
+    engine_network_rm "$(legacy_egress_network_name)" &>/dev/null || true
 }
 
 # Boot self-test: prove the agent can ONLY egress via the proxy. Direct (proxy-less)
@@ -1395,6 +1412,18 @@ stop_gvproxy() {
     local pidfile; pidfile="$(gvproxy_pidfile)"
     gvproxy_running && kill "$(cat "$pidfile")" 2>/dev/null || true
     rm -f "$pidfile" "$(gvproxy_socket)" 2>/dev/null || true
+    # Migration: mirror of stop_proxy's reap, for the pre-path-hash gvproxy names
+    # ("<slug>.gvproxy.pid" + "<slug>.vfkit.sock"). gvproxy_running only ever consults the
+    # CURRENT pidfile, so a gvproxy started by an older augur is invisible to `down --macos`
+    # and to `status` — the operator would be left with an orphan holding a live vfkit socket
+    # and no augur command that finds it. The socket is unlinked unconditionally: a socket file
+    # with no live owner is exactly the stale file start_gvproxy's `-S` wait would accept.
+    local legacy_pid; legacy_pid="$AUGUR_PROXY_DIR/$(workspace_slug).gvproxy.pid"
+    if [[ -f "$legacy_pid" ]]; then
+        kill "$(cat "$legacy_pid" 2>/dev/null)" 2>/dev/null || true
+        rm -f "$legacy_pid" 2>/dev/null || true
+    fi
+    rm -f "$AUGUR_PROXY_DIR/$(workspace_slug).vfkit.sock" 2>/dev/null || true
 }
 
 # ── Container mode commands (Apple Container) ─────────────────────────────────
