@@ -27,6 +27,31 @@ And one standing prohibition across all four:
 > explicitly named credential env vars (`agent_auth_specs`) and the category-3 profile directory,
 > which the operator creates on purpose.
 
+### Why this axis, and on what terms it was accepted
+
+The categories are cut on **who owns the file** — who is its source of truth, and therefore which
+direction data flows. Not on what the file *does*, and not on which mechanism carries it.
+
+This was accepted knowing it is **not provably the best cut**, for a reason worth recording: the
+alternative is not a better taxonomy, it is *no* taxonomy — and then every mount and every seam
+accessor is an isolated judgement call with nothing to check it against. The mount layout is the
+part that would decay first. A rule that is right most of the time and can be argued with beats an
+arbitrary layout that cannot.
+
+Two known strains, so the next person does not think they were missed:
+
+- **A file can have two owners.** `settings.json` is written by the operator *and* by Claude Code
+  (`/model`, `/config`, `/effort`, plugin configs). It is placed in category 3, so the host wins and
+  guest-side changes do not survive the next wiring. Placing it in category 1 would have been about
+  equally defensible and would have inverted that. `keybindings.json` has the same shape.
+- **Category 1's mechanism is already split.** `projects/` and `agents/` are mounts;
+  `history.jsonl` is a snapshot, because it cannot be mounted (atomic-rename writes break single-file
+  mounts). The category holds by *ownership*, not by mechanism — which is the point of cutting on
+  ownership, but it does mean "category 1" alone does not tell you how a thing is carried.
+
+If a future surface does not fit, the useful question is "who owns this file?", not "which existing
+category looks closest?".
+
 ### Category 1 — persisted guest state
 
 State the agent *generates* while running. Kept in a **per-project host directory keyed on
