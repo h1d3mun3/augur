@@ -58,11 +58,17 @@ AUGUR_PROJECT_CONF="${AUGUR_PROJECT_CONF:-$AUGUR_PROJECT_DIR/allowlist.conf}"
 # not worth the approval-prompt UX cost.
 AUGUR_PROJECT_RESOURCES_CONF="${AUGUR_PROJECT_RESOURCES_CONF:-$AUGUR_PROJECT_DIR/resources.conf}"
 AUGUR_PROXY_DIR="$AUGUR_DIR/proxy"
-# Per-project derivation: a stable hash of the project dir name yields an offset used
-# for both the proxy ports AND the internal subnet, so two egress-enabled projects can
-# run at once without colliding. Override any value below with its matching env var.
+# Per-project derivation: a stable hash of the project dir yields an offset used for both the
+# proxy ports AND the internal subnet, so two egress-enabled projects can run at once without
+# colliding. Override any value below with its matching env var.
 # (Collisions are ~1/900 between distinct projects.)
-_augur_port_offset=$(( $(basename "$WORKSPACE_DIR" | tr '[:upper:]' '[:lower:]' | cksum | cut -d' ' -f1) % 900 ))
+# Hashed over the FULL workspace path, not its basename: with the basename, ~/work/app and
+# ~/archive/app got the SAME ports and subnet — a GUARANTEED collision, not a 1/900 one — so
+# the second project's `up` silently shared the first's proxy and network. The offset's stated
+# purpose is anti-collision, and the full path serves it strictly better: the same ~1/900 for
+# unrelated projects, minus the certain collision for same-basename pairs. See
+# workspace_path_hash for the general rule (host-namespace identifiers carry the path hash).
+_augur_port_offset=$(( $(printf '%s' "$WORKSPACE_DIR" | tr '[:upper:]' '[:lower:]' | cksum | cut -d' ' -f1) % 900 ))
 # Carve a per-project /28 out of 172.31.0.0/16: third octet = offset/16, fourth octet =
 # (offset%16)*16 (a /28 boundary). The network is --internal, so it has no route to the
 # host or the internet regardless of the subnet.
@@ -646,10 +652,16 @@ egress_enabled() {
 # mode kills the shared proxy out from under the other. The two instances bind the same ports
 # but on different addresses (127.0.0.1 vs the gateway), so they never collide.
 proxy_role() { if $MACOS_MODE; then echo macos; else echo container; fi; }
-proxy_pidfile() { echo "$AUGUR_PROXY_DIR/$(workspace_slug)-$(proxy_role).pid"; }
-proxy_logfile() { echo "$AUGUR_PROXY_DIR/$(workspace_slug)-$(proxy_role).log"; }
-# The allowlist is shared content (identical merge regardless of mode), so it stays per-project.
-proxy_allowlist() { echo "$AUGUR_PROXY_DIR/$(workspace_slug).allowlist"; }
+# Keyed on the FULL workspace path (slug + workspace_path_hash), never the basename slug alone —
+# see workspace_path_hash's header for why every host-namespace identifier carries the hash.
+proxy_pidfile() { echo "$AUGUR_PROXY_DIR/$(workspace_slug)-$(workspace_path_hash)-$(proxy_role).pid"; }
+proxy_logfile() { echo "$AUGUR_PROXY_DIR/$(workspace_slug)-$(workspace_path_hash)-$(proxy_role).log"; }
+# The allowlist is shared between the two MODES (identical merge either way), so it is keyed on
+# the project and NOT on proxy_role — but it is still per (project PATH), not per basename. It is
+# the proxy's live enforcement input (hot-reloaded on mtime change every ~2s), so a basename-only
+# key let a same-basename sibling's `up` overwrite a LIVE session's approved policy: `~/work/app`
+# and `~/archive/app` resolved to one file, and whichever ran last owned both projects' egress.
+proxy_allowlist() { echo "$AUGUR_PROXY_DIR/$(workspace_slug)-$(workspace_path_hash).allowlist"; }
 
 proxy_running() {
     local pf; pf="$(proxy_pidfile)"
@@ -862,7 +874,22 @@ resolve_macos_vm_memory_mb() {
 # share a basename also share workspace_slug; this distinguishes them so security-sensitive
 # per-project host state — the .augur/allowlist.conf approval fingerprint and the container history dir —
 # is never shared between an unrelated (possibly hostile) same-named project and a trusted
-# one. Display names, egress ports, and the in-container /workspace-<slug> path stay slug-based.
+# one.
+#
+# THE RULE: guest-visible names stay slug-based; HOST-NAMESPACE identifiers get the hash.
+# The host has ONE namespace per resource, shared by every project on the machine, so a
+# same-basename pair collides there with certainty — which is why the container name, the VM
+# name, the TOFU approval file, the carry-over/history/agents dirs, every egress host-state file
+# (merged allowlist, proxy + gvproxy pidfiles, logs, vfkit socket), the egress network name AND
+# the port/subnet offset all carry it. A guest-visible name lives in a PER-GUEST namespace where
+# a collision is harmless and unobservable, so make_workspace_mount (/workspace-<slug>) and
+# MACOS_SHARE (~/workspace-<slug>) deliberately stay slug-based and readable.
+#
+# The egress ports and the network name were on the slug-based side until they were moved (see
+# _augur_port_offset). The carve-out that used to be recorded here — "egress ports … stay
+# slug-based" — was wrong by this very rule: the ports' own purpose is anti-collision in the
+# host's single port namespace, and the basename input GUARANTEED a collision for exactly the
+# pair the hash exists to separate.
 workspace_path_hash() {
     local h
     if command -v sha256sum &>/dev/null; then
@@ -1116,7 +1143,13 @@ stop_proxy() {
 #   Closing that needs host pf rules (sudo), which augur deliberately avoids, so it's
 #   documented, not enforced.
 
-egress_network_name() { echo "augur-$(workspace_slug)-net"; }
+# Keyed on the FULL workspace path, like the container name it is wired to. ensure_egress_network
+# checks existence BY NAME only, so a basename-keyed name made project B's `up` silently ATTACH to
+# project A's live network — same subnet, same gateway, same host-side proxy port. The rename also
+# has to ship WITH the _augur_port_offset change: without it, an upgraded install would find the
+# old network still present by name and keep its old subnet while the new offset expects a
+# different one, i.e. a gateway the proxy never binds.
+egress_network_name() { echo "augur-$(workspace_slug)-$(workspace_path_hash)-net"; }
 
 # The agent's --internal "host-only" network (host reachable, internet severed).
 ensure_egress_network() {
@@ -1261,13 +1294,43 @@ resolve_gvproxy() {
     echo ""   # not found
 }
 
-gvproxy_socket()  { echo "$AUGUR_PROXY_DIR/$(workspace_slug).vfkit.sock"; }
-gvproxy_pidfile() { echo "$AUGUR_PROXY_DIR/$(workspace_slug).gvproxy.pid"; }
+# The vfkit socket is the ONE per-project host-state name whose slug is TRUNCATED (24 chars).
+# It is a unix-domain socket path, and macOS `sockaddr_un.sun_path` is 104 bytes — 103 usable —
+# so unlike the pidfiles/logs/allowlist next to it (regular files under PATH_MAX 1024) it has a
+# hard, short budget. With AUGUR_PROXY_DIR="$HOME/.augur/proxy" the fixed parts cost
+# 21 + len($USER) as a prefix and 11 as a suffix ("<slug>-<12hex>.vfkit.sock"), so adding the
+# path hash moved the breaking slug length from ~66 to ~53 for a 5-char username. Truncating
+# costs nothing but readability: uniqueness is carried by the hash, not the slug, and any slug
+# under 24 chars is unchanged. The resulting 69 + len($USER) is ~74 for "admin" and still 99 for
+# a 30-char username. AUGUR_SOCKET_MAX_LEN below is the backstop for the residual (a relocated
+# AUGUR_PROXY_DIR, a very long username).
+# The naming asymmetry with gvproxy_pidfile (full slug) is fine: stop_gvproxy derives BOTH from
+# these helpers and never correlates them by name.
+AUGUR_SOCKET_MAX_LEN=103          # macOS sockaddr_un.sun_path is 104 bytes incl. the NUL
+gvproxy_socket()  { local s; s="$(workspace_slug)"; echo "$AUGUR_PROXY_DIR/${s:0:24}-$(workspace_path_hash).vfkit.sock"; }
+gvproxy_pidfile() { echo "$AUGUR_PROXY_DIR/$(workspace_slug)-$(workspace_path_hash).gvproxy.pid"; }
 # Diagnostic logs for the macOS egress datapath. gvproxy and the VM run are otherwise
 # launched with output discarded, which makes an "SSH did not come up" failure opaque;
 # these capture their stderr so the failure path can surface the real cause.
-gvproxy_log()     { echo "$AUGUR_PROXY_DIR/$(workspace_slug).gvproxy.log"; }
-macos_vm_log()    { echo "$AUGUR_PROXY_DIR/$(workspace_slug).vm.log"; }
+gvproxy_log()     { echo "$AUGUR_PROXY_DIR/$(workspace_slug)-$(workspace_path_hash).gvproxy.log"; }
+macos_vm_log()    { echo "$AUGUR_PROXY_DIR/$(workspace_slug)-$(workspace_path_hash).vm.log"; }
+
+# Fail closed on a socket path that cannot fit in sun_path. Without this, gvproxy's
+# --listen-vfkit bind fails with a bare "invalid argument" and augur reports only "gvproxy did
+# not create its socket in time" — an opaque failure whose real cause (a long $HOME or a
+# relocated AUGUR_PROXY_DIR) is invisible. Checked in BYTES: workspace_slug emits only
+# [a-z0-9-], but AUGUR_PROXY_DIR is operator-supplied and may be multi-byte.
+require_socket_path_fits() {
+    local sock="$1" len
+    len=$(printf '%s' "$sock" | LC_ALL=C wc -c | tr -d ' ')
+    if (( len > AUGUR_SOCKET_MAX_LEN )); then
+        error "The gvproxy socket path is ${len} bytes, over the ${AUGUR_SOCKET_MAX_LEN}-byte macOS"
+        error "unix-socket limit (sockaddr_un.sun_path is 104 bytes including the NUL):"
+        error "  ${sock}"
+        error "Set ${BOLD}AUGUR_PROXY_DIR${RESET} to a shorter path (e.g. /tmp/augur-proxy) and retry."
+        exit 1
+    fi
+}
 # Base-VM maintenance boot log (augur update --macos). Not project-specific, so it lives
 # under AUGUR_DIR (always present) rather than the per-project proxy dir. Captures the
 # base VM's NAT boot stderr so an "SSH did not come up" failure can surface the real cause.
@@ -1293,6 +1356,10 @@ start_gvproxy() {
     fi
     sock="$(gvproxy_socket)"; pidfile="$(gvproxy_pidfile)"
     gvproxy_running && return 0
+    # Checked on the path that actually BINDS the socket (same placement rule as the unlink
+    # below): a reused gvproxy already proved its path fits, and the failure this catches is
+    # `--listen-vfkit`'s, which happens here and nowhere else.
+    require_socket_path_fits "$sock"
     # Only once no live gvproxy owns this path: clear a socket left behind by a crashed one,
     # or the -S wait at the end of this function succeeds instantly against a dead file. The
     # unlink must stay BELOW the early return — above it, reusing a running gvproxy unlinked
