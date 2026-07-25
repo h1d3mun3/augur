@@ -39,6 +39,14 @@ never enumerates guest-written files.
   by the `projects/` mount above, which carries every leaf under it, not just the transcripts.
 - `~/.claude/history.jsonl` — up-arrow prompt recall. **Not** on a mount, so Container mode keeps a
   bounded **carry-over snapshot** under `$AUGUR_DIR/claude-carryover/<slug>-<hash>` (mode `0600`).
+- `~/.claude/agent-memory/` — **known limitation, deliberately not carried.** This is subagent
+  persistent memory, created only for a subagent whose frontmatter sets `memory: user` (the
+  cross-project variant). It has no mount and no snapshot, so it does not survive a container
+  recreate. Judged not worth a third per-project mount in both modes for how narrow it is: the
+  *project*-scoped variants (`memory:` → `.claude/agent-memory/`, `memory: local` →
+  `.claude/agent-memory-local/`) already live in the workspace mount and survive everything, and a
+  subagent without a `memory:` field never creates any of this. Note it is a different feature from
+  the main session's auto-memory above, which *is* covered.
 
 The snapshot exists because augur recreates the container for its *own* reasons — a rotated
 credential, an egress toggle, a memory change, `build`/`update`/`install-cert`, any fingerprint
