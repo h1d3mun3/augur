@@ -133,7 +133,9 @@ What you get instead is a directory you populate on purpose:
   write; visible some time before the 10-minute mark. So if you change the profile while a VM is
   running, run `augur down --macos && augur up --macos` to pick it up — a fresh `vm run` rebuilds
   the share device and is guaranteed to see current content. Container mode is unaffected.
-  See [issue #124](https://github.com/h1d3mun3/augur/issues/124).
+  **augur warns you when this applies**: `augur claude --macos` / `shell --macos` check host-side
+  whether the profile changed since the VM booted, and print the remedy if so — so the failure is
+  never silent. See [issue #124](https://github.com/h1d3mun3/augur/issues/124).
 
 Your **repository's** own `.claude/settings.json`, `CLAUDE.md`, `.claude/commands/`,
 `.claude/skills/` and `.mcp.json` already work with no setup — they arrive inside the workspace

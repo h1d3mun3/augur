@@ -516,6 +516,15 @@ vm_known_hosts_file() {
     echo "$AUGUR_DIR/known_hosts/${1}"
 }
 
+# Per-VM marker recording the last time this VM booted with a FRESH view of the operator profile.
+# Written by cmd_up_macos (a `vm run` rebuilds the virtiofs device, so the guest's view is current
+# at that moment) and compared against the host profile's mtimes by warn_if_macos_profile_stale.
+# See that function for why this exists at all. Removed by `destroy --macos`.
+macos_profile_marker_file() {
+    mkdir -p "$AUGUR_DIR/vm-state"
+    echo "$AUGUR_DIR/vm-state/${1}.profile-seen"
+}
+
 ssh_macos() {
     local vm="$1"; shift
     local host port
@@ -2539,6 +2548,37 @@ ensure_macos_claude_profile() {
     return 0
 }
 
+# Warn when the host profile has changed since this VM booted, because in macOS mode the guest will
+# NOT see that change: a read-only virtiofs share serves the macOS guest stale content for minutes
+# (issue #124 — verified not to be a `readOnly` problem; an Apple Container guest reading the same
+# host directory over an equally read-only virtiofs mount is live, so the variable is the guest-side
+# virtiofs client). Without this the failure is SILENT — the operator edits a slash command, runs
+# `augur claude --macos`, and simply gets the old behaviour with no error to explain it.
+#
+# Entirely host-side by design: it compares mtimes on the host's own filesystem against a marker
+# written at boot, so the stale share cannot influence the check that reports the stale share.
+#
+# Called from `claude`/`shell` only, never from `up` — `up` is what refreshes the view, and
+# cmd_up_macos re-stamps the marker after wiring, so a freshly booted VM never warns.
+warn_if_macos_profile_stale() {
+    local vm="$1" marker profile
+    marker="$(macos_profile_marker_file "$vm")"
+    profile="$AUGUR_DIR/$(agent_profile_host_subdir)"
+    # No marker: this VM was booted by an augur that predates the marker, so we cannot tell when its
+    # view was taken. Say nothing rather than guess — a false alarm here trains people to ignore it.
+    [[ -f "$marker" ]] || return 0
+    [[ -d "$profile" ]] || return 0
+    # `find -newer` rather than parsing timestamps: no clock arithmetic, and it catches a change
+    # anywhere in the tree (a new command file, a rewritten skill) rather than just the top level.
+    # The command substitution's status is discarded by `[[ -n ]]`, so `head` closing the pipe early
+    # cannot trip `set -o pipefail`.
+    [[ -n "$(find "$profile" -newer "$marker" -print 2>/dev/null | head -n1)" ]] || return 0
+    warn "The operator profile changed since this VM booted — the guest will NOT see it yet."
+    warn "macOS mode reaches the profile over a virtiofs share that serves stale content for"
+    warn "minutes (see issue #124). To apply it now: ${BOLD}augur down --macos && augur up --macos${RESET}"
+    return 0
+}
+
 # AUGUR_AGENT_SEAM | agent managed policy (macOS peer of the Dockerfile's /etc/claude-code block).
 # Installed into the BASE VM, never a project clone: /Library is root-owned and project VMs
 # deliberately have no sudo grant (build revokes it before the base is saved), so this is the only
@@ -2794,11 +2834,18 @@ cmd_up_macos() {
             "git config --global 'credential.https://github.com.helper' '!f() { test \"\$1\" = get && echo username=x-access-token && echo password=\$GH_TOKEN; }; f'"
     fi
 
+    # This `up` ran `vm run`, which rebuilds the virtiofs device, so the guest's view of the profile
+    # is current as of now. Stamp the marker so warn_if_macos_profile_stale has a baseline — and
+    # stamp it AFTER the wiring above, so an edit made while the VM was booting is not misread as
+    # already-seen. Best-effort: a failed stamp only costs a missed warning later.
+    touch "$(macos_profile_marker_file "$project_vm")" 2>/dev/null || true
+
     success "VM '${project_vm}' is up."
     echo ""
-    echo -e "  ${BOLD}augur claude --macos${RESET} → Launch Claude Code"
-    echo -e "  ${BOLD}augur shell --macos${RESET}  → Open bash shell"
-    echo -e "  ${BOLD}augur down --macos${RESET}   → Stop and remove"
+    echo -e "  ${BOLD}augur claude --macos${RESET}  → Launch Claude Code"
+    echo -e "  ${BOLD}augur shell --macos${RESET}   → Open bash shell"
+    echo -e "  ${BOLD}augur down --macos${RESET}    → Stop (clone kept for a fast restart)"
+    echo -e "  ${BOLD}augur destroy --macos${RESET} → Remove the VM clone entirely"
 }
 
 cmd_claude_macos() {
@@ -2810,6 +2857,7 @@ cmd_claude_macos() {
     ensure_macos_claude_projects "$project_vm"
     ensure_macos_claude_agents "$project_vm"
     ensure_macos_claude_profile "$project_vm"
+    warn_if_macos_profile_stale "$project_vm"
     ensure_macos_claude_bin "$project_vm"
     info "Launching $(agent_display_name) in '${project_vm}'..."
     # AUGUR_AGENT_SEAM | interactive launch (macOS: interpolated into SSH string — see C4 on agent_launch_argv)
@@ -2827,6 +2875,7 @@ cmd_shell_macos() {
     ensure_macos_claude_projects "$project_vm"
     ensure_macos_claude_agents "$project_vm"
     ensure_macos_claude_profile "$project_vm"
+    warn_if_macos_profile_stale "$project_vm"
     info "Opening shell in '${project_vm}'..."
     ssh_macos "$project_vm" -t "cd ~/${MACOS_SHARE} && exec zsh -l"
 }
@@ -2910,6 +2959,10 @@ cmd_destroy_macos() {
     # Drop the pinned SSH host key so the next clone (which will have a new key) is
     # not rejected against this project's fixed 127.0.0.1:<fwd-port> egress target.
     rm -f "$(vm_known_hosts_file "$project_vm")"
+    # Drop the profile-freshness marker too: leaving it would make the next VM's first
+    # `claude`/`shell` compare against a boot that no longer exists, warning about a staleness that
+    # the re-clone has already resolved.
+    rm -f "$(macos_profile_marker_file "$project_vm")"
     success "VM '${project_vm}' has been removed."
 }
 

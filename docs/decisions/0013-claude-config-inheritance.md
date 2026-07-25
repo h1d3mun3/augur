@@ -159,7 +159,16 @@ access control). The workaround is `down --macos && up --macos`, which is correc
 Accepted rather than fixed in this change, because the profile is not edited often, the workaround
 is exact, and the alternative is a real redesign — pushing the tree from the host over SSH instead
 of mounting it, which would also require re-implementing deletion tracking and the `.pre-profile`
-rescue. Tracked as a follow-up. Two things about it are worth recording now: that redesign would let
+rescue. Tracked as a follow-up.
+
+**But not accepted *silently*.** The failure mode is the problem here, not the delay: the operator
+edits a slash command, runs `augur claude --macos`, and gets the old behaviour with no error to
+explain it — indistinguishable from an augur bug. So `claude`/`shell` in macOS mode compare the host
+profile's mtimes against a marker stamped at boot (`warn_if_macos_profile_stale`) and print the
+remedy when they differ. The check is deliberately **entirely host-side**: it never reads the guest,
+because the stale share must not be the thing that decides whether the share is stale. `up` does not
+warn — it is what makes the view fresh — and stamps the marker *after* wiring, so an edit made while
+the VM was booting is not misrecorded as already-seen. Two things about it are worth recording now: that redesign would let
 the share be **dropped entirely** (stronger isolation than read-only, since the guest could no
 longer reach the host directory at all), and the same staleness plausibly affects the **existing
 `gh-config` read-only share**, which has had this property since `:ro` support landed (2026-06-28,
