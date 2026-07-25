@@ -107,6 +107,9 @@ trace="$(cat "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null)"
 has   "$trace" "container start"    "up: reuses (starts) the stopped container when config is unchanged"
 hasnt "$trace" "container run"      "up: does NOT rebuild a matching persisted container"
 hasnt "$trace" "delete --force"     "up: does NOT remove a matching persisted container"
+# The reuse path is the WHOLE reason apply_guest_profile lives in finish_up rather than on the
+# create path: a profile edited on the host must land without recreating the container.
+has   "$trace" "AUGUR_PROFILE_SRC=/home/dev/.augur-profile" "up: the REUSE path also wires the operator profile (finish_up runs on both)"
 
 # ── Reconcile: a config change (here: memory) forces a clean RECREATE (delete + run) ──
 rm -f "$AUGUR_TEST_SHIMLOG.trace"
@@ -295,7 +298,44 @@ carry_run drop >/dev/null
 [[ -e "$snapdir/history.jsonl" ]] && fail "carry-over: destroy left the snapshot behind" "clean-guest guarantee broken" \
                                   || ok "carry-over: destroy drops the snapshot (clean guest stays clean)"
 
+# Best-effort under the PRODUCTION shell options. Everything above runs the snapshot under
+# `set +e +u`, which cannot see the `set -e` trap that matters here: save_guest_history runs from
+# cmd_down BEFORE the stop, from invalidate_persisted_container BEFORE the container is removed, and
+# between cmd_claude's exit-code capture and its `return`. An unguarded failure there would abort
+# the operator's actual command. Force cp/mv to fail with errexit fully armed and prove the caller
+# still gets to its next statement.
+# Re-seed a guest history file: the drop test above removed both it and the snapshot, and without a
+# non-empty capture save_guest_history takes its `else` branch and never reaches the cp/mv at all —
+# which would make this a test that passes for the wrong reason.
+mkdir -p "$ctd/guest/.claude"; printf '{"display":"p"}\n' > "$ctd/guest/.claude/history.jsonl"
+besteffort="$(AUGUR_CARRY_TD="$ctd" bash -c '
+  AUGUR_SOURCE_ONLY=1 source "$1"          # augur itself enables set -euo pipefail
+  TD="$AUGUR_CARRY_TD"; CONTAINER_NAME=fake
+  WORKSPACE_DIR="$TD/proj"; AUGUR_DIR="$TD/augur"
+  agent_state_guest_history_file() { echo "$TD/guest/.claude/history.jsonl"; }
+  container_running() { true; }
+  eng() {
+    [ "${1:-}" = exec ] || return 0
+    shift; local envs=()
+    while [ "${1:-}" = "-e" ]; do envs+=("$2"); shift 2; done
+    shift 3
+    env ${envs[@]+"${envs[@]}"} sh -c "$1"
+  }
+  cp() { return 1; }                        # simulate a full disk / unwritable snapshot dir
+  mv() { return 1; }
+  save_guest_history
+  echo REACHED_NEXT_STATEMENT
+' _ "$AUGUR" 2>/dev/null)"
+has "$besteffort" "REACHED_NEXT_STATEMENT" "carry-over: a failing snapshot never aborts the caller under set -euo pipefail"
+
 # Source guards for the lifecycle wiring — behaviour above cannot see WHERE these are called.
+claude_body="$(awk '/^cmd_claude\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
+shell_body="$(awk '/^cmd_shell\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
+has "$claude_body" 'save_guest_history' "carry-over: cmd_claude snapshots on the way out"
+has "$shell_body"  'save_guest_history' "carry-over: cmd_shell snapshots on the way out"
+# Both must preserve the interactive exit status rather than returning the snapshot's.
+has "$claude_body" 'return "$_rc"'      "carry-over: cmd_claude still returns the agent's own exit status"
+has "$shell_body"  'return "$_rc"'      "carry-over: cmd_shell still returns the shell's own exit status"
 up_body="$(awk '/^cmd_up\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
 down_body="$(awk '/^cmd_down\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
 destroy_body="$(awk '/^cmd_destroy\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
