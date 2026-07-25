@@ -57,13 +57,12 @@ else
   fail "up: no container run captured" "trace: $(cat "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null)"
 fi
 
-# ── Folder-trust seed: create-path `up` marks the mounted workspace trusted in the guest's
-#    ~/.claude.json (via a `container exec` jq merge) so `/agents` surfaces user-level subagents
-#    without a trust prompt — and it re-runs on every create, so it survives destroy+up. ──
+# ── No folder-trust seed: augur no longer pre-trusts the mounted workspace (ADR-0012, reverses
+#    ADR-0011) — a fresh create issues no `container exec` at all under --no-egress (the egress
+#    self-test, the only other exec caller, doesn't run without egress). ──
 create_trace="$(cat "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null)"
-has "$create_trace" "hasTrustDialogAccepted"                  "up: seeds folder-trust in the guest on create (container exec)"
-has "$create_trace" "AUGUR_TRUST_PATH=/workspace-${slug}"     "up: trust seed keyed on the workspace cwd (/workspace-<slug>)"
-has "$create_trace" "AUGUR_CFG=/home/dev/.claude.json"        "up: trust seed targets the guest's own ~/.claude.json (state seam)"
+hasnt "$create_trace" "hasTrustDialogAccepted"                "up: does NOT seed folder-trust in the guest on create"
+hasnt "$create_trace" "exec"                                  "up: create path issues no container exec under --no-egress (no trust seed left)"
 
 # ── augur up (again): pre-Option-A flat layout migrates into the new leaf subdir ──
 host_hist_dir="$(find "$HOME/.augur/claude-projects" -maxdepth 1 -type d -name "${slug}-*" 2>/dev/null | head -1)"
@@ -92,7 +91,6 @@ trace="$(cat "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null)"
 has   "$trace" "container start"    "up: reuses (starts) the stopped container when config is unchanged"
 hasnt "$trace" "container run"      "up: does NOT rebuild a matching persisted container"
 hasnt "$trace" "delete --force"     "up: does NOT remove a matching persisted container"
-hasnt "$trace" "hasTrustDialogAccepted" "up: does NOT re-seed folder-trust on reuse (create-path only)"
 
 # ── Reconcile: a config change (here: memory) forces a clean RECREATE (delete + run) ──
 rm -f "$AUGUR_TEST_SHIMLOG.trace"
@@ -116,17 +114,5 @@ if [[ -f "$ex" ]]; then
 else
   fail "claude: no container exec captured" "trace: $(cat "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null)"
 fi
-
-# ── Best-effort seed: a FAILING trust-seed exec must WARN yet still let `up` exit 0 ──
-# seed_workspace_trust is called at the tail of cmd_up's create path, under `set -e` — the same
-# abort class the ~/.gitconfig fingerprint guard above covers. Force the seed's `container exec` to
-# fail (AUGUR_TEST_EXEC_FAIL=1 → shim exits 1 on exec) on a fresh create and confirm up still
-# succeeds and surfaces the fallback warning (never a silent abort that would skip the I1 self-test).
-export AUGUR_TEST_CONTAINER_RUNNING=0
-unset AUGUR_TEST_CONTAINER_STOPPED
-rm -f "$AUGUR_TEST_SHIMLOG.trace"
-( cd "$proj" && AUGUR_TEST_EXEC_FAIL=1 bash "$AUGUR" up --no-egress ) >"$work/seedfail.out" 2>&1; seed_rc=$?
-eq "0" "$seed_rc"                                             "up: still exits 0 when the trust-seed exec fails (best-effort, must not abort up)"
-has "$(cat "$work/seedfail.out")" "may prompt once for folder trust" "up: warns when the trust seed fails (not silently swallowed)"
 
 finish

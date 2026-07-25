@@ -1,6 +1,7 @@
 # ADR-0011 — augur pre-trusts the mounted workspace in the guest's Claude config
 
-- **Status:** Accepted.
+- **Status:** Superseded by [`0012`](./0012-drop-workspace-trust-seed.md) (2026-07-25). Kept for
+  the historical rationale below; augur no longer pre-trusts the workspace.
 - **Date:** 2026-07-23.
 - **Applies to:** Both modes (Apple Container + macOS VM).
 

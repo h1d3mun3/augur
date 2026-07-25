@@ -17,9 +17,6 @@ case "${1:-}" in
   run|exec)
     : > "$log.$1"
     for a in "$@"; do printf '%s\n' "$a" >> "$log.$1"; done
-    # Injected failure for the exec path only (AUGUR_TEST_EXEC_FAIL=1): lets a test drive
-    # seed_workspace_trust's best-effort branch — a failing seed must warn yet keep `up` exit 0.
-    if [[ "$1" == exec && "${AUGUR_TEST_EXEC_FAIL:-0}" == 1 ]]; then exit 1; fi
     exit 0 ;;
   system)
     # `system status` → service up (exit 0); `system start` → succeed.
