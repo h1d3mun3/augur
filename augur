@@ -3647,8 +3647,12 @@ start_provision_gvproxy() {
         exit 1
     fi
     sock="$(provision_gvproxy_socket)"; pidfile="$(provision_gvproxy_pidfile)"
-    rm -f "$sock"
     provision_gvproxy_running && return 0
+    # Same ordering rule as start_gvproxy, for the same reason: the unlink clears a socket left
+    # behind by a crashed gvproxy (or the -S wait below succeeds instantly against a dead file),
+    # so it must stay BELOW the early return — above it, reusing a running gvproxy unlinked the
+    # socket run_base_provisioning is about to hand `vm run --net-vfkit`.
+    rm -f "$sock"
     info "Starting build-provisioning gvproxy..."
     local gvp_debug=()
     [[ "${AUGUR_DEBUG:-}" == "1" ]] && gvp_debug=(--debug)
