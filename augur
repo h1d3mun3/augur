@@ -1229,8 +1229,12 @@ start_gvproxy() {
         exit 1
     fi
     sock="$(gvproxy_socket)"; pidfile="$(gvproxy_pidfile)"
-    rm -f "$sock"
     gvproxy_running && return 0
+    # Only once no live gvproxy owns this path: clear a socket left behind by a crashed one,
+    # or the -S wait at the end of this function succeeds instantly against a dead file. The
+    # unlink must stay BELOW the early return — above it, reusing a running gvproxy unlinked
+    # the socket the VM is about to attach to, and returned 0 as if all was well.
+    rm -f "$sock"
     info "Starting gvproxy (guest netstack → SOCKS5 allowlist)..."
     # --listen-vfkit: the socket the VM's NIC attaches to (one datagram = one frame).
     # --socks-upstream: send all guest TCP to augur-proxy by name for the allowlist
