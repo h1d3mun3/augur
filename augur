@@ -191,17 +191,6 @@ agent_state_guest_leaf()         { echo "-workspace-$1"; }                # leaf
 # would let a guest inject a subagent read by every future session in every project).
 agent_state_agents_host_subdir() { echo "claude-agents"; }                # dir under $AUGUR_DIR (both modes)
 agent_state_guest_agents_dir()   { echo "/home/dev/.claude/agents"; }     # guest user-level subagent-defs dir
-# Folder-trust seed target. DATA only — the guest's OWN Claude config file, which holds the
-# per-workspace trust decision (`projects["<cwd>"].hasTrustDialogAccepted`). augur is itself the
-# isolation/trust boundary, so the CORE (seed_workspace_trust / cmd_up_macos) marks the mounted
-# workspace as trusted in THIS file — a synthetic, per-container stub — and NEVER reads or mounts
-# the host's real ~/.claude.json (which enumerates every host repo and can hold MCP keys; see the
-# Dockerfile seed and the macOS seed comment). Without the seed a freshly CREATED guest (the first
-# `up`, or `up` after `destroy`) starts trust-less, and Claude Code won't surface user-level
-# subagents (~/.claude/agents) via `/agents` until the operator re-accepts the trust dialog. The
-# trust KEY is the workspace cwd, owned by the core (make_workspace_mount); this only DECLARES the
-# file path. See docs/decisions/0011-workspace-trust-seed.md.
-agent_state_guest_config_file()  { echo "/home/dev/.claude.json"; }       # guest Claude config (folder-trust)
 # Integrity gate (agent_verify_integrity_engine/_macos), save_oauth_token,
 # setup_token_security_notice and the macOS state/install helpers are tagged
 # AUGUR_AGENT_SEAM in place. Egress baseline is file-based: see augur.conf.
@@ -1327,38 +1316,6 @@ finish_up() {
     echo -e "  ${BOLD}augur destroy${RESET} → Remove the container entirely"
 }
 
-# Mark the mounted workspace as folder-trusted in the guest's OWN ~/.claude.json so Claude Code
-# surfaces user-level subagents (`/agents`) immediately — see the AGENT SEAM note on
-# agent_state_guest_config_file (and ADR-0011) for why augur, the isolation boundary, owns this
-# instead of re-prompting inside the sandbox. CREATE-path only: a reused (down→up) container
-# already carries the flag in its persisted writable layer, so re-seeding would be redundant work
-# on the fast path. Idempotent (sets exactly one key via jq, preserving any config the guest has
-# since accumulated) and STRICTLY best-effort: any failure falls back to the pre-seed behavior
-# (Claude prompts once for folder trust) and must never abort `up` (we run under `set -e`).
-seed_workspace_trust() {
-    local cfg; cfg="$(agent_state_guest_config_file)"
-    # jq ships in the image. The trust KEY (workspace cwd) and the jq PROGRAM travel as env vars,
-    # never interpolated into the shell script, so an odd slug or the program's own `$p` can't
-    # break quoting (POSIX sh does not re-expand a variable's value). The exec runs as the image's
-    # default user (dev), matching the seed file's owner, so the rewrite stays writable by Claude.
-    if eng exec \
-        -e "AUGUR_TRUST_PATH=${WORKSPACE_MOUNT}" \
-        -e "AUGUR_CFG=${cfg}" \
-        -e 'AUGUR_JQ=.projects[$p].hasTrustDialogAccepted = true' \
-        "$CONTAINER_NAME" sh -c '
-            set -eu
-            [ -f "$AUGUR_CFG" ] || printf "{}\n" > "$AUGUR_CFG"
-            tmp="${AUGUR_CFG}.augur-tmp.$$"
-            jq --arg p "$AUGUR_TRUST_PATH" "$AUGUR_JQ" "$AUGUR_CFG" > "$tmp" \
-                && mv "$tmp" "$AUGUR_CFG" || { rm -f "$tmp"; exit 1; }
-        ' >/dev/null 2>&1
-    then
-        return 0
-    fi
-    warn "Could not pre-trust the workspace in the guest; Claude Code may prompt once for folder trust."
-    return 0
-}
-
 cmd_up() {
     require_engine
     ensure_image
@@ -1557,10 +1514,6 @@ cmd_up() {
     # Record the config this fresh container was created with, so the next `up` can tell whether
     # the persisted container is still reusable or must be recreated (see the reconcile above).
     write_container_fingerprint
-
-    # Trust the mounted workspace in this fresh container's Claude config (create-path only; the
-    # reuse path above already returned). Best-effort — seed_workspace_trust never fails `up`.
-    seed_workspace_trust
 
     # The agent container has now ATTACHED to the network — the host's host-only gateway
     # interface comes up at that point, so finish_up starts the host proxy and runs the boot
@@ -2114,6 +2067,15 @@ cmd_build_macos() {
     # hook.sh) — no-op unless the operator created those files. See run_base_provisioning.
     run_base_provisioning "$MACOS_BUILD_VM" "$vm_pid"
 
+    # Scrub any ~/.claude.json this base VM has accumulated (e.g. a manual `claude` login during
+    # Setup Assistant / manual verification) before it's frozen into the base image. augur never
+    # seeds this file with real account state on purpose (ADR-0012) — a leaked account here would
+    # otherwise be inherited by every `augur up --macos` clone forever. Neither this build script
+    # nor run_base_provisioning invokes `claude` interactively, so this is normally a no-op; it
+    # exists to guarantee the invariant even when a human has poked at the VM by hand.
+    info "Scrubbing any accumulated Claude Code account state from the base VM..."
+    ssh_macos "$MACOS_BUILD_VM" "rm -f ~/.claude.json"
+
     # Step 7: Save as base VM
     # Revoke the build-time NOPASSWD sudo grant before saving. Project VMs are cloned from
     # this base, so leaving the grant in place would give the AI agent root access.
@@ -2278,7 +2240,9 @@ cmd_up_macos() {
     # (only relevant when egress filtering is on).
     if egress_enabled; then check_project_conf_approved; fi
 
+    local _fresh_clone=false
     if ! macos_vm_exists "$project_vm"; then
+        _fresh_clone=true
         info "Cloning base VM to '${project_vm}'..."
         "$VM_CLI" clone "$MACOS_BASE_VM" "$project_vm"
         # A fresh clone gets a fresh SSH host key. The egress SSH target is a fixed
@@ -2378,23 +2342,29 @@ cmd_up_macos() {
     ensure_macos_claude_bin "$project_vm"
 
     # Copy git config, and seed a minimal .claude.json one-way for onboarding state only (NOT auth —
-    # on macOS the OAuth token lives in the Keychain, not in this file; see docs/macos-vm-architecture-review.md).
+    # on macOS the OAuth token lives in the Keychain, not in this file; see docs/macos-vm-architecture-review.md;
+    # and NOT folder-trust — augur no longer pre-trusts the workspace, see docs/decisions/0012-drop-workspace-trust-seed.md).
     # We deliberately do NOT copy the host's ~/.claude.json (not even a stripped copy): it enumerates
     # every repo on the host (`projects`) and can hold third-party MCP API keys (`mcpServers`), and the
     # guest needs none of it. Seed the exact same static onboarding stub the container image bakes
     # (Dockerfile), independent of the host config and of whether jq is installed.
-    # It ALSO pre-trusts the mounted workspace so `/agents` surfaces user-level subagents without a
-    # trust prompt — the macOS peer of container mode's seed_workspace_trust (ADR-0011). The VM is a
-    # throwaway clone re-seeded on every `up`, so without this the trust flag never survives a
-    # `destroy`/re-clone. We trust BOTH the symlinked cwd (~/<share>) and its resolved share path,
-    # because Claude Code keys trust on the RESOLVED cwd and `cd ~/<share>` lands on a symlink into
-    # `/Volumes/My Shared Files/<share>`; seeding a path Claude doesn't use is a harmless no-op.
-    # Still a synthetic static stub — the host's real ~/.claude.json is never read.
-    local _cj; _cj="$(mktemp)"
-    printf '{"hasCompletedOnboarding":true,"installMethod":"native","projects":{"/Users/%s/%s":{"hasTrustDialogAccepted":true},"/Volumes/My Shared Files/%s":{"hasTrustDialogAccepted":true}}}\n' \
-        "${MACOS_SSH_USER}" "${MACOS_SHARE}" "${MACOS_SHARE}" > "$_cj"
-    scp_to_macos "$project_vm" "$_cj" "/Users/${MACOS_SSH_USER}/.claude.json"
-    rm -f "$_cj"
+    #
+    # WRITE-ONCE, gated on `_fresh_clone` (this `up` just created the VM above) — NOT on the
+    # file's absence. `down --macos` keeps the clone (ADR-0006/ADR-0010), so unlike a throwaway VM
+    # this file accumulates real guest state after the first boot — prompt history, guest-side MCP
+    # servers, caches, whatever folder-trust decision the operator made — and an unconditional
+    # overwrite on a REUSED VM would silently destroy all of that. A fresh clone gets the opposite
+    # treatment: overwrite unconditionally, regardless of whether the inherited disk already has
+    # some `.claude.json`. Keying off "did we just clone" rather than "does the file exist" matters
+    # because the base VM is a long-lived, mutable disk that can itself accumulate a stale/real
+    # `.claude.json` between builds (see cmd_build_macos/cmd_update_macos's scrub and ADR-0012) —
+    # an existence check alone would silently inherit that into every new project clone again.
+    if $_fresh_clone; then
+        local _cj; _cj="$(mktemp)"
+        printf '{"hasCompletedOnboarding":true,"installMethod":"native"}\n' > "$_cj"
+        scp_to_macos "$project_vm" "$_cj" "/Users/${MACOS_SSH_USER}/.claude.json"
+        rm -f "$_cj"
+    fi
     [[ -f "$HOME/.gitconfig" ]] && \
         scp_to_macos "$project_vm" "$HOME/.gitconfig" "/Users/${MACOS_SSH_USER}/.gitconfig"
 
@@ -2890,6 +2860,13 @@ cmd_update_macos() {
     # in sync with the base VM on every update too, not just at first build. No-op unless
     # the operator created those files. See run_base_provisioning.
     run_base_provisioning "$MACOS_BASE_VM" "$vm_pid"
+
+    # Same scrub as cmd_build_macos (ADR-0012): re-assert the no-account-state invariant on every
+    # update too, not just at build. The base VM is long-lived and mutable, so a human can log
+    # into `claude` by hand between updates (the actual leak vector — neither build's provisioning
+    # nor this update step ever runs `claude` interactively); running this on every update makes
+    # that self-healing instead of requiring a full rebuild to notice and fix.
+    ssh_macos "$MACOS_BASE_VM" "rm -f ~/.claude.json"
 
     stop_and_reap_macos_vm "$MACOS_BASE_VM" "$vm_pid"
     success "CLI tools updated in '${MACOS_BASE_VM}'."
