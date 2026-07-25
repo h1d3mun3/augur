@@ -119,6 +119,34 @@ a symlink into a read-only mount would turn that into an error. The profile is t
 truth — but augur only ever writes a name that actually **exists** in the profile, so an operator
 who ships no `settings.json` never has one written.
 
+**Freshness is NOT symmetric across the two modes.** Container mode reaches the profile through an
+Apple Container **bind mount**, and a host-side edit is visible immediately (verified on real
+hardware). macOS VM mode reaches it through a **virtiofs share**
+(`VZVirtioFileSystemDeviceConfiguration` + `VZSharedDirectory(readOnly: true)`, see
+`augur-vm/Sources/augur-vm/RunSession.swift`), and there a host-side edit is **not** visible to the
+guest for minutes. Measured on real hardware: still stale 2 minutes after the write, visible some
+time before the 10-minute mark. augur holds no cache of its own — `ensure_macos_claude_profile` only
+`ln -sfn`s and `cp`s — and Virtualization.framework exposes **no** cache-control knob for these
+shares (Apple's documentation is silent on caching entirely; `isReadOnly` is documented purely as
+access control). The workaround is `down --macos && up --macos`, which is correct *by construction*:
+`cmd_up_macos` builds a brand-new VM and share device every time.
+
+Accepted rather than fixed in this change, because the profile is not edited often, the workaround
+is exact, and the alternative is a real redesign — pushing the tree from the host over SSH instead
+of mounting it, which would also require re-implementing deletion tracking and the `.pre-profile`
+rescue. Tracked as a follow-up. Two things about it are worth recording now: that redesign would let
+the share be **dropped entirely** (stronger isolation than read-only, since the guest could no
+longer reach the host directory at all), and the same staleness plausibly affects the **existing
+`gh-config` read-only share**, which has had this property since `:ro` support landed (2026-06-28,
+`213aa24`) without anyone noticing — that share's content simply changes too rarely to surface it.
+
+**UNVERIFIED and load-bearing for any future fix:** whether `readOnly: true` is the causal variable
+at all. No test has compared a read-write virtiofs share in the *same VM* against a read-only one.
+The read-write shares (workspace, `claude-projects`, `claude-agents`) are *presumed* live — strongly
+so, since a stale workspace would mean the agent reads stale source code, which macOS-mode users
+would have noticed — but presumption is not verification. An idle/time-based staleness affecting
+every share, read-only or not, has not been ruled out.
+
 **Wiring is non-destructive.** A real `~/.claude/commands` or `~/.claude/skills` the *guest* created
 before the profile existed is moved aside to `<name>.pre-profile`, never deleted (an empty one is
 dropped, and if the rescue name is already taken the entry is left unwired rather than either copy

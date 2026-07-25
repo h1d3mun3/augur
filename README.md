@@ -97,7 +97,7 @@ What you get instead is a directory you populate on purpose:
 ├── settings.json      → copied     (Claude rewrites it at user scope)
 ├── CLAUDE.md          → copied     (/memory can edit it)
 ├── keybindings.json   → copied     (the TUI owns it)
-├── commands/          → symlinked  (host edits are live)
+├── commands/          → symlinked  (host edits live in Container mode — see the macOS caveat)
 ├── skills/            → symlinked
 ├── rules/             → symlinked
 ├── output-styles/     → symlinked
@@ -111,15 +111,14 @@ What you get instead is a directory you populate on purpose:
 - **Host-global, read-only.** One profile for every project on the machine: personal tooling is not
   project-scoped. Read-only *because* it is shared — a guest able to write there would plant a hook
   or command for every project.
-- **The directories are live**, in two senses. Editing a file *inside* an already-wired directory
-  (adding a command to `commands/` that's already there) needs no augur action at all — you're
-  editing the live mount, and the next `augur claude` sees it. Adding/removing/replacing a whole
-  entry (populating `commands/` for the first time, or deleting it) needs augur to re-run the
-  wiring, which happens on **every** `augur claude`/`shell`/`up`, not just when the container
-  happens to restart — a container left running across many `claude` calls still re-wires on each
-  one. (Claude Code itself only *scans* a top-level `skills/`/`commands/` directory that existed
-  when its session started, so the very first time you populate one, exit and relaunch `claude`
-  once — that part isn't augur's to fix.)
+- **In Container mode the directories are live**, in two senses. Editing a file *inside* an
+  already-wired directory (adding a command to `commands/` that's already there) needs no augur
+  action at all — you're editing the live mount, and the next `augur claude` sees it.
+  Adding/removing/replacing a whole entry (populating `commands/` for the first time, or deleting
+  it) needs augur to re-run the wiring, which happens on **every** `augur claude`/`shell`/`up`, not
+  just when the container happens to restart. (Claude Code itself only *scans* a top-level
+  `skills/`/`commands/` directory that existed when its session started, so the very first time you
+  populate one, exit and relaunch `claude` once — that part isn't augur's to fix.)
 - **The three JSON/markdown files are copies**, refreshed on that same every-`claude`/`shell`/`up`
   cadence, because Claude Code writes user-scope `settings.json` and a read-only symlink would make
   that an error. The profile is their source of truth: if you ship one, guest-side edits to it do
@@ -127,7 +126,14 @@ What you get instead is a directory you populate on purpose:
 - **Your own files are never deleted.** If the guest already had a real `~/.claude/commands` or
   `~/.claude/skills` when you first populate the profile, augur moves it aside to
   `<name>.pre-profile` rather than replacing it (an empty one is simply dropped).
-- Works the same in `--macos` mode (shared read-only into the VM).
+- **macOS VM mode caveat — profile edits need a VM restart.** The profile works there (it is shared
+  read-only into the VM and wired the same way), but macOS mode reaches it over a **virtiofs share**
+  rather than a bind mount, and a read-only virtiofs share serves the guest **stale content for
+  minutes** after a host-side edit. Measured on real hardware: still stale 2 minutes after the
+  write; visible some time before the 10-minute mark. So if you change the profile while a VM is
+  running, run `augur down --macos && augur up --macos` to pick it up — a fresh `vm run` rebuilds
+  the share device and is guaranteed to see current content. Container mode is unaffected.
+  See [issue #124](https://github.com/h1d3mun3/augur/issues/124).
 
 Your **repository's** own `.claude/settings.json`, `CLAUDE.md`, `.claude/commands/`,
 `.claude/skills/` and `.mcp.json` already work with no setup — they arrive inside the workspace
