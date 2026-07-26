@@ -83,6 +83,17 @@ stop_proxy()   { echo "stop_proxy"   >> "$LOG"; }
 logged() { grep -qx "$1" "$LOG" 2>/dev/null; }
 teardown_ran() { logged "stop $1" && logged stop_gvproxy && logged stop_proxy; }
 
+# The self-test resolves an SSH transport BEFORE its first probe, because ssh_macos EXITS rather than
+# returns when it cannot name a host. This fixture stubs ssh_macos itself — one layer ABOVE
+# macos_ssh_host — so without this stub the precheck would find no host at all (VM_CLI here is a
+# recorder, and answers `ip` with nothing) and every scenario below would short-circuit into the "no
+# SSH transport" verdict instead of exercising the probes. Pinning it to gvproxy's forward keeps
+# G_REACHABLE meaning what it has always meant here: transport present, guest not answering.
+# The MISSING-transport case is tests/40_macos_selftest_transport.sh's subject, and it drives the REAL
+# ssh_macos (shadowing the `ssh` binary instead) precisely because a stub at THIS layer cannot model
+# a helper that terminates the script.
+macos_ssh_host() { echo "127.0.0.1"; }
+
 # ── The scriptable guest. Each knob is one gvproxy-argv mutation's observable effect. ───────────
 G_REACHABLE=1 G_IPLIT=0 G_BADDNS=0 G_UDP=0 G_ICMP=0 G_OKDNS=1 G_HTTPCODE=200
 reset_guest() { G_REACHABLE=1 G_IPLIT=0 G_BADDNS=0 G_UDP=0 G_ICMP=0 G_OKDNS=1 G_HTTPCODE=200; }
