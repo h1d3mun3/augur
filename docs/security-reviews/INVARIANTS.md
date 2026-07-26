@@ -66,13 +66,23 @@ in time," this **prescribes** "what must never break." It changes rarely.
 - **Enforced by:** `SNIAndFilterTests.{testHotReloadSwapsPolicy, testFromFileReturnsNilOnUnreadable, testHotReloadKeepsPolicyWhenFileUnreadable}`. To make "unreadable → nil → keep old policy" testable, the file load was extracted into the core lib `Allowlist.fromFile`.
 
 ### I7. The guest cannot widen its own allowlist  ✅ test
-- **Rule:** The merged allowlist is written host-side at `~/.augur/proxy/<slug>.allowlist`
-  (**outside the project tree**). A `./.augur/allowlist.conf` is merged only after TOFU
-  approval and only its sanitized domains (via `conf_line_valid`).
-- **Why:** Prevent root-in-guest from rewriting the egress policy mid-session.
+- **Rule:** The merged allowlist is written host-side at
+  `~/.augur/proxy/<slug>-<workspace-path-hash>.allowlist` (**outside the project tree**). A
+  `./.augur/allowlist.conf` is merged only after TOFU approval and only its sanitized domains
+  (via `conf_line_valid`); and every per-project egress host-state file — merged allowlist,
+  proxy/gvproxy pidfiles, logs, vfkit socket — is keyed on the **FULL workspace path**, so an
+  approval granted for one project can never reach another project's enforcement point.
+- **Why:** Prevent root-in-guest from rewriting the egress policy mid-session. The path-keying
+  clause covers the other direction: an approval is scoped to the project it was granted for, so
+  a *second* project can neither inherit that approval nor donate its own to the first project's
+  live proxy. Keyed on the basename alone, `~/work/app` and `~/archive/app` shared one merged
+  allowlist, and whichever ran `up` last silently rewrote the other's live policy.
 - **Enforced by:** `tests/01_egress_allowlist_unit.sh` (checks `conf_line_valid`'s grammar,
-  `project_conf_domains` sanitization, and that `write_merged_allowlist` drops guest-supplied
-  junk and writes **outside the project tree**). The TOFU approval itself
+  `project_conf_domains` sanitization, that `write_merged_allowlist` drops guest-supplied junk and
+  writes **outside the project tree**, and that two same-basename projects write **different**
+  merged allowlists neither of which contains the other's approved domains) plus
+  `tests/32_proxy_per_mode.sh` (every per-project host-state path differs between two
+  same-basename projects while the slug is identical). The TOFU approval itself
   (`check_project_conf_approved`) is ⚠ review-only.
 
 ### I8. Keep the private-IP dial guard always armed  ✅ test

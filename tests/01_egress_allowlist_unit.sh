@@ -23,9 +23,13 @@ for f in write_merged_allowlist conf_line_valid project_conf_domains project_con
   echo >> "$helpers"
 done
 
-# Stubs for the few externals the extracted helpers reference.
-workspace_slug()      { echo testslug; }
-workspace_path_hash() { echo testpathhash; }
+# Stubs for the few externals the extracted helpers reference. The path hash reads a VARIABLE
+# (not a constant) so a section below can switch projects: two workspaces that share a basename
+# share workspace_slug and are told apart ONLY by workspace_path_hash.
+TEST_SLUG="testslug"
+TEST_PATH_HASH="testpathhash"
+workspace_slug()      { echo "$TEST_SLUG"; }
+workspace_path_hash() { echo "$TEST_PATH_HASH"; }
 warn()    { :; }
 info()    { :; }
 success() { :; }
@@ -124,5 +128,48 @@ if ( set -e; AUGUR_ACCEPT_PROJECT_CONF=1 check_project_conf_approved ) >/dev/nul
 else
   fail "approval under set -e" "check_project_conf_approved aborted (project_conf_domains returned non-zero)"
 fi
+
+section "Tier 0 — I7: an approval granted for one project never reaches another's enforcement point"
+# The contamination this guards against. Projects A (~/work/myapp) and B (~/archive/myapp) share a
+# BASENAME, so workspace_slug is identical for both and only workspace_path_hash separates them.
+# With the merged allowlist keyed on the slug alone, both resolved to ONE file: B's `up` overwrote
+# it with baseline+global+B, augur-proxy hot-reloaded it within ~2s (main.swift polls its mtime),
+# and A's LIVE session lost every domain its operator had approved — while gaining B's, which that
+# operator never saw. B's own TOFU gate passes here (it is keyed on the path hash and prompts "for
+# this project"), so nothing in the approval path notices.
+approve_and_merge() {   # $1 = path hash (the project), $2 = the domain that project approves
+  TEST_PATH_HASH="$1"
+  printf '%s\n' "$2" > "$AUGUR_PROJECT_CONF"
+  AUGUR_ACCEPT_PROJECT_CONF=1 check_project_conf_approved >/dev/null 2>&1
+  write_merged_allowlist
+}
+a_out="$(approve_and_merge hash-of-work-myapp   a-only.example.com)"
+has "$(cat "$a_out")" "a-only.example.com" "A's merged allowlist honors A's approved domain"
+b_out="$(approve_and_merge hash-of-archive-myapp b-only.example.com)"
+has "$(cat "$b_out")" "b-only.example.com" "B's merged allowlist honors B's approved domain"
+
+if [[ "$a_out" != "$b_out" ]]; then
+  ok "the two same-basename projects write DIFFERENT merged-allowlist paths"
+else
+  fail "same-basename projects must not share a merged allowlist" "both = $a_out"
+fi
+# Both calls above ran with the SAME slug (this harness's stub is a constant), so the hash is
+# provably the only thing that separated them. tests/32_proxy_per_mode.sh proves the same for the
+# REAL workspace_slug driven from two real same-basename directories.
+a_after="$(cat "$a_out")"
+has   "$a_after" "a-only.example.com" "A's approved domain SURVIVES project B's up (no narrowing of a live policy)"
+hasnt "$a_after" "b-only.example.com" "B's approved domain never appears in A's policy (no widening without A's approval)"
+has   "$a_out" "$AUGUR_PROXY_DIR" "A's allowlist stays under the host-side proxy dir"
+has   "$b_out" "$AUGUR_PROXY_DIR" "B's allowlist stays under the host-side proxy dir"
+
+# Degenerate variant: a same-basename sibling with NO ./.augur/allowlist.conf at all.
+# check_project_conf_approved returns 0 immediately and write_merged_allowlist omits the project
+# block entirely, so a bare `augur up` in ANY same-basename directory used to strip a live
+# session's project domains with zero interaction — no prompt, no output, nothing to notice.
+rm -f "$AUGUR_PROJECT_CONF"
+TEST_PATH_HASH="hash-of-tmp-myapp"
+c_out="$(write_merged_allowlist)"
+hasnt "$(cat "$c_out")" "a-only.example.com" "a conf-less sibling's own policy carries no other project's domains"
+has   "$(cat "$a_out")" "a-only.example.com" "a bare up in a conf-less same-basename dir leaves A's live policy intact"
 
 finish
