@@ -114,8 +114,16 @@ ssh_macos() {
         *"curl "*)                                     # everything else curl'd is an IP literal
             [[ "$G_IPLIT" == 1 ]] && return 0
             return 28 ;;
-        *".augur-env"*)                                # the credential push (cmd_up_macos sections)
-            cat >/dev/null; return 0 ;;
+        *"cat > "*".augur-env"*)                       # the credential push, which IS piped:
+            cat >/dev/null; return 0 ;;                #   { … } | ssh_macos … "cat > ~/.augur-env"
+        *".augur-env"*)                                # ANY OTHER command that merely NAMES it —
+            return 0 ;;                                # notably `grep -q '.augur-env' ~/.zshenv ||
+                                                       # echo … >> ~/.zshenv`, which is NOT piped.
+                                                       # Draining stdin there consumes the CALLER's:
+                                                       # harmless under CI (stdin is /dev/null) and
+                                                       # in a subagent, but on a developer's TTY the
+                                                       # whole suite silently blocks on the keyboard.
+                                                       # Measured: `make offline-tests` hung here.
         "/bin/date +%s")                               # the guest-clock sync that now precedes the
             printf '%s\n' "$(date +%s)"; return 0 ;;    # self-test on both up paths (tests/38 owns
                                                        # it). Answering with the host's own clock
