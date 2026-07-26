@@ -2946,6 +2946,43 @@ ensure_macos_claude_bin() {
     '"
 }
 
+# Enable HTTPS `git push` from the guest off GH_TOKEN alone, by writing git's credential helper into
+# the guest's ~/.gitconfig. Independent of gh and of whether `gh auth setup-git` was ever run, and it
+# keeps working in non-login shells. The helper stores only the REFERENCE `$GH_TOKEN` (expanded in
+# the guest at push time), never the token value. Must run AFTER cmd_up_macos scp's the host's
+# ~/.gitconfig, which REPLACES the file this writes into — see the call site.
+#
+# --replace-all, not a plain set. `credential.<url>.helper` is a MULTI-VALUED key by git's design,
+# and the file this writes into is the host's own ~/.gitconfig: `gh auth setup-git` writes TWO
+# entries for github.com (an empty one to reset the helper chain, then its own), so every operator
+# who has run it arrives here with the key already duplicated. A plain
+# `git config --global <key> <value>` then refuses to collapse them — exit 5, "cannot overwrite
+# multiple values with a single value" — which under augur's `set -e` aborted `up` AFTER the clone,
+# the sizing, the boot and the SSH wait, tearing none of it down: the same stranded-guest shape the
+# pre-clone credential check exists to prevent. Collapsing is exactly the intent: on a
+# single-valued file the plain form ALREADY overwrote whatever the host had, so --replace-all
+# changes nothing on the path that worked, and the host's values are inert in the guest regardless
+# (osxkeychain needs the host Keychain — the very reason augur injects GH_TOKEN at all — and a
+# `!/opt/homebrew/bin/gh …` helper needs that host path). Nor is the copy a faithful original to
+# begin with: it carries the host's `[include]`/`[includeIf]` lines while the files they point at
+# were never copied, so it is already a lossy snapshot. (An include CANNOT be what introduces the
+# duplicate, incidentally: `--includes` defaults OFF for a scope-limited `git config --global`.)
+# Container mode never hits any of this because it never mutates the file — it bind-mounts
+# ~/.gitconfig read-only and injects the identical helper via GIT_CONFIG_KEY_0/VALUE_0 (cmd_up).
+#
+# Best-effort like ensure_macos_claude_profile, for the residue --replace-all cannot fix: the copied
+# file is arbitrary operator-authored input, and a shape git cannot parse at all still fails (exit
+# 128 on a malformed section header). A guest with no push credential plus a warning beats an `up`
+# that dies with the VM already running.
+ensure_macos_git_credential_helper() {
+    local vm="$1" gh_token="$2"
+    [[ -n "$gh_token" ]] || return 0
+    ssh_macos "$vm" \
+        "git config --global --replace-all 'credential.https://github.com.helper' '!f() { test \"\$1\" = get && echo username=x-access-token && echo password=\$GH_TOKEN; }; f'" \
+        || warn "Could not configure git's credential helper in the VM; HTTPS 'git push' in the guest may prompt for credentials."
+    return 0
+}
+
 
 cmd_up_macos() {
     require_vz
@@ -3163,13 +3200,11 @@ cmd_up_macos() {
     ssh_macos "$project_vm" \
         "grep -q '.augur-env' ~/.zshenv 2>/dev/null || echo '[[ -f ~/.augur-env ]] && source ~/.augur-env' >> ~/.zshenv"
 
-    # Enable HTTPS `git push` with GH_TOKEN by configuring git's credential helper to read GH_TOKEN
-    # from the environment. This is independent of gh and keeps git auth working even in non-login
-    # shells where `gh auth setup-git` was never run.
-    if [[ -n "$gh_token" ]]; then
-        ssh_macos "$project_vm" \
-            "git config --global 'credential.https://github.com.helper' '!f() { test \"\$1\" = get && echo username=x-access-token && echo password=\$GH_TOKEN; }; f'"
-    fi
+    # Enable HTTPS `git push` with GH_TOKEN. Deliberately BELOW the ~/.gitconfig scp above: that
+    # copy replaces the very file this writes the helper into, so the reverse order would silently
+    # discard the helper. No-op without a host gh token. See the function for why it must use
+    # --replace-all and why it is best-effort.
+    ensure_macos_git_credential_helper "$project_vm" "$gh_token"
 
     # This `up` ran `vm run`, which rebuilds the virtiofs device, so the guest's view of the profile
     # is current as of now. Stamp the marker so warn_if_macos_profile_stale has a baseline — and
