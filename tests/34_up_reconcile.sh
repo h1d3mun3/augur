@@ -16,9 +16,11 @@
 #      reconcile that exists to catch exactly that sits below it too.
 #
 # The two modes are deliberately ASYMMETRIC. Container mode can refuse (`exit 1`) because it HAS a
-# drift signal; macOS mode has no fingerprint and no boot self-test, so its half applies what the
-# host owns and WARNS about what a live VM cannot pick up (gvproxy's DNS allowlist is read once at
-# startup, VM sizing needs the VM stopped, ~/.augur-env is not re-pushed).
+# drift signal; macOS mode has no fingerprint, so its half applies what the host owns and WARNS about
+# what a live VM cannot pick up (gvproxy's DNS allowlist is read once at startup, VM sizing needs the
+# VM stopped, ~/.augur-env is not re-pushed). It does now re-run a boot self-test on this path —
+# verify_macos_egress_locked, whose behaviour tests/36_macos_egress_selftest.sh owns — and that is
+# the one thing that can still end the path non-zero, but on a DETECTED leak, never on drift.
 #
 # The last section covers the OTHER half of that story: WHY an operator ended up on the
 # already-running path with a credential-less guest in the first place. macOS mode validated the
@@ -127,6 +129,11 @@ stop_gvproxy()      { :; }
 stop_proxy()        { :; }
 wait_for_macos_ssh() { return 1; }   # would fail loudly if the branch ever fell through
 ssh_macos()         { echo "ssh_macos" >> "$LOG"; return 0; }
+# I1's macOS boot tripwire, recorded rather than run: it probes the guest over ssh_macos, and the
+# blanket stub above answers every probe with success — i.e. a screaming leak — which would tear the
+# VM down mid-reconcile. tests/36_macos_egress_selftest.sh owns its behaviour; here we only assert
+# that this path reaches it, exactly as the container half asserts it reaches finish_up.
+verify_macos_egress_locked() { echo "verify_macos_egress_locked" >> "$LOG"; }
 scp_to_macos()      { :; }
 # Recorder standing in for the augur-vm CLI. $VM_CLI is invoked as "$VM_CLI" <subcmd>, so a function
 # name works — and unlike a stub that silently succeeds, this makes "run was never invoked" a real
@@ -160,6 +167,8 @@ else fail "up --macos: never ran check_project_conf_approved" "log: $(cat "$LOG"
 if logged "start_proxy 127.0.0.1"; then ok "up --macos: starts/refreshes the proxy on 127.0.0.1 (gvproxy's SOCKS upstream)"
 else fail "up --macos: start_proxy was not called with 127.0.0.1" "log: $(cat "$LOG")"; fi
 has "$mout" "gvproxy snapshots its DNS allowlist ONCE" "up --macos: warns that gvproxy's DNS allowlist is pinned to boot"
+if logged verify_macos_egress_locked; then ok "up --macos: runs the boot self-test on this path too (I1's tripwire, like finish_up's)"
+else fail "up --macos: never ran verify_macos_egress_locked" "I1's tripwire does not fire on the already-running path"; fi
 if [[ -s "$VMLOG" ]]; then fail "up --macos: touched the augur-vm CLI on the already-running path" "$(cat "$VMLOG")"
 else ok "up --macos: never invokes the augur-vm CLI at all (no clone, no set, no run)"; fi
 if grep -q '^run' "$VMLOG" 2>/dev/null; then fail "up --macos: BOOTED a VM on the already-running path" "$(cat "$VMLOG")"
@@ -304,7 +313,7 @@ has   "$pinned_fn" 'gvproxy_pidfile' "the pinned-state check keys off the gvprox
 has   "$up_body"       'exit 1'  "cmd_up can refuse on drift (it has container_fingerprint)"
 if printf '%s\n' "$up_macos_body" | sed -n '/already running/,/^    fi$/p' | grep -q 'exit 1'
 then fail "cmd_up_macos refuses on the already-running path" "macOS has no drift signal to refuse on"
-else ok "cmd_up_macos returns 0 on the already-running path (no fingerprint, no boot self-test)"; fi
+else ok "cmd_up_macos returns 0 on the already-running path (no fingerprint ⇒ no drift refusal)"; fi
 
 # The credential check's POSITION in the source, not just its effect: a future edit that moves it
 # back below the boot must fail here too, not only behaviourally.

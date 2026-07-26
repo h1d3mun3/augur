@@ -1485,6 +1485,142 @@ stop_gvproxy() {
     rm -f "$AUGUR_PROXY_DIR/$(workspace_slug).vfkit.sock" 2>/dev/null || true
 }
 
+# Boot self-test, macOS-VM peer of verify_egress_locked — I1's tripwire on this engine. Read that
+# function first: this one deliberately keeps its shape, including the property that matters most.
+#
+# A probe that only checks "direct egress fails" reports SUCCESS when the guest has NO network at
+# all. Both halves are therefore load-bearing, exactly as in the container version:
+#
+#   NEGATIVE — direct egress must FAIL. Container probes IP literals + a hostname with every proxy
+#     env var unset. There is no proxy env to unset here (the forwarding is transparent: gvproxy is
+#     the guest's only NIC and dials augur-proxy's SOCKS5 per connection), so "direct" means the
+#     things that can leave WITHOUT the allowlist deciding — and each maps to exactly ONE gvproxy
+#     flag in start_gvproxy, which is what makes deleting that flag detectable:
+#       • an IP-literal TCP connect        → only --socks-upstream stops it
+#       • a non-allowlisted NAME resolving → only --dns-allowlist stops it
+#       • raw UDP / ICMP                   → only --deny-direct stops those
+#     Deleting any one of those three from start_gvproxy's argv previously left `up --macos`
+#     printing "Egress restricted…" and then "VM is up." with nothing detecting it.
+#   POSITIVE — allowlisted egress must WORK, or a total network outage reads as "secure".
+#
+# Container proves its positive half WITHOUT the network: it sends a request THROUGH the proxy to
+# a `.invalid` host and accepts any HTTP status (even a 403 deny), because reaching the proxy at
+# all is the proof. That trick is unavailable here — the guest cannot address the proxy, and any
+# name must clear gvproxy's DNS allowlist first — so this half necessarily reaches a real
+# allowlisted host. `up --macos` with egress ON therefore now REQUIRES working egress to
+# _SELFTEST_HOST; `--no-egress` skips the whole self-test, as it does in container mode.
+#
+# Every probe shape below was measured in a live gvproxy-backed guest, not inferred.
+_SELFTEST_HOST="api.github.com"
+verify_macos_egress_locked() {
+    local vm="$1"
+    info "Running egress self-test (in-guest)..."
+    local leaked=false
+    # PATH pinning, same reason as verify_egress_locked's and the same blast radius: `down --macos`
+    # KEEPS the clone (ADR-0006/ADR-0010), and augur's own ~/.augur-env puts $HOME/.local/bin FIRST
+    # in the PATH of every guest shell — including the non-login shell `ssh <host> <cmd>` runs, which
+    # still sources ~/.zshenv. A prior guest session could otherwise plant ~/.local/bin/curl|dig|
+    # dscacheutil|ping and fake every isolated answer below. The real tools live in system dirs a
+    # project VM has no sudo grant to write (curl/dig/dscacheutil in /usr/bin, ping in /sbin), so
+    # this can never cause a "not found" false failure — it only stops the tripwire being shadowed.
+    local pp='export PATH=/usr/bin:/bin:/usr/sbin:/sbin;'
+
+    # The transport itself, first. Every negative probe below "passes" when the guest is merely
+    # unreachable, so an unverifiable datapath must be named as such rather than reported as
+    # isolated. It still fails CLOSED (same teardown) — container mode does the same thing when
+    # `eng exec` stops working, because its proxy probe then returns no status either.
+    if ! ssh_macos "$vm" "${pp} true" &>/dev/null; then
+        error "Self-test: cannot run a command in the guest over SSH — egress cannot be VERIFIED."
+        leaked=true
+    else
+        # Raw routing. ANY success is a leak. Two distinct public IPv4 anycast addresses plus an
+        # IPv6 literal, so one blackholed/rerouted address (or a v6-only leak the v4 probes would
+        # miss) cannot make a routable network look isolated. Only :443 — unlike container's
+        # routeless --internal network, the deny here comes from the proxy refusing an IP-literal
+        # destination unconditionally (I4), which is port-agnostic, so container's second :80 pass
+        # would buy no coverage and cost another full timeout. --max-time is 4 rather than
+        # container's 6 for the same reason it matters at all: gvproxy's netstack ACCEPTS the
+        # connection and the SOCKS deny closes it afterwards, so a severed IP-literal probe burns
+        # its entire budget (measured: curl exits 28 at the deadline) instead of failing instantly.
+        local _probe
+        for _probe in https://1.1.1.1 https://8.8.8.8 'https://[2606:4700:4700::1111]'; do
+            # Single-quoted in the remote string: the guest shell is zsh, which ABORTS on an
+            # unmatched glob, and a bare IPv6 literal in brackets is one.
+            if ssh_macos "$vm" "${pp} curl -s --max-time 4 -o /dev/null '${_probe}'" &>/dev/null; then
+                leaked=true; error "Self-test: the guest reached ${_probe} directly (raw routing not severed)."
+            fi
+        done
+        # DNS is the FIRST gate in this mode (gvproxy's --dns-allowlist gates resolution; the
+        # proxy's SNI peek happens later), so a non-allowlisted name must not resolve.
+        #
+        # Two deliberate divergences from container's `getent hosts dns-leak-probe.example`:
+        #   • macOS has no getent. dscacheutil goes through the guest's REAL resolver stack
+        #     (mDNSResponder → gvproxy's DNS at the gateway) — the path curl/git/claude take. It
+        #     exits 0 whether or not the name resolved, so the ANSWER is the signal, not $?.
+        #   • the probe name must be one that genuinely RESOLVES publicly. Container can use a
+        #     bogus `.example` TLD because its guest has no resolver at all, so any answer is a
+        #     leak. Here the gate is a filter in FRONT of a working resolver: a bogus TLD would
+        #     NXDOMAIN with --dns-allowlist deleted too, and the mutation would go undetected.
+        # Matched on *_address* rather than ip_address so a AAAA-only answer (dscacheutil prints
+        # `ipv6_address:`) is a leak here too.
+        local _dnsout
+        _dnsout="$(ssh_macos "$vm" "${pp} dscacheutil -q host -a name 'example.com'" 2>/dev/null || true)"
+        if [[ "$_dnsout" == *_address* ]]; then
+            leaked=true; error "Self-test: the guest resolved non-allowlisted example.com (DNS allowlist not enforced)."
+        fi
+        # UDP and ICMP, the two forwarders --deny-direct refuses to register. Neither is reachable
+        # through the SOCKS allowlist, so neither of the TCP probes above can see them: a DNS query
+        # aimed straight at a public resolver bypasses the guest's configured (gvproxy) one entirely,
+        # which is a full-bandwidth exfil channel that resolves nothing through the allowlist.
+        # An ANSWER is the signal, not dig's exit status (0 on an NXDOMAIN too) and not its raw
+        # output — `dig +short` prints its "connection timed out" diagnostic on STDOUT, so the
+        # dotted-quad shape is filtered in the guest and the host side only asks "was there one".
+        local _udpout
+        _udpout="$(ssh_macos "$vm" "${pp} dig +time=2 +tries=1 +short @1.1.1.1 example.com A | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'" 2>/dev/null || true)"
+        if [[ -n "$_udpout" ]]; then
+            leaked=true; error "Self-test: the guest resolved via direct UDP to 1.1.1.1 (UDP egress not dropped)."
+        fi
+        if ssh_macos "$vm" "${pp} ping -c 1 -t 2 1.1.1.1" &>/dev/null; then
+            leaked=true; error "Self-test: the guest got an ICMP reply from 1.1.1.1 (ICMP egress not dropped)."
+        fi
+        # POSITIVE half — two assertions, because they fail for different reasons and a single one
+        # would mask the other. The NAME must resolve, which proves gvproxy's DNS gate is armed and
+        # DISCRIMINATING rather than simply closed (or absent, with the host offline); and a request
+        # to it must come back with an HTTP status, which proves the SOCKS forward plus the proxy's
+        # ALLOW decision. Deliberately a MANAGED-BASELINE domain: the already-running path warns
+        # that gvproxy snapshots its DNS allowlist once at boot, so a project-conf domain could be
+        # allowlisted host-side and still unresolvable in a live guest — a false leak. A merged
+        # allowlist missing the baseline entirely is a broken install that denies the agent's own
+        # API too, and failing `up` closed is the right answer there.
+        local _okdns _pcode
+        _okdns="$(ssh_macos "$vm" "${pp} dscacheutil -q host -a name '${_SELFTEST_HOST}'" 2>/dev/null || true)"
+        if [[ "$_okdns" != *_address* ]]; then
+            leaked=true
+            error "Self-test: the guest cannot resolve allowlisted ${_SELFTEST_HOST} (egress is DOWN, not locked)."
+        fi
+        # curl prints 000 (and exits nonzero) when it never got a response, so `|| true` keeps the
+        # failure on the fail-closed branch below instead of aborting under `set -e`.
+        _pcode="$(ssh_macos "$vm" "${pp} curl -s -o /dev/null -w '%{http_code}' --max-time 12 'https://${_SELFTEST_HOST}/'" 2>/dev/null || true)"
+        if [[ -z "$_pcode" || "$_pcode" == "000" ]]; then
+            leaked=true
+            error "Self-test: allowlisted egress to ${_SELFTEST_HOST} does not work (HTTP '${_pcode:-<none>}')."
+        fi
+    fi
+
+    if $leaked; then
+        error "Egress self-test FAILED — refusing to continue. Tearing down."
+        # The macOS analogue of container mode's engine_rm_force + stop_egress, and byte-for-byte
+        # what the SSH-timeout path in cmd_up_macos already does: a detected leak must not leave a
+        # live VM with a live NIC behind. This is a NEW way for `up --macos` to end with a stopped
+        # VM — see the call sites.
+        "$VM_CLI" stop "$vm" 2>/dev/null || true
+        stop_gvproxy
+        stop_proxy
+        exit 1
+    fi
+    success "Egress self-test passed: gvproxy+proxy are the guest's only egress; only allowlisted domains resolve and connect."
+}
+
 # ── Container mode commands (Apple Container) ─────────────────────────────────
 
 cmd_build() {
@@ -2999,7 +3135,9 @@ cmd_up_macos() {
     # defect as cmd_up's peer branch (a bare `return 0` skipped the approval gate and the allowlist
     # rewrite, so a REVOCATION never reached the live proxy), but the remedy is deliberately weaker:
     # `return 0`, never `exit 1`. macOS mode has no container_fingerprint, so there is no reliable
-    # drift signal to refuse on, and no boot self-test to re-run either.
+    # drift signal to refuse on. It DOES now have a boot self-test to re-run (see the bottom of this
+    # branch), which is the one thing that can still end this path non-zero — on a detected leak,
+    # never on drift.
     if macos_vm_running "$project_vm"; then
         warn "VM '${project_vm}' is already running — reconciling host-side state only."
         if egress_enabled; then
@@ -3012,6 +3150,15 @@ cmd_up_macos() {
         fi
         # …and the half a live VM genuinely cannot pick up. Warn; do not pretend to have applied it.
         warn_if_macos_egress_pinned "$project_vm"
+        # I1's tripwire on THIS path too, mirroring container mode: finish_up (and therefore
+        # verify_egress_locked) runs on cmd_up's already-running branch, and ADR-0010 already
+        # accepted the consequence — "`augur up` against a running container can now end an
+        # operator's session, but only on a DETECTED leak, which is precisely when I1 says it
+        # should." A live check on a running VM is if anything MORE valuable than one on a fresh
+        # boot: this branch is the only place a proxy killed out from under a live session is
+        # revived, and the self-test is what proves that revival actually restored enforcement. It
+        # runs LAST so the pinned-state warning above is still printed on the way out.
+        verify_macos_egress_locked "$project_vm"
         return 0
     fi
 
@@ -3131,6 +3278,15 @@ cmd_up_macos() {
         stop_proxy
         exit 1
     }
+
+    # I1's boot tripwire, as early as it can possibly run: the moment a command can be run in the
+    # guest, and BEFORE any of the wiring below — in particular before ~/.augur-env pushes an
+    # Anthropic token and a gh token into it. A guest whose egress is not contained is exactly the
+    # guest that must not receive credentials, so this deliberately precedes the injection rather
+    # than sitting just above the success banner. Skipped entirely with --no-egress, like
+    # container mode's (finish_up guards verify_egress_locked the same way): with filtering off
+    # there is no allowlist to be locked to, and the warning above already said so.
+    if egress_enabled; then verify_macos_egress_locked "$project_vm"; fi
 
     ensure_macos_workspace "$project_vm"
     ensure_macos_claude_projects "$project_vm"

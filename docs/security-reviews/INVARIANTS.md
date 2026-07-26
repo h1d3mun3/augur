@@ -31,7 +31,16 @@ in time," this **prescribes** "what must never break." It changes rarely.
   fails, tear the container down.
 - **Why:** Prevent a misconfiguration or partial failure from "opening up." When it
   fails, it must fail to the closed side.
-- **Enforced by:** `AllowlistTests.testEmptyConfDeniesEverything` / shell `verify_egress_locked()` (`augur`)
+- **Enforced by:** `AllowlistTests.testEmptyConfDeniesEverything` / shell `verify_egress_locked()`
+  (container) **and `verify_macos_egress_locked()`** (macOS VM, `augur`). Until the latter existed,
+  "on every engine" held for the *policy* half on both engines but the boot tripwire was
+  container-only: `verify_egress_locked` had exactly one call site (`finish_up`), which macOS mode
+  never reaches, so no macOS production path ever probed the guest's network. The macOS peer now
+  runs on **both** `up --macos` paths (fresh boot and the already-running reconcile) and tears the
+  VM, gvproxy and the proxy down on a failure. Both self-tests are inherently live (they need a
+  booted guest); the *wiring* — invoked on both paths, and a NOT-locked verdict exits non-zero with
+  the teardown having run — is covered offline by `tests/36_macos_egress_selftest.sh`.
+  `verify_egress_locked` has no offline peer; its live gate is `tests/22_egress_failclosed.sh`.
 
 ### I2. Domain matching is label-boundary anchored  ✅ test
 - **Rule:** `*.x` matches `a.x` but not `evilx`. `x` = apex only; `.x` = apex + subdomains.
