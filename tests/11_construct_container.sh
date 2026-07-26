@@ -385,4 +385,84 @@ hasnt "$destroy_body" 'save_guest_history'    "carry-over: cmd_destroy never sna
 # build/update/install-cert all discard the writable layer through here, possibly while RUNNING.
 has   "$inval_body"   'save_guest_history'    "carry-over: build/update/install-cert snapshot before discarding the layer"
 
+# ── The workspace must not CONTAIN augur's own control plane ─────────────────
+# $WORKSPACE_DIR is mounted READ-WRITE, and ~/.augur holds the host-executed binaries install
+# puts first on the host's PATH (augur, augur-proxy, augur-gvproxy, augur-vm) plus the merged
+# allowlist augur-proxy hot-reloads. Sharing $HOME (or ~/.augur, or an ancestor of either) is
+# therefore guest→host code execution, not just "the guest can attack the repo you gave it".
+# See docs/decisions/0014-workspace-must-not-contain-augur.md.
+#
+# Asserted BEHAVIOURALLY through the real dispatch, three ways per case: a non-zero exit, NO
+# shim run-log at all (proof nothing was ever mounted — a message plus a mount would be worse
+# than no message), and stderr naming the offending directory so the operator can act on it.
+section "Tier 1 — refuse a workspace containing augur's control plane (R1–R4, real dispatch)"
+export AUGUR_TEST_CONTAINER_RUNNING=0
+unset AUGUR_TEST_CONTAINER_NAME || true
+guard_log="$work/guardshim"
+mkdir -p "$HOME/sub" "$HOME/.augur/proxy"
+ln -sfn "$HOME" "$work/homelink"          # a LOGICAL path that resolves to $HOME
+
+# The refusal is colorized, and ${BOLD} sits between "share " and the path — so assert on the
+# ANSI-stripped text, or a passing check would depend on where the escapes happen to fall.
+strip_ansi() { sed $'s/\033\\[[0-9;]*m//g'; }
+
+guard_case() {   # guard_case <label> <dir> <expected-substring-in-stderr> [rule-phrase]
+  rm -f "$guard_log.run" "$guard_log.trace"
+  local out rc
+  # Capture status from a NON-pipelined assignment, then strip — so the exit-code assertion does
+  # not silently depend on `pipefail` being set.
+  out="$( cd "$2" && AUGUR_TEST_SHIMLOG="$guard_log" bash "$AUGUR" up --no-egress 2>&1 )"; rc=$?
+  out="$(printf '%s\n' "$out" | strip_ansi)"
+  if [[ $rc -ne 0 ]]; then ok "$1: up exits non-zero"
+  else fail "$1: up exited 0" "the guard did not refuse"; fi
+  if [[ ! -e "$guard_log.run" ]]; then ok "$1: no 'container run' constructed (nothing was mounted)"
+  else fail "$1: a container run WAS constructed" "$(tr '\n' ' ' < "$guard_log.run")"; fi
+  has "$out" "Refusing to share $3" "$1: stderr names the offending directory"
+  [[ -n "${4:-}" ]] && has "$out" "$4" "$1: stderr says which rule was hit"
+  return 0
+}
+
+# The guard compares — and reports — PHYSICAL paths, so the expectations must be physical too.
+# On macOS `mktemp -d` hands back /var/folders/… which is itself a symlink to /private/var/…;
+# asserting on the logical string would pass on the Linux CI runner and fail on a Mac.
+phys() { ( cd "$1" && pwd -P ); }
+work_p="$(phys "$work")"; home_p="$(phys "$HOME")"
+
+guard_case "R1 root"               "/"                  "/"               "filesystem root"
+guard_case "R2 \$HOME"              "$HOME"              "$home_p"         "your home directory"
+guard_case "R3 ancestor of \$HOME"   "$work"              "$work_p"         "contains your home directory"
+guard_case "R4 \$AUGUR_DIR"          "$HOME/.augur"       "$home_p/.augur"  "augur's own directory"
+guard_case "R4 inside \$AUGUR_DIR"   "$HOME/.augur/proxy" "$home_p/.augur/proxy" "augur's own directory"
+# WORKSPACE_DIR is $(pwd) — the LOGICAL path. Comparing it as a string would let a symlinked
+# cwd through while the engine happily shares the physical $HOME behind it.
+guard_case "R2 via a symlinked cwd" "$work/homelink"     "$home_p"         "your home directory"
+# …and the refusal must name the RESOLVED target, not the link the operator typed — otherwise
+# the operator cannot tell why a cwd that "isn't $HOME" was refused.
+sym_out="$( cd "$work/homelink" && AUGUR_TEST_SHIMLOG="$guard_log" bash "$AUGUR" up --no-egress 2>&1 )"
+sym_out="$(printf '%s\n' "$sym_out" | strip_ansi)"
+hasnt "$sym_out" "homelink" "R2 via a symlinked cwd: the message reports the resolved path, not the symlink"
+# The message must state BOTH remedies, not just "no".
+rm -f "$guard_log.run"
+guard_out="$( cd "$HOME" && AUGUR_TEST_SHIMLOG="$guard_log" bash "$AUGUR" up --no-egress 2>&1 )"
+guard_out="$(printf '%s\n' "$guard_out" | strip_ansi)"
+has "$guard_out" "subdirectory"             "guard: the refusal offers the move-into-a-subdirectory remedy"
+# NOT a bare "augur destroy": a SUCCESSFUL up prints that in its next-steps hint (augur:1636), so
+# the bare substring passes even with the guard neutered. Anchor on wording only the refusal has.
+has "$guard_out" "augur destroy here first" "guard: the refusal offers 'augur destroy' for a pre-fix container"
+
+# POSITIVE CONTROL — the guard must not swallow the normal case. A directory INSIDE $HOME that
+# is not $HOME and not ~/.augur still produces a real `container run`. Without this, deleting
+# every mount in cmd_up would leave the three assertions above passing.
+rm -f "$guard_log.run" "$guard_log.trace"
+( cd "$HOME/sub" && AUGUR_TEST_SHIMLOG="$guard_log" bash "$AUGUR" up --no-egress ) >/dev/null 2>&1
+sub_rc=$?
+eq "0" "$sub_rc" "positive control: up from \$HOME/sub exits 0"
+if [[ -f "$guard_log.run" ]]; then
+  ok "positive control: up from \$HOME/sub still constructs a 'container run'"
+  eq "run" "$(head -n1 "$guard_log.run")" "positive control: it is the engine 'run' subcommand"
+  has "$(cat "$guard_log.run")" "$HOME/sub:" "positive control: \$HOME/sub is the mount source"
+else
+  fail "positive control: no container run from \$HOME/sub" "the guard over-refuses"
+fi
+
 finish

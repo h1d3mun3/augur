@@ -264,6 +264,56 @@ else fail "bootstrap: a failed ssh must propagate non-zero" "got rc=$rc_f"; fi
 hasnt "$out_f" "SHOULD_NOT_PRINT" "bootstrap: set -e aborts the caller when the helper fails"
 eq "0" "$left_f" "bootstrap: temp askpass helper removed on the failure path too"
 
+section "Tier 1 — the containment guard covers macOS mode too (one call site, run anywhere)"
+# The workspace-containment refusal lives in the SHARED dispatch tail, not in cmd_up/cmd_up_macos
+# (docs/decisions/0014-workspace-must-not-contain-augur.md). This is the cross-mode proof of that:
+# `up --macos` from $HOME must refuse with the WORKSPACE message, not require_vz's "requires macOS".
+# Because the guard runs before dispatch reaches any cmd_*_macos — and therefore before require_vz —
+# this asserts real behaviour on the ubuntu CI runner, where require_vz would otherwise fire first.
+# Asserted on stderr rather than by extracting source: a source guard here would pass even with
+# the whole guard body deleted.
+guard_td="$(mktemp -d)"
+mkdir -p "$guard_td/home/.augur" "$guard_td/home/sub"
+# Sets $g_out (ANSI-stripped) and $g_rc. NOT a stdout-returning function: called inside `$(…)`
+# it would run in a subshell and $g_rc would never reach the parent.
+#
+# AUGUR_VM_BIN points at a path that does not exist, on purpose. This tier must never boot
+# anything, and on a developer's Mac that already has the base VM built, an `up --macos` the
+# guard correctly ALLOWS (the negative control below) would otherwise run on to clone and boot a
+# real project VM. An unresolvable backend makes require_vz the hard stop on every host, so the
+# only thing these cases can distinguish is WHICH refusal fires first — which is the point.
+guard_macos() {   # guard_macos <dir>
+  ( cd "$1" && HOME="$guard_td/home" AUGUR_VM_BIN="$guard_td/no-such-augur-vm" \
+      bash "$AUGUR" up --macos ) >"$guard_td/out" 2>&1
+  g_rc=$?
+  g_out="$(sed $'s/\033\\[[0-9;]*m//g' "$guard_td/out")"
+}
+
+guard_macos "$guard_td/home"
+if [[ "$g_rc" -ne 0 ]]; then ok "up --macos from \$HOME exits non-zero"
+else fail "up --macos from \$HOME exited 0" "the containment guard did not refuse"; fi
+has   "$g_out" "Refusing to share"  "up --macos from \$HOME refuses on the WORKSPACE rule"
+has   "$g_out" "your home directory" "up --macos names the rule it hit"
+# The two messages require_vz would have printed INSTEAD. Either one showing up here means the
+# guard is no longer in the shared dispatch tail — it was moved into a cmd_*_macos, and macOS
+# mode is unguarded again. One assertion covers each host: the OS check fires on Linux, the
+# backend check on a Mac.
+hasnt "$g_out" "requires macOS"     "the guard runs BEFORE require_vz's OS check (the Linux CI runner)"
+hasnt "$g_out" "was not found"      "the guard runs BEFORE require_vz's backend check (a Mac)"
+
+guard_macos "$guard_td/home/.augur"
+has   "$g_out" "augur's own directory" "up --macos from ~/.augur refuses on the AUGUR_DIR rule"
+hasnt "$g_out" "requires macOS"        "up --macos from ~/.augur refuses before require_vz too"
+
+# Negative control: a directory the guard PERMITS must fall THROUGH to require_vz. Without this,
+# a guard that refused everything unconditionally would pass every assertion above.
+guard_macos "$guard_td/home/sub"
+hasnt "$g_out" "Refusing to share" "up --macos from \$HOME/sub is NOT refused by the containment guard"
+if [[ "$(uname -s)" != "Darwin" ]]
+then has "$g_out" "requires macOS" "up --macos from \$HOME/sub falls through to require_vz (OS check)"
+else has "$g_out" "was not found"  "up --macos from \$HOME/sub falls through to require_vz (backend check)"; fi
+rm -rf "$guard_td"
+
 section "Tier 2 — macOS live smoke (gated)"
 if [[ "$(uname -s)" != "Darwin" ]]; then skip "live macOS checks" "not a macOS host"; finish; exit $?; fi
 if ! command -v augur-vm >/dev/null 2>&1; then skip "live macOS checks" "augur-vm not built (run: bash install)"; finish; exit $?; fi

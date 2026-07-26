@@ -8,6 +8,10 @@
 
 Run Claude Code in an isolated environment.
 Works in any directory — only the current directory is exposed to the container or VM.
+It must be a directory that does not contain augur itself: `augur up`/`claude`/`shell` refuse to run
+in `$HOME`, in `~/.augur`, or in any parent of either, because the workspace is shared **read-write**
+and those hold the binaries your host runs (see
+[ADR-0014](docs/decisions/0014-workspace-must-not-contain-augur.md)). Use a subdirectory instead.
 
 Two modes are available:
 
