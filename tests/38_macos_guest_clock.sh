@@ -114,9 +114,16 @@ ssh_macos() {
             g_offset "$G_SET_TO"
             date -u +'%a %b %e %H:%M:%S UTC %Y'            # what `date` prints when it sets
             return 0 ;;
-        *".augur-env"*)                                    # the credential push (cmd_up_macos)
-            cat >/dev/null; return 0 ;;
-        *".zshenv"*)          return 0 ;;
+        *"cat > "*".augur-env"*)                           # the credential push, which IS piped:
+            cat >/dev/null; return 0 ;;                    #  { … } | ssh_macos … "cat > ~/.augur-env"
+        *".zshenv"*)          return 0 ;;                  # MUST stay reachable: the .zshenv line is
+                                                           # `grep -q '.augur-env' ~/.zshenv || …`, so
+                                                           # a bare *".augur-env"* pattern above would
+                                                           # shadow it and drain the CALLER's stdin.
+                                                           # Harmless on CI (/dev/null) and in a
+                                                           # subagent; on a developer's TTY the whole
+                                                           # suite blocks on the keyboard. Measured.
+        *".augur-env"*)       return 0 ;;                  # any other command that merely names it
         *"exec zsh -l"*)      return 0 ;;                  # cmd_shell_macos' interactive launch
         *"zsh -l -c"*)        return 0 ;;                  # cmd_claude_macos' interactive launch
         *) echo "UNEXPECTED GUEST COMMAND: $cmd" >&2; return 1 ;;
