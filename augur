@@ -1229,8 +1229,12 @@ start_gvproxy() {
         exit 1
     fi
     sock="$(gvproxy_socket)"; pidfile="$(gvproxy_pidfile)"
-    rm -f "$sock"
     gvproxy_running && return 0
+    # Only once no live gvproxy owns this path: clear a socket left behind by a crashed one,
+    # or the -S wait at the end of this function succeeds instantly against a dead file. The
+    # unlink must stay BELOW the early return — above it, reusing a running gvproxy unlinked
+    # the socket the VM is about to attach to, and returned 0 as if all was well.
+    rm -f "$sock"
     info "Starting gvproxy (guest netstack → SOCKS5 allowlist)..."
     # --listen-vfkit: the socket the VM's NIC attaches to (one datagram = one frame).
     # --socks-upstream: send all guest TCP to augur-proxy by name for the allowlist
@@ -3643,8 +3647,12 @@ start_provision_gvproxy() {
         exit 1
     fi
     sock="$(provision_gvproxy_socket)"; pidfile="$(provision_gvproxy_pidfile)"
-    rm -f "$sock"
     provision_gvproxy_running && return 0
+    # Same ordering rule as start_gvproxy, for the same reason: the unlink clears a socket left
+    # behind by a crashed gvproxy (or the -S wait below succeeds instantly against a dead file),
+    # so it must stay BELOW the early return — above it, reusing a running gvproxy unlinked the
+    # socket run_base_provisioning is about to hand `vm run --net-vfkit`.
+    rm -f "$sock"
     info "Starting build-provisioning gvproxy..."
     local gvp_debug=()
     [[ "${AUGUR_DEBUG:-}" == "1" ]] && gvp_debug=(--debug)
