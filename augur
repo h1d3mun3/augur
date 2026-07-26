@@ -3119,6 +3119,140 @@ ensure_macos_git_credential_helper() {
     return 0
 }
 
+# Tolerance, in seconds, for BOTH the "is it worth correcting" test and the read-back below. One
+# constant on purpose: two numbers would drift apart, and the pair only makes sense if the value we
+# refuse to correct is the same value we accept afterwards. 5s is chosen against what actually
+# consumes the clock — JWT `nbf`/`exp` windows (minutes), X.509 validity (days), TLS handshakes —
+# none of which can tell 5s from 0. It is also comfortably above the noise floor: the drift below is
+# measured across an SSH round-trip through gvproxy's forward and both clocks are read at whole-second
+# granularity, so |drift| of 0–1 is normal on a correct guest and must not trigger a `sudo` write.
+_MACOS_CLOCK_TOLERANCE_S=5
+
+# Set the guest's wall clock from the HOST's, over SSH, on every path that hands a guest to the agent.
+#
+# THE DEFECT. A cloned macOS guest boots with a CLOCK_REALTIME that is a fixed offset behind the
+# host's — measured on this host at -5733s (95.6 min), with `kern.monotoniclock_offset_usecs`
+# byte-identical across two different boots and unchanged across 7h36m of uptime, and
+# `kern.sleeptime`/`kern.waketime` both zero. So it is not accumulated suspend time: it is a constant
+# baked into the base VM's persisted state and inherited by every clone, and nothing in augur ever
+# corrected it. The guest's `kern.monotonicclock` meanwhile tracks the host's wall clock exactly,
+# which is why the skew is invisible to anything that measures a DURATION and lethal to anything that
+# compares an ABSOLUTE instant.
+#
+# WHY IT MATTERS, worst first. A JWT issued by the host's `gh`/`claude setup-token` at time T is
+# handed to a guest that believes it is T-95min, so `nbf`/`iat` can put a freshly minted token in the
+# FUTURE and the agent refuses its own credential; `exp` on a short-lived token is the mirror case.
+# Then git commit timestamps land 95 min in the past, `gh` API request signing sees a skewed clock,
+# and TLS certificate validity windows are evaluated 95 min early — the last is normally harmless
+# (windows are days wide) but a certificate rotated within the last 95 minutes is not yet valid to
+# this guest, which in verify_macos_egress_locked's positive half reads as "allowlisted egress does
+# not work" and tears down a perfectly good VM.
+#
+# WHY NOT NTP. The obvious fix — let the guest sync time itself — cannot work here and must not be
+# made to. NTP is UDP/123; augur.conf is a SOCKS5/TCP name allowlist, so adding a time server to it
+# forwards nothing. And per gvproxy/augur-egress.patch, `--deny-direct` does not register the UDP or
+# ICMP forwarders at all, so UDP has no path out of the datapath regardless of the allowlist. Opening
+# one would be a straight security regression against INVARIANTS.md I9 ("the gvproxy patch drops
+# UDP/ICMP"), which verify_macos_egress_locked now actively self-tests. See
+# docs/decisions/0015-guest-clock-from-host.md.
+#
+# WHY THE HOST'S CLOCK AND NOT THE GUEST'S OWN `kern.monotonicclock`. The guest does hold a correct
+# wall clock in that sysctl, and reading it would need no host round-trip — but `monotonicclock` is
+# only specified as a clock `settimeofday` cannot perturb, not as "the host's wall clock". That it
+# matches the host here is an artifact of this hypervisor seeding the guest timebase from the host's;
+# nothing guarantees it on another host, another Virtualization.framework version, or a base VM whose
+# monotonic base was itself seeded from the same stale persisted state — and a guest reading its own
+# bad clock has no way to notice. The host is a real NTP-synced Mac and is already the authority for
+# everything else augur pushes in (credentials, ~/.gitconfig, the managed policy, the allowlist), so
+# it is the authority for time too. The cost is transfer accuracy: the value is stale by one SSH
+# round-trip (tens of ms locally, and the read-back below bounds the total at
+# _MACOS_CLOCK_TOLERANCE_S), which is three orders of magnitude below the 5733s being fixed.
+#
+# The push shape is install_macos_managed_settings': `echo <user> | sudo -S -p ''`. A project clone
+# has NO passwordless sudo — cmd_build_macos revokes /etc/sudoers.d/augur before saving the base VM —
+# so `sudo -S` fed the documented fixed password (ADR-0007) is the established, and only, way augur
+# runs a privileged command in a project guest. This takes no privilege augur's build does not
+# already take, and ADR-0001's sudo-free rule is about the HOST (its examples are host `pf` rules and
+# the bridged-networking entitlement), which is untouched. `/bin/date` is absolute for the same
+# reason verify_macos_egress_locked pins PATH: ~/.augur-env puts $HOME/.local/bin first in every
+# guest shell and the clone survives `down --macos`, so a bare `date` is shadowable by a prior guest
+# session. That is hygiene, not a security control — the clock is not a boundary, and a guest that
+# can lie about it can also lie on the read-back.
+#
+# BEST-EFFORT, never fatal. A guest with a wrong clock is degraded, not uncontained: it is the
+# opposite of verify_macos_egress_locked, whose hard `exit 1` exists because I1 makes an unverifiable
+# datapath a security failure. Aborting here would also abort with the VM already cloned, sized,
+# booted and SSH-reachable — the stranded-guest shape the pre-clone credential check was written to
+# remove — in exchange for a condition every augur before this one shipped with. So: warn, name the
+# consequence, continue, exactly as the profile wiring and the git credential helper do.
+#
+# The guest's CLOCK_REALTIME in epoch seconds, or nothing at all. One reader for both the drift
+# measurement and the read-back, so there is no second validator to drift from the first. The shape
+# is checked rather than scrubbed: `ssh <host> <cmd>` runs the command under the guest's zsh, which
+# sources ~/.zshenv (and therefore augur's own ~/.augur-env), so anything that ever printed on that
+# path would otherwise be spliced into the number and silently move the clock.
+_macos_guest_epoch() {
+    local raw
+    raw="$(ssh_macos "$1" '/bin/date +%s' 2>/dev/null || true)"
+    raw="${raw//[[:space:]]/}"
+    if [[ "$raw" =~ ^[0-9]{10,11}$ ]]; then printf '%s' "$raw"; fi
+    return 0
+}
+
+sync_macos_guest_clock() {
+    local vm="$1" tol="$_MACOS_CLOCK_TOLERANCE_S" host_epoch guest_epoch drift adrift stamp setout
+    # Read first. This is what makes the correction idempotent across the four call sites (a second
+    # `up`, or a `claude`/`shell` attach, must not re-`sudo` a guest that is already right), and it
+    # is also the only way to report HOW far off the guest was rather than just "we set the clock".
+    host_epoch="$(date +%s)"
+    guest_epoch="$(_macos_guest_epoch "$vm")"
+    if [[ -z "$guest_epoch" ]]; then
+        warn "Could not read the guest's clock over SSH; leaving it as it is."
+        warn "  A guest clock behind the host's can make a freshly issued token look not-yet-valid."
+        return 0
+    fi
+    drift=$(( guest_epoch - host_epoch )); adrift="${drift#-}"
+    if (( adrift <= tol )); then return 0; fi
+
+    info "Guest clock is ${drift}s off the host's — correcting from the host."
+    # Stamped fresh, NOT derived from the $host_epoch read before the round-trip above, so the value
+    # sent is the host's time now. `date`'s own positional setting format — [[[mm]dd]HH]MM[[cc]yy][.SS]
+    # read as UTC under -u — is used rather than a `-f %s` parse: it is what the guest's `date(1)`
+    # documents in its synopsis, and `+%m%d%H%M%Y.%S` needs only POSIX conversion specifiers on the
+    # host side, so this line does not depend on BSD `date` (`date -r <seconds>` would have, and the
+    # offline test tier runs on a Linux runner).
+    stamp="$(date -u +%m%d%H%M%Y.%S)"
+    setout="$(ssh_macos "$vm" "echo '${MACOS_SSH_USER}' | sudo -S -p '' /bin/date -u '${stamp}'" 2>&1)" || {
+        warn "Could not set the guest's clock (${drift}s off the host's): ${setout%%$'\n'*}"
+        warn "  Tokens, TLS validity windows and commit timestamps in the guest will use that skewed clock."
+        return 0
+    }
+
+    # VERIFY, do not trust the exit status. It only covers the two failures `sudo`/`date` report —
+    # a rejected password and a malformed stamp. It cannot see the third: /usr/libexec/timed is
+    # running in the guest, and `systemsetup -getusingnetworktime` needs root even to READ, so augur
+    # cannot cheaply know whether network time is on. In augur's own datapath timed has no reference
+    # to step back to (UDP/123 is dropped, see above — measured: this offset held byte-identical for
+    # 7h36m with timed live), and under --no-egress NAT it would correct the clock to the same answer
+    # anyway. But "the command exited 0 and the clock is still wrong" is precisely the silent case a
+    # read-back turns into a named warning, for one extra round-trip on a path that already makes a
+    # dozen.
+    host_epoch="$(date +%s)"
+    guest_epoch="$(_macos_guest_epoch "$vm")"
+    if [[ -z "$guest_epoch" ]]; then
+        warn "Set the guest's clock but could not read it back to confirm."
+        return 0
+    fi
+    drift=$(( guest_epoch - host_epoch )); adrift="${drift#-}"
+    if (( adrift > tol )); then
+        warn "The guest's clock is still ${drift}s off the host's after being set."
+        warn "  Something in the guest is overriding it; tokens and TLS validity may be misjudged there."
+        return 0
+    fi
+    success "Guest clock synchronised with the host (within ${adrift}s)."
+    return 0
+}
+
 
 cmd_up_macos() {
     require_vz
@@ -3150,6 +3284,13 @@ cmd_up_macos() {
         fi
         # …and the half a live VM genuinely cannot pick up. Warn; do not pretend to have applied it.
         warn_if_macos_egress_pinned "$project_vm"
+        # The one guest-side thing this branch CAN still reconcile. The measured offset is a
+        # boot-invariant constant, so a single correction per boot is enough for the defect as
+        # observed — but a VM this branch exists to serve is by definition long-lived (`down --macos`
+        # keeps the clone, ADR-0006/0010), and a guest paused while the host sleeps has its
+        # CLOCK_REALTIME frozen while the host's advances, which would reintroduce drift no boot-time
+        # correction can reach. Idempotent: it re-reads first and only writes when it must.
+        sync_macos_guest_clock "$project_vm"
         # I1's tripwire on THIS path too, mirroring container mode: finish_up (and therefore
         # verify_egress_locked) runs on cmd_up's already-running branch, and ADR-0010 already
         # accepted the consequence — "`augur up` against a running container can now end an
@@ -3279,6 +3420,17 @@ cmd_up_macos() {
         exit 1
     }
 
+    # Correct the guest's clock before ANYTHING that judges an absolute instant runs. Everything
+    # below this line does: the self-test's TLS handshakes evaluate certificate validity windows, the
+    # ~/.augur-env push hands over a JWT whose `nbf`/`exp` the agent will check against this clock,
+    # and the git credential helper's token is the same object. It is deliberately the one step that
+    # precedes I1's tripwire, and that is safe for a reason the tripwire's own comment names: what
+    # must not reach an uncontained guest is a CREDENTIAL, and the host's wall-clock time is not one
+    # — the guest can already read it off the mtimes of the virtiofs share it is mounting. Going
+    # second instead would leave the self-test's own positive half judging a certificate window 95
+    # minutes early, i.e. able to tear down a healthy VM over a certificate rotated minutes ago.
+    sync_macos_guest_clock "$project_vm"
+
     # I1's boot tripwire, as early as it can possibly run: the moment a command can be run in the
     # guest, and BEFORE any of the wiring below — in particular before ~/.augur-env pushes an
     # Anthropic token and a gh token into it. A guest whose egress is not contained is exactly the
@@ -3381,6 +3533,13 @@ cmd_claude_macos() {
     local project_vm
     project_vm="$(macos_project_vm)"
     macos_vm_running "$project_vm" || cmd_up_macos
+    # Here for the same reason warn_if_macos_profile_stale and warn_if_macos_egress_pinned are: on an
+    # already-running VM this command skips cmd_up_macos entirely, so anything an `up` does for the
+    # guest has to be done here too or it never happens. This is the site where a skewed clock costs
+    # the most — the interactive launch below hands a JWT to the agent, and a token minted on the host
+    # seconds ago looks NOT-YET-VALID to a guest sitting 95 minutes in the past. Cheap and idempotent
+    # (a read, then a write only if needed) against the half-dozen SSH round-trips already below.
+    sync_macos_guest_clock "$project_vm"
     ensure_macos_workspace "$project_vm"
     ensure_macos_claude_projects "$project_vm"
     ensure_macos_claude_agents "$project_vm"
@@ -3400,6 +3559,10 @@ cmd_shell_macos() {
     local project_vm
     project_vm="$(macos_project_vm)"
     macos_vm_running "$project_vm" || cmd_up_macos
+    # Same rationale as cmd_claude_macos': this path attaches to a running guest without going
+    # through `up`. A shell is where the operator runs `git`, `gh` and `curl` by hand, all of which
+    # sign, stamp or validate against this clock.
+    sync_macos_guest_clock "$project_vm"
     ensure_macos_workspace "$project_vm"
     ensure_macos_claude_projects "$project_vm"
     ensure_macos_claude_agents "$project_vm"

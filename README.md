@@ -280,6 +280,18 @@ every `up` (the same way it does for the GitHub token):
   back once and augur saves it to `~/.claude_code_oauth_token`.
 - `ANTHROPIC_API_KEY` — Console API key (env or `~/.anthropic_api_key`). Takes priority if both are set.
 
+### Guest clock
+
+A cloned macOS guest boots with its wall clock a fixed amount **behind** the host's (measured at ~95
+minutes on the machine this was found on — a constant inherited from the base VM's saved state, not
+drift), and it cannot fix itself: NTP is UDP/123 and macOS VM egress drops UDP by design. So augur
+**sets the guest's clock from the host's** over SSH — on `up --macos` (both a fresh boot and a
+reconcile of an already-running VM) and on `claude`/`shell --macos`, which attach without going
+through `up`. It runs before the token is injected, because a token minted on the host seconds ago
+looks *not yet valid* to a guest sitting in the past. Best-effort: if it cannot be set you get a
+warning, not a failed `up`. See
+[`docs/decisions/0015-guest-clock-from-host.md`](docs/decisions/0015-guest-clock-from-host.md).
+
 ### File access
 
 | Path | Description |

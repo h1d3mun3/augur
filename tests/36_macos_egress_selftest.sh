@@ -116,6 +116,12 @@ ssh_macos() {
             return 28 ;;
         *".augur-env"*)                                # the credential push (cmd_up_macos sections)
             cat >/dev/null; return 0 ;;
+        "/bin/date +%s")                               # the guest-clock sync that now precedes the
+            printf '%s\n' "$(date +%s)"; return 0 ;;    # self-test on both up paths (tests/38 owns
+                                                       # it). Answering with the host's own clock
+                                                       # models an already-correct guest, so no
+                                                       # privileged set follows and this fixture
+                                                       # stays about egress.
         *)
             echo "UNEXPECTED PROBE: $cmd" >&2; return 1 ;;
     esac
