@@ -3467,10 +3467,31 @@ cmd_down_macos() {
         return 0
     fi
     info "Stopping VM '${project_vm}'..."
+    # Keep the `|| true` (a stop failure must not abort the rest of this teardown), but re-check the
+    # REAL state instead of reporting success unconditionally — the same re-check cmd_down does after
+    # its `eng stop`, for the same reason, and it matters more here. `augur-vm stop` swallows its
+    # diagnostics (2>/dev/null) and exits 0 even on its force-kill path, so the one case that counts
+    # — the signal never landed (a `run` process this host user cannot signal, or a stop that errored
+    # before signalling at all) — is otherwise completely invisible, and this function's last word
+    # would be "stopped" about a VM that is still executing. Unlike container mode's version of that
+    # lie, gvproxy and the proxy are ALREADY down by this point (see the top of the function), so the
+    # guest keeps running with this workspace still shared into it while no augur command can reach
+    # it any more: ssh_macos routes through gvproxy's forward when gvproxy is up and falls back to a
+    # DHCP lease that a vfkit-networked guest never had. Do NOT drop this as redundant on the grounds
+    # that a bounded stop "cannot fail" — the bound is what makes it exit 0, not what makes it work.
     "$VM_CLI" stop "$project_vm" 2>/dev/null || true
-    success "VM '${project_vm}' stopped (clone kept; CoW so it costs ~0 on disk)."
-    echo -e "  ${BOLD}augur up --macos${RESET}      → restart it (fast, no re-clone)"
-    echo -e "  ${BOLD}augur destroy --macos${RESET} → remove the clone entirely"
+    if macos_vm_running "$project_vm"; then
+        warn "VM '${project_vm}' did NOT stop — it is still running, with its egress datapath already torn down."
+        warn "The guest keeps running and keeps writing to ${WORKSPACE_DIR} through its share, and no augur"
+        warn "command can reach it again (SSH goes through the gvproxy this teardown just stopped)."
+        warn "Kill its VM process, then re-run the teardown:"
+        warn "  ${BOLD}kill \$(cat ~/.augur/vms/${project_vm}/run.pid) && augur down --macos${RESET}"
+        warn "${BOLD}augur destroy --macos${RESET} cannot help while it runs — 'augur-vm delete' refuses a running VM."
+    else
+        success "VM '${project_vm}' stopped (clone kept; CoW so it costs ~0 on disk)."
+        echo -e "  ${BOLD}augur up --macos${RESET}      → restart it (fast, no re-clone)"
+        echo -e "  ${BOLD}augur destroy --macos${RESET} → remove the clone entirely"
+    fi
 }
 
 cmd_destroy_macos() {
@@ -3485,6 +3506,14 @@ cmd_destroy_macos() {
     fi
     info "Stopping and removing VM '${project_vm}'..."
     "$VM_CLI" stop "$project_vm" 2>/dev/null || true
+    # No `|| true` on the delete, and that is what makes this path need no re-check of its own
+    # (cmd_down_macos's, above, is not redundant here — it is unreachable). `augur-vm delete`
+    # validates that the VM is NOT running and refuses otherwise, so a stop that failed above turns
+    # into a hard, visible failure right here: the message reaches the terminal (no 2>/dev/null) and
+    # `set -e` aborts before the "has been removed" success below. Adding `|| true` to this line
+    # would reintroduce exactly the defect `down --macos` had — a false success over a live VM whose
+    # egress datapath is already gone — so if this ever needs to tolerate a delete failure, it needs
+    # a `macos_vm_running` re-check first, not a swallowed exit status.
     "$VM_CLI" delete "$project_vm"
     # Drop the pinned SSH host key so the next clone (which will have a new key) is
     # not rejected against this project's fixed 127.0.0.1:<fwd-port> egress target.
