@@ -1529,7 +1529,38 @@ verify_macos_egress_locked() {
     # unreachable, so an unverifiable datapath must be named as such rather than reported as
     # isolated. It still fails CLOSED (same teardown) — container mode does the same thing when
     # `eng exec` stops working, because its proxy probe then returns no status either.
-    if ! ssh_macos "$vm" "${pp} true" &>/dev/null; then
+    #
+    # RESOLVABILITY is checked BEFORE the first probe, and separately, because ssh_macos does not
+    # RETURN when it cannot name a host for the VM — it `exit 1`s the whole script:
+    #     host="$(macos_ssh_host "$vm")"; [[ -n "$host" ]] || { error …; exit 1; }
+    # Every probe below invokes it under `&>/dev/null` or inside `$( … )`, so that exit was
+    # UNOBSERVABLE and, being an exit rather than a non-zero return, it jumped clean over the
+    # fail-closed teardown at the bottom of this function — leaving precisely the live VM with a live
+    # NIC that the teardown exists to prevent, and ending `up --macos` at rc=1 with no diagnostic at
+    # all. The `cannot run a command` branch below was written for this very situation and could
+    # never be reached in it.
+    #
+    # The state is reachable, not theoretical: a RUNNING VM with gvproxy DOWN. macos_ssh_host then
+    # falls back to `augur-vm ip`, which a vfkit-networked guest has no DHCP lease to answer, so it
+    # prints nothing. tests/37_macos_down_verify.sh's header predicted this exact chain from
+    # `cmd_down_macos` stopping gvproxy first; `make e2e` then reproduced it verbatim on the
+    # already-running reconcile branch (2026-07-26).
+    #
+    # Fixing it HERE rather than in ssh_macos is deliberate: turning that `exit 1` into `return 1`
+    # would change the failure mode of all 47 call sites at once, many of which rely on `set -e`
+    # aborting the operation. Checking the same condition first is local and total — once a host
+    # resolves, ssh_macos has no other exit path, so every probe below is covered.
+    if [[ -z "$(macos_ssh_host "$vm")" ]]; then
+        error "Self-test: no SSH transport to '${vm}' — egress cannot be VERIFIED."
+        error "  The VM is running but gvproxy is not, so nothing on the host can reach the guest."
+        error "  gvproxy cannot be restarted under a live VM (its unixgram socket IS the guest's"
+        error "  NIC), so this fails closed and stops the VM below; \`augur up --macos\` then boots a"
+        error "  fresh guest with a working datapath."
+        leaked=true
+    # A host that resolves can still be unreachable (gvproxy dying between the check above and the
+    # probe below is a genuine, if narrow, race). That lands here rather than in the branch above:
+    # same fail-closed verdict, less specific remedy.
+    elif ! ssh_macos "$vm" "${pp} true" &>/dev/null; then
         error "Self-test: cannot run a command in the guest over SSH — egress cannot be VERIFIED."
         leaked=true
     else
