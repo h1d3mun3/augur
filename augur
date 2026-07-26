@@ -372,6 +372,39 @@ validate_secret_value() {
     return 0
 }
 
+# Resolve every credential an `up` would inject and validate each value, injecting NOTHING.
+# This is the CHECK half of the auth seam, split from the PUSH half so it can run before anything
+# irreversible happens: resolution reads only host env vars, host files and `gh auth token`, while
+# the push needs a booted guest (macOS mode writes ~/.augur-env over SSH).
+#
+# WHY IT EXISTS: macOS mode used to do both in one place, AFTER `augur-vm clone`, `augur-vm set` and
+# `augur-vm run` plus the SSH wait — so a value that could not be safely injected aborted `up` with
+# a VM already cloned, sized and BOOTED, and (unlike the SSH-timeout path just above it) nothing torn
+# down. The operator fixed the value, re-ran `up --macos`, and hit the already-running branch, which
+# by design cannot re-push ~/.augur-env — so the guest kept running with no credentials at all, and
+# the only remedy was `down --macos && up --macos`. Container mode always checked before
+# `container run`; this is what brings macOS into line. cmd_up_macos calls it before the clone.
+#
+# Deliberately NOT an error: an ABSENT credential. A guest with no token is a supported state in both
+# modes (`augur setup-token` runs `claude setup-token` inside it), so this refuses only a value that
+# exists and cannot be injected — exactly what container mode refuses. Fails closed, and the message
+# still names the offending variable because validate_secret_value does.
+# AUGUR_AGENT_SEAM | credential CHECK — the agent DECLARES names + host sources (agent_auth_specs)
+# and the core owns both the resolver (resolve_api_key) and the validator (validate_secret_value).
+# CONTRACT (C3): a future multi-agent build adds its per-spec VALIDATOR field here, in ONE place,
+# rather than at each injection site.
+validate_resolved_credentials() {
+    local _genv _henv _hfile _hvalidator _aval _gh
+    _gh="$(gh auth token 2>/dev/null || true)"
+    [[ -n "$_gh" ]] && { validate_secret_value GH_TOKEN "$_gh" || return 1; }
+    while IFS='|' read -r _genv _henv _hfile _hvalidator; do
+        [[ -z "$_genv" ]] && continue
+        _aval="$(resolve_api_key "${!_henv:-}" "$_hfile")"
+        [[ -n "$_aval" ]] && { validate_secret_value "$_genv" "$_aval" || return 1; }
+    done < <(agent_auth_specs)
+    return 0
+}
+
 # Persist a captured Claude subscription token to the host token file augur reads on
 # every `up` (resolve_api_key picks it up as CLAUDE_CODE_OAUTH_TOKEN). Validates the
 # shape and writes it 0600. The host never needs claude installed for this.
@@ -2949,6 +2982,18 @@ cmd_up_macos() {
     # (only relevant when egress filtering is on).
     if egress_enabled; then check_project_conf_approved; fi
 
+    # Resolve and validate the credentials this `up` will inject BEFORE anything irreversible
+    # happens — before the clone, before `augur-vm set`, before `augur-vm run`. Container mode has
+    # always checked before `container run`; macOS mode checked only down at the ~/.augur-env writer,
+    # i.e. after a VM had been cloned, sized and booted, and its `exit 1` tore none of that down. The
+    # retry then hit the already-running branch above, which cannot re-push ~/.augur-env, so the
+    # operator was left with a live credential-less guest. Nothing here needs the guest: resolution
+    # reads host env vars, host files and `gh auth token`. Placed ABOVE the _fresh_clone split on
+    # purpose — a reused stopped clone must fail before `set`/`run` too, not just a fresh one — and
+    # BELOW the already-running branch, which injects no credentials and must stay a pure host-side
+    # reconcile. The PUSH stays where it must (see the writer below); this is only the check.
+    validate_resolved_credentials || exit 1
+
     local _fresh_clone=false
     if ! macos_vm_exists "$project_vm"; then
         _fresh_clone=true
@@ -3094,16 +3139,16 @@ cmd_up_macos() {
     # before this point. See docs §4 C3.
     local gh_token _genv _henv _hfile _hvalidator _aval
     gh_token="$(gh auth token 2>/dev/null || true)"
-    # Pre-validate every secret BEFORE writing ~/.augur-env: these values are interpolated into a
-    # SOURCED shell file as `export VAR='<value>'`, so a stray single quote / control byte would
-    # inject shell into every guest session. A validate_secret_value failure inside the pipe below
-    # would only exit the subshell, so gate here where `exit 1` aborts the whole `up` (fail-closed).
-    [[ -n "$gh_token" ]] && { validate_secret_value GH_TOKEN "$gh_token" || exit 1; }
-    while IFS='|' read -r _genv _henv _hfile _hvalidator; do
-        [[ -z "$_genv" ]] && continue
-        _aval="$(resolve_api_key "${!_henv:-}" "$_hfile")"
-        [[ -n "$_aval" ]] && { validate_secret_value "$_genv" "$_aval" || exit 1; }
-    done < <(agent_auth_specs)
+    # Re-run the SAME check immediately before the write — one helper, no second validator to drift.
+    # The early call (above the clone) is what keeps a bad credential from booting a VM; this one
+    # covers the window between the two, which spans a clone and a full guest boot and is therefore
+    # minutes long: the env var is fixed for the process, but a credential FILE can be rewritten in
+    # it, and the loop below RE-RESOLVES every value at write time. These values are interpolated
+    # into a SOURCED shell file as `export VAR='<value>'`, so a stray single quote / control byte
+    # would inject shell into every guest session. It stays OUT of the pipe below because a
+    # validate_secret_value failure in there would exit only that subshell, whereas `exit 1` here
+    # aborts the whole `up` (fail-closed).
+    validate_resolved_credentials || exit 1
     {
         echo '# augur (regenerated at VM startup)'
         echo 'eval "$(/opt/homebrew/bin/brew shellenv)" 2>/dev/null || true'
