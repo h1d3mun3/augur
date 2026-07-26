@@ -125,11 +125,12 @@ export AUGUR_TEST_CONTAINER_NAME="$cname"
 rm -f "$AUGUR_TEST_SHIMLOG.trace"
 ( cd "$proj" && bash "$AUGUR" claude ) >/dev/null 2>&1 || true
 ex="$AUGUR_TEST_SHIMLOG.exec"
-# `cmd_claude` issues MORE than one exec now: apply_guest_profile (re-wiring, since cmd_up short-
-# circuits to a no-op when the container is ALREADY running and would otherwise skip finish_up —
-# see the augur comment at the call site), the interactive launch, then the prompt-history snapshot
-# on the way out. The shim's .exec file keeps only the LAST argv, so pull the launch line (the ONE
-# `-it` exec) out of the cumulative trace rather than assuming position.
+# `cmd_claude` issues MORE than one exec now: apply_guest_profile (re-wiring, since an
+# ALREADY-RUNNING container never reaches cmd_up at all — `container_running || cmd_up` — so
+# finish_up and the apply_guest_profile inside it never run; see the augur comment at the call
+# site), the interactive launch, then the prompt-history snapshot on the way out. The shim's .exec
+# file keeps only the LAST argv, so pull the launch line (the ONE `-it` exec) out of the cumulative
+# trace rather than assuming position.
 launch_line="$(grep -E '^container exec -it ' "$AUGUR_TEST_SHIMLOG.trace" | tail -n1)"
 if [[ -f "$ex" && -n "$launch_line" ]]; then
   body="$launch_line"
@@ -339,12 +340,14 @@ besteffort="$(AUGUR_CARRY_TD="$ctd" bash -c '
 has "$besteffort" "REACHED_NEXT_STATEMENT" "carry-over: a failing snapshot never aborts the caller under set -euo pipefail"
 
 # ── Re-wiring while the container is ALREADY running (real bug, found in live testing) ──────
-# cmd_up short-circuits to a no-op ("already running") without ever calling finish_up when the
-# container is already up — the common case of repeated `claude`/`shell` calls with no intervening
-# `down`. That skipped apply_guest_profile entirely, so a STRUCTURAL profile change (an entry
-# added/removed/replaced) was invisible until the operator ran `down` first, contradicting the
-# documented "the next `augur claude` picks it up." Assert cmd_claude/cmd_shell wire the profile
-# themselves, not only via cmd_up, by driving them with the container already RUNNING.
+# `claude`/`shell` route through cmd_up only when the container is NOT running
+# (`container_running || cmd_up`), so on the common case — repeated `claude`/`shell` calls with no
+# intervening `down` — finish_up never runs. That skipped apply_guest_profile entirely, so a
+# STRUCTURAL profile change (an entry added/removed/replaced) was invisible until the operator ran
+# `down` first, contradicting the documented "the next `augur claude` picks it up." Assert
+# cmd_claude/cmd_shell wire the profile themselves, not only via cmd_up, by driving them with the
+# container already RUNNING. (cmd_up's own already-running path now reconciles rather than
+# no-opping — see tests/34_up_reconcile.sh — but it is still not on this path.)
 section "Tier 1 — profile re-wiring when the container is already running (the live-testing bug)"
 export AUGUR_TEST_CONTAINER_RUNNING=1
 rm -f "$AUGUR_TEST_SHIMLOG.trace"

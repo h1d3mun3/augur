@@ -172,4 +172,62 @@ c_out="$(write_merged_allowlist)"
 hasnt "$(cat "$c_out")" "a-only.example.com" "a conf-less sibling's own policy carries no other project's domains"
 has   "$(cat "$a_out")" "a-only.example.com" "a bare up in a conf-less same-basename dir leaves A's live policy intact"
 
+section "Tier 0 — write_merged_allowlist is CONTENT-idempotent (its mtime is a signal, not metadata)"
+
+# The file used to carry a "generated at <date>" header rewritten on EVERY call, so its mtime bumped
+# unconditionally. Two consumers read that mtime as a POLICY-CHANGED signal:
+#   • augur-proxy hot-reloads on mtime change (main.swift polls every ~2s) — so every `up` forced a
+#     pointless reload of a byte-identical policy;
+#   • warn_if_macos_egress_pinned compares this file against the gvproxy pidfile to detect a DNS
+#     allowlist gvproxy snapshotted BEFORE the policy changed — which would have cried wolf forever.
+# Asserted with `-nt` against a reference file rather than by parsing timestamps: no `stat` portability
+# (BSD `-f %m` vs GNU `-c %Y`) and no clock arithmetic. Same technique as warn_if_macos_profile_stale.
+TEST_PATH_HASH="hash-idempotence"
+printf 'idem.example.com\n' > "$AUGUR_PROJECT_CONF"
+AUGUR_ACCEPT_PROJECT_CONF=1 check_project_conf_approved >/dev/null 2>&1
+i_out="$(write_merged_allowlist)"                 # baseline write
+has "$(cat "$i_out")" "idem.example.com" "baseline: the approved domain is in the merged policy"
+
+# Stamp the reference NOW, then sleep — so every later write lands STRICTLY after it. (Stamping the
+# reference after the sleep instead would put it in the same second as the next write, and `-nt`
+# is false on equal timestamps: the assertion would pass even against an unconditional rewrite.)
+touch "$WORK/ref"
+sleep 1
+i_out2="$(write_merged_allowlist)"                # identical inputs → must NOT touch the live file
+eq "$i_out" "$i_out2" "the return value is unchanged across calls (start_proxy consumes it)"
+if [[ "$i_out" -nt "$WORK/ref" ]]; then
+  fail "a content-identical rewrite must NOT bump the mtime" "the generated-at header is back, or the compare ignores it"
+else
+  ok "a content-identical rewrite leaves the live file (and its mtime) untouched"
+fi
+has "$(cat "$i_out")" "idem.example.com" "…and the policy itself is intact after the no-op call"
+
+# A REAL policy change must still land — and bump the mtime, or augur-proxy would never hot-reload it.
+sleep 1
+printf 'idem.example.com\nsecond.example.com\n' > "$AUGUR_PROJECT_CONF"
+AUGUR_ACCEPT_PROJECT_CONF=1 check_project_conf_approved >/dev/null 2>&1
+write_merged_allowlist >/dev/null
+if [[ "$i_out" -nt "$WORK/ref" ]]; then ok "a CHANGED approved snapshot does bump the mtime (the proxy reloads)"
+else fail "a changed policy did not bump the mtime" "augur-proxy would keep enforcing the old policy"; fi
+has "$(cat "$i_out")" "second.example.com" "…and the newly approved domain is honored"
+
+# A REVOCATION is the direction that matters most: it must land too, not just an addition.
+sleep 1
+printf 'idem.example.com\n' > "$AUGUR_PROJECT_CONF"
+AUGUR_ACCEPT_PROJECT_CONF=1 check_project_conf_approved >/dev/null 2>&1
+write_merged_allowlist >/dev/null
+hasnt "$(cat "$i_out")" "second.example.com" "a revoked domain is removed from the merged policy"
+
+# The same-directory temp file must never be left behind: the proxy dir is gvproxy's --dns-allowlist
+# neighbourhood, and a leaked copy of the policy is host-side clutter with a stale mtime.
+leftovers="$(find "$AUGUR_PROXY_DIR" -name '*.allowlist.??????' 2>/dev/null | wc -l | tr -d ' ')"
+eq "0" "$leftovers" "no staging temp file is left in the proxy dir"
+
+# The fail-closed missing-snapshot branch must survive the rewrite: no snapshot ⇒ the project block
+# is OMITTED (a narrower policy) and an error is surfaced, never a fresh read of the live conf.
+rm -f "$(project_conf_hash_file).domains"
+nosnap_err="$(write_merged_allowlist 2>&1 >/dev/null)"
+hasnt "$(cat "$i_out")" "idem.example.com" "no approved snapshot → the project block is omitted (fail closed)"
+has   "$nosnap_err" "No approved snapshot" "…and the omission is reported, not silent"
+
 finish
