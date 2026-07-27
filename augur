@@ -3573,6 +3573,12 @@ verify_macos_share_freshness() {
 _MACOS_REFRESH_INTERVAL="${AUGUR_MACOS_REFRESH_INTERVAL:-5}"
 
 share_refresher_pidfile() { echo "$AUGUR_PROXY_DIR/$(workspace_slug)-$(workspace_path_hash)-refresher.pid"; }
+# A background loop has nowhere to warn TO — the operator is inside `claude`, not watching the shell
+# that started it. Without this the loop's failures went to /dev/null, so the one property the quiet
+# mode was designed to keep ("a failing sweep still warns") reached nobody, and a session whose
+# refresher had been failing for an hour looked identical to a healthy one. Same shape and same
+# directory as proxy_logfile / gvproxy_log / macos_vm_log.
+share_refresher_logfile() { echo "$AUGUR_PROXY_DIR/$(workspace_slug)-$(workspace_path_hash)-refresher.log"; }
 
 share_refresher_running() {
     local pf; pf="$(share_refresher_pidfile)"
@@ -3582,8 +3588,8 @@ share_refresher_running() {
 }
 
 start_share_refresher() {
-    local vm="$1" pf
-    pf="$(share_refresher_pidfile)"
+    local vm="$1" pf lf
+    pf="$(share_refresher_pidfile)"; lf="$(share_refresher_logfile)"
     share_refresher_running && return 0
     mkdir -p "$AUGUR_PROXY_DIR"
 
@@ -3595,10 +3601,12 @@ start_share_refresher() {
         while macos_vm_running "$vm"; do
             sleep "$_MACOS_REFRESH_INTERVAL"
             macos_vm_running "$vm" || break
-            refresh_macos_shares "$vm" quiet >/dev/null 2>&1
+            # NOT silenced here: `quiet` already suppresses the routine report, and what is left is
+            # exactly the warnings that must survive — they land in the log rather than nowhere.
+            refresh_macos_shares "$vm" quiet
         done
         rm -f "$pf" 2>/dev/null || true
-    ) &>/dev/null &
+    ) >>"$lf" 2>&1 &
     echo $! > "$pf"
     disown
     return 0
@@ -4094,6 +4102,7 @@ cmd_destroy_macos() {
     # sweep on the next attach, which is the conservative direction and costs seconds once.
     rm -f "$(macos_share_sweep_marker "$project_vm")" "$(macos_share_sweep_marker "$project_vm").pending"
     rmdir "$(macos_share_sweep_marker "$project_vm").lock" 2>/dev/null || true
+    rm -f "$(share_refresher_logfile)" 2>/dev/null || true
     success "VM '${project_vm}' has been removed."
 }
 
