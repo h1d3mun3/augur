@@ -8,6 +8,10 @@
 
 Run Claude Code in an isolated environment.
 Works in any directory — only the current directory is exposed to the container or VM.
+It must be a directory that does not contain augur itself: `augur up`/`claude`/`shell` refuse to run
+in `$HOME`, in `~/.augur`, or in any parent of either, because the workspace is shared **read-write**
+and those hold the binaries your host runs (see
+[ADR-0014](docs/decisions/0014-workspace-must-not-contain-augur.md)). Use a subdirectory instead.
 
 Two modes are available:
 
@@ -276,12 +280,24 @@ every `up` (the same way it does for the GitHub token):
   back once and augur saves it to `~/.claude_code_oauth_token`.
 - `ANTHROPIC_API_KEY` — Console API key (env or `~/.anthropic_api_key`). Takes priority if both are set.
 
+### Guest clock
+
+A cloned macOS guest boots with its wall clock a fixed amount **behind** the host's (measured at ~95
+minutes on the machine this was found on — a constant inherited from the base VM's saved state, not
+drift), and it cannot fix itself: NTP is UDP/123 and macOS VM egress drops UDP by design. So augur
+**sets the guest's clock from the host's** over SSH — on `up --macos` (both a fresh boot and a
+reconcile of an already-running VM) and on `claude`/`shell --macos`, which attach without going
+through `up`. It runs before the token is injected, because a token minted on the host seconds ago
+looks *not yet valid* to a guest sitting in the past. Best-effort: if it cannot be set you get a
+warning, not a failed `up`. See
+[`docs/decisions/0015-guest-clock-from-host.md`](docs/decisions/0015-guest-clock-from-host.md).
+
 ### File access
 
 | Path | Description |
 |------|-------------|
 | Current directory | exposed at `~/workspace-<project>` in the VM (read/write, virtiofs auto-mount) |
-| `~/.gitconfig` | copied on VM start (HTTPS `git push` uses `GH_TOKEN`) |
+| `~/.gitconfig` | **copied** on VM start (unlike container mode, which mounts it read-only). augur then rewrites `credential.https://github.com.helper` in **the guest's copy** so HTTPS `git push` works off `GH_TOKEN`; any helper the host set for `github.com` is replaced, including the pair `gh auth setup-git` writes, because those need a host path or the host Keychain the guest does not have. Your host file is never modified. |
 | `~/.config/gh/` | shared **read-only** (token also injected via `GH_TOKEN`) |
 | Claude history | **only this project's** history is shared, in a per-VM isolated dir (`~/.augur/claude-projects/<vm>`), so other projects' transcripts stay invisible. Cross-mode (container↔macOS) resume is no longer shared. |
 | Claude auth | **not** shared — injected via env (the macOS Keychain is unreadable over SSH; see above) |

@@ -58,11 +58,17 @@ AUGUR_PROJECT_CONF="${AUGUR_PROJECT_CONF:-$AUGUR_PROJECT_DIR/allowlist.conf}"
 # not worth the approval-prompt UX cost.
 AUGUR_PROJECT_RESOURCES_CONF="${AUGUR_PROJECT_RESOURCES_CONF:-$AUGUR_PROJECT_DIR/resources.conf}"
 AUGUR_PROXY_DIR="$AUGUR_DIR/proxy"
-# Per-project derivation: a stable hash of the project dir name yields an offset used
-# for both the proxy ports AND the internal subnet, so two egress-enabled projects can
-# run at once without colliding. Override any value below with its matching env var.
+# Per-project derivation: a stable hash of the project dir yields an offset used for both the
+# proxy ports AND the internal subnet, so two egress-enabled projects can run at once without
+# colliding. Override any value below with its matching env var.
 # (Collisions are ~1/900 between distinct projects.)
-_augur_port_offset=$(( $(basename "$WORKSPACE_DIR" | tr '[:upper:]' '[:lower:]' | cksum | cut -d' ' -f1) % 900 ))
+# Hashed over the FULL workspace path, not its basename: with the basename, ~/work/app and
+# ~/archive/app got the SAME ports and subnet — a GUARANTEED collision, not a 1/900 one — so
+# the second project's `up` silently shared the first's proxy and network. The offset's stated
+# purpose is anti-collision, and the full path serves it strictly better: the same ~1/900 for
+# unrelated projects, minus the certain collision for same-basename pairs. See
+# workspace_path_hash for the general rule (host-namespace identifiers carry the path hash).
+_augur_port_offset=$(( $(printf '%s' "$WORKSPACE_DIR" | tr '[:upper:]' '[:lower:]' | cksum | cut -d' ' -f1) % 900 ))
 # Carve a per-project /28 out of 172.31.0.0/16: third octet = offset/16, fourth octet =
 # (offset%16)*16 (a /28 boundary). The network is --internal, so it has no route to the
 # host or the internet regardless of the subnet.
@@ -366,6 +372,39 @@ validate_secret_value() {
     return 0
 }
 
+# Resolve every credential an `up` would inject and validate each value, injecting NOTHING.
+# This is the CHECK half of the auth seam, split from the PUSH half so it can run before anything
+# irreversible happens: resolution reads only host env vars, host files and `gh auth token`, while
+# the push needs a booted guest (macOS mode writes ~/.augur-env over SSH).
+#
+# WHY IT EXISTS: macOS mode used to do both in one place, AFTER `augur-vm clone`, `augur-vm set` and
+# `augur-vm run` plus the SSH wait — so a value that could not be safely injected aborted `up` with
+# a VM already cloned, sized and BOOTED, and (unlike the SSH-timeout path just above it) nothing torn
+# down. The operator fixed the value, re-ran `up --macos`, and hit the already-running branch, which
+# by design cannot re-push ~/.augur-env — so the guest kept running with no credentials at all, and
+# the only remedy was `down --macos && up --macos`. Container mode always checked before
+# `container run`; this is what brings macOS into line. cmd_up_macos calls it before the clone.
+#
+# Deliberately NOT an error: an ABSENT credential. A guest with no token is a supported state in both
+# modes (`augur setup-token` runs `claude setup-token` inside it), so this refuses only a value that
+# exists and cannot be injected — exactly what container mode refuses. Fails closed, and the message
+# still names the offending variable because validate_secret_value does.
+# AUGUR_AGENT_SEAM | credential CHECK — the agent DECLARES names + host sources (agent_auth_specs)
+# and the core owns both the resolver (resolve_api_key) and the validator (validate_secret_value).
+# CONTRACT (C3): a future multi-agent build adds its per-spec VALIDATOR field here, in ONE place,
+# rather than at each injection site.
+validate_resolved_credentials() {
+    local _genv _henv _hfile _hvalidator _aval _gh
+    _gh="$(gh auth token 2>/dev/null || true)"
+    [[ -n "$_gh" ]] && { validate_secret_value GH_TOKEN "$_gh" || return 1; }
+    while IFS='|' read -r _genv _henv _hfile _hvalidator; do
+        [[ -z "$_genv" ]] && continue
+        _aval="$(resolve_api_key "${!_henv:-}" "$_hfile")"
+        [[ -n "$_aval" ]] && { validate_secret_value "$_genv" "$_aval" || return 1; }
+    done < <(agent_auth_specs)
+    return 0
+}
+
 # Persist a captured Claude subscription token to the host token file augur reads on
 # every `up` (resolve_api_key picks it up as CLAUDE_CODE_OAUTH_TOKEN). Validates the
 # shape and writes it 0600. The host never needs claude installed for this.
@@ -646,10 +685,16 @@ egress_enabled() {
 # mode kills the shared proxy out from under the other. The two instances bind the same ports
 # but on different addresses (127.0.0.1 vs the gateway), so they never collide.
 proxy_role() { if $MACOS_MODE; then echo macos; else echo container; fi; }
-proxy_pidfile() { echo "$AUGUR_PROXY_DIR/$(workspace_slug)-$(proxy_role).pid"; }
-proxy_logfile() { echo "$AUGUR_PROXY_DIR/$(workspace_slug)-$(proxy_role).log"; }
-# The allowlist is shared content (identical merge regardless of mode), so it stays per-project.
-proxy_allowlist() { echo "$AUGUR_PROXY_DIR/$(workspace_slug).allowlist"; }
+# Keyed on the FULL workspace path (slug + workspace_path_hash), never the basename slug alone —
+# see workspace_path_hash's header for why every host-namespace identifier carries the hash.
+proxy_pidfile() { echo "$AUGUR_PROXY_DIR/$(workspace_slug)-$(workspace_path_hash)-$(proxy_role).pid"; }
+proxy_logfile() { echo "$AUGUR_PROXY_DIR/$(workspace_slug)-$(workspace_path_hash)-$(proxy_role).log"; }
+# The allowlist is shared between the two MODES (identical merge either way), so it is keyed on
+# the project and NOT on proxy_role — but it is still per (project PATH), not per basename. It is
+# the proxy's live enforcement input (hot-reloaded on mtime change every ~2s), so a basename-only
+# key let a same-basename sibling's `up` overwrite a LIVE session's approved policy: `~/work/app`
+# and `~/archive/app` resolved to one file, and whichever ran last owned both projects' egress.
+proxy_allowlist() { echo "$AUGUR_PROXY_DIR/$(workspace_slug)-$(workspace_path_hash).allowlist"; }
 
 proxy_running() {
     local pf; pf="$(proxy_pidfile)"
@@ -662,11 +707,28 @@ proxy_running() {
 # allowlist the proxy reads. Deliberately written under ~/.augur (NOT the project tree)
 # so the guest — which can write the mounted ./.augur/allowlist.conf — cannot widen its own
 # policy mid-session.
+#
+# CONTENT-IDEMPOTENT: builds into a same-directory temp file and `mv`s only when the POLICY
+# actually differs (the generated-at header is excluded from that comparison, or the timestamp
+# alone would make every call a "change"). Two reasons this matters:
+#   • The file's mtime is a SIGNAL, not just metadata. augur-proxy hot-reloads on mtime change
+#     (main.swift polls every ~2s) and warn_if_macos_egress_pinned uses "allowlist newer than the
+#     gvproxy pidfile" to detect a policy gvproxy snapshotted before it changed. A header rewritten
+#     on every `up` made both fire unconditionally — a pointless reload, and a warning that cried
+#     wolf forever.
+#   • `mv` is atomic (rename(2), same directory). The old truncate-in-place let a poller read a
+#     PREFIX of the file. That never fell open — a prefix is only ever NARROWER, so I6 held — but
+#     the rename removes the window entirely.
+# The temp file's 0600 mode also tightens this file from the previous umask-dependent mode. Only
+# augur-proxy and gvproxy read it, both as this same user, so nothing loses access.
 write_merged_allowlist() {
     mkdir -p "$AUGUR_PROXY_DIR"
-    local out snap
+    local out snap tmp cur_body new_body
     out="$(proxy_allowlist)"
     snap="$(project_conf_hash_file).domains"   # the domains SNAPSHOTTED at approval time (host-side)
+    # Same directory as $out so the `mv` below is a rename, not a copy across filesystems.
+    tmp="$(mktemp "${out}.XXXXXX")" \
+        || { error "Could not stage the merged egress allowlist in ${AUGUR_PROXY_DIR}. Refusing to continue (fail closed)."; exit 1; }
     {
         echo "# generated by augur at $(date) — do not edit (regenerated on 'augur up')"
         [[ -f "$AUGUR_BASELINE_CONF" ]] && { echo "# --- baseline: $AUGUR_BASELINE_CONF"; cat "$AUGUR_BASELINE_CONF"; }
@@ -685,7 +747,16 @@ write_merged_allowlist() {
                 error "No approved snapshot for ./.augur/allowlist.conf — its domains are NOT being honored (run 'augur up' to approve). Failing closed."
             fi
         fi
-    } > "$out"
+    } > "$tmp"
+    # Compare POLICY, not bytes: drop the generated-at header from both sides. `|| true` because
+    # grep -v exits 1 when it emits nothing (an empty policy is a legitimate deny-all).
+    cur_body="$(grep -v '^# generated by augur at ' "$out" 2>/dev/null || true)"
+    new_body="$(grep -v '^# generated by augur at ' "$tmp" || true)"
+    if [[ -f "$out" && "$cur_body" == "$new_body" ]]; then
+        rm -f "$tmp"                 # unchanged: leave the live file (and its mtime) alone
+    else
+        mv -f "$tmp" "$out"          # atomic swap; a poller never sees a partial policy
+    fi
     echo "$out"
 }
 
@@ -862,7 +933,22 @@ resolve_macos_vm_memory_mb() {
 # share a basename also share workspace_slug; this distinguishes them so security-sensitive
 # per-project host state — the .augur/allowlist.conf approval fingerprint and the container history dir —
 # is never shared between an unrelated (possibly hostile) same-named project and a trusted
-# one. Display names, egress ports, and the in-container /workspace-<slug> path stay slug-based.
+# one.
+#
+# THE RULE: guest-visible names stay slug-based; HOST-NAMESPACE identifiers get the hash.
+# The host has ONE namespace per resource, shared by every project on the machine, so a
+# same-basename pair collides there with certainty — which is why the container name, the VM
+# name, the TOFU approval file, the carry-over/history/agents dirs, every egress host-state file
+# (merged allowlist, proxy + gvproxy pidfiles, logs, vfkit socket), the egress network name AND
+# the port/subnet offset all carry it. A guest-visible name lives in a PER-GUEST namespace where
+# a collision is harmless and unobservable, so make_workspace_mount (/workspace-<slug>) and
+# MACOS_SHARE (~/workspace-<slug>) deliberately stay slug-based and readable.
+#
+# The egress ports and the network name were on the slug-based side until they were moved (see
+# _augur_port_offset). The carve-out that used to be recorded here — "egress ports … stay
+# slug-based" — was wrong by this very rule: the ports' own purpose is anti-collision in the
+# host's single port namespace, and the basename input GUARANTEED a collision for exactly the
+# pair the hash exists to separate.
 workspace_path_hash() {
     local h
     if command -v sha256sum &>/dev/null; then
@@ -871,6 +957,69 @@ workspace_path_hash() {
         h="$(printf '%s' "$WORKSPACE_DIR" | shasum -a 256)"
     fi
     echo "${h:0:12}"
+}
+
+# Refuse to share a workspace that CONTAINS augur's own control plane.
+#
+# $WORKSPACE_DIR is mounted READ-WRITE into the guest — `-v "${WORKSPACE_DIR}:…"` in
+# container mode, `--dir="${MACOS_SHARE}:${WORKSPACE_DIR}"` in macOS mode — so anything
+# under it is guest-writable. That is accepted for a project checkout
+# (docs/security-reviews/2026-07-23-egress.md §6 item 12: the guest can attack the repo you
+# gave it). It is NOT acceptable for $HOME or $AUGUR_DIR, because `~/.augur` holds the
+# host-executed binaries `install` puts FIRST on the host's PATH (install:150) — augur,
+# augur-proxy, augur-gvproxy, augur-vm — which resolve_proxy_cli/resolve_gvproxy then run as
+# the host user on every `up`. A guest that can write there owns the host account, and it can
+# also edit the merged allowlist `augur-proxy` hot-reloads on mtime change every ~2s, which
+# is a direct I7 violation ("written host-side … outside the project tree").
+# See docs/decisions/0014-workspace-must-not-contain-augur.md.
+#
+# Reads $WORKSPACE_DIR / $HOME / $AUGUR_DIR as globals at call time so a test can set them.
+# Compares PHYSICAL paths: $WORKSPACE_DIR is `$(pwd)` — the LOGICAL path — so `cd ~/link`
+# where link → $HOME would otherwise pass a string that isn't $HOME while the engine happily
+# shares $HOME. The physical forms are local to this function on purpose: $WORKSPACE_DIR
+# itself must NOT change, because workspace_path_hash feeds container/VM names, the TOFU
+# approval key and every per-project state dir — re-basing it on `pwd -P` would silently
+# rename all of that for anyone whose path crosses a symlink.
+require_safe_workspace() {
+    local ws home augur_dir ad_parent
+    ws="$(cd "$WORKSPACE_DIR" 2>/dev/null && pwd -P)" || ws="$WORKSPACE_DIR"
+    [[ -n "$ws" ]] || ws="$WORKSPACE_DIR"
+    home="$(cd "$HOME" 2>/dev/null && pwd -P)"        || home="$HOME"
+    [[ -n "$home" ]] || home="$HOME"
+    # $AUGUR_DIR need not exist yet (first run), so resolve its PARENT and re-append the leaf
+    # rather than cd'ing into it. An unresolvable parent falls back to the literal path — a
+    # guard that cannot resolve a path must still compare something, never "".
+    ad_parent="$(cd "$(dirname "$AUGUR_DIR")" 2>/dev/null && pwd -P)" || ad_parent=""
+    if [[ -n "$ad_parent" ]]; then
+        augur_dir="${ad_parent%/}/$(basename "$AUGUR_DIR")"
+    else
+        augur_dir="$AUGUR_DIR"
+    fi
+
+    local why=""
+    # R1 needs its own branch: "$ws"/* is //* when ws=/ and matches nothing.
+    if [[ "$ws" == "/" ]]; then
+        why="it is the filesystem root"
+    elif [[ "$ws" == "$home" ]]; then
+        why="it is your home directory"
+    elif [[ "$home" == "$ws"/* ]]; then
+        why="it contains your home directory"
+    elif [[ "$ws" == "$augur_dir" || "$augur_dir" == "$ws"/* || "$ws" == "$augur_dir"/* ]]; then
+        why="it is, contains, or lives inside augur's own directory ($augur_dir)"
+    else
+        return 0
+    fi
+
+    error "Refusing to share ${BOLD}${ws}${RESET} with the guest: ${why}."
+    error "The workspace is mounted ${BOLD}read-write${RESET}, so the guest could rewrite augur's"
+    error "own binaries in ${augur_dir} — which the host then executes as you — and the egress"
+    error "allowlist that confines it."
+    error ""
+    error "Instead:"
+    error "  • ${BOLD}cd${RESET} into a subdirectory holding just the project you want the agent to see, or"
+    error "  • run ${BOLD}augur destroy${RESET} here first if an older augur already made a container/VM"
+    error "    from this directory, then re-run from that subdirectory."
+    exit 1
 }
 
 # Host-side record of approved project-conf fingerprints (TOFU). Under ~/.augur — NEVER the
@@ -1034,14 +1183,22 @@ stop_proxy() {
         kill "$(cat "$pidfile")" 2>/dev/null || true
     fi
     rm -f "$pidfile" 2>/dev/null || true
-    # Migration: reap a proxy left running under the pre-role pidfile ("<slug>.pid") by a
-    # version of augur before the per-role split. It is invisible to the role-keyed
-    # proxy_running above, so without this the next same-address `up` would collide with it.
-    local legacy; legacy="$AUGUR_PROXY_DIR/$(workspace_slug).pid"
-    if [[ -f "$legacy" ]]; then
-        kill "$(cat "$legacy" 2>/dev/null)" 2>/dev/null || true
-        rm -f "$legacy" 2>/dev/null || true
-    fi
+    # Migration: reap a proxy left running under an OLDER pidfile name, in the two generations
+    # this file has had. Both are invisible to the current proxy_running above, so without this
+    # they survive every `down` and the next same-address `up` collides with them:
+    #   • "<slug>.pid"        — before the per-role split (proxy_role).
+    #   • "<slug>-<role>.pid" — before the path-hash keying (this change). NOTE: on a
+    #     same-basename pair this name was SHARED, so whichever project runs `down` first reaps
+    #     it. That is correct — the process it points at is serving a basename, not a project,
+    #     and it is exactly the shared instance this change abolishes.
+    local legacy
+    for legacy in "$AUGUR_PROXY_DIR/$(workspace_slug).pid" \
+                  "$AUGUR_PROXY_DIR/$(workspace_slug)-$(proxy_role).pid"; do
+        if [[ -f "$legacy" ]]; then
+            kill "$(cat "$legacy" 2>/dev/null)" 2>/dev/null || true
+            rm -f "$legacy" 2>/dev/null || true
+        fi
+    done
 }
 
 # ── Container egress topology (no host sudo) ──────────────────────────────────
@@ -1053,7 +1210,16 @@ stop_proxy() {
 #   Closing that needs host pf rules (sudo), which augur deliberately avoids, so it's
 #   documented, not enforced.
 
-egress_network_name() { echo "augur-$(workspace_slug)-net"; }
+# Keyed on the FULL workspace path, like the container name it is wired to. ensure_egress_network
+# checks existence BY NAME only, so a basename-keyed name made project B's `up` silently ATTACH to
+# project A's live network — same subnet, same gateway, same host-side proxy port. The rename also
+# has to ship WITH the _augur_port_offset change: without it, an upgraded install would find the
+# old network still present by name and keep its old subnet while the new offset expects a
+# different one, i.e. a gateway the proxy never binds.
+egress_network_name() { echo "augur-$(workspace_slug)-$(workspace_path_hash)-net"; }
+# Pre-hash name, kept ONLY so the teardown path can still reap a network an older augur created
+# for this project. Never used to create or look up a network.
+legacy_egress_network_name() { echo "augur-$(workspace_slug)-net"; }
 
 # The agent's --internal "host-only" network (host reachable, internet severed).
 ensure_egress_network() {
@@ -1130,6 +1296,12 @@ start_egress_proxy() {
 stop_egress() {
     stop_proxy
     engine_network_rm "$(egress_network_name)" &>/dev/null || true
+    # Migration: also reap the pre-hash name (augur-<slug>-net) an older augur created for this
+    # project. It is no longer looked up anywhere, so nothing else would ever remove it and
+    # `destroy` would leave its subnet allocated for good. Best-effort, same as above: on a
+    # same-basename pair the sibling project may own that name, and `network delete` refuses a
+    # network with attached containers — which is exactly the right outcome there.
+    engine_network_rm "$(legacy_egress_network_name)" &>/dev/null || true
 }
 
 # Boot self-test: prove the agent can ONLY egress via the proxy. Direct (proxy-less)
@@ -1198,13 +1370,43 @@ resolve_gvproxy() {
     echo ""   # not found
 }
 
-gvproxy_socket()  { echo "$AUGUR_PROXY_DIR/$(workspace_slug).vfkit.sock"; }
-gvproxy_pidfile() { echo "$AUGUR_PROXY_DIR/$(workspace_slug).gvproxy.pid"; }
+# The vfkit socket is the ONE per-project host-state name whose slug is TRUNCATED (24 chars).
+# It is a unix-domain socket path, and macOS `sockaddr_un.sun_path` is 104 bytes — 103 usable —
+# so unlike the pidfiles/logs/allowlist next to it (regular files under PATH_MAX 1024) it has a
+# hard, short budget. With AUGUR_PROXY_DIR="$HOME/.augur/proxy" the fixed parts cost
+# 21 + len($USER) as a prefix and 11 as a suffix ("<slug>-<12hex>.vfkit.sock"), so adding the
+# path hash moved the breaking slug length from ~66 to ~53 for a 5-char username. Truncating
+# costs nothing but readability: uniqueness is carried by the hash, not the slug, and any slug
+# under 24 chars is unchanged. The resulting 69 + len($USER) is ~74 for "admin" and still 99 for
+# a 30-char username. AUGUR_SOCKET_MAX_LEN below is the backstop for the residual (a relocated
+# AUGUR_PROXY_DIR, a very long username).
+# The naming asymmetry with gvproxy_pidfile (full slug) is fine: stop_gvproxy derives BOTH from
+# these helpers and never correlates them by name.
+AUGUR_SOCKET_MAX_LEN=103          # macOS sockaddr_un.sun_path is 104 bytes incl. the NUL
+gvproxy_socket()  { local s; s="$(workspace_slug)"; echo "$AUGUR_PROXY_DIR/${s:0:24}-$(workspace_path_hash).vfkit.sock"; }
+gvproxy_pidfile() { echo "$AUGUR_PROXY_DIR/$(workspace_slug)-$(workspace_path_hash).gvproxy.pid"; }
 # Diagnostic logs for the macOS egress datapath. gvproxy and the VM run are otherwise
 # launched with output discarded, which makes an "SSH did not come up" failure opaque;
 # these capture their stderr so the failure path can surface the real cause.
-gvproxy_log()     { echo "$AUGUR_PROXY_DIR/$(workspace_slug).gvproxy.log"; }
-macos_vm_log()    { echo "$AUGUR_PROXY_DIR/$(workspace_slug).vm.log"; }
+gvproxy_log()     { echo "$AUGUR_PROXY_DIR/$(workspace_slug)-$(workspace_path_hash).gvproxy.log"; }
+macos_vm_log()    { echo "$AUGUR_PROXY_DIR/$(workspace_slug)-$(workspace_path_hash).vm.log"; }
+
+# Fail closed on a socket path that cannot fit in sun_path. Without this, gvproxy's
+# --listen-vfkit bind fails with a bare "invalid argument" and augur reports only "gvproxy did
+# not create its socket in time" — an opaque failure whose real cause (a long $HOME or a
+# relocated AUGUR_PROXY_DIR) is invisible. Checked in BYTES: workspace_slug emits only
+# [a-z0-9-], but AUGUR_PROXY_DIR is operator-supplied and may be multi-byte.
+require_socket_path_fits() {
+    local sock="$1" len
+    len=$(printf '%s' "$sock" | LC_ALL=C wc -c | tr -d ' ')
+    if (( len > AUGUR_SOCKET_MAX_LEN )); then
+        error "The gvproxy socket path is ${len} bytes, over the ${AUGUR_SOCKET_MAX_LEN}-byte macOS"
+        error "unix-socket limit (sockaddr_un.sun_path is 104 bytes including the NUL):"
+        error "  ${sock}"
+        error "Set ${BOLD}AUGUR_PROXY_DIR${RESET} to a shorter path (e.g. /tmp/augur-proxy) and retry."
+        exit 1
+    fi
+}
 # Base-VM maintenance boot log (augur update --macos). Not project-specific, so it lives
 # under AUGUR_DIR (always present) rather than the per-project proxy dir. Captures the
 # base VM's NAT boot stderr so an "SSH did not come up" failure can surface the real cause.
@@ -1229,8 +1431,16 @@ start_gvproxy() {
         exit 1
     fi
     sock="$(gvproxy_socket)"; pidfile="$(gvproxy_pidfile)"
-    rm -f "$sock"
     gvproxy_running && return 0
+    # Checked on the path that actually BINDS the socket (same placement rule as the unlink
+    # below): a reused gvproxy already proved its path fits, and the failure this catches is
+    # `--listen-vfkit`'s, which happens here and nowhere else.
+    require_socket_path_fits "$sock"
+    # Only once no live gvproxy owns this path: clear a socket left behind by a crashed one,
+    # or the -S wait at the end of this function succeeds instantly against a dead file. The
+    # unlink must stay BELOW the early return — above it, reusing a running gvproxy unlinked
+    # the socket the VM is about to attach to, and returned 0 as if all was well.
+    rm -f "$sock"
     info "Starting gvproxy (guest netstack → SOCKS5 allowlist)..."
     # --listen-vfkit: the socket the VM's NIC attaches to (one datagram = one frame).
     # --socks-upstream: send all guest TCP to augur-proxy by name for the allowlist
@@ -1261,6 +1471,185 @@ stop_gvproxy() {
     local pidfile; pidfile="$(gvproxy_pidfile)"
     gvproxy_running && kill "$(cat "$pidfile")" 2>/dev/null || true
     rm -f "$pidfile" "$(gvproxy_socket)" 2>/dev/null || true
+    # Migration: mirror of stop_proxy's reap, for the pre-path-hash gvproxy names
+    # ("<slug>.gvproxy.pid" + "<slug>.vfkit.sock"). gvproxy_running only ever consults the
+    # CURRENT pidfile, so a gvproxy started by an older augur is invisible to `down --macos`
+    # and to `status` — the operator would be left with an orphan holding a live vfkit socket
+    # and no augur command that finds it. The socket is unlinked unconditionally: a socket file
+    # with no live owner is exactly the stale file start_gvproxy's `-S` wait would accept.
+    local legacy_pid; legacy_pid="$AUGUR_PROXY_DIR/$(workspace_slug).gvproxy.pid"
+    if [[ -f "$legacy_pid" ]]; then
+        kill "$(cat "$legacy_pid" 2>/dev/null)" 2>/dev/null || true
+        rm -f "$legacy_pid" 2>/dev/null || true
+    fi
+    rm -f "$AUGUR_PROXY_DIR/$(workspace_slug).vfkit.sock" 2>/dev/null || true
+}
+
+# Boot self-test, macOS-VM peer of verify_egress_locked — I1's tripwire on this engine. Read that
+# function first: this one deliberately keeps its shape, including the property that matters most.
+#
+# A probe that only checks "direct egress fails" reports SUCCESS when the guest has NO network at
+# all. Both halves are therefore load-bearing, exactly as in the container version:
+#
+#   NEGATIVE — direct egress must FAIL. Container probes IP literals + a hostname with every proxy
+#     env var unset. There is no proxy env to unset here (the forwarding is transparent: gvproxy is
+#     the guest's only NIC and dials augur-proxy's SOCKS5 per connection), so "direct" means the
+#     things that can leave WITHOUT the allowlist deciding — and each maps to exactly ONE gvproxy
+#     flag in start_gvproxy, which is what makes deleting that flag detectable:
+#       • an IP-literal TCP connect        → only --socks-upstream stops it
+#       • a non-allowlisted NAME resolving → only --dns-allowlist stops it
+#       • raw UDP / ICMP                   → only --deny-direct stops those
+#     Deleting any one of those three from start_gvproxy's argv previously left `up --macos`
+#     printing "Egress restricted…" and then "VM is up." with nothing detecting it.
+#   POSITIVE — allowlisted egress must WORK, or a total network outage reads as "secure".
+#
+# Container proves its positive half WITHOUT the network: it sends a request THROUGH the proxy to
+# a `.invalid` host and accepts any HTTP status (even a 403 deny), because reaching the proxy at
+# all is the proof. That trick is unavailable here — the guest cannot address the proxy, and any
+# name must clear gvproxy's DNS allowlist first — so this half necessarily reaches a real
+# allowlisted host. `up --macos` with egress ON therefore now REQUIRES working egress to
+# _SELFTEST_HOST; `--no-egress` skips the whole self-test, as it does in container mode.
+#
+# Every probe shape below was measured in a live gvproxy-backed guest, not inferred.
+_SELFTEST_HOST="api.github.com"
+verify_macos_egress_locked() {
+    local vm="$1"
+    info "Running egress self-test (in-guest)..."
+    local leaked=false
+    # PATH pinning, same reason as verify_egress_locked's and the same blast radius: `down --macos`
+    # KEEPS the clone (ADR-0006/ADR-0010), and augur's own ~/.augur-env puts $HOME/.local/bin FIRST
+    # in the PATH of every guest shell — including the non-login shell `ssh <host> <cmd>` runs, which
+    # still sources ~/.zshenv. A prior guest session could otherwise plant ~/.local/bin/curl|dig|
+    # dscacheutil|ping and fake every isolated answer below. The real tools live in system dirs a
+    # project VM has no sudo grant to write (curl/dig/dscacheutil in /usr/bin, ping in /sbin), so
+    # this can never cause a "not found" false failure — it only stops the tripwire being shadowed.
+    local pp='export PATH=/usr/bin:/bin:/usr/sbin:/sbin;'
+
+    # The transport itself, first. Every negative probe below "passes" when the guest is merely
+    # unreachable, so an unverifiable datapath must be named as such rather than reported as
+    # isolated. It still fails CLOSED (same teardown) — container mode does the same thing when
+    # `eng exec` stops working, because its proxy probe then returns no status either.
+    #
+    # RESOLVABILITY is checked BEFORE the first probe, and separately, because ssh_macos does not
+    # RETURN when it cannot name a host for the VM — it `exit 1`s the whole script:
+    #     host="$(macos_ssh_host "$vm")"; [[ -n "$host" ]] || { error …; exit 1; }
+    # Every probe below invokes it under `&>/dev/null` or inside `$( … )`, so that exit was
+    # UNOBSERVABLE and, being an exit rather than a non-zero return, it jumped clean over the
+    # fail-closed teardown at the bottom of this function — leaving precisely the live VM with a live
+    # NIC that the teardown exists to prevent, and ending `up --macos` at rc=1 with no diagnostic at
+    # all. The `cannot run a command` branch below was written for this very situation and could
+    # never be reached in it.
+    #
+    # The state is reachable, not theoretical: a RUNNING VM with gvproxy DOWN. macos_ssh_host then
+    # falls back to `augur-vm ip`, which a vfkit-networked guest has no DHCP lease to answer, so it
+    # prints nothing. tests/37_macos_down_verify.sh's header predicted this exact chain from
+    # `cmd_down_macos` stopping gvproxy first; `make e2e` then reproduced it verbatim on the
+    # already-running reconcile branch (2026-07-26).
+    #
+    # Fixing it HERE rather than in ssh_macos is deliberate: turning that `exit 1` into `return 1`
+    # would change the failure mode of all 47 call sites at once, many of which rely on `set -e`
+    # aborting the operation. Checking the same condition first is local and total — once a host
+    # resolves, ssh_macos has no other exit path, so every probe below is covered.
+    if [[ -z "$(macos_ssh_host "$vm")" ]]; then
+        error "Self-test: no SSH transport to '${vm}' — egress cannot be VERIFIED."
+        error "  The VM is running but gvproxy is not, so nothing on the host can reach the guest."
+        error "  gvproxy cannot be restarted under a live VM (its unixgram socket IS the guest's"
+        error "  NIC), so this fails closed and stops the VM below; \`augur up --macos\` then boots a"
+        error "  fresh guest with a working datapath."
+        leaked=true
+    # A host that resolves can still be unreachable (gvproxy dying between the check above and the
+    # probe below is a genuine, if narrow, race). That lands here rather than in the branch above:
+    # same fail-closed verdict, less specific remedy.
+    elif ! ssh_macos "$vm" "${pp} true" &>/dev/null; then
+        error "Self-test: cannot run a command in the guest over SSH — egress cannot be VERIFIED."
+        leaked=true
+    else
+        # Raw routing. ANY success is a leak. Two distinct public IPv4 anycast addresses plus an
+        # IPv6 literal, so one blackholed/rerouted address (or a v6-only leak the v4 probes would
+        # miss) cannot make a routable network look isolated. Only :443 — unlike container's
+        # routeless --internal network, the deny here comes from the proxy refusing an IP-literal
+        # destination unconditionally (I4), which is port-agnostic, so container's second :80 pass
+        # would buy no coverage and cost another full timeout. --max-time is 4 rather than
+        # container's 6 for the same reason it matters at all: gvproxy's netstack ACCEPTS the
+        # connection and the SOCKS deny closes it afterwards, so a severed IP-literal probe burns
+        # its entire budget (measured: curl exits 28 at the deadline) instead of failing instantly.
+        local _probe
+        for _probe in https://1.1.1.1 https://8.8.8.8 'https://[2606:4700:4700::1111]'; do
+            # Single-quoted in the remote string: the guest shell is zsh, which ABORTS on an
+            # unmatched glob, and a bare IPv6 literal in brackets is one.
+            if ssh_macos "$vm" "${pp} curl -s --max-time 4 -o /dev/null '${_probe}'" &>/dev/null; then
+                leaked=true; error "Self-test: the guest reached ${_probe} directly (raw routing not severed)."
+            fi
+        done
+        # DNS is the FIRST gate in this mode (gvproxy's --dns-allowlist gates resolution; the
+        # proxy's SNI peek happens later), so a non-allowlisted name must not resolve.
+        #
+        # Two deliberate divergences from container's `getent hosts dns-leak-probe.example`:
+        #   • macOS has no getent. dscacheutil goes through the guest's REAL resolver stack
+        #     (mDNSResponder → gvproxy's DNS at the gateway) — the path curl/git/claude take. It
+        #     exits 0 whether or not the name resolved, so the ANSWER is the signal, not $?.
+        #   • the probe name must be one that genuinely RESOLVES publicly. Container can use a
+        #     bogus `.example` TLD because its guest has no resolver at all, so any answer is a
+        #     leak. Here the gate is a filter in FRONT of a working resolver: a bogus TLD would
+        #     NXDOMAIN with --dns-allowlist deleted too, and the mutation would go undetected.
+        # Matched on *_address* rather than ip_address so a AAAA-only answer (dscacheutil prints
+        # `ipv6_address:`) is a leak here too.
+        local _dnsout
+        _dnsout="$(ssh_macos "$vm" "${pp} dscacheutil -q host -a name 'example.com'" 2>/dev/null || true)"
+        if [[ "$_dnsout" == *_address* ]]; then
+            leaked=true; error "Self-test: the guest resolved non-allowlisted example.com (DNS allowlist not enforced)."
+        fi
+        # UDP and ICMP, the two forwarders --deny-direct refuses to register. Neither is reachable
+        # through the SOCKS allowlist, so neither of the TCP probes above can see them: a DNS query
+        # aimed straight at a public resolver bypasses the guest's configured (gvproxy) one entirely,
+        # which is a full-bandwidth exfil channel that resolves nothing through the allowlist.
+        # An ANSWER is the signal, not dig's exit status (0 on an NXDOMAIN too) and not its raw
+        # output — `dig +short` prints its "connection timed out" diagnostic on STDOUT, so the
+        # dotted-quad shape is filtered in the guest and the host side only asks "was there one".
+        local _udpout
+        _udpout="$(ssh_macos "$vm" "${pp} dig +time=2 +tries=1 +short @1.1.1.1 example.com A | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'" 2>/dev/null || true)"
+        if [[ -n "$_udpout" ]]; then
+            leaked=true; error "Self-test: the guest resolved via direct UDP to 1.1.1.1 (UDP egress not dropped)."
+        fi
+        if ssh_macos "$vm" "${pp} ping -c 1 -t 2 1.1.1.1" &>/dev/null; then
+            leaked=true; error "Self-test: the guest got an ICMP reply from 1.1.1.1 (ICMP egress not dropped)."
+        fi
+        # POSITIVE half — two assertions, because they fail for different reasons and a single one
+        # would mask the other. The NAME must resolve, which proves gvproxy's DNS gate is armed and
+        # DISCRIMINATING rather than simply closed (or absent, with the host offline); and a request
+        # to it must come back with an HTTP status, which proves the SOCKS forward plus the proxy's
+        # ALLOW decision. Deliberately a MANAGED-BASELINE domain: the already-running path warns
+        # that gvproxy snapshots its DNS allowlist once at boot, so a project-conf domain could be
+        # allowlisted host-side and still unresolvable in a live guest — a false leak. A merged
+        # allowlist missing the baseline entirely is a broken install that denies the agent's own
+        # API too, and failing `up` closed is the right answer there.
+        local _okdns _pcode
+        _okdns="$(ssh_macos "$vm" "${pp} dscacheutil -q host -a name '${_SELFTEST_HOST}'" 2>/dev/null || true)"
+        if [[ "$_okdns" != *_address* ]]; then
+            leaked=true
+            error "Self-test: the guest cannot resolve allowlisted ${_SELFTEST_HOST} (egress is DOWN, not locked)."
+        fi
+        # curl prints 000 (and exits nonzero) when it never got a response, so `|| true` keeps the
+        # failure on the fail-closed branch below instead of aborting under `set -e`.
+        _pcode="$(ssh_macos "$vm" "${pp} curl -s -o /dev/null -w '%{http_code}' --max-time 12 'https://${_SELFTEST_HOST}/'" 2>/dev/null || true)"
+        if [[ -z "$_pcode" || "$_pcode" == "000" ]]; then
+            leaked=true
+            error "Self-test: allowlisted egress to ${_SELFTEST_HOST} does not work (HTTP '${_pcode:-<none>}')."
+        fi
+    fi
+
+    if $leaked; then
+        error "Egress self-test FAILED — refusing to continue. Tearing down."
+        # The macOS analogue of container mode's engine_rm_force + stop_egress, and byte-for-byte
+        # what the SSH-timeout path in cmd_up_macos already does: a detected leak must not leave a
+        # live VM with a live NIC behind. This is a NEW way for `up --macos` to end with a stopped
+        # VM — see the call sites.
+        "$VM_CLI" stop "$vm" 2>/dev/null || true
+        stop_gvproxy
+        stop_proxy
+        exit 1
+    fi
+    success "Egress self-test passed: gvproxy+proxy are the guest's only egress; only allowlisted domains resolve and connect."
 }
 
 # ── Container mode commands (Apple Container) ─────────────────────────────────
@@ -1544,21 +1933,30 @@ drop_guest_history() {
     return 0
 }
 
-# Shared tail of `up` (both the fresh-create and the reuse path): bring the host egress proxy up
-# now that the container has attached, run the boot self-test (I1's tripwire — runs on EVERY up,
-# never cached from a prior boot), and print the ready banner.
+# Shared tail of `up` — ALL THREE paths (fresh create, stopped→running reuse, and the
+# already-running reconcile): bring the host egress proxy up now that the container has attached,
+# run the boot self-test (I1's tripwire — runs on EVERY up, never cached from a prior boot), and
+# print the ready banner.
+#
+# On the already-running path this one line buys three distinct things:
+#   • start_egress_proxy → start_proxy rewrites the merged allowlist AND REVIVES A DEAD PROXY. That
+#     is the only recovery from a proxy killed out from under a live session; nothing else in
+#     `up`/`claude` restarts one.
+#   • verify_egress_locked restores I1's tripwire on that path.
+#   • apply_guest_profile picks up a structural profile change.
 finish_up() {
     if egress_enabled; then
         start_egress_proxy
         verify_egress_locked
     fi
-    # Both paths (fresh create and fast reuse) land here, so a host-side profile edit is picked up on
-    # a container transitioning stopped→running without a recreate. This is NOT sufficient on its
-    # own, though: `cmd_up` short-circuits to a no-op when the container is ALREADY running, so
-    # cmd_claude/cmd_shell also call apply_guest_profile directly — see those call sites (found live,
-    # not by inspection: a profile entry added/removed while the container stayed running was
-    # invisible until an explicit `down`). Best-effort; never aborts `up`. Runs AFTER the egress
-    # self-test so it can never delay or mask that tripwire.
+    # Every `up` path lands here, so a host-side profile edit is picked up without a recreate. That
+    # is still NOT sufficient on its own: cmd_claude/cmd_shell reach cmd_up only when the container
+    # is NOT running (`container_running || cmd_up`), so on the common case — repeated
+    # `claude`/`shell` with no intervening `down` — nothing in this function runs at all. They
+    # therefore call apply_guest_profile directly too; see those call sites (found live, not by
+    # inspection: a profile entry added/removed while the container stayed running was invisible
+    # until an explicit `down`). Best-effort; never aborts `up`. Runs AFTER the egress self-test so
+    # it can never delay or mask that tripwire.
     apply_guest_profile
     success "Container '${CONTAINER_NAME}' is up."
     echo ""
@@ -1572,8 +1970,42 @@ cmd_up() {
     require_engine
     ensure_image
 
+    # ALREADY RUNNING — reconcile the host side instead of no-opping. This used to `return 0`
+    # before the approval gate and before any datapath work, which did not WIDEN anything (the
+    # previously approved policy stayed in force, which is fail-closed) but silently dropped three
+    # things the rest of this file claims `up` always does:
+    #   • A REVOCATION never landed. write_merged_allowlist has exactly one caller — start_proxy,
+    #     reached only from start_egress_proxy (container) and cmd_up_macos (macOS), both BELOW this
+    #     point — and augur-proxy hot-reloads policy from that file's mtime. So editing the allowlist
+    #     and running `augur up` printed one yellow line, exited 0, and left the live proxy enforcing
+    #     the old policy.
+    #   • I1's tripwire did not run. verify_egress_locked lives in finish_up, also below this point.
+    #   • A flipped egress mode / rotated credential was not surfaced: the container_fingerprint
+    #     reconcile that exists to catch exactly that is below this point too.
     if container_running; then
-        warn "Container '${CONTAINER_NAME}' is already running."
+        warn "Container '${CONTAINER_NAME}' is already running — reconciling host-side state only."
+        if egress_enabled; then
+            check_project_conf_approved      # the gate runs wherever policy is written
+            # DELIBERATELY REDUNDANT with the write inside start_proxy on the match path below.
+            # It is here so a REVOCATION still lands on the MISMATCH path, which exits before
+            # finish_up is ever reached. Do not "simplify" it away.
+            write_merged_allowlist >/dev/null
+        fi
+        # A running container cannot be re-provisioned: --network / --cap-drop / HTTP_PROXY /
+        # --no-dns / -e credentials are baked once at `container run`. Refuse rather than warn and
+        # continue: the fingerprint is an opaque digest (it hashes RESOLVED SECRET VALUES, so naming
+        # the drifted field would mean storing them in plaintext), and continuing into
+        # start_egress_proxy with a container created under --no-egress fails opaquely anyway —
+        # container_egress_gateway falls back to a COMPUTED IP when `network inspect` reports none,
+        # start_egress_proxy then burns its 5s ifconfig wait on an address no interface holds, and
+        # start_proxy dies on the bind. A missing fingerprint (a container started by an augur that
+        # predates it) lands here too, and the same remedy heals it.
+        if ! container_fingerprint_matches; then
+            error "Container '${CONTAINER_NAME}' was created with a different config (egress mode, memory, credentials or mounts"
+            error "changed since). A running container cannot pick those up: ${BOLD}augur down && augur up${RESET}"
+            exit 1
+        fi
+        finish_up                            # restores I1's boot self-test on this path
         return 0
     fi
 
@@ -1796,9 +2228,9 @@ cmd_claude() {
     # reuse path; a bare start would re-attach the guest with NO proxy re-established and NO
     # self-test — silently bypassing egress. Mirrors macOS `cmd_claude_macos` (running || up).
     container_running || cmd_up
-    # `cmd_up` short-circuits to a no-op when the container is ALREADY running (the common case:
-    # repeated `claude`/`shell` calls without an intervening `down`), so its finish_up — and the
-    # apply_guest_profile inside it — never runs on that path. Call it here too, matching macOS
+    # The line above reaches `cmd_up` only when the container is NOT running, so on the common case
+    # — repeated `claude`/`shell` calls without an intervening `down` — cmd_up (and therefore its
+    # finish_up, and the apply_guest_profile inside it) never runs. Call it here too, matching macOS
     # mode's ensure_macos_claude_profile (already called from cmd_claude_macos/cmd_shell_macos
     # unconditionally). Content edits inside an already-symlinked entry are live via the mount with
     # no re-wiring needed; this is for STRUCTURAL changes — an entry added, removed, or replaced in
@@ -1823,9 +2255,9 @@ cmd_shell() {
     # Same as cmd_claude: route a stopped/absent container through the full `up` so egress is
     # re-established and self-tested, never a bare `container start`.
     container_running || cmd_up
-    # Same reasoning as cmd_claude: `cmd_up` no-ops when already running, so re-wire the profile
-    # here too — otherwise a structural profile change (an entry added/removed/replaced) is
-    # invisible until an intervening `down`.
+    # Same reasoning as cmd_claude: an already-running container never reaches `cmd_up` at all, so
+    # re-wire the profile here too — otherwise a structural profile change (an entry
+    # added/removed/replaced) is invisible until an intervening `down`.
     apply_guest_profile
     info "Opening bash shell in '${CONTAINER_NAME}'..."
     local _rc=0
@@ -2579,6 +3011,51 @@ warn_if_macos_profile_stale() {
     return 0
 }
 
+# Warn when host-side egress state has changed since this VM booted, because a LIVE macOS VM cannot
+# pick that change up. Direct peer of warn_if_macos_profile_stale above (same host-side-only
+# technique, same remedy phrasing), for the three things pinned at BOOT on this datapath:
+#
+#   1. gvproxy's DNS ALLOWLIST. gvproxy reads --dns-allowlist exactly ONCE, at startup (a single
+#      os.ReadFile in GvproxyConfigure — no watcher, no reload, unlike augur-proxy which polls the
+#      merged file's mtime every ~2s). And on this datapath DNS is the FIRST gate: the guest
+#      resolves through gvproxy's gateway resolver before augur-proxy ever sees an SNI. So the two
+#      directions are ASYMMETRIC on a live VM — a REVOCATION lands at once (augur-proxy reloads and
+#      denies), but a newly APPROVED domain stays NXDOMAIN in the guest until a restart. gvproxy
+#      cannot be restarted under a live VM: its unixgram socket IS the VM's NIC.
+#   2. VM SIZING. `augur-vm set --cpu/--memory` requires the VM stopped, so cmd_up_macos re-applies
+#      the resolved sizing only on a boot.
+#   3. CREDENTIALS. ~/.augur-env is written over SSH during the boot sequence and is not re-pushed
+#      to a running VM. (Re-pushing over SSH is possible — a separate enhancement, not this.)
+#
+# Entirely host-side, like its peer: it compares two host mtimes and never asks the guest anything.
+#
+# The staleness signal needs NO new state file. The gvproxy pidfile is written when gvproxy STARTS,
+# i.e. at the exact moment it snapshotted the DNS allowlist — so "the merged allowlist is newer than
+# the gvproxy pidfile" is precisely "gvproxy is enforcing a policy older than the one on disk".
+# That is only exact because write_merged_allowlist is content-idempotent (it does not bump the
+# mtime when the policy is unchanged); without that this would warn on every single `up`. Both names
+# are keyed on the full workspace path, so this never reads another project's state.
+#
+# It reports what the LAST POLICY WRITE knows. An edit to ./.augur/allowlist.conf that has not been
+# approved+merged yet (i.e. `claude --macos` with no intervening `up --macos`) is invisible here —
+# by construction, since an unapproved conf has no honored policy to be stale against.
+warn_if_macos_egress_pinned() {
+    local vm="$1" allowlist gvp_pid
+    allowlist="$(proxy_allowlist)"; gvp_pid="$(gvproxy_pidfile)"
+    # No pidfile: nothing snapshotted a DNS allowlist for this VM (egress off, or a gvproxy started
+    # by an augur that predates this name). Say nothing rather than guess — same rule as its peer.
+    [[ -f "$gvp_pid" ]] || return 0
+    [[ -f "$allowlist" ]] || return 0
+    [[ "$allowlist" -nt "$gvp_pid" ]] || return 0
+    warn "The egress allowlist changed since VM '${vm}' booted — the guest will NOT see it yet."
+    warn "gvproxy snapshots its DNS allowlist ONCE at startup and DNS is the FIRST gate here, so a"
+    warn "newly APPROVED domain stays unresolvable in the guest (a REVOKED one is already denied by"
+    warn "the proxy). gvproxy cannot be restarted under a live VM — its socket is the VM's NIC."
+    warn "VM sizing (cpu/memory) and the ~/.augur-env credentials are pinned at boot too."
+    warn "To apply all three now: ${BOLD}augur down --macos && augur up --macos${RESET}"
+    return 0
+}
+
 # AUGUR_AGENT_SEAM | agent managed policy (macOS peer of the Dockerfile's /etc/claude-code block).
 # Installed into the BASE VM, never a project clone: /Library is root-owned and project VMs
 # deliberately have no sudo grant (build revokes it before the base is saved), so this is the only
@@ -2636,6 +3113,177 @@ ensure_macos_claude_bin() {
     '"
 }
 
+# Enable HTTPS `git push` from the guest off GH_TOKEN alone, by writing git's credential helper into
+# the guest's ~/.gitconfig. Independent of gh and of whether `gh auth setup-git` was ever run, and it
+# keeps working in non-login shells. The helper stores only the REFERENCE `$GH_TOKEN` (expanded in
+# the guest at push time), never the token value. Must run AFTER cmd_up_macos scp's the host's
+# ~/.gitconfig, which REPLACES the file this writes into — see the call site.
+#
+# --replace-all, not a plain set. `credential.<url>.helper` is a MULTI-VALUED key by git's design,
+# and the file this writes into is the host's own ~/.gitconfig: `gh auth setup-git` writes TWO
+# entries for github.com (an empty one to reset the helper chain, then its own), so every operator
+# who has run it arrives here with the key already duplicated. A plain
+# `git config --global <key> <value>` then refuses to collapse them — exit 5, "cannot overwrite
+# multiple values with a single value" — which under augur's `set -e` aborted `up` AFTER the clone,
+# the sizing, the boot and the SSH wait, tearing none of it down: the same stranded-guest shape the
+# pre-clone credential check exists to prevent. Collapsing is exactly the intent: on a
+# single-valued file the plain form ALREADY overwrote whatever the host had, so --replace-all
+# changes nothing on the path that worked, and the host's values are inert in the guest regardless
+# (osxkeychain needs the host Keychain — the very reason augur injects GH_TOKEN at all — and a
+# `!/opt/homebrew/bin/gh …` helper needs that host path). Nor is the copy a faithful original to
+# begin with: it carries the host's `[include]`/`[includeIf]` lines while the files they point at
+# were never copied, so it is already a lossy snapshot. (An include CANNOT be what introduces the
+# duplicate, incidentally: `--includes` defaults OFF for a scope-limited `git config --global`.)
+# Container mode never hits any of this because it never mutates the file — it bind-mounts
+# ~/.gitconfig read-only and injects the identical helper via GIT_CONFIG_KEY_0/VALUE_0 (cmd_up).
+#
+# Best-effort like ensure_macos_claude_profile, for the residue --replace-all cannot fix: the copied
+# file is arbitrary operator-authored input, and a shape git cannot parse at all still fails (exit
+# 128 on a malformed section header). A guest with no push credential plus a warning beats an `up`
+# that dies with the VM already running.
+ensure_macos_git_credential_helper() {
+    local vm="$1" gh_token="$2"
+    [[ -n "$gh_token" ]] || return 0
+    ssh_macos "$vm" \
+        "git config --global --replace-all 'credential.https://github.com.helper' '!f() { test \"\$1\" = get && echo username=x-access-token && echo password=\$GH_TOKEN; }; f'" \
+        || warn "Could not configure git's credential helper in the VM; HTTPS 'git push' in the guest may prompt for credentials."
+    return 0
+}
+
+# Tolerance, in seconds, for BOTH the "is it worth correcting" test and the read-back below. One
+# constant on purpose: two numbers would drift apart, and the pair only makes sense if the value we
+# refuse to correct is the same value we accept afterwards. 5s is chosen against what actually
+# consumes the clock — JWT `nbf`/`exp` windows (minutes), X.509 validity (days), TLS handshakes —
+# none of which can tell 5s from 0. It is also comfortably above the noise floor: the drift below is
+# measured across an SSH round-trip through gvproxy's forward and both clocks are read at whole-second
+# granularity, so |drift| of 0–1 is normal on a correct guest and must not trigger a `sudo` write.
+_MACOS_CLOCK_TOLERANCE_S=5
+
+# Set the guest's wall clock from the HOST's, over SSH, on every path that hands a guest to the agent.
+#
+# THE DEFECT. A cloned macOS guest boots with a CLOCK_REALTIME that is a fixed offset behind the
+# host's — measured on this host at -5733s (95.6 min), with `kern.monotoniclock_offset_usecs`
+# byte-identical across two different boots and unchanged across 7h36m of uptime, and
+# `kern.sleeptime`/`kern.waketime` both zero. So it is not accumulated suspend time: it is a constant
+# baked into the base VM's persisted state and inherited by every clone, and nothing in augur ever
+# corrected it. The guest's `kern.monotonicclock` meanwhile tracks the host's wall clock exactly,
+# which is why the skew is invisible to anything that measures a DURATION and lethal to anything that
+# compares an ABSOLUTE instant.
+#
+# WHY IT MATTERS, worst first. A JWT issued by the host's `gh`/`claude setup-token` at time T is
+# handed to a guest that believes it is T-95min, so `nbf`/`iat` can put a freshly minted token in the
+# FUTURE and the agent refuses its own credential; `exp` on a short-lived token is the mirror case.
+# Then git commit timestamps land 95 min in the past, `gh` API request signing sees a skewed clock,
+# and TLS certificate validity windows are evaluated 95 min early — the last is normally harmless
+# (windows are days wide) but a certificate rotated within the last 95 minutes is not yet valid to
+# this guest, which in verify_macos_egress_locked's positive half reads as "allowlisted egress does
+# not work" and tears down a perfectly good VM.
+#
+# WHY NOT NTP. The obvious fix — let the guest sync time itself — cannot work here and must not be
+# made to. NTP is UDP/123; augur.conf is a SOCKS5/TCP name allowlist, so adding a time server to it
+# forwards nothing. And per gvproxy/augur-egress.patch, `--deny-direct` does not register the UDP or
+# ICMP forwarders at all, so UDP has no path out of the datapath regardless of the allowlist. Opening
+# one would be a straight security regression against INVARIANTS.md I9 ("the gvproxy patch drops
+# UDP/ICMP"), which verify_macos_egress_locked now actively self-tests. See
+# docs/decisions/0015-guest-clock-from-host.md.
+#
+# WHY THE HOST'S CLOCK AND NOT THE GUEST'S OWN `kern.monotonicclock`. The guest does hold a correct
+# wall clock in that sysctl, and reading it would need no host round-trip — but `monotonicclock` is
+# only specified as a clock `settimeofday` cannot perturb, not as "the host's wall clock". That it
+# matches the host here is an artifact of this hypervisor seeding the guest timebase from the host's;
+# nothing guarantees it on another host, another Virtualization.framework version, or a base VM whose
+# monotonic base was itself seeded from the same stale persisted state — and a guest reading its own
+# bad clock has no way to notice. The host is a real NTP-synced Mac and is already the authority for
+# everything else augur pushes in (credentials, ~/.gitconfig, the managed policy, the allowlist), so
+# it is the authority for time too. The cost is transfer accuracy: the value is stale by one SSH
+# round-trip (tens of ms locally, and the read-back below bounds the total at
+# _MACOS_CLOCK_TOLERANCE_S), which is three orders of magnitude below the 5733s being fixed.
+#
+# The push shape is install_macos_managed_settings': `echo <user> | sudo -S -p ''`. A project clone
+# has NO passwordless sudo — cmd_build_macos revokes /etc/sudoers.d/augur before saving the base VM —
+# so `sudo -S` fed the documented fixed password (ADR-0007) is the established, and only, way augur
+# runs a privileged command in a project guest. This takes no privilege augur's build does not
+# already take, and ADR-0001's sudo-free rule is about the HOST (its examples are host `pf` rules and
+# the bridged-networking entitlement), which is untouched. `/bin/date` is absolute for the same
+# reason verify_macos_egress_locked pins PATH: ~/.augur-env puts $HOME/.local/bin first in every
+# guest shell and the clone survives `down --macos`, so a bare `date` is shadowable by a prior guest
+# session. That is hygiene, not a security control — the clock is not a boundary, and a guest that
+# can lie about it can also lie on the read-back.
+#
+# BEST-EFFORT, never fatal. A guest with a wrong clock is degraded, not uncontained: it is the
+# opposite of verify_macos_egress_locked, whose hard `exit 1` exists because I1 makes an unverifiable
+# datapath a security failure. Aborting here would also abort with the VM already cloned, sized,
+# booted and SSH-reachable — the stranded-guest shape the pre-clone credential check was written to
+# remove — in exchange for a condition every augur before this one shipped with. So: warn, name the
+# consequence, continue, exactly as the profile wiring and the git credential helper do.
+#
+# The guest's CLOCK_REALTIME in epoch seconds, or nothing at all. One reader for both the drift
+# measurement and the read-back, so there is no second validator to drift from the first. The shape
+# is checked rather than scrubbed: `ssh <host> <cmd>` runs the command under the guest's zsh, which
+# sources ~/.zshenv (and therefore augur's own ~/.augur-env), so anything that ever printed on that
+# path would otherwise be spliced into the number and silently move the clock.
+_macos_guest_epoch() {
+    local raw
+    raw="$(ssh_macos "$1" '/bin/date +%s' 2>/dev/null || true)"
+    raw="${raw//[[:space:]]/}"
+    if [[ "$raw" =~ ^[0-9]{10,11}$ ]]; then printf '%s' "$raw"; fi
+    return 0
+}
+
+sync_macos_guest_clock() {
+    local vm="$1" tol="$_MACOS_CLOCK_TOLERANCE_S" host_epoch guest_epoch drift adrift stamp setout
+    # Read first. This is what makes the correction idempotent across the four call sites (a second
+    # `up`, or a `claude`/`shell` attach, must not re-`sudo` a guest that is already right), and it
+    # is also the only way to report HOW far off the guest was rather than just "we set the clock".
+    host_epoch="$(date +%s)"
+    guest_epoch="$(_macos_guest_epoch "$vm")"
+    if [[ -z "$guest_epoch" ]]; then
+        warn "Could not read the guest's clock over SSH; leaving it as it is."
+        warn "  A guest clock behind the host's can make a freshly issued token look not-yet-valid."
+        return 0
+    fi
+    drift=$(( guest_epoch - host_epoch )); adrift="${drift#-}"
+    if (( adrift <= tol )); then return 0; fi
+
+    info "Guest clock is ${drift}s off the host's — correcting from the host."
+    # Stamped fresh, NOT derived from the $host_epoch read before the round-trip above, so the value
+    # sent is the host's time now. `date`'s own positional setting format — [[[mm]dd]HH]MM[[cc]yy][.SS]
+    # read as UTC under -u — is used rather than a `-f %s` parse: it is what the guest's `date(1)`
+    # documents in its synopsis, and `+%m%d%H%M%Y.%S` needs only POSIX conversion specifiers on the
+    # host side, so this line does not depend on BSD `date` (`date -r <seconds>` would have, and the
+    # offline test tier runs on a Linux runner).
+    stamp="$(date -u +%m%d%H%M%Y.%S)"
+    setout="$(ssh_macos "$vm" "echo '${MACOS_SSH_USER}' | sudo -S -p '' /bin/date -u '${stamp}'" 2>&1)" || {
+        warn "Could not set the guest's clock (${drift}s off the host's): ${setout%%$'\n'*}"
+        warn "  Tokens, TLS validity windows and commit timestamps in the guest will use that skewed clock."
+        return 0
+    }
+
+    # VERIFY, do not trust the exit status. It only covers the two failures `sudo`/`date` report —
+    # a rejected password and a malformed stamp. It cannot see the third: /usr/libexec/timed is
+    # running in the guest, and `systemsetup -getusingnetworktime` needs root even to READ, so augur
+    # cannot cheaply know whether network time is on. In augur's own datapath timed has no reference
+    # to step back to (UDP/123 is dropped, see above — measured: this offset held byte-identical for
+    # 7h36m with timed live), and under --no-egress NAT it would correct the clock to the same answer
+    # anyway. But "the command exited 0 and the clock is still wrong" is precisely the silent case a
+    # read-back turns into a named warning, for one extra round-trip on a path that already makes a
+    # dozen.
+    host_epoch="$(date +%s)"
+    guest_epoch="$(_macos_guest_epoch "$vm")"
+    if [[ -z "$guest_epoch" ]]; then
+        warn "Set the guest's clock but could not read it back to confirm."
+        return 0
+    fi
+    drift=$(( guest_epoch - host_epoch )); adrift="${drift#-}"
+    if (( adrift > tol )); then
+        warn "The guest's clock is still ${drift}s off the host's after being set."
+        warn "  Something in the guest is overriding it; tokens and TLS validity may be misjudged there."
+        return 0
+    fi
+    success "Guest clock synchronised with the host (within ${adrift}s)."
+    return 0
+}
+
 
 cmd_up_macos() {
     require_vz
@@ -2648,14 +3296,59 @@ cmd_up_macos() {
         exit 1
     }
 
+    # ALREADY RUNNING — reconcile what the host owns, and be explicit about what it cannot. Same
+    # defect as cmd_up's peer branch (a bare `return 0` skipped the approval gate and the allowlist
+    # rewrite, so a REVOCATION never reached the live proxy), but the remedy is deliberately weaker:
+    # `return 0`, never `exit 1`. macOS mode has no container_fingerprint, so there is no reliable
+    # drift signal to refuse on. It DOES now have a boot self-test to re-run (see the bottom of this
+    # branch), which is the one thing that can still end this path non-zero — on a detected leak,
+    # never on drift.
     if macos_vm_running "$project_vm"; then
-        warn "VM '${project_vm}' is already running."
+        warn "VM '${project_vm}' is already running — reconciling host-side state only."
+        if egress_enabled; then
+            check_project_conf_approved      # the gate runs wherever policy is written
+            # Rewrites the merged allowlist (augur-proxy hot-reloads it) AND revives a proxy that
+            # died under this live VM — the only recovery from that, since gvproxy dials
+            # --socks-upstream per CONNECTION, so a fresh proxy on the same port is picked up with
+            # no gvproxy or VM restart.
+            start_proxy "127.0.0.1"
+        fi
+        # …and the half a live VM genuinely cannot pick up. Warn; do not pretend to have applied it.
+        warn_if_macos_egress_pinned "$project_vm"
+        # The one guest-side thing this branch CAN still reconcile. The measured offset is a
+        # boot-invariant constant, so a single correction per boot is enough for the defect as
+        # observed — but a VM this branch exists to serve is by definition long-lived (`down --macos`
+        # keeps the clone, ADR-0006/0010), and a guest paused while the host sleeps has its
+        # CLOCK_REALTIME frozen while the host's advances, which would reintroduce drift no boot-time
+        # correction can reach. Idempotent: it re-reads first and only writes when it must.
+        sync_macos_guest_clock "$project_vm"
+        # I1's tripwire on THIS path too, mirroring container mode: finish_up (and therefore
+        # verify_egress_locked) runs on cmd_up's already-running branch, and ADR-0010 already
+        # accepted the consequence — "`augur up` against a running container can now end an
+        # operator's session, but only on a DETECTED leak, which is precisely when I1 says it
+        # should." A live check on a running VM is if anything MORE valuable than one on a fresh
+        # boot: this branch is the only place a proxy killed out from under a live session is
+        # revived, and the self-test is what proves that revival actually restored enforcement. It
+        # runs LAST so the pinned-state warning above is still printed on the way out.
+        verify_macos_egress_locked "$project_vm"
         return 0
     fi
 
     # Gate the untrusted project ./.augur/allowlist.conf before cloning or starting the proxy
     # (only relevant when egress filtering is on).
     if egress_enabled; then check_project_conf_approved; fi
+
+    # Resolve and validate the credentials this `up` will inject BEFORE anything irreversible
+    # happens — before the clone, before `augur-vm set`, before `augur-vm run`. Container mode has
+    # always checked before `container run`; macOS mode checked only down at the ~/.augur-env writer,
+    # i.e. after a VM had been cloned, sized and booted, and its `exit 1` tore none of that down. The
+    # retry then hit the already-running branch above, which cannot re-push ~/.augur-env, so the
+    # operator was left with a live credential-less guest. Nothing here needs the guest: resolution
+    # reads host env vars, host files and `gh auth token`. Placed ABOVE the _fresh_clone split on
+    # purpose — a reused stopped clone must fail before `set`/`run` too, not just a fresh one — and
+    # BELOW the already-running branch, which injects no credentials and must stay a pure host-side
+    # reconcile. The PUSH stays where it must (see the writer below); this is only the check.
+    validate_resolved_credentials || exit 1
 
     local _fresh_clone=false
     if ! macos_vm_exists "$project_vm"; then
@@ -2758,6 +3451,26 @@ cmd_up_macos() {
         exit 1
     }
 
+    # Correct the guest's clock before ANYTHING that judges an absolute instant runs. Everything
+    # below this line does: the self-test's TLS handshakes evaluate certificate validity windows, the
+    # ~/.augur-env push hands over a JWT whose `nbf`/`exp` the agent will check against this clock,
+    # and the git credential helper's token is the same object. It is deliberately the one step that
+    # precedes I1's tripwire, and that is safe for a reason the tripwire's own comment names: what
+    # must not reach an uncontained guest is a CREDENTIAL, and the host's wall-clock time is not one
+    # — the guest can already read it off the mtimes of the virtiofs share it is mounting. Going
+    # second instead would leave the self-test's own positive half judging a certificate window 95
+    # minutes early, i.e. able to tear down a healthy VM over a certificate rotated minutes ago.
+    sync_macos_guest_clock "$project_vm"
+
+    # I1's boot tripwire, as early as it can possibly run: the moment a command can be run in the
+    # guest, and BEFORE any of the wiring below — in particular before ~/.augur-env pushes an
+    # Anthropic token and a gh token into it. A guest whose egress is not contained is exactly the
+    # guest that must not receive credentials, so this deliberately precedes the injection rather
+    # than sitting just above the success banner. Skipped entirely with --no-egress, like
+    # container mode's (finish_up guards verify_egress_locked the same way): with filtering off
+    # there is no allowlist to be locked to, and the warning above already said so.
+    if egress_enabled; then verify_macos_egress_locked "$project_vm"; fi
+
     ensure_macos_workspace "$project_vm"
     ensure_macos_claude_projects "$project_vm"
     ensure_macos_claude_agents "$project_vm"
@@ -2802,16 +3515,16 @@ cmd_up_macos() {
     # before this point. See docs §4 C3.
     local gh_token _genv _henv _hfile _hvalidator _aval
     gh_token="$(gh auth token 2>/dev/null || true)"
-    # Pre-validate every secret BEFORE writing ~/.augur-env: these values are interpolated into a
-    # SOURCED shell file as `export VAR='<value>'`, so a stray single quote / control byte would
-    # inject shell into every guest session. A validate_secret_value failure inside the pipe below
-    # would only exit the subshell, so gate here where `exit 1` aborts the whole `up` (fail-closed).
-    [[ -n "$gh_token" ]] && { validate_secret_value GH_TOKEN "$gh_token" || exit 1; }
-    while IFS='|' read -r _genv _henv _hfile _hvalidator; do
-        [[ -z "$_genv" ]] && continue
-        _aval="$(resolve_api_key "${!_henv:-}" "$_hfile")"
-        [[ -n "$_aval" ]] && { validate_secret_value "$_genv" "$_aval" || exit 1; }
-    done < <(agent_auth_specs)
+    # Re-run the SAME check immediately before the write — one helper, no second validator to drift.
+    # The early call (above the clone) is what keeps a bad credential from booting a VM; this one
+    # covers the window between the two, which spans a clone and a full guest boot and is therefore
+    # minutes long: the env var is fixed for the process, but a credential FILE can be rewritten in
+    # it, and the loop below RE-RESOLVES every value at write time. These values are interpolated
+    # into a SOURCED shell file as `export VAR='<value>'`, so a stray single quote / control byte
+    # would inject shell into every guest session. It stays OUT of the pipe below because a
+    # validate_secret_value failure in there would exit only that subshell, whereas `exit 1` here
+    # aborts the whole `up` (fail-closed).
+    validate_resolved_credentials || exit 1
     {
         echo '# augur (regenerated at VM startup)'
         echo 'eval "$(/opt/homebrew/bin/brew shellenv)" 2>/dev/null || true'
@@ -2826,13 +3539,11 @@ cmd_up_macos() {
     ssh_macos "$project_vm" \
         "grep -q '.augur-env' ~/.zshenv 2>/dev/null || echo '[[ -f ~/.augur-env ]] && source ~/.augur-env' >> ~/.zshenv"
 
-    # Enable HTTPS `git push` with GH_TOKEN by configuring git's credential helper to read GH_TOKEN
-    # from the environment. This is independent of gh and keeps git auth working even in non-login
-    # shells where `gh auth setup-git` was never run.
-    if [[ -n "$gh_token" ]]; then
-        ssh_macos "$project_vm" \
-            "git config --global 'credential.https://github.com.helper' '!f() { test \"\$1\" = get && echo username=x-access-token && echo password=\$GH_TOKEN; }; f'"
-    fi
+    # Enable HTTPS `git push` with GH_TOKEN. Deliberately BELOW the ~/.gitconfig scp above: that
+    # copy replaces the very file this writes the helper into, so the reverse order would silently
+    # discard the helper. No-op without a host gh token. See the function for why it must use
+    # --replace-all and why it is best-effort.
+    ensure_macos_git_credential_helper "$project_vm" "$gh_token"
 
     # This `up` ran `vm run`, which rebuilds the virtiofs device, so the guest's view of the profile
     # is current as of now. Stamp the marker so warn_if_macos_profile_stale has a baseline — and
@@ -2853,11 +3564,19 @@ cmd_claude_macos() {
     local project_vm
     project_vm="$(macos_project_vm)"
     macos_vm_running "$project_vm" || cmd_up_macos
+    # Here for the same reason warn_if_macos_profile_stale and warn_if_macos_egress_pinned are: on an
+    # already-running VM this command skips cmd_up_macos entirely, so anything an `up` does for the
+    # guest has to be done here too or it never happens. This is the site where a skewed clock costs
+    # the most — the interactive launch below hands a JWT to the agent, and a token minted on the host
+    # seconds ago looks NOT-YET-VALID to a guest sitting 95 minutes in the past. Cheap and idempotent
+    # (a read, then a write only if needed) against the half-dozen SSH round-trips already below.
+    sync_macos_guest_clock "$project_vm"
     ensure_macos_workspace "$project_vm"
     ensure_macos_claude_projects "$project_vm"
     ensure_macos_claude_agents "$project_vm"
     ensure_macos_claude_profile "$project_vm"
     warn_if_macos_profile_stale "$project_vm"
+    warn_if_macos_egress_pinned "$project_vm"
     ensure_macos_claude_bin "$project_vm"
     info "Launching $(agent_display_name) in '${project_vm}'..."
     # AUGUR_AGENT_SEAM | interactive launch (macOS: interpolated into SSH string — see C4 on agent_launch_argv)
@@ -2871,11 +3590,16 @@ cmd_shell_macos() {
     local project_vm
     project_vm="$(macos_project_vm)"
     macos_vm_running "$project_vm" || cmd_up_macos
+    # Same rationale as cmd_claude_macos': this path attaches to a running guest without going
+    # through `up`. A shell is where the operator runs `git`, `gh` and `curl` by hand, all of which
+    # sign, stamp or validate against this clock.
+    sync_macos_guest_clock "$project_vm"
     ensure_macos_workspace "$project_vm"
     ensure_macos_claude_projects "$project_vm"
     ensure_macos_claude_agents "$project_vm"
     ensure_macos_claude_profile "$project_vm"
     warn_if_macos_profile_stale "$project_vm"
+    warn_if_macos_egress_pinned "$project_vm"
     info "Opening shell in '${project_vm}'..."
     ssh_macos "$project_vm" -t "cd ~/${MACOS_SHARE} && exec zsh -l"
 }
@@ -2937,10 +3661,31 @@ cmd_down_macos() {
         return 0
     fi
     info "Stopping VM '${project_vm}'..."
+    # Keep the `|| true` (a stop failure must not abort the rest of this teardown), but re-check the
+    # REAL state instead of reporting success unconditionally — the same re-check cmd_down does after
+    # its `eng stop`, for the same reason, and it matters more here. `augur-vm stop` swallows its
+    # diagnostics (2>/dev/null) and exits 0 even on its force-kill path, so the one case that counts
+    # — the signal never landed (a `run` process this host user cannot signal, or a stop that errored
+    # before signalling at all) — is otherwise completely invisible, and this function's last word
+    # would be "stopped" about a VM that is still executing. Unlike container mode's version of that
+    # lie, gvproxy and the proxy are ALREADY down by this point (see the top of the function), so the
+    # guest keeps running with this workspace still shared into it while no augur command can reach
+    # it any more: ssh_macos routes through gvproxy's forward when gvproxy is up and falls back to a
+    # DHCP lease that a vfkit-networked guest never had. Do NOT drop this as redundant on the grounds
+    # that a bounded stop "cannot fail" — the bound is what makes it exit 0, not what makes it work.
     "$VM_CLI" stop "$project_vm" 2>/dev/null || true
-    success "VM '${project_vm}' stopped (clone kept; CoW so it costs ~0 on disk)."
-    echo -e "  ${BOLD}augur up --macos${RESET}      → restart it (fast, no re-clone)"
-    echo -e "  ${BOLD}augur destroy --macos${RESET} → remove the clone entirely"
+    if macos_vm_running "$project_vm"; then
+        warn "VM '${project_vm}' did NOT stop — it is still running, with its egress datapath already torn down."
+        warn "The guest keeps running and keeps writing to ${WORKSPACE_DIR} through its share, and no augur"
+        warn "command can reach it again (SSH goes through the gvproxy this teardown just stopped)."
+        warn "Kill its VM process, then re-run the teardown:"
+        warn "  ${BOLD}kill \$(cat ~/.augur/vms/${project_vm}/run.pid) && augur down --macos${RESET}"
+        warn "${BOLD}augur destroy --macos${RESET} cannot help while it runs — 'augur-vm delete' refuses a running VM."
+    else
+        success "VM '${project_vm}' stopped (clone kept; CoW so it costs ~0 on disk)."
+        echo -e "  ${BOLD}augur up --macos${RESET}      → restart it (fast, no re-clone)"
+        echo -e "  ${BOLD}augur destroy --macos${RESET} → remove the clone entirely"
+    fi
 }
 
 cmd_destroy_macos() {
@@ -2955,6 +3700,14 @@ cmd_destroy_macos() {
     fi
     info "Stopping and removing VM '${project_vm}'..."
     "$VM_CLI" stop "$project_vm" 2>/dev/null || true
+    # No `|| true` on the delete, and that is what makes this path need no re-check of its own
+    # (cmd_down_macos's, above, is not redundant here — it is unreachable). `augur-vm delete`
+    # validates that the VM is NOT running and refuses otherwise, so a stop that failed above turns
+    # into a hard, visible failure right here: the message reaches the terminal (no 2>/dev/null) and
+    # `set -e` aborts before the "has been removed" success below. Adding `|| true` to this line
+    # would reintroduce exactly the defect `down --macos` had — a false success over a live VM whose
+    # egress datapath is already gone — so if this ever needs to tolerate a delete failure, it needs
+    # a `macos_vm_running` re-check first, not a swallowed exit status.
     "$VM_CLI" delete "$project_vm"
     # Drop the pinned SSH host key so the next clone (which will have a new key) is
     # not rejected against this project's fixed 127.0.0.1:<fwd-port> egress target.
@@ -3643,8 +4396,12 @@ start_provision_gvproxy() {
         exit 1
     fi
     sock="$(provision_gvproxy_socket)"; pidfile="$(provision_gvproxy_pidfile)"
-    rm -f "$sock"
     provision_gvproxy_running && return 0
+    # Same ordering rule as start_gvproxy, for the same reason: the unlink clears a socket left
+    # behind by a crashed gvproxy (or the -S wait below succeeds instantly against a dead file),
+    # so it must stay BELOW the early return — above it, reusing a running gvproxy unlinked the
+    # socket run_base_provisioning is about to hand `vm run --net-vfkit`.
+    rm -f "$sock"
     info "Starting build-provisioning gvproxy..."
     local gvp_debug=()
     [[ "${AUGUR_DEBUG:-}" == "1" ]] && gvp_debug=(--debug)
@@ -4208,6 +4965,21 @@ WORKSPACE_MOUNT="$(make_workspace_mount)"
 # "/Volumes/My Shared Files/<name>", which is the path Claude actually records as cwd (it resolves
 # the ~/workspace-<slug> symlink), so a per-project name keeps each project's history under a distinct slug.
 MACOS_SHARE="workspace-$(workspace_slug)"
+
+# ONE containment gate for BOTH modes, deliberately here in the shared dispatch tail rather
+# than inside cmd_up/cmd_up_macos. Two reasons:
+#   • Structural: a single site makes it impossible to fix one mode and forget the other.
+#   • Correctness: cmd_claude/cmd_shell only call cmd_up when the guest is NOT already
+#     running (`container_running || cmd_up`, `macos_vm_running … || cmd_up_macos`), so a
+#     check inside `up` would be skipped entirely when attaching to a guest a pre-fix augur
+#     had already created from $HOME — exactly the case that needs refusing.
+# It also runs BEFORE require_vz (called from inside the macOS cmd_* functions), so the
+# refusal names the workspace rather than the host OS.
+# NOT gated, on purpose (see the ADR): down/destroy/list/status must keep working here so a
+# container/VM a pre-fix augur made in $HOME can still be cleaned up; init-conf/build/update/
+# install-cert/version/help never hand this directory to a guest (`build` uses $SCRIPT_DIR as
+# its context).
+case "$COMMAND" in up|claude|shell|setup-token) require_safe_workspace ;; esac
 
 if $MACOS_MODE; then
     case "$COMMAND" in

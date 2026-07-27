@@ -56,7 +56,11 @@ Persistence is not inherently unsafe (macOS proves it); the danger was in copyin
    takes effect.
 2. **The boot self-test gates every `up`, including reuse.** `verify_egress_locked` runs on both
    the fresh and the reused path (via `finish_up`); the datapath is rebuilt on every `up`, never
-   cached from a prior boot (upholds INVARIANT I1). One honest caveat introduced by persistence:
+   cached from a prior boot (upholds INVARIANT I1). *(Amended 2026-07-26: "every `up`" originally
+   held only for the two paths this ADR had in view — fresh create and stopped→running reuse. A
+   third path, `up` against an **already-running** container, returned before `finish_up` and
+   before the approval gate; see the Consequences entry below for how it was closed.)* One honest
+   caveat introduced by persistence:
    on the reuse path the self-test's probes (`curl`/`getent`) execute *inside a container whose
    writable layer a prior session could have modified*, so they are no longer a fully independent
    tripwire the way they are against a pristine image. This is mitigated — the probes are pinned to
@@ -88,6 +92,28 @@ are container-create-time and re-applied by `start`; the allowlist is host-side)
   network + reconcile fingerprint. `augur destroy` added to the container-mode dispatch and help.
 - `cmd_up` reconciles: `container start` on a fingerprint match, else `engine_rm_force` + fresh
   `run`; `finish_up` (proxy + self-test) runs on both paths.
+- **`up` against an ALREADY-RUNNING container reconciles too (amended 2026-07-26).** As first
+  landed, that case printed "already running" and `return 0`'d *before* the approval gate and
+  before any datapath work — so the two mechanisms this ADR leans on were quietly absent exactly
+  where a live session needed them. Nothing widened (a skipped rewrite leaves the *previously
+  approved* policy in force, which is fail-closed), but: a **revocation could not land**
+  (`write_merged_allowlist` is reached only via `start_proxy`, i.e. only below that return, and
+  `augur-proxy` hot-reloads policy from that file's mtime); the **I1 self-test did not run**; and
+  the **fingerprint reconcile** — which exists to catch a flipped egress mode or a rotated
+  credential — never ran either. `cmd_up` now runs the approval gate, rewrites the merged
+  allowlist, and calls `finish_up` on that path as well, and **refuses (`exit 1`) on fingerprint
+  drift** rather than warning: `--network` / `--cap-drop` / `HTTP_PROXY` / `--no-dns` / `-e`
+  credentials are baked at `container run`, so a running container cannot pick them up, and the
+  remedy is the `augur down && augur up` this ADR already made cheap. The allowlist rewrite is
+  deliberately *duplicated* with the one inside `start_proxy` so a revocation still lands on that
+  refusal path. One new consequence to accept: `verify_egress_locked` is destructive on failure
+  (it force-removes the container), so `augur up` against a running container can now end an
+  operator's session — but only on a **detected leak**, which is precisely when I1 says it should.
+- **The merged allowlist is now written content-idempotently** (built into a same-directory temp
+  file, `mv`d only when the policy really differs, generated-at header excluded from the compare).
+  Its mtime is a *signal* — `augur-proxy` hot-reloads on it — so rewriting a byte-identical policy
+  on every `up` forced a pointless reload; and `mv` makes the swap atomic where the old
+  truncate-in-place let a poller read a prefix (only ever *narrower*, so I6 held either way).
 - `build`/`update`/`install-cert` remove this project's container so the new image takes effect;
   other projects on the same image tag need their own `augur destroy && augur up`.
 - Credentials are re-fingerprinted, so a rotated token recreates the container on the next `up`

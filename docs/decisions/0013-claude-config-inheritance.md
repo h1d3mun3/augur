@@ -133,10 +133,10 @@ already-wired one needs no augur action — it's a live mount. The three files a
 the copies and any *structural* directory change (an entry added, removed, or replaced, as opposed
 to a file changed inside one already wired) need the wiring itself to re-run. That happens on
 **every** `up`/`claude`/`shell` in both modes, not only when the container transitions
-stopped→running: `cmd_up` short-circuits to a no-op when the container is already running (the
-common case — repeated `claude`/`shell` calls with no intervening `down`), which would otherwise
-skip the wiring entirely, so `cmd_claude`/`cmd_shell` (and their macOS equivalents) call it directly
-too. Found live rather than by inspection: a profile entry added while the container stayed running
+stopped→running: `claude`/`shell` reach `cmd_up` only when the guest is **not** running
+(`container_running || cmd_up`), so on the common case — repeated `claude`/`shell` calls with no
+intervening `down` — nothing in `up` runs at all and the wiring would be skipped entirely; hence
+`cmd_claude`/`cmd_shell` (and their macOS equivalents) call it directly too. Found live rather than by inspection: a profile entry added while the container stayed running
 was invisible until an explicit `down`, contradicting the "next `claude` picks it up" promise the
 directories make for in-place edits. The copy exists in the first place because Claude Code
 **writes** user-scope `settings.json` (model selection and several `/config` toggles land there) and

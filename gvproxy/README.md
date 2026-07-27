@@ -32,9 +32,16 @@ funnels through); the SOCKS5 client is dependency-free (`socks_client.go`).
 ```
 augur-gvproxy --listen-vfkit unixgram://<sock> \
               --socks-upstream 127.0.0.1:<augur-proxy-socks-port> \
-              --dns-allowlist ~/.augur/proxy/<slug>.allowlist \
+              --dns-allowlist ~/.augur/proxy/<slug>-<path-hash>.allowlist \
               --ssh-port <fwd-port> --deny-direct
 ```
+
+Every per-project name above is keyed on `<slug>-<path-hash>` — the project directory's
+basename plus the first 12 hex of a sha256 of its FULL path — so two checkouts that share a
+basename (`~/work/app`, `~/archive/app`) never share an allowlist, a socket or a pidfile
+(invariant I7). `<sock>` is the one exception to the *full* slug: it is truncated to 24
+characters, because a unix-socket path has only 103 usable bytes (`sun_path`) where the
+neighbouring regular files have `PATH_MAX`.
 
 `augur` starts this automatically in `cmd_up_macos` when egress filtering is on;
 `augur-vm run --net-vfkit <sock>` attaches the VM's NIC to the same socket. The
