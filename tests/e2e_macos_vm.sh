@@ -116,6 +116,51 @@ else
   ok "IP-literal direct egress severed in the VM (no raw-routing bypass)"
 fi
 
+# ── ARM A: reconcile a RUNNING guest (the second `up`) ────────────────────────────────────────
+# Until this arm existed, this gate called `up --macos` exactly ONCE, so the already-running
+# reconcile branch had ZERO live coverage on this engine — and it is not a minor branch: it is where
+# a revoked allowlist reaches a live proxy, where the guest clock is re-corrected, and where the
+# boot self-test re-runs against a guest that is already up. Container mode has live evidence for
+# its half (`make egress` asserts "boot self-test re-ran on the reused container"); macOS had none.
+#
+# The branch was in fact only ever entered by ACCIDENT: on 2026-07-26 two consecutive runs of this
+# script hit it because a stale running VM happened to be left over, and that is how the silent-exit
+# defect fixed in #137 was found. An accident is not coverage. This arm enters it deliberately.
+#
+# The clock assertion is a NEGATIVE one on purpose. sync_macos_guest_clock is silent when the guest
+# is already within tolerance (`return 0`, no output), so "it printed something" cannot be asserted.
+# What CAN be asserted is that it did not report the failure it reports when SSH is unusable — which
+# is precisely the symptom the observed defect showed on this branch, one line before dying.
+section "Reconcile a running guest (second up --macos)"
+reout="$( cd "$PROJECT" && AUGUR_ACCEPT_PROJECT_CONF=1 bash "$AUGUR" up --macos 2>&1 )"; rerc=$?
+if [[ $rerc -eq 0 ]]; then
+  ok "a second augur up --macos against the running VM succeeds"
+else
+  fail "a second augur up --macos against the running VM succeeds" "exited $rerc — last lines:
+$(printf '%s\n' "$reout" | tail -n 12)"
+fi
+if [[ "$reout" == *"already running — reconciling host-side state only"* ]]; then
+  ok "it took the reconcile branch (not a fresh boot)"
+else
+  fail "it took the reconcile branch" "the reconcile warning is absent — this arm proved nothing:
+$(printf '%s\n' "$reout" | tail -n 12)"
+fi
+if [[ "$reout" == *"Egress self-test passed"* ]]; then
+  ok "the boot self-test RE-RAN on the already-running guest (I1 gates reuse on this engine too)"
+else
+  fail "the boot self-test re-ran on the already-running guest" "no passing self-test verdict:
+$(printf '%s\n' "$reout" | tail -n 12)"
+fi
+if [[ "$reout" != *"Could not read the guest's clock over SSH"* ]]; then
+  ok "the guest clock was readable over SSH on the reconcile path"
+else
+  fail "the guest clock was readable over SSH on the reconcile path" "SSH to the guest is broken on this branch — the exact symptom that preceded #137's silent exit"
+fi
+if macos_vm_running "$vm"; then ok "the VM is still running after the reconcile (nothing was torn down)"
+else fail "the VM is still running after the reconcile" "the reconcile stopped the VM"; fi
+if vssh true >/dev/null 2>&1; then ok "the VM is still reachable over SSH after the reconcile"
+else fail "the VM is still reachable over SSH after the reconcile"; fi
+
 # ── Bounded teardown (the #64 guarantee, end-to-end on a real VM) ─────────────────────────────
 # The base/build VM maintenance paths reap their backgrounded `augur-vm run` via
 # stop_and_reap_macos_vm (unit-tested against a SIGTERM-ignoring stand-in in 31_macos_teardown.sh).
@@ -133,5 +178,70 @@ else
   fail "augur down --macos took ${down_el}s" "possible unbounded teardown hang (regression in the reap path)"
 fi
 # The EXIT trap runs `down --macos` again — a harmless no-op now the VM is already stopped.
+
+# ── ARM B: the self-test with NO SSH transport (gvproxy killed under a live VM) ────────────────
+# The state #137 fixed, constructed on purpose. It is reachable in the field because
+# cmd_down_macos stops gvproxy and the proxy at the TOP: a stop that fails to kill the VM leaves a
+# running guest whose NIC is gone. macos_ssh_host then falls back to `augur-vm ip`, which a
+# vfkit-networked guest has no DHCP lease to answer, and ssh_macos EXITS the script rather than
+# returning — which used to end `up --macos` at rc=1 with no output and, worse, JUMP OVER the
+# self-test's own fail-closed teardown, leaving a live VM with a live NIC.
+#
+# tests/40 pins that offline through the real ssh_macos, but only a live host can prove the pieces
+# it has to stub: that a real `stop_gvproxy` really does strand the guest, and that `augur-vm ip`
+# really does answer with nothing for this network mode.
+#
+# This arm runs LAST and boots its own VM, so every assertion above keeps testing exactly what it
+# tested before. It ends with the VM STOPPED — by the self-test's teardown, which is the point.
+section "Self-test with no SSH transport (gvproxy killed under a live VM)"
+btout="$( cd "$PROJECT" && AUGUR_ACCEPT_PROJECT_CONF=1 bash "$AUGUR" up --macos 2>&1 )"; btrc=$?
+if [[ $btrc -eq 0 ]] && macos_vm_running "$vm"; then
+  ok "precondition: a fresh VM is up again for this arm"
+
+  # augur's OWN teardown function, the one cmd_down_macos calls — not a hand-rolled kill, so this
+  # cannot drift from the production path that creates the state.
+  stop_gvproxy >/dev/null 2>&1 || true
+  if ! gvproxy_running; then ok "precondition: gvproxy stopped under the live VM"
+  else fail "precondition: gvproxy stopped under the live VM" "stop_gvproxy left it running"; fi
+  if macos_vm_running "$vm"; then ok "precondition: the VM is still running with its NIC gone"
+  else fail "precondition: the VM is still running with its NIC gone" "stopping gvproxy also stopped the VM"; fi
+
+  ntout="$( cd "$PROJECT" && AUGUR_ACCEPT_PROJECT_CONF=1 bash "$AUGUR" up --macos 2>&1 )"; ntrc=$?
+
+  # THE two load-bearing assertions, and both are environment-independent: whichever branch the
+  # self-test takes, an unverifiable datapath must end `up` non-zero AND must not leave the guest
+  # running. The second is the one the defect broke — rc was already 1 before #137.
+  if [[ $ntrc -ne 0 ]]; then ok "up --macos against the stranded guest exits non-zero"
+  else fail "up --macos against the stranded guest exits non-zero" "it exited 0 — an unverifiable datapath was accepted:
+$(printf '%s\n' "$ntout" | tail -n 12)"; fi
+  if ! macos_vm_running "$vm"; then
+    ok "the fail-closed teardown actually stopped the VM (no live VM with a live NIC left behind)"
+  else
+    fail "the fail-closed teardown actually stopped the VM" "the VM is STILL RUNNING — this is #137's defect, or a new path around the teardown:
+$(printf '%s\n' "$ntout" | tail -n 12)"
+  fi
+  if [[ "$ntout" == *"Egress self-test FAILED"* ]]; then
+    ok "it reported through the normal fail-closed verdict"
+  else
+    fail "it reported through the normal fail-closed verdict" "no verdict line — did it die silently again?:
+$(printf '%s\n' "$ntout" | tail -n 12)"
+  fi
+
+  # Which of the two unverifiable-transport branches fired is environment-dependent: the specific one
+  # needs `augur-vm ip` to answer with nothing, which is true for a vfkit-networked guest but is not
+  # a property this script controls. Reported, never failed on — the assertions above already hold
+  # either way, and a silent exit would have failed them.
+  if [[ "$ntout" == *"no SSH transport"* ]]; then
+    ok "it named the missing transport and the remedy (#137's specific branch)"
+  elif [[ "$ntout" == *"cannot run a command in the guest over SSH"* ]]; then
+    skip "it named the missing transport (#137's branch)" "took the unreachable-but-resolvable branch instead — 'augur-vm ip' answered for this guest"
+  else
+    fail "it named the missing transport" "neither transport branch reported:
+$(printf '%s\n' "$ntout" | tail -n 12)"
+  fi
+else
+  fail "precondition: a fresh VM is up again for this arm" "exited $btrc — the arm could not be set up, so nothing below it ran:
+$(printf '%s\n' "$btout" | tail -n 12)"
+fi
 
 finish
