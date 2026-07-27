@@ -3299,7 +3299,9 @@ sync_macos_guest_clock() {
 # cached pages for it, and the next ordinary `read()` refetches from the host. POSIX specifies
 # exactly this ("invalidate cached copies … inconsistent with the permanent storage locations"),
 # though Apple's man page reduces it to four words and the client is a closed kext — hence the
-# self-test that PR #3 of this series adds, and the removal condition recorded in ADR-0016.
+# self-test in verify_macos_share_freshness, and the removal procedure in ADR-0016 §5 — which lists
+# every function, call site, state file and test this mechanism owns, because "delete the function"
+# stopped being accurate the moment the tripwire and the refresher loop were added.
 # Measured properties, all in a live guest: no privilege needed, no WRITE permission needed
 # (`O_RDONLY` + `PROT_READ` suffices, so `:ro` shares are reachable), the file is not modified
 # (ino/size/mtime unchanged), and it does not force a mass vnode reclaim (+7 recycled).
