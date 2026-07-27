@@ -77,6 +77,17 @@ else fail "it msyncs real files and counts them" "got '$out'"; fi
 if [[ "$out" == *"empty=1"* ]]; then ok "a zero-length file is classified, not treated as a failure"
 else fail "a zero-length file is classified" "got '$out'"; fi
 
+# msync's return value must be CHECKED, not discarded. A failing msync that still reports ok= is
+# precisely the silent failure this whole series exists to remove: the sweep would say it worked and
+# the guest would keep reading stale bytes. Driven by making the syscall fail for real — msync
+# rejects a length of 0 with EINVAL, and mapping a 1-byte file then asking for 0 bytes reaches that
+# branch without needing to stub libc.
+_probe_rc="$TMPD/rc.py"
+sed 's/L.msync(ctypes.c_void_p(a),n,2)/L.msync(ctypes.c_void_p(a),0,2)/' "$PROG" > "$_probe_rc"
+out="$(printf '%s\0' "$TMPD/real/a" | python3 "$_probe_rc" 3 2>&1)"
+if [[ "$out" == *"msyncfail=1"* ]]; then ok "a FAILING msync is reported, not counted as ok"
+else fail "a failing msync is reported" "got '$out' — a discarded return value means the sweep reports success while the guest stays stale"; fi
+
 out="$(printf '%s\0' "$TMPD/real/does-not-exist" | python3 "$PROG" 3 2>&1)"
 if [[ "$out" == *"gone=1"* ]]; then ok "a vanished path is reported as gone, not as a crash"
 else fail "a vanished path is reported as gone" "got '$out'"; fi

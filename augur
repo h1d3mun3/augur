@@ -3365,8 +3365,9 @@ def one(p,tries):
             if n==0: return "empty"
             a=L.mmap(None,n,1,1,fd,0)
             if a==NOMAP or a is None: return "nomap"
-            L.msync(ctypes.c_void_p(a),n,2)
+            rc=L.msync(ctypes.c_void_p(a),n,2)
             L.munmap(ctypes.c_void_p(a),n)
+            if rc!=0: return "msyncfail"
         finally: os.close(fd)
         try: after=os.stat(p).st_size
         except OSError: return "gone"
@@ -3461,7 +3462,7 @@ _refresh_macos_shares_locked() {
     # `unstable` means a file kept changing size across every retry — a live host-side writer, not a
     # defect — but it also means that file may still read short in the guest, so it is named.
     case "$out" in
-        *unstable=*|*nomap=*) warn "Share refresh finished with problems (${out}); some files may still read stale in the guest." ;;
+        *unstable=*|*nomap=*|*msyncfail=*) warn "Share refresh finished with problems (${out}); some files may still read stale in the guest." ;;
         *) [[ "$out" == *ok=* && "$quiet" != quiet ]] && info "Refreshed the guest's view of ${n} changed shared file(s) (${out})." ;;
     esac
     return 0
