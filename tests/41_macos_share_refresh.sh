@@ -88,6 +88,16 @@ out="$(printf '%s\0' "$TMPD/real/My Shared Dir/f one" | python3 "$PROG" 3 2>&1)"
 if [[ "$out" == "ok=1" ]]; then ok "a path with spaces survives the NUL protocol intact"
 else fail "a path with spaces survives the NUL protocol" "got '$out'"; fi
 
+# The retry bound must come from the ARGUMENT, not be hardcoded. With 0 tries the loop body never
+# runs, so every path must fall through to "unstable"; a program that ignores argv[1] and loops a
+# fixed number of times would report ok=1 here and the silent-truncation guard would be unpinned.
+out="$(printf '%s\0' "$TMPD/real/a" | python3 "$PROG" 0 2>&1)"
+if [[ "$out" == "unstable=1" ]]; then ok "the retry bound is taken from the argument, not hardcoded"
+else fail "the retry bound is taken from the argument" "with 0 tries expected unstable=1, got '$out'"; fi
+out="$(printf '%s\0' "$TMPD/real/a" | python3 "$PROG" 1 2>&1)"
+if [[ "$out" == "ok=1" ]]; then ok "…and one try is enough for a file whose size is stable"
+else fail "one try is enough for a stable file" "got '$out'"; fi
+
 out="$(printf '\0\0' | python3 "$PROG" 3 2>&1)"
 if [[ -z "${out// /}" ]]; then ok "an empty list is a clean no-op"
 else fail "an empty list is a clean no-op" "got '$out'"; fi
