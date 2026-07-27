@@ -84,7 +84,7 @@ if [[ "$(ssh_macos x cat | tr -d '\r\n')" == "OLDVAL" ]]; then ok "'stale' answe
 else fail "'stale' answers from the cache"; fi
 # …and the counter must survive being run in a subshell, which is how the function calls it.
 set_modes fresh stale
-( ssh_macos x cat >/dev/null | cat >/dev/null )
+( ssh_macos x cat | cat >/dev/null )   # the pipe is the point: it puts ssh_macos in a subshell
 if [[ "$(cat "$CTRFILE")" == "1" ]]; then ok "the call counter survives a subshell (variables would not)"
 else fail "the call counter survives a subshell" "counter=$(cat "$CTRFILE")"; fi
 
