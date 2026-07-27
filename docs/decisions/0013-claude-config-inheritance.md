@@ -190,9 +190,13 @@ could no longer reach the host directory at all. Second, the same staleness affe
 `gh-config` read-only share**, which has had this property since `:ro` support landed (2026-06-28,
 `213aa24`) without anyone noticing. Originally recorded as "plausibly affects"; **confirmed
 2026-07-28**, along with a simpler reason nobody noticed: that share is never wired into the guest
-at all in macOS mode — the share is created and mounted, but no `~/.config/gh` is ever produced
-inside the VM, so the host's `gh` aliases, `git_protocol` and GHE host are silently ignored there.
-(Container mode is unaffected: it mounts at `/home/dev/.config/gh`, the real path.)
+at all in macOS mode — the share was created and mounted, but no `~/.config/gh` was ever produced
+inside the VM, so the host's `gh` aliases, `git_protocol` and GHE host were silently ignored there.
+(Container mode is unaffected: it mounts at `/home/dev/.config/gh`, the real path.) **Resolved by
+removing the share from macOS mode, 2026-07-28**: a mount carrying the host's real `config.yml` and
+`hosts.yml` into a guest that never reads them is exposure without a feature. `gh` in the guest is
+unaffected — `GH_TOKEN` is the auth path on both engines. Wiring it properly is a feature addition
+and belongs in its own change.
 
 **`readOnly: true` is NOT the cause — the guest OS is.** Verified directly: an Apple Container guest
 on the same host, reading the same directory over a mount that is *also* `virtiofs (ro,relatime)`,
