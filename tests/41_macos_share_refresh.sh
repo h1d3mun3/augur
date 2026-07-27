@@ -149,7 +149,7 @@ else fail "only the changed file is swept" "fed $(nfed): $(fed | tr '\n' ' ')"; 
 if fed | grep -qx "/Volumes/My Shared Files/${MACOS_SHARE}/two"; then ok "…and it is the right one"
 else fail "…and it is the right one" "$(fed | tr '\n' ' ')"; fi
 
-section "a path with spaces survives the HOST half too"
+section "the wire protocol really is NUL-separated"
 
 sleep 1; mkdir -p "$WORKSPACE_DIR/a dir"; printf 's\n' > "$WORKSPACE_DIR/a dir/a file"
 : > "$STDINLOG"; refresh_macos_shares "$VM" >/dev/null 2>&1
@@ -157,6 +157,24 @@ if fed | grep -qx "/Volumes/My Shared Files/${MACOS_SHARE}/a dir/a file"; then o
 else fail "a host path with spaces arrives as one path" "$(fed | tr '\n' ' ')"; fi
 if [[ "$(nfed)" == "1" ]]; then ok "…and as exactly one entry, not three"
 else fail "…and as exactly one entry" "fed $(nfed)"; fi
+
+# Spaces alone do NOT pin the protocol: a newline-separated list carries a path with spaces just
+# fine, so the two are indistinguishable to every assertion above. Measured — swapping the \0 for a
+# \n in the producer left this file completely green. Two things actually discriminate:
+#   (a) the bytes on the wire contain NUL at all;
+#   (b) a path containing a NEWLINE survives as ONE path.
+# (b) is the behavioural form and is the reason NUL was chosen; macOS permits newlines in filenames.
+if [[ "$(tr -dc '\0' < "$STDINLOG" | wc -c | tr -d ' ')" -gt 0 ]]; then ok "the wire bytes actually contain NUL separators"
+else fail "the wire bytes actually contain NUL separators" "a newline-separated list would pass every other assertion here"; fi
+
+sleep 1; printf 'n\n' > "$WORKSPACE_DIR/we
+ird"
+: > "$STDINLOG"; refresh_macos_shares "$VM" >/dev/null 2>&1
+_nulcount="$(tr -dc '\0' < "$STDINLOG" | wc -c | tr -d ' ')"
+if [[ "$_nulcount" == "1" ]]; then ok "a filename containing a NEWLINE crosses as exactly one path"
+else fail "a filename containing a newline crosses as one path" "expected 1 NUL-terminated entry, saw $_nulcount"; fi
+rm -f "$WORKSPACE_DIR/we
+ird"
 
 section "failure is best-effort, and must not advance the marker"
 
