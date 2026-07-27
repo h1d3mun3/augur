@@ -179,17 +179,27 @@ ird"
 section "failure is best-effort, and must not advance the marker"
 
 sleep 1; printf 'MORE\n' > "$WORKSPACE_DIR/one"
-before="$(stat -f %m "$(macos_share_sweep_marker "$VM")" 2>/dev/null)"
+# A reference stamped AFTER the edit and BEFORE the sweep. The pending marker is created later
+# still, so a marker promoted by the sweep is necessarily newer than this; one left alone is not.
+# `-nt` is a bash builtin and behaves the same on both CI platforms — `stat -f %m` does not: on
+# macOS it prints the mtime, on GNU coreutils `-f` selects FILESYSTEM status and the arm silently
+# compared two error strings. It failed on ubuntu-latest while passing here.
+sleep 1; : > "$TMPD/ref-before-failure"
 SSH_RC=1; SSH_OUT="boom"
+: > "$SSHLOG"
 out="$( refresh_macos_shares "$VM" 2>&1 )"; rc=$?
 SSH_RC=0; SSH_OUT="ok=3"
+# Self-diagnosis first: if the sweep found nothing to do, it took the early-return path, never
+# reached the guest, and every assertion below would be about a sweep that did not happen.
+if [[ -s "$SSHLOG" ]]; then ok "the failing sweep actually had work and reached the guest"
+else fail "the failing sweep actually had work and reached the guest" "no guest call was made — the arm below would prove nothing"; fi
 if [[ $rc -eq 0 ]]; then ok "a guest-side failure still returns 0 (bring-up continues)"
 else fail "a guest-side failure still returns 0" "rc=$rc"; fi
 if [[ "$out" == *"Could not refresh"* ]]; then ok "…and says so"
 else fail "…and says so" "$out"; fi
-after="$(stat -f %m "$(macos_share_sweep_marker "$VM")" 2>/dev/null)"
-if [[ "$before" == "$after" ]]; then ok "the marker is NOT advanced on failure (the file is retried next time)"
-else fail "the marker is NOT advanced on failure" "$before -> $after"; fi
+if [[ ! "$(macos_share_sweep_marker "$VM")" -nt "$TMPD/ref-before-failure" ]]; then
+    ok "the marker is NOT advanced on failure (the file is retried next time)"
+else fail "the marker is NOT advanced on failure" "the marker moved forward despite the guest failing"; fi
 if [[ ! -f "$(macos_share_sweep_marker "$VM").pending" ]]; then ok "the pending marker is cleaned up after a failure"
 else fail "the pending marker is cleaned up after a failure"; fi
 : > "$STDINLOG"; refresh_macos_shares "$VM" >/dev/null 2>&1
