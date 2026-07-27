@@ -184,7 +184,9 @@ sleep 1; printf 'MORE\n' > "$WORKSPACE_DIR/one"
 # `-nt` is a bash builtin and behaves the same on both CI platforms — `stat -f %m` does not: on
 # macOS it prints the mtime, on GNU coreutils `-f` selects FILESYSTEM status and the arm silently
 # compared two error strings. It failed on ubuntu-latest while passing here.
-sleep 1; : > "$TMPD/ref-before-failure"
+: > "$TMPD/ref-before-failure"
+sleep 1        # `-nt` compares whole seconds on this bash; without the gap a promoted marker and
+               # the reference land in the same second and the assertion cannot fire. Measured.
 SSH_RC=1; SSH_OUT="boom"
 : > "$SSHLOG"
 out="$( refresh_macos_shares "$VM" 2>&1 )"; rc=$?
