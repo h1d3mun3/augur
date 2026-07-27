@@ -65,6 +65,7 @@ ssh_macos() {
         fresh)  cat "$PROBE" ;;
         stale)  cat "$CACHEFILE" ;;
         unread) return 1 ;;
+        noop)   : ;;              # the pre-read invalidate: the function discards its output
     esac
     # After the warm read, freeze what the guest "cached" — this is the value a stale answer serves.
     (( i == 0 )) && [[ "$mode" == fresh ]] && cp "$PROBE" "$CACHEFILE"
@@ -91,7 +92,7 @@ else fail "the call counter survives a subshell" "counter=$(cat "$CTRFILE")"; fi
 section "verified — staleness reproduced, then made current"
 
 # warm read fresh (the guest can see the probe), second read STALE, read after msync FRESH.
-set_modes fresh stale fresh
+set_modes noop fresh stale fresh
 run
 if [[ $rc -eq 0 ]]; then ok "returns 0"; else fail "returns 0" "rc=$rc"; fi
 if [[ "$out" == *"Shared-file refresh verified"* ]]; then ok "reports the mitigation as verified"
@@ -102,7 +103,7 @@ if [[ "$out" != *SELF-TEST\ FAILED* ]]; then ok "does not warn"; else fail "does
 
 section "BROKEN — msync did not make the read current"
 
-set_modes fresh stale stale
+set_modes noop fresh stale stale
 run
 if [[ $rc -eq 0 ]]; then ok "a broken mitigation is still NOT fatal (bring-up continues)"
 else fail "a broken mitigation is still not fatal" "rc=$rc"; fi
@@ -119,7 +120,7 @@ section "REMOVAL SIGNAL — the guest was already current before any msync"
 
 # This is the arm that a one-control self-test cannot distinguish from "working": both end with the
 # guest reading the new value. Only the read taken BEFORE the msync separates them.
-set_modes fresh fresh fresh
+set_modes noop fresh fresh fresh
 run
 if [[ "$out" == *"no longer need"* ]]; then ok "an already-fresh guest is reported as the removal signal (ADR-0016 §5)"
 else fail "an already-fresh guest is reported as the removal signal" "$out"; fi
@@ -131,7 +132,7 @@ if [[ $rc -eq 0 ]]; then ok "returns 0"; else fail "returns 0" "rc=$rc"; fi
 
 section "UNVERIFIED — the guest cannot read the probe at all"
 
-set_modes unread
+set_modes noop unread
 run
 if [[ "$out" == *"Could not verify"* ]]; then ok "an unreadable probe is reported as unverified"
 else fail "an unreadable probe is reported as unverified" "$out"; fi
@@ -141,14 +142,31 @@ if [[ "$out" != *"SELF-TEST FAILED"* ]]; then ok "…so it cannot be mistaken fo
 else fail "…so it cannot be mistaken for BROKEN" "$out"; fi
 if [[ "$out" != *"Shared-file refresh verified"* ]]; then ok "…nor for a pass (the #137 failure mode)"
 else fail "…nor for a pass" "$out"; fi
-_calls="$(grep -c . "$SSHLOG")"
-set_modes unread; : > "$SSHLOG"; run
-if [[ "$(grep -c . "$SSHLOG")" == "1" ]]; then ok "it stops after the failed read instead of probing on"
-else fail "it stops after the failed read" "issued $(grep -c . "$SSHLOG") commands"; fi
+# Count CALLS, not lines. The invalidate command carries the whole python program, so one call is
+# ~25 lines in the log — a line count reported 32 for what is actually two calls. The fixture's own
+# counter is the honest measure.
+set_modes noop unread; : > "$SSHLOG"; run
+# Two calls: the invalidate that makes the warm read meaningful, then the read that failed. Not
+# three or four — an unreadable probe must not go on to run the before/after comparison.
+if [[ "$(cat "$CTRFILE")" == "2" ]]; then ok "it stops after the failed read instead of probing on"
+else fail "it stops after the failed read" "issued $(cat "$CTRFILE") guest calls, expected 2"; fi
+
+section "the warm read is preceded by an invalidate"
+
+# The direct form of the fix. Without it the tripwire misreports on every run but the first: the
+# probe keeps one path, so the guest holds a warm STALE page from the previous run, the first read
+# returns that, and the function concludes "cannot read the probe". A permanently-unverified
+# self-test looks like a working one, which is the failure mode this whole series removes.
+set_modes noop fresh stale fresh; : > "$SSHLOG"; run
+if head -1 "$SSHLOG" | grep -q "msync\|python3 -c"; then
+    ok "the FIRST guest call is an invalidate, not a bare read"
+else fail "the first guest call is an invalidate" "it read straight away: $(head -1 "$SSHLOG")"; fi
+if [[ "$(cat "$CTRFILE")" == "4" ]]; then ok "…so a full run is 4 calls: invalidate, warm, before, after"
+else fail "a full run is 4 calls" "made $(cat "$CTRFILE")"; fi
 
 section "it exercises the SHIPPED program, not a copy of it"
 
-set_modes fresh stale fresh; : > "$SSHLOG"; run
+set_modes noop fresh stale fresh; : > "$SSHLOG"; run
 if grep -q "MS_INVALIDATE\|msync" "$SSHLOG"; then ok "the invalidation is performed in the guest, not simulated"
 else fail "the invalidation is performed in the guest" "$(head -2 "$SSHLOG")"; fi
 _prog="$(_macos_msync_program | head -3)"
@@ -163,7 +181,7 @@ if [[ "$(basename "$PROBE")" == .* ]]; then ok "…as a dotfile (Claude Code sca
 else fail "…as a dotfile"; fi
 if [[ "$(basename "$PROBE")" != *.md ]]; then ok "…with no .md extension, so nothing loads it as an agent"
 else fail "…with no .md extension"; fi
-_before="$(cat "$PROBE")"; set_modes fresh stale fresh; run
+_before="$(cat "$PROBE")"; set_modes noop fresh stale fresh; run
 if [[ -f "$PROBE" ]]; then ok "the probe is overwritten, never deleted (a delete leaves a phantom — #135)"
 else fail "the probe is overwritten, never deleted"; fi
 if [[ "$(cat "$PROBE")" != "$_before" ]]; then ok "…with a fresh nonce each run, so a cached answer cannot pass"
@@ -172,7 +190,7 @@ else fail "…with a fresh nonce each run" "the same value twice would let a fro
 section "a missing share directory is a no-op, not a failure"
 
 rm -rf "$PROBE_DIR"
-set_modes fresh; : > "$SSHLOG"; run
+set_modes noop fresh; : > "$SSHLOG"; run
 if [[ $rc -eq 0 && -z "$out" ]]; then ok "no agents share → silent no-op"
 else fail "no agents share → silent no-op" "rc=$rc out='$out'"; fi
 if [[ ! -s "$SSHLOG" ]]; then ok "…and no guest round trip is made"

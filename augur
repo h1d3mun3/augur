@@ -3509,6 +3509,13 @@ verify_macos_share_freshness() {
     a="probe-$$-${RANDOM}-a"; b="probe-$$-${RANDOM}-b"
 
     printf '%s\n' "$a" > "$host_dir/${_MACOS_FRESHNESS_PROBE}" 2>/dev/null || return 0
+    # Invalidate BEFORE the warm read. The probe keeps one path across runs (a delete would leave the
+    # phantom dentries #135 measured), so from the second `up` onward the guest already holds a warm,
+    # STALE page for it — the previous run's second value. Reading straight away would return that,
+    # `warm != a` would fire, and the tripwire would report "cannot read the probe" on every run but
+    # the first. A self-test that permanently says "unverified" is worse than none, because it looks
+    # like it is working. This is what makes the warm read mean what it claims.
+    ssh_macos "$vm" "printf %s '${guest_path}' | python3 -c '$(_macos_msync_program)' ${_MACOS_SWEEP_TRIES} >/dev/null 2>&1" >/dev/null 2>&1
     warm="$(ssh_macos "$vm" "cat '${guest_path}'" 2>/dev/null | tr -d '\r\n')"
     if [[ "$warm" != "$a" ]]; then
         # The guest cannot see the probe at all. That is not a verdict about msync — say so rather
