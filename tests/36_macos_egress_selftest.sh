@@ -264,6 +264,11 @@ egress_enabled()                { return 0; }
 check_project_conf_approved()   { echo "gate" >> "$LOG"; }
 start_proxy()                   { echo "start_proxy $1" >> "$LOG"; }
 start_gvproxy()                 { echo "start_gvproxy" >> "$LOG"; }
+# Stubbed for the same reason start_proxy is: it spawns a real background process. Left unstubbed,
+# its loop polls the stubbed macos_vm_running (permanently true) forever and the suite never ends.
+# The real function is exercised in tests/43_macos_share_refresher.sh.
+start_share_refresher()         { echo "start_share_refresher" >> "$LOG"; }
+stop_share_refresher()          { echo "stop_share_refresher" >> "$LOG"; }
 resolve_macos_vm_cpu()          { echo 4; }
 resolve_macos_vm_memory_mb()    { echo 8192; }
 wait_for_macos_ssh()            { return 0; }

@@ -115,9 +115,35 @@ one identical rule at four call sites.
 
 ## 4. What this does NOT fix
 
-- **It is not coherence.** The guarantee is "fresh as of the last sweep", not "fresh at the instant of
-  read". A host edit made after a sweep is invisible until the next one. This ADR covers the
-  attach-time sweep only; continuous refresh during a session is a separate change.
+- **It is not coherence.** The guarantee is "fresh within one refresh interval", not "fresh at the
+  instant of read". A host edit is invisible to the guest until the next sweep picks it up. That
+  turns "stale until a vnode reclaim, which may never come" into a bounded window — a large
+  practical difference, and still not a coherent filesystem.
+
+  The attach-time sweep alone would not even buy that: it gives "fresh as of the last attach", which
+  does **not** fix the symptom #124 actually reports — an edit made on the host *while the agent is
+  running*. So a host-side loop re-runs the sweep every `AUGUR_MACOS_REFRESH_INTERVAL` seconds
+  (default 5) for as long as the VM is up, started on both `up` paths and stopped by `down` and
+  `destroy`. Its pidfile is keyed by `workspace_path_hash`, like every other per-project host-side
+  process, because a same-basename sibling sharing one pidfile is the collision class PR #127
+  removed. An idle tick costs one host-side `find` and **zero** SSH round trips, because a sweep that
+  finds nothing never reaches the guest.
+
+  The loop's exit condition is the guest's own liveness, checked before every tick, rather than
+  trusting anyone to stop it: a crashed augur, a killed VM or a host reboot must not leave a process
+  SSHing at a guest that no longer exists.
+
+  It **polls** rather than watching. An FSEvents watcher would be event-driven and strictly cheaper,
+  but there is no FSEvents binding in the shell or in the stdlib python this uses, and `fswatch` is
+  not a dependency augur has — so it would mean a compiled component. That is the obvious next
+  optimisation and is deliberately not in the first cut.
+
+  The second sweeper is also what forces a **lock**. Two concurrent sweeps each stamp a pending
+  marker, scan against the shared one, and promote — and the loser's promotion can carry a timestamp
+  taken before the winner's scan, silently dropping every file changed in between. `mkdir` is the
+  atomic primitive; a skipped tick is correct because the holder is scanning the same trees against
+  the same marker. A lock older than two minutes is stolen, so a crash cannot wedge the refresh
+  permanently.
 - **Directory entries are out of reach.** A directory cannot be `mmap`ed at all (EINVAL — also true
   on local APFS, so it is a POSIX property, not a virtiofs quirk). The measured residue is that
   `stat` succeeds on a host-deleted path and reports `nlink=0`, which is the direct cause of augur's

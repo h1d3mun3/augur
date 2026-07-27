@@ -3387,8 +3387,35 @@ PYEOF
 # the guest clock, and for the same reason: failing `up` here would abandon a booted VM over a
 # freshness problem, which is the shape #129 removed from the credential path. Every caller ignores
 # the exit status; problems are reported, never fatal.
+# The lock exists only because PR 4 of this series introduced a SECOND sweeper. Until then there was
+# exactly one caller at a time and none was needed. Two concurrent sweeps would each stamp their own
+# pending marker, scan against the shared one, and promote — and the loser's promotion can carry a
+# timestamp taken before the winner's scan, which silently drops every file changed in between.
+# `mkdir` is the atomic primitive here; skipping the tick is correct, because whoever holds the lock
+# is scanning the same trees against the same marker and will cover this tick's work.
 refresh_macos_shares() {
-    local vm="$1" marker pending name root rel f n=0 out
+    local vm="$1" quiet="${2:-}" lock rc
+    lock="$(macos_share_sweep_marker "$vm").lock"
+    if ! mkdir "$lock" 2>/dev/null; then
+        # A crashed augur would otherwise wedge every future sweep behind a directory nobody owns.
+        # Steal it once it is far older than any real sweep could be (a full blind sweep of 12,600
+        # files measures 2.87 s), then try once more; a genuine holder keeps its lock.
+        if [[ -n "$(find "$lock" -maxdepth 0 -mmin +2 2>/dev/null)" ]]; then
+            rmdir "$lock" 2>/dev/null || true
+            mkdir "$lock" 2>/dev/null || return 0
+        else
+            return 0
+        fi
+    fi
+    ( trap 'rmdir '"$(printf %q "$lock")"' 2>/dev/null || true' EXIT
+      _refresh_macos_shares_locked "$vm" "$quiet" )
+    rc=$?
+    rmdir "$lock" 2>/dev/null || true
+    return $rc
+}
+
+_refresh_macos_shares_locked() {
+    local vm="$1" quiet="${2:-}" marker pending name root rel f n=0 out
     marker="$(macos_share_sweep_marker "$vm")"
     pending="${marker}.pending"
 
@@ -3420,7 +3447,7 @@ refresh_macos_shares() {
     done < <(macos_share_roots "$vm")
 
     if (( n == 0 )); then rm -f "$list"; mv -f "$pending" "$marker" 2>/dev/null || true; return 0; fi
-    (( n > 2000 )) && info "Refreshing ${n} changed shared file(s) in the guest — this takes a moment."
+    (( n > 2000 )) && [[ "$quiet" != quiet ]] && info "Refreshing ${n} changed shared file(s) in the guest — this takes a moment."
 
     # One round trip: the program is an argument, so stdin stays free for the NUL-separated list.
     out="$(ssh_macos "$vm" "python3 -c '$(_macos_msync_program)' ${_MACOS_SWEEP_TRIES}" < "$list" 2>&1)" || {
@@ -3436,7 +3463,7 @@ refresh_macos_shares() {
     # defect — but it also means that file may still read short in the guest, so it is named.
     case "$out" in
         *unstable=*|*nomap=*) warn "Share refresh finished with problems (${out}); some files may still read stale in the guest." ;;
-        *) [[ "$out" == *ok=* ]] && info "Refreshed the guest's view of ${n} changed shared file(s) (${out})." ;;
+        *) [[ "$out" == *ok=* && "$quiet" != quiet ]] && info "Refreshed the guest's view of ${n} changed shared file(s) (${out})." ;;
     esac
     return 0
 }
@@ -3514,6 +3541,71 @@ verify_macos_share_freshness() {
     return 0
 }
 
+# ── Continuous refresh while the VM runs ──────────────────────────────────────────────────────
+#
+# WHY A LOOP AT ALL. The sweep at the four attach points buys "fresh as of the last attach", which is
+# the same guarantee an SSH push would give — and it does NOT fix the symptom #124 actually reports.
+# That symptom is a host-side edit made WHILE the agent is running: the operator changes a slash
+# command or a source file, the agent reads it seconds later, and gets the old bytes. Nothing between
+# two attaches ever runs, so nothing invalidates anything.
+#
+# WHY IT LIVES ON THE HOST. Detection needs host mtimes (the guest's own metadata is not reliably
+# fresh — see ADR-0016), and the guest cannot be trusted to decide when it is stale. This is also the
+# cheap side: the host walk is 0.31 s for 12,626 files, and a tick that finds nothing makes NO ssh
+# call at all, so an idle session costs one `find` per interval and zero round trips.
+#
+# Modelled on start_proxy/stop_proxy, including the pidfile key. `workspace_path_hash` is not
+# decoration here: a same-basename sibling project sharing one pidfile is exactly the collision class
+# PR #127 removed from the egress state, and a refresher pointed at the wrong VM would sweep one
+# project's shares against another's marker.
+#
+# It is a POLLING loop rather than an FSEvents watcher because a watcher needs a compiled helper —
+# there is no FSEvents binding in the shell or in the stdlib python this uses, and `fswatch` is not a
+# dependency augur has. Event-driven is strictly better and is recorded in ADR-0016 as the obvious
+# next optimisation; it is not worth a Swift component in the first cut.
+_MACOS_REFRESH_INTERVAL="${AUGUR_MACOS_REFRESH_INTERVAL:-5}"
+
+share_refresher_pidfile() { echo "$AUGUR_PROXY_DIR/$(workspace_slug)-$(workspace_path_hash)-refresher.pid"; }
+
+share_refresher_running() {
+    local pf; pf="$(share_refresher_pidfile)"
+    [[ -f "$pf" ]] || return 1
+    local pid; pid="$(cat "$pf" 2>/dev/null)"
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+start_share_refresher() {
+    local vm="$1" pf
+    pf="$(share_refresher_pidfile)"
+    share_refresher_running && return 0
+    mkdir -p "$AUGUR_PROXY_DIR"
+
+    # The loop watches the VM itself rather than trusting anyone to stop it. `down --macos` does call
+    # stop_share_refresher, but a crashed augur, a `kill`ed VM or a host reboot must not leave a
+    # process sweeping a guest that no longer exists — so the exit condition is the guest's own
+    # liveness, checked before every tick.
+    (
+        while macos_vm_running "$vm"; do
+            sleep "$_MACOS_REFRESH_INTERVAL"
+            macos_vm_running "$vm" || break
+            refresh_macos_shares "$vm" quiet >/dev/null 2>&1
+        done
+        rm -f "$pf" 2>/dev/null || true
+    ) &>/dev/null &
+    echo $! > "$pf"
+    disown
+    return 0
+}
+
+stop_share_refresher() {
+    local pf; pf="$(share_refresher_pidfile)"
+    if share_refresher_running; then
+        kill "$(cat "$pf")" 2>/dev/null || true
+    fi
+    rm -f "$pf" 2>/dev/null || true
+    return 0
+}
+
 cmd_up_macos() {
     require_vz
     local project_vm
@@ -3556,6 +3648,9 @@ cmd_up_macos() {
         # afterwards does, and an operator who already has a shell open gets the refresh for free.
         refresh_macos_shares "$project_vm"
         verify_macos_share_freshness "$project_vm"
+        # Revive a refresher that died under this live VM — the same reason this branch revives the
+        # proxy a few lines above, and the only place that recovery can happen.
+        start_share_refresher "$project_vm"
         # I1's tripwire on THIS path too, mirroring container mode: finish_up (and therefore
         # verify_egress_locked) runs on cmd_up's already-running branch, and ADR-0010 already
         # accepted the consequence — "`augur up` against a running container can now end an
@@ -3709,6 +3804,10 @@ cmd_up_macos() {
     # the same two the egress self-test runs on. Reports; never fatal (see the function header for
     # why it deliberately differs from verify_macos_egress_locked on exactly that point).
     verify_macos_share_freshness "$project_vm"
+    # …and keep it fresh for the rest of the session. Attach-time sweeps alone buy "fresh as of the
+    # last attach", which does not fix what #124 actually reports: an edit made on the host WHILE the
+    # agent is running. Idempotent — a second `up` against a live refresher is a no-op.
+    start_share_refresher "$project_vm"
 
     # I1's boot tripwire, as early as it can possibly run: the moment a command can be run in the
     # guest, and BEFORE any of the wiring below — in particular before ~/.augur-env pushes an
@@ -3906,7 +4005,10 @@ cmd_down_macos() {
     local project_vm
     project_vm="$(macos_project_vm)"
     # Always tear down the host-side egress (gvproxy/proxy) so a stranded one from a
-    # crashed VM is cleaned up, even if the VM clone itself is already gone.
+    # crashed VM is cleaned up, even if the VM clone itself is already gone. The share refresher is
+    # unconditional for the same reason and goes FIRST: it is the only one of the three that would
+    # otherwise keep issuing SSH into a guest this function is about to stop.
+    stop_share_refresher
     stop_gvproxy
     stop_proxy
     if ! macos_vm_exists "$project_vm"; then
@@ -3945,6 +4047,9 @@ cmd_destroy_macos() {
     require_vz
     local project_vm
     project_vm="$(macos_project_vm)"
+    # Mirrors cmd_down_macos, and for the sharper version of the same reason: this path DELETES the
+    # clone, so a surviving refresher would be SSHing at a VM that is about to stop existing.
+    stop_share_refresher
     stop_gvproxy
     stop_proxy
     if ! macos_vm_exists "$project_vm"; then
@@ -3974,6 +4079,7 @@ cmd_destroy_macos() {
     # exists, silently skipping every file edited before the destroy. Removing it forces one full
     # sweep on the next attach, which is the conservative direction and costs seconds once.
     rm -f "$(macos_share_sweep_marker "$project_vm")" "$(macos_share_sweep_marker "$project_vm").pending"
+    rmdir "$(macos_share_sweep_marker "$project_vm").lock" 2>/dev/null || true
     success "VM '${project_vm}' has been removed."
 }
 
