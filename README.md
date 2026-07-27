@@ -132,14 +132,24 @@ What you get instead is a directory you populate on purpose:
   `<name>.pre-profile` rather than replacing it (an empty one is simply dropped).
 - **macOS VM mode caveat — profile edits need a VM restart.** The profile works there (it is shared
   read-only into the VM and wired the same way), but macOS mode reaches it over a **virtiofs share**
-  rather than a bind mount, and a read-only virtiofs share serves the guest **stale content for
-  minutes** after a host-side edit. Measured on real hardware: still stale 2 minutes after the
-  write; visible some time before the 10-minute mark. So if you change the profile while a VM is
-  running, run `augur down --macos && augur up --macos` to pick it up — a fresh `vm run` rebuilds
-  the share device and is guaranteed to see current content. Container mode is unaffected.
+  rather than a bind mount, and the macOS guest's virtiofs client keeps serving **stale file data**
+  after a host-side edit. A 105-arm experiment measured it: a file stayed stale for **904.9 s** with
+  no natural refresh, and then every share went fresh together **10.3 s after a guest vnode reclaim
+  was forced**. The delay is therefore not a timeout you can wait out — nothing expires.
+  Two things this document used to claim are wrong and are corrected here: it is **not** specific to
+  read-only shares (the read-write workspace share behaves identically — see
+  [issue #135](https://github.com/h1d3mun3/augur/issues/135)), and content does **not** reliably
+  become visible "before the 10-minute mark".
+  So if you change the profile while a VM is running, run `augur down --macos && augur up --macos`
+  to pick it up. That works because the guest **reboots with an empty vnode cache**, not because a
+  fresh `vm run` rebuilds the share device — a distinction that matters to anyone trying to fix
+  this. Container mode is unaffected, and that is diagnostic rather than incidental: a Linux guest
+  reading the same host directory over a mount that is *also* virtiofs sees current content live, so
+  the defect is in the **guest-side** client, not in the sharing mechanism or in `readOnly`.
   **augur warns you when this applies**: `augur claude --macos` / `shell --macos` check host-side
   whether the profile changed since the VM booted, and print the remedy if so — so the failure is
-  never silent. See [issue #124](https://github.com/h1d3mun3/augur/issues/124).
+  never silent. See [issue #124](https://github.com/h1d3mun3/augur/issues/124) and
+  [issue #135](https://github.com/h1d3mun3/augur/issues/135).
 
 Your **repository's** own `.claude/settings.json`, `CLAUDE.md`, `.claude/commands/`,
 `.claude/skills/` and `.mcp.json` already work with no setup — they arrive inside the workspace
