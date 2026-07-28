@@ -55,6 +55,14 @@ MODEFILE="$TMPD/modes"; CTRFILE="$TMPD/ctr"; CACHEFILE="$TMPD/cache"
 # The probe file is REAL on the host, so "fresh" is answered from what the host actually wrote and
 # "stale" from what the guest cached earlier — a canned string would let the fixture pass while the
 # function read the wrong path entirely.
+# The function resolves a transport BEFORE its first probe (ssh_macos EXITS rather than returns when
+# it cannot name a host, so the verdict has to distinguish "no transport" from "unreadable probe").
+# This fixture stubs ssh_macos itself — one layer ABOVE macos_ssh_host — so without this the precheck
+# would find no host at all (VM_CLI here points at a path that cannot exist) and every scenario below
+# would short-circuit into the "no SSH transport" verdict instead of exercising the four outcomes.
+# The missing-transport case has its own section, which overrides this locally.
+macos_ssh_host() { echo "127.0.0.1"; }
+
 set_modes() { printf '%s\n' "$@" > "$MODEFILE"; echo 0 > "$CTRFILE"; }
 ssh_macos() {
     printf '%s\n' "$*" >> "$SSHLOG"
@@ -65,6 +73,7 @@ ssh_macos() {
         fresh)  cat "$PROBE" ;;
         stale)  cat "$CACHEFILE" ;;
         unread) return 1 ;;
+        exits)  exit 1 ;;         # what ssh_macos really does when it cannot name a host (#137)
         noop)   : ;;              # the pre-read invalidate: the function discards its output
     esac
     # After the warm read, freeze what the guest "cached" — this is the value a stale answer serves.
@@ -196,6 +205,68 @@ else fail "no agents share → silent no-op" "rc=$rc out='$out'"; fi
 if [[ ! -s "$SSHLOG" ]]; then ok "…and no guest round trip is made"
 else fail "…and no guest round trip is made" "$(cat "$SSHLOG")"; fi
 mkdir -p "$PROBE_DIR"
+
+section "under \`set -e\` — the way augur actually runs"
+
+# THE GAP THIS SECTION EXISTS FOR. Every offline suite runs with `set +e` (lib.sh needs
+# assert-and-continue), and every assertion above calls the function inside `$( … )`. Both of those
+# NEUTRALISE the failure being tested here: under `set +e` a bare command returning non-zero is
+# harmless, and inside a command substitution an `exit` kills only the subshell. augur itself runs
+# with `set -e`, so a bare `ssh_macos` there either aborts the bring-up (non-zero return) or takes
+# the whole process down (exit) — silently, if the call is redirected.
+#
+# That is #137's defect, and it was reintroduced by the pre-read invalidate this file's own subject
+# needed. `make e2e` caught it as "the fail-closed teardown actually stopped the VM — the VM is
+# STILL RUNNING", i.e. the guest was left running with a live NIC. Nothing offline could see it.
+#
+# The marker is the discriminator: if the function aborts or exits, SURVIVED never prints.
+survives() {  # survives <mode> -> sets $out; the marker is present iff the caller lived
+    set_modes "$@"
+    out="$( set -e; verify_macos_share_freshness "$VM" 2>&1; echo SURVIVED )"
+}
+
+survives noop fresh stale fresh
+if [[ "$out" == *SURVIVED* ]]; then ok "a healthy guest: the caller survives"
+else fail "a healthy guest: the caller survives" "$out"; fi
+
+# Every call fails, not just the first: a short mode list falls back to `fresh`, which would let
+# the arm pass while testing a healthy guest.
+survives rcfail rcfail rcfail rcfail
+if [[ "$out" == *SURVIVED* ]]; then ok "an ssh that RETURNS non-zero does not abort the bring-up"
+else fail "an ssh that returns non-zero does not abort the bring-up" "under set -e a bare call would; got: $out"; fi
+if [[ "$out" == *"Could not verify"* ]]; then ok "…and still reports a verdict"
+else fail "…and still reports a verdict" "$out"; fi
+
+survives exits exits exits exits
+if [[ "$out" == *SURVIVED* ]]; then ok "an ssh that EXITS does not take the process with it"
+else fail "an ssh that exits does not take the process with it" "this is #137 exactly: augur dies with no output and the fail-closed teardown never runs"; fi
+if [[ "$out" == *"Could not verify"* ]]; then ok "…and still reports a verdict"
+else fail "…and still reports a verdict" "$out"; fi
+
+# A guest that answers the first probes and then stops — gvproxy dying mid-check is enough. Without
+# an arm here the `before`/`after` guards are unpinned, because every arm above dies at the warm read
+# and never reaches them.
+survives noop fresh exits exits
+if [[ "$out" == *SURVIVED* ]]; then ok "a guest that stops answering MID-check does not abort the bring-up"
+else fail "a guest that stops answering mid-check does not abort the bring-up" "$out"; fi
+if [[ "$out" == *"stopped answering mid-check"* ]]; then ok "…and is reported as UNVERIFIED, not as a broken mitigation"
+else fail "…and is reported as unverified" "\"msync did not work\" would send the operator after a platform behaviour that was never measured: $out"; fi
+if [[ "$out" != *"SELF-TEST FAILED"* ]]; then ok "…so it cannot be mistaken for BROKEN"
+else fail "…so it cannot be mistaken for BROKEN" "$out"; fi
+
+section "no transport at all is named as such"
+
+_saved_host="$(declare -f macos_ssh_host 2>/dev/null)"
+macos_ssh_host() { printf ''; }
+: > "$SSHLOG"
+out="$( set -e; verify_macos_share_freshness "$VM" 2>&1; echo SURVIVED )"
+if [[ "$out" == *"no SSH transport"* ]]; then ok "an unresolvable transport is named, not reported as an unreadable probe"
+else fail "an unresolvable transport is named" "\"cannot read the probe\" would send the operator after the wrong thing: $out"; fi
+if [[ "$out" == *SURVIVED* ]]; then ok "…and the caller survives"
+else fail "…and the caller survives" "$out"; fi
+if [[ ! -s "$SSHLOG" ]]; then ok "…without attempting a single probe"
+else fail "…without attempting a probe" "$(head -1 "$SSHLOG")"; fi
+[[ -n "$_saved_host" ]] && eval "$_saved_host" || unset -f macos_ssh_host
 
 section "call sites — the two \`up\` paths only"
 

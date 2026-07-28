@@ -3527,7 +3527,7 @@ _refresh_macos_shares_locked() {
 # on the heavier command, none on `claude`/`shell`, and the platform cannot change mid-boot anyway.
 _MACOS_FRESHNESS_PROBE=".augur-freshness-probe"
 verify_macos_share_freshness() {
-    local vm="$1" host_dir guest_path a b warm before after
+    local vm="$1" host_dir guest_path a b warm before after _ignored
     host_dir="$AUGUR_DIR/$(agent_state_agents_host_subdir)/${vm}"
     guest_path="/Volumes/My Shared Files/$(agent_state_agents_host_subdir)/${_MACOS_FRESHNESS_PROBE}"
     [[ -d "$host_dir" ]] || return 0
@@ -3537,6 +3537,17 @@ verify_macos_share_freshness() {
     # host-side delete is what leaves the phantom dentries measured in #135, and the file is 40 bytes.
     a="probe-$$-${RANDOM}-a"; b="probe-$$-${RANDOM}-b"
 
+    # Transport first, exactly as verify_macos_egress_locked does and for exactly the same reason:
+    # ssh_macos does not RETURN when it cannot name a host for the VM, it `exit 1`s the whole script,
+    # and `|| true` does not catch an exit. Every probe below is a command substitution, so an exit
+    # would only kill that subshell — but the verdict it produced would then be "the guest cannot
+    # read the probe" when the truth is "there is no transport at all". Name the real state.
+    if [[ -z "$(macos_ssh_host "$vm")" ]]; then
+        warn "Could not verify the shared-file refresh: no SSH transport to '${vm}'."
+        warn "  Host-side edits may not be visible in the guest (issues #124/#135); this is unverified, not proven broken."
+        return 0
+    fi
+
     printf '%s\n' "$a" > "$host_dir/${_MACOS_FRESHNESS_PROBE}" 2>/dev/null || return 0
     # Invalidate BEFORE the warm read. The probe keeps one path across runs (a delete would leave the
     # phantom dentries #135 measured), so from the second `up` onward the guest already holds a warm,
@@ -3544,8 +3555,23 @@ verify_macos_share_freshness() {
     # `warm != a` would fire, and the tripwire would report "cannot read the probe" on every run but
     # the first. A self-test that permanently says "unverified" is worse than none, because it looks
     # like it is working. This is what makes the warm read mean what it claims.
-    ssh_macos "$vm" "printf %s '${guest_path}' | python3 -c '$(_macos_msync_program)' ${_MACOS_SWEEP_TRIES} >/dev/null 2>&1" >/dev/null 2>&1
-    warm="$(ssh_macos "$vm" "cat '${guest_path}'" 2>/dev/null | tr -d '\r\n')"
+    # EVERY probe below ends in `|| true`, and that is not belt-and-braces — it is required, for two
+    # independent reasons that a command substitution alone does NOT cover:
+    #
+    #   1. augur runs under `set -e` (augur:7). A probe that merely RETURNS non-zero aborts the whole
+    #      bring-up. Wrapping in `$( … )` does nothing about that: the substitution's status is still
+    #      the command's.
+    #   2. augur also runs under `set -o pipefail` (same line). These probes pipe through `tr`, so a
+    #      failure on the LEFT of the pipe becomes the pipeline's status even though `tr` succeeded.
+    #      `ssh_macos` `exit 1`s when it cannot name a host (#137) — inside `$( … )` that kills only
+    #      the substitution's subshell, but pipefail then hands the non-zero straight back out.
+    #
+    # Measured: with the probes unguarded, a guest whose gvproxy had gone away made `up --macos` die
+    # here with NO output at all — and therefore skipped the fail-closed teardown, leaving a running
+    # VM with a live NIC. `make e2e` caught it; nothing offline could, because every offline suite
+    # runs with `set +e` and calls this inside `$( … )`, which neutralises both mechanisms.
+    _ignored="$(ssh_macos "$vm" "printf %s '${guest_path}' | python3 -c '$(_macos_msync_program)' ${_MACOS_SWEEP_TRIES}" 2>&1)" || true
+    warm="$(ssh_macos "$vm" "cat '${guest_path}'" 2>/dev/null | tr -d '\r\n')" || true
     if [[ "$warm" != "$a" ]]; then
         # The guest cannot see the probe at all. That is not a verdict about msync — say so rather
         # than reporting either control, which is the mistake #137's transport probe could not avoid.
@@ -3555,11 +3581,20 @@ verify_macos_share_freshness() {
     fi
 
     printf '%s\n' "$b" > "$host_dir/${_MACOS_FRESHNESS_PROBE}" 2>/dev/null || return 0
-    before="$(ssh_macos "$vm" "cat '${guest_path}'" 2>/dev/null | tr -d '\r\n')"
+    before="$(ssh_macos "$vm" "cat '${guest_path}'" 2>/dev/null | tr -d '\r\n')" || true
     # Invalidate and re-read in one round trip, through the SAME program the sweep uses — a self-test
     # that exercised its own copy of the mechanism would pass while the shipped one was broken.
-    after="$(ssh_macos "$vm" "printf %s '${guest_path}' | python3 -c '$(_macos_msync_program)' ${_MACOS_SWEEP_TRIES} >/dev/null 2>&1; cat '${guest_path}'" 2>/dev/null | tr -d '\r\n')"
+    after="$(ssh_macos "$vm" "printf %s '${guest_path}' | python3 -c '$(_macos_msync_program)' ${_MACOS_SWEEP_TRIES} >/dev/null 2>&1; cat '${guest_path}'" 2>/dev/null | tr -d '\r\n')" || true
 
+    # Empty means the guest stopped answering partway through — gvproxy dying mid-check is enough.
+    # That is UNVERIFIED, not broken: reporting "msync did not work" would send the operator after a
+    # platform behaviour when the truth is that nothing could be measured. Same distinction #137
+    # forced on the egress self-test, for the same reason.
+    if [[ -z "$after" ]]; then
+        warn "Could not verify the shared-file refresh: the guest stopped answering mid-check."
+        warn "  Host-side edits may not be visible in the guest (issues #124/#135); this is unverified, not proven broken."
+        return 0
+    fi
     if [[ "$after" != "$b" ]]; then
         warn "Shared-file refresh SELF-TEST FAILED: msync did not make the guest's read current."
         warn "  Host-side edits will not be visible in the guest until it reboots (issues #124/#135)."
