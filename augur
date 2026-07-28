@@ -3441,6 +3441,79 @@ refresh_macos_shares() {
     return 0
 }
 
+# ── Tripwire for the refresh above ────────────────────────────────────────────────────────────
+#
+# WHY THIS EXISTS. `refresh_macos_shares` rests on a behaviour of a CLOSED guest-side component.
+# POSIX specifies `MS_INVALIDATE` closely enough that the behaviour is clearly intended — "invalidate
+# cached copies … inconsistent with the permanent storage locations" — but Apple's man page reduces
+# it to four words and the client is `com.apple.driver.AppleVirtIO`, a kext with no published
+# contract for this interaction. Measured on exactly one guest OS (macOS 26.5.2, build 25F84,
+# xnu-12377.121.10). A future guest image could change it.
+#
+# And it would change SILENTLY. `msync` would keep returning 0, the sweep would keep reporting `ok=`,
+# and the guest would keep reading stale bytes with no error anywhere — the same failure class this
+# whole series exists to remove (#131 taught it for the boot self-test, #136 for a test guard, #137
+# for a probe that could not report). "We ran it" is not "it worked". So this asserts the outcome.
+#
+# TWO CONTROLS, because one cannot tell the two futures apart:
+#
+#   after-msync mismatch  → the mitigation is BROKEN on this guest OS.  warn loudly.
+#   before-msync ALREADY fresh → the mitigation is NO LONGER NEEDED, i.e. Apple fixed the client.
+#                                That is the removal signal ADR-0016 §5 asks for, and a self-test
+#                                with only the first control would report a clean pass for it.
+#
+# NOT FATAL, and deliberately unlike `verify_macos_egress_locked`. That one gates a SECURITY
+# invariant and tears the VM down on failure. This one gates a freshness MITIGATION: a guest whose
+# shares are stale is degraded, not uncontained, and killing an operator's VM over it would be the
+# defect #129 removed from the credential path. It reports; it never ends the bring-up.
+#
+# Runs on the two `up` paths only, mirroring where the boot self-test runs — three extra round trips
+# on the heavier command, none on `claude`/`shell`, and the platform cannot change mid-boot anyway.
+_MACOS_FRESHNESS_PROBE=".augur-freshness-probe"
+verify_macos_share_freshness() {
+    local vm="$1" host_dir guest_path a b warm before after
+    host_dir="$AUGUR_DIR/$(agent_state_agents_host_subdir)/${vm}"
+    guest_path="/Volumes/My Shared Files/$(agent_state_agents_host_subdir)/${_MACOS_FRESHNESS_PROBE}"
+    [[ -d "$host_dir" ]] || return 0
+
+    # A dotfile with no extension in the per-VM agents share: augur owns the directory, and Claude
+    # Code scans it for `*.md`, so nothing reads this. Overwritten rather than deleted each run — a
+    # host-side delete is what leaves the phantom dentries measured in #135, and the file is 40 bytes.
+    a="probe-$$-${RANDOM}-a"; b="probe-$$-${RANDOM}-b"
+
+    printf '%s\n' "$a" > "$host_dir/${_MACOS_FRESHNESS_PROBE}" 2>/dev/null || return 0
+    warm="$(ssh_macos "$vm" "cat '${guest_path}'" 2>/dev/null | tr -d '\r\n')"
+    if [[ "$warm" != "$a" ]]; then
+        # The guest cannot see the probe at all. That is not a verdict about msync — say so rather
+        # than reporting either control, which is the mistake #137's transport probe could not avoid.
+        warn "Could not verify the shared-file refresh: the guest cannot read the probe file."
+        warn "  Host-side edits may not be visible in the guest (issues #124/#135); this is unverified, not proven broken."
+        return 0
+    fi
+
+    printf '%s\n' "$b" > "$host_dir/${_MACOS_FRESHNESS_PROBE}" 2>/dev/null || return 0
+    before="$(ssh_macos "$vm" "cat '${guest_path}'" 2>/dev/null | tr -d '\r\n')"
+    # Invalidate and re-read in one round trip, through the SAME program the sweep uses — a self-test
+    # that exercised its own copy of the mechanism would pass while the shipped one was broken.
+    after="$(ssh_macos "$vm" "printf %s '${guest_path}' | python3 -c '$(_macos_msync_program)' ${_MACOS_SWEEP_TRIES} >/dev/null 2>&1; cat '${guest_path}'" 2>/dev/null | tr -d '\r\n')"
+
+    if [[ "$after" != "$b" ]]; then
+        warn "Shared-file refresh SELF-TEST FAILED: msync did not make the guest's read current."
+        warn "  Host-side edits will not be visible in the guest until it reboots (issues #124/#135)."
+        warn "  This mitigation was measured against macOS 26.5.2; a newer guest image may have changed the"
+        warn "  behaviour it relies on. Remedy for now: \`augur down --macos && augur up --macos\`. See ADR-0016."
+        return 0
+    fi
+    if [[ "$before" == "$b" ]]; then
+        # Both reads current, including the one taken BEFORE any msync: the guest saw the host's write
+        # with no help. One observation is not proof, but this is the signal ADR-0016 §5 names.
+        info "Shared files were already current before the refresh — this guest OS may no longer need it (ADR-0016 §5)."
+        return 0
+    fi
+    success "Shared-file refresh verified (stale read reproduced, then made current)."
+    return 0
+}
+
 cmd_up_macos() {
     require_vz
     local project_vm
@@ -3482,6 +3555,7 @@ cmd_up_macos() {
         # so nothing here depends on the order — but a `claude`/`shell` that attaches to this guest
         # afterwards does, and an operator who already has a shell open gets the refresh for free.
         refresh_macos_shares "$project_vm"
+        verify_macos_share_freshness "$project_vm"
         # I1's tripwire on THIS path too, mirroring container mode: finish_up (and therefore
         # verify_egress_locked) runs on cmd_up's already-running branch, and ADR-0010 already
         # accepted the consequence — "`augur up` against a running container can now end an
@@ -3631,6 +3705,10 @@ cmd_up_macos() {
     # sites. It reads the HOST's mtimes only, so the guest clock is not an input and the two
     # mitigations do not interact.
     refresh_macos_shares "$project_vm"
+    # …and the tripwire that proves the refresh above actually worked, on the two `up` paths only —
+    # the same two the egress self-test runs on. Reports; never fatal (see the function header for
+    # why it deliberately differs from verify_macos_egress_locked on exactly that point).
+    verify_macos_share_freshness "$project_vm"
 
     # I1's boot tripwire, as early as it can possibly run: the moment a command can be run in the
     # guest, and BEFORE any of the wiring below — in particular before ~/.augur-env pushes an
