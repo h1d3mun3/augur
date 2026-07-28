@@ -98,6 +98,14 @@ else fail "the loop actually sweeps" "no sweep in 8s at interval ${AUGUR_MACOS_R
 if grep -qx quiet "$SWEEPLOG"; then ok "…and sweeps QUIETLY (a line per interval would flood the terminal)"
 else fail "…and sweeps quietly" "recorded: $(tr '\n' ' ' < "$SWEEPLOG")"; fi
 
+# A background loop has nowhere to warn TO — the operator is inside `claude`. Its output has to land
+# in a file or the "a failing quiet sweep still warns" property below reaches nobody, and an hour of
+# failing sweeps looks exactly like a healthy session.
+if [[ -f "$(share_refresher_logfile)" ]]; then ok "the loop writes to a logfile, not to /dev/null"
+else fail "the loop writes to a logfile" "warnings from a background sweep would be discarded"; fi
+if [[ "$(share_refresher_logfile)" == "$AUGUR_PROXY_DIR"/* ]]; then ok "…beside the proxy and gvproxy logs"
+else fail "…beside the proxy and gvproxy logs" "$(share_refresher_logfile)"; fi
+
 stop_share_refresher
 if ! share_refresher_running; then ok "stop kills the loop"; else fail "stop kills the loop"; fi
 if [[ ! -f "$_PF" ]]; then ok "…and removes the pidfile"; else fail "…and removes the pidfile"; fi
@@ -121,6 +129,20 @@ fi
 if wait_until 5 '[[ ! -f "$_PF" ]]'; then ok "…and cleans up its own pidfile on the way out"
 else fail "…and cleans up its own pidfile"; fi
 echo yes > "$ALIVE"
+
+section "a failing sweep in the loop reaches the log"
+
+# End to end: the warning the quiet mode preserves has to arrive somewhere an operator can read.
+: > "$(share_refresher_logfile)"
+_saved_refresh="$(declare -f refresh_macos_shares)"
+refresh_macos_shares() { warn "SIMULATED sweep failure"; return 0; }
+echo yes > "$ALIVE"
+start_share_refresher "$VM"
+if wait_until 8 'grep -q "SIMULATED sweep failure" "$(share_refresher_logfile)"'; then
+    ok "a warning from inside the background loop lands in the log"
+else fail "a warning from inside the background loop lands in the log" "an operator has no other way to learn the refresher is failing"; fi
+stop_share_refresher
+eval "$_saved_refresh"
 
 section "the sweep lock — two concurrent sweepers must not race"
 
