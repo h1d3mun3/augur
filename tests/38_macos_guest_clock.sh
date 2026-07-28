@@ -304,6 +304,8 @@ egress_enabled()                { return 0; }
 check_project_conf_approved()   { :; }
 start_proxy()                   { :; }
 start_gvproxy()                 { :; }
+start_share_refresher()         { :; }   # spawns a real background loop; covered by tests/43
+stop_share_refresher()          { :; }
 resolve_macos_vm_cpu()          { echo 4; }
 resolve_macos_vm_memory_mb()    { echo 8192; }
 wait_for_macos_ssh()            { return 0; }
