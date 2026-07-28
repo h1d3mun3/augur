@@ -77,6 +77,22 @@ else fail "it msyncs real files and counts them" "got '$out'"; fi
 if [[ "$out" == *"empty=1"* ]]; then ok "a zero-length file is classified, not treated as a failure"
 else fail "a zero-length file is classified" "got '$out'"; fi
 
+# msync's return value must be CHECKED, not discarded. A failing msync that still reports ok= is
+# precisely the silent failure this whole series exists to remove: the sweep would say it worked and
+# the guest would keep reading stale bytes. Driven by making the syscall fail FOR REAL rather than by
+# stubbing libc — POSIX requires EINVAL when the address is not a multiple of the page size, so a
+# copy of the shipped program with the address nudged off alignment reaches the failure branch
+# through the same code path everything else uses.
+#
+# NOT a zero length, which was the first attempt: macOS rejects that with EINVAL but Linux returns 0,
+# so the arm passed here and failed on ubuntu-latest, where offline-tests actually runs. Page
+# alignment is specified on both.
+_probe_rc="$TMPD/rc.py"
+sed 's/L.msync(ctypes.c_void_p(a),n,2)/L.msync(ctypes.c_void_p(a+1),n,2)/' "$PROG" > "$_probe_rc"
+out="$(printf '%s\0' "$TMPD/real/a" | python3 "$_probe_rc" 3 2>&1)"
+if [[ "$out" == *"msyncfail=1"* ]]; then ok "a FAILING msync is reported, not counted as ok"
+else fail "a failing msync is reported" "got '$out' — a discarded return value means the sweep reports success while the guest stays stale"; fi
+
 out="$(printf '%s\0' "$TMPD/real/does-not-exist" | python3 "$PROG" 3 2>&1)"
 if [[ "$out" == *"gone=1"* ]]; then ok "a vanished path is reported as gone, not as a crash"
 else fail "a vanished path is reported as gone" "got '$out'"; fi
