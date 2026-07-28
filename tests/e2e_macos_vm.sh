@@ -53,7 +53,7 @@ MACOS_SHARE="workspace-$(workspace_slug)"
 vssh() { ssh_macos "$vm" "$@"; }          # run a command in the VM via augur's real SSH path
 
 # ── Boot the VM with egress ON (default; --macos is a TRAILING flag) ─────────────────────────
-cleanup() { ( cd "$PROJECT" && bash "$AUGUR" down --macos ) >/dev/null 2>&1; }
+cleanup() { rm -rf "$PROJECT/.refresh-lab"; ( cd "$PROJECT" && bash "$AUGUR" down --macos ) >/dev/null 2>&1; }
 trap cleanup EXIT
 section "Boot VM (egress on)"
 upout="$( cd "$PROJECT" && AUGUR_ACCEPT_PROJECT_CONF=1 bash "$AUGUR" up --macos 2>&1 )"; uprc=$?
@@ -161,6 +161,85 @@ else fail "the VM is still running after the reconcile" "the reconcile stopped t
 if vssh true >/dev/null 2>&1; then ok "the VM is still reachable over SSH after the reconcile"
 else fail "the VM is still reachable over SSH after the reconcile"; fi
 
+
+# ── Shared-file cache refresh (#124 / #135) ───────────────────────────────────────────────────
+# The defect: a macOS guest's virtiofs client serves STALE FILE DATA after a host-side edit, on every
+# share, with no timeout — measured 904.9 s stale, then fresh 10.3 s after a forced vnode reclaim.
+# The mitigation (ADR-0016) has a host half and a guest half and only a real host can exercise both:
+# offline tests drive the wiring with stubs, and no stub can reproduce a virtiofs cache.
+#
+# The headline arm is the one that needs NO augur command at all. The continuous refresher is the
+# only reason a host edit reaches a running guest, so if it works, an edit made here becomes visible
+# in the guest within one interval with nobody attaching to anything.
+section "Shared-file refresh — a host edit reaches a RUNNING guest"
+LAB="$PROJECT/.refresh-lab"; GLAB="~/${MACOS_SHARE}/.refresh-lab"
+mkdir -p "$LAB"
+printf 'MARK-A\n' > "$LAB/f1"
+if [[ "$(vssh "cat ${GLAB}/f1" 2>/dev/null | tr -d '\r\n')" == "MARK-A" ]]; then
+  ok "the guest can see the lab file (precondition)"
+else
+  fail "the guest can see the lab file" "nothing below can be interpreted without this"
+fi
+printf 'MARK-B\n' > "$LAB/f1"                       # same length: exactly the shape #124 reported
+_iv="${_MACOS_REFRESH_INTERVAL:-5}"
+_saw=""
+for _try in 1 2 3 4 5 6; do
+  sleep "$_iv"
+  _saw="$(vssh "cat ${GLAB}/f1" 2>/dev/null | tr -d '\r\n')"
+  [[ "$_saw" == "MARK-B" ]] && break
+done
+if [[ "$_saw" == "MARK-B" ]]; then
+  ok "a host edit became visible in the running guest within $((_try * _iv))s, with no augur command"
+else
+  fail "a host edit became visible in the running guest" "still '$_saw' after $((6 * _iv))s — the refresher is not working, which is the whole point of ADR-0016"
+fi
+
+# The silent-truncation guard. A guest whose cached size is the old, smaller one maps too few bytes,
+# invalidates only those pages, and the read comes back EOF-clamped — the first N bytes OF THE NEW
+# CONTENT. The file then looks valid and is quietly truncated, which is worse than being stale.
+# Measured offline; this is the live form. A whole-file hash is the only oracle that sees it.
+{ printf 'HEAD-B'; head -c 262144 /dev/zero | tr '\0' 'b'; printf 'TAIL-B'; } > "$LAB/f2"
+_hostsha="$(shasum -a 256 "$LAB/f2" | cut -d' ' -f1)"
+printf 'x\n' > "$LAB/f2.touch"                       # ensure the sweep has work even if f2 raced
+_gsha=""
+for _try in 1 2 3 4 5 6; do
+  sleep "$_iv"
+  _gsha="$(vssh "shasum -a 256 ${GLAB}/f2" 2>/dev/null | cut -d' ' -f1)"
+  [[ "$_gsha" == "$_hostsha" ]] && break
+done
+if [[ "$_gsha" == "$_hostsha" ]]; then
+  ok "a 256 KiB file is refreshed WHOLE (no EOF-clamped truncation)"
+else
+  fail "a 256 KiB file is refreshed whole" "guest sha=$_gsha host sha=$_hostsha — a partial refresh returns valid-looking, truncated content"
+fi
+
+# The refresher is a real host-side process with a pidfile, like the proxy and gvproxy.
+if [[ -f "$(share_refresher_pidfile)" ]] && share_refresher_running; then
+  ok "the share refresher is running (pid $(cat "$(share_refresher_pidfile)"))"
+else
+  fail "the share refresher is running" "no live pidfile at $(share_refresher_pidfile)"
+fi
+
+# The tripwire's verdict, from the `up` output already captured above. Three outcomes are possible
+# and they mean different things — a BROKEN one is the signal that this guest OS changed under us.
+case "$reout" in
+  *"SELF-TEST FAILED"*)
+    fail "the freshness self-test passed" "it reported BROKEN — msync no longer refreshes on this guest OS; see ADR-0016 §5" ;;
+  *"Shared-file refresh verified"*)
+    ok "the freshness self-test reproduced staleness and then cleared it" ;;
+  *"no longer need"*)
+    skip "the freshness self-test" "it reports the guest was ALREADY current before any msync — the platform may be fixed (ADR-0016 §5)" ;;
+  *)
+    fail "the freshness self-test ran" "no verdict in the up output at all" ;;
+esac
+
+# The gh-config share was removed: mounted, never wired, and carrying the host's real config.
+if vssh "test -d '/Volumes/My Shared Files/gh-config'" >/dev/null 2>&1; then
+  fail "the gh-config share is gone from the guest" "it is still mounted — the host's config.yml/hosts.yml are readable there for no working feature"
+else
+  ok "the gh-config share is gone from the guest"
+fi
+
 # ── Bounded teardown (the #64 guarantee, end-to-end on a real VM) ─────────────────────────────
 # The base/build VM maintenance paths reap their backgrounded `augur-vm run` via
 # stop_and_reap_macos_vm (unit-tested against a SIGTERM-ignoring stand-in in 31_macos_teardown.sh).
@@ -177,6 +256,9 @@ if (( down_el < 90 )); then
 else
   fail "augur down --macos took ${down_el}s" "possible unbounded teardown hang (regression in the reap path)"
 fi
+if ! share_refresher_running; then ok "…and the share refresher is stopped with it (no orphan SSHing at a dead guest)"
+else fail "the share refresher is stopped with the VM" "pid $(cat "$(share_refresher_pidfile)" 2>/dev/null) survived \`down --macos\`"; fi
+
 # The EXIT trap runs `down --macos` again — a harmless no-op now the VM is already stopped.
 
 # ── ARM B: the self-test with NO SSH transport (gvproxy killed under a live VM) ────────────────
