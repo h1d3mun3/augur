@@ -243,6 +243,17 @@ else fail "an ssh that exits does not take the process with it" "this is #137 ex
 if [[ "$out" == *"Could not verify"* ]]; then ok "…and still reports a verdict"
 else fail "…and still reports a verdict" "$out"; fi
 
+# A guest that answers the first probes and then stops — gvproxy dying mid-check is enough. Without
+# an arm here the `before`/`after` guards are unpinned, because every arm above dies at the warm read
+# and never reaches them.
+survives noop fresh exits exits
+if [[ "$out" == *SURVIVED* ]]; then ok "a guest that stops answering MID-check does not abort the bring-up"
+else fail "a guest that stops answering mid-check does not abort the bring-up" "$out"; fi
+if [[ "$out" == *"stopped answering mid-check"* ]]; then ok "…and is reported as UNVERIFIED, not as a broken mitigation"
+else fail "…and is reported as unverified" "\"msync did not work\" would send the operator after a platform behaviour that was never measured: $out"; fi
+if [[ "$out" != *"SELF-TEST FAILED"* ]]; then ok "…so it cannot be mistaken for BROKEN"
+else fail "…so it cannot be mistaken for BROKEN" "$out"; fi
+
 section "no transport at all is named as such"
 
 _saved_host="$(declare -f macos_ssh_host 2>/dev/null)"

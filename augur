@@ -3586,6 +3586,15 @@ verify_macos_share_freshness() {
     # that exercised its own copy of the mechanism would pass while the shipped one was broken.
     after="$(ssh_macos "$vm" "printf %s '${guest_path}' | python3 -c '$(_macos_msync_program)' ${_MACOS_SWEEP_TRIES} >/dev/null 2>&1; cat '${guest_path}'" 2>/dev/null | tr -d '\r\n')" || true
 
+    # Empty means the guest stopped answering partway through — gvproxy dying mid-check is enough.
+    # That is UNVERIFIED, not broken: reporting "msync did not work" would send the operator after a
+    # platform behaviour when the truth is that nothing could be measured. Same distinction #137
+    # forced on the egress self-test, for the same reason.
+    if [[ -z "$after" ]]; then
+        warn "Could not verify the shared-file refresh: the guest stopped answering mid-check."
+        warn "  Host-side edits may not be visible in the guest (issues #124/#135); this is unverified, not proven broken."
+        return 0
+    fi
     if [[ "$after" != "$b" ]]; then
         warn "Shared-file refresh SELF-TEST FAILED: msync did not make the guest's read current."
         warn "  Host-side edits will not be visible in the guest until it reboots (issues #124/#135)."
