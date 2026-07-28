@@ -156,19 +156,80 @@ one identical rule at four call sites.
 This mitigation exists because of a defect in a closed guest-side component. It must be **cheap to
 remove**, and its removal must be **detectable** rather than guessed at.
 
-- The mechanism is one function plus one call at each of four sites. Removing it is deleting a
-  function; nothing else depends on it.
+### 5.1 What tells you it can go
+
 - **No invariant asserts freshness.** `INVARIANTS.md` is deliberately untouched by this change. If a
   later change wants to depend on "the guest sees the host's current content", that is a contract
   change and needs the dated-snapshot ceremony — precisely so that this mitigation cannot quietly
-  become load-bearing for something else.
-- The self-test that accompanies this work carries **two** controls, because one is not enough to
-  tell the two futures apart:
-  - does content match **after** msync? — the mitigation is working (warn if not);
-  - does content already match **before** msync? — the mitigation is **no longer needed**, i.e. the
-    platform has been fixed and this ADR can be retired.
-- Re-verify when the guest base image is rebuilt from a new IPSW. `augur update --macos` does not
-  change the guest OS; a base rebuild does.
+  become load-bearing for something else. Nothing outside the list in §5.3 reads its state.
+- The self-test carries **two** controls, because one cannot tell the two futures apart:
+  - content does not match **after** msync → the mitigation is **broken** on this guest OS (warn);
+  - content already matches **before** any msync → the mitigation is **no longer needed**, i.e. the
+    platform has been fixed. `up --macos` prints *"Shared files were already current before the
+    refresh — this guest OS may no longer need it (ADR-0016 §5)"*.
+- One such observation is a signal, not a proof. Confirm it across a few `up`s and, if possible, more
+  than one guest image before acting: a single run can be fresh by luck if nothing was cached.
+- Re-verify whenever the guest base image is rebuilt from a new IPSW. `augur update --macos` does not
+  change the guest OS; a base rebuild does. That is the moment the behaviour this rests on can change
+  in either direction.
+
+### 5.2 Staged removal, not a single delete
+
+The mitigation is inert when it is not needed — an unnecessary `msync` costs 0.23 ms and changes
+nothing — so there is no pressure to rip it out the day the signal appears. Prefer:
+
+1. **Stop the loop first.** `AUGUR_MACOS_REFRESH_INTERVAL` only sets the period, so add a disable
+   path or set it absurdly high locally, and run normally for a while. If nothing goes stale, the
+   platform really is fixed. This is the cheapest and most reversible step.
+2. **Keep the tripwire longest.** It is three SSH round trips on `up` and it is the only thing that
+   would notice a *regression* in a later macOS. Delete it last, or keep it permanently as a cheap
+   canary.
+3. **Then delete the mechanism** per §5.3.
+
+### 5.3 What removal actually touches
+
+Not "one function". As shipped, in `augur`:
+
+| | |
+|---|---|
+| Sweep | `refresh_macos_shares`, `_refresh_macos_shares_locked`, `_macos_msync_program`, `macos_share_roots`, `macos_share_sweep_marker`, `_MACOS_SWEEP_TRIES` |
+| Tripwire | `verify_macos_share_freshness`, `_MACOS_FRESHNESS_PROBE` |
+| Loop | `start_share_refresher`, `stop_share_refresher`, `share_refresher_running`, `share_refresher_pidfile`, `share_refresher_logfile`, `_MACOS_REFRESH_INTERVAL` (and its `AUGUR_MACOS_REFRESH_INTERVAL` override) |
+
+Call sites: `refresh_macos_shares` ×4 (`cmd_up_macos` fresh + reconcile, `cmd_claude_macos`,
+`cmd_shell_macos`) plus once inside the loop; `verify_macos_share_freshness` ×2 and
+`start_share_refresher` ×2 (both `up` paths); `stop_share_refresher` ×2 (`cmd_down_macos`,
+`cmd_destroy_macos`). The reaping block in `cmd_destroy_macos` goes too.
+
+Host state to stop creating — and to clean up once from existing installs, since nothing will remove
+it afterwards: `$AUGUR_DIR/vm-state/<vm>.shares-swept` (plus `.pending` and the `.lock` **directory**),
+`$AUGUR_PROXY_DIR/<slug>-<hash>-refresher.{pid,log}`. Guest state: the
+`.augur-freshness-probe` dotfile in each per-VM `claude-agents` share.
+
+Tests: delete `tests/41_macos_share_refresh.sh`, `tests/42_macos_share_freshness_selftest.sh`,
+`tests/43_macos_share_refresher.sh`; drop the `start_share_refresher`/`stop_share_refresher` stubs
+from `tests/34`, `tests/36` and `tests/38` (left in place they are harmless, but they would stub
+functions that no longer exist); and remove the "Shared-file refresh" section from
+`tests/e2e_macos_vm.sh`.
+
+Docs: this ADR is retired (status → superseded, with the observation that retired it), its index row
+in `docs/decisions/README.md` goes, and the macOS caveat in `README.md`'s operator-profile section is
+rewritten — **not deleted**. A reader on an older guest image still hits the defect.
+
+### 5.4 What must NOT be reverted with it
+
+Two changes rode along in the same series and are **independent of whether Apple ever fixes this**:
+
+- **The documentation corrections.** `README.md` and ADR-0013 used to attribute the staleness to
+  read-only sharing and to claim it resolved "before the 10-minute mark". Both were measured false.
+  That is historical fact about the platform, not a consequence of the mitigation.
+- **The removal of the `gh-config` share from macOS mode.** That share was mounted and never wired to
+  `~/.config/gh`, so it carried the host's real `config.yml` and `hosts.yml` into a guest that never
+  read them. It is exposure without a feature and stays removed regardless. If it is ever wired
+  properly it must reappear in **both** the `--dir=` argv and `macos_share_roots`.
+
+Measured on macOS **26.5.2** (build 25F84, `xnu-12377.121.10 RELEASE_ARM64_VMAPPLE`), guest page size
+16384. Everything above rests on that one guest.
 
 Measured on macOS **26.5.2** (build 25F84, `xnu-12377.121.10 RELEASE_ARM64_VMAPPLE`), guest page size
 16384. Everything above rests on that one guest.
