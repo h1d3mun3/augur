@@ -107,16 +107,63 @@ else fail "a path with spaces survives the NUL protocol" "got '$out'"; fi
 # The retry bound must come from the ARGUMENT, not be hardcoded. With 0 tries the loop body never
 # runs, so every path must fall through to "unstable"; a program that ignores argv[1] and loops a
 # fixed number of times would report ok=1 here and the silent-truncation guard would be unpinned.
-out="$(printf '%s\0' "$TMPD/real/a" | python3 "$PROG" 0 2>&1)"
+out="$(printf '%s\0' "$TMPD/real/a" | python3 "$PROG" 0 2>&1 | head -1)"
 if [[ "$out" == "unstable=1" ]]; then ok "the retry bound is taken from the argument, not hardcoded"
-else fail "the retry bound is taken from the argument" "with 0 tries expected unstable=1, got '$out'"; fi
-out="$(printf '%s\0' "$TMPD/real/a" | python3 "$PROG" 1 2>&1)"
+else fail "the retry bound is taken from the argument" "with 0 tries expected the summary unstable=1, got '$out'"; fi
+out="$(printf '%s\0' "$TMPD/real/a" | python3 "$PROG" 1 2>&1 | head -1)"
 if [[ "$out" == "ok=1" ]]; then ok "…and one try is enough for a file whose size is stable"
 else fail "one try is enough for a stable file" "got '$out'"; fi
 
 out="$(printf '\0\0' | python3 "$PROG" 3 2>&1)"
 if [[ -z "${out// /}" ]]; then ok "an empty list is a clean no-op"
 else fail "an empty list is a clean no-op" "got '$out'"; fi
+
+section "failures are NAMED, not just counted"
+
+# Counts answer "is one file wrong or are hundreds?" — which changes how alarmed to be. They do not
+# answer "which one", which is what decides whether to care at all: `unstable` on a build artefact
+# while a host-side build runs is expected; the same verdict on a source file is not. The remedy is
+# identical either way, so this is diagnosis, and it is bounded for that reason.
+mkdir -p "$TMPD/many"
+for _i in 1 2 3 4 5 6 7 8; do printf 'x\n' > "$TMPD/many/f$_i"; done
+_all_fail="$TMPD/allfail.py"
+sed 's/L.msync(ctypes.c_void_p(a),n,2)/L.msync(ctypes.c_void_p(a+1),n,2)/' "$PROG" > "$_all_fail"
+out="$(for _i in 1 2 3 4 5 6 7 8; do printf '%s\0' "$TMPD/many/f$_i"; done | python3 "$_all_fail" 3 5 2>&1)"
+
+if [[ "$(printf '%s\n' "$out" | head -1)" == "msyncfail=8" ]]; then ok "the counts stay on the FIRST line"
+else fail "the counts stay on the first line" "the host reads line 1 as the summary; got '$(printf '%s\n' "$out" | head -1)'"; fi
+if [[ "$(printf '%s\n' "$out" | grep -c '^msyncfail /')" == "5" ]]; then ok "it names the failures, capped at the requested 5"
+else fail "it names the failures, capped at 5" "got $(printf '%s\n' "$out" | grep -c '^msyncfail /')"; fi
+if printf '%s\n' "$out" | grep -qx "and 3 more"; then ok "…and says how many it did not name"
+else fail "…and says how many it did not name" "silent truncation is the failure class this series removes: $out"; fi
+
+out="$(printf '%s\0%s\0' "$TMPD/many/f1" "$TMPD/many/f2" | python3 "$PROG" 3 5 2>&1)"
+if [[ "$(printf '%s\n' "$out" | grep -c .)" == "1" ]]; then ok "a clean sweep prints the summary and nothing else"
+else fail "a clean sweep prints only the summary" "got: $(printf '%s\n' "$out" | tr '\n' '|')"; fi
+
+# A filename may contain a newline on macOS. Unsanitised it would split one failure across two
+# output lines and the host would print half a path as if it were a second failure.
+mkdir -p "$TMPD/nl"; printf 'x\n' > "$TMPD/nl/we
+ird"
+out="$(printf '%s\0' "$TMPD/nl/we
+ird" | python3 "$_all_fail" 3 5 2>&1)"
+if [[ "$(printf '%s\n' "$out" | grep -c .)" == "2" ]]; then ok "a filename containing a newline stays on ONE detail line"
+else fail "a filename with a newline stays on one line" "$(printf '%s\n' "$out" | tr '\n' '|')"; fi
+
+section "the host surfaces the named failures"
+
+sleep 1; printf 'edited\n' > "$WORKSPACE_DIR/one"
+SSH_OUT="ok=2 unstable=1
+unstable /Volumes/My Shared Files/workspace-testslug/src/main.swift
+and 7 more"
+out="$( refresh_macos_shares "$VM" 2>&1 )"
+SSH_OUT="ok=3"
+if [[ "$out" == *"(ok=2 unstable=1)"* ]]; then ok "the summary line is used for the headline, not the whole blob"
+else fail "the summary line is used for the headline" "$out"; fi
+if [[ "$out" == *"unstable /Volumes/My Shared Files/workspace-testslug/src/main.swift"* ]]; then ok "the named file reaches the operator"
+else fail "the named file reaches the operator" "$out"; fi
+if [[ "$out" == *"and 7 more"* ]]; then ok "…so does the truncation notice"
+else fail "…so does the truncation notice" "$out"; fi
 
 section "the share inventory matches what --dir= actually mounts"
 
@@ -244,8 +291,10 @@ section "the retry count reaches the guest"
 # the invocation shape on the first line, and the retry count as the final argument on the last.
 if head -1 "$SSHLOG" | grep -q "python3 -c "; then ok "the guest is invoked as \`python3 -c\`"
 else fail "the guest is invoked as \`python3 -c\`" "$(head -1 "$SSHLOG")"; fi
-if tail -1 "$SSHLOG" | grep -q " ${_MACOS_SWEEP_TRIES}$"; then ok "the configured retry count is the final argument"
-else fail "the configured retry count is the final argument" "$(tail -1 "$SSHLOG")"; fi
+# Both tuning arguments, in order: a swap would silently give 5 retries and name 3 failures.
+if tail -1 "$SSHLOG" | grep -q " ${_MACOS_SWEEP_TRIES} ${_MACOS_SWEEP_DETAIL}$"; then
+    ok "the retry count and the detail cap are passed, in that order"
+else fail "the retry count and the detail cap are passed, in that order" "$(tail -1 "$SSHLOG")"; fi
 
 section "call-site ORDER — the refresh must precede the wiring"
 

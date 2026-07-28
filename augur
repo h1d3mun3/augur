@@ -3326,6 +3326,10 @@ sync_macos_guest_clock() {
 # be large, the worst case is bounded at seconds, and a silent truncation of the list would be the
 # same class of failure this whole series exists to remove.
 _MACOS_SWEEP_TRIES=3
+# How many individual failures the guest names before collapsing the rest into "and N more". Bounded
+# because a host-side build running during a sweep can legitimately leave hundreds of files
+# `unstable`, and the attach-path warnings go to the operator's terminal.
+_MACOS_SWEEP_DETAIL=5
 
 # Per-VM marker: the instant of the last successful sweep. Mirrors macos_profile_marker_file, and
 # lives beside it so `destroy --macos` reaps both.
@@ -3376,12 +3380,22 @@ def one(p,tries):
         if after==n: return "ok"
     return "unstable"
 tries=int(sys.argv[1])
+cap=int(sys.argv[2]) if len(sys.argv)>2 else 5
+NAMED=("unstable","nomap","msyncfail")
+def disp(q): return q.replace(chr(10),"?").replace(chr(13),"?")
 c={}
+named=[]
+extra=0
 for p in sys.stdin.read().split(chr(0)):
     if p:
         r=one(p,tries)
         c[r]=c.get(r,0)+1
+        if r in NAMED:
+            if len(named)<cap: named.append("%s %s"%(r,disp(p)))
+            else: extra+=1
 print(" ".join(["%s=%d"%(k,c[k]) for k in sorted(c)]))
+for l in named: print(l)
+if extra: print("and %d more"%extra)
 PYEOF
 }
 
@@ -3452,7 +3466,7 @@ _refresh_macos_shares_locked() {
     (( n > 2000 )) && [[ "$quiet" != quiet ]] && info "Refreshing ${n} changed shared file(s) in the guest — this takes a moment."
 
     # One round trip: the program is an argument, so stdin stays free for the NUL-separated list.
-    out="$(ssh_macos "$vm" "python3 -c '$(_macos_msync_program)' ${_MACOS_SWEEP_TRIES}" < "$list" 2>&1)" || {
+    out="$(ssh_macos "$vm" "python3 -c '$(_macos_msync_program)' ${_MACOS_SWEEP_TRIES} ${_MACOS_SWEEP_DETAIL}" < "$list" 2>&1)" || {
         warn "Could not refresh the guest's view of the shared files: ${out%%$'\n'*}"
         warn "  Host-side edits may not be visible in the guest (issues #124/#135). \`down --macos && up --macos\` clears it."
         rm -f "$pending" "$list" 2>/dev/null || true
@@ -3463,9 +3477,22 @@ _refresh_macos_shares_locked() {
 
     # `unstable` means a file kept changing size across every retry — a live host-side writer, not a
     # defect — but it also means that file may still read short in the guest, so it is named.
-    case "$out" in
-        *unstable=*|*nomap=*|*msyncfail=*) warn "Share refresh finished with problems (${out}); some files may still read stale in the guest." ;;
-        *) [[ "$out" == *ok=* && "$quiet" != quiet ]] && info "Refreshed the guest's view of ${n} changed shared file(s) (${out})." ;;
+    # The guest prints its counts on the FIRST line and, below it, up to _MACOS_SWEEP_DETAIL lines
+    # naming the individual files it could not invalidate. Counts alone answer "is one file wrong or
+    # are hundreds?", which is the question that changes how alarmed to be — but not "which one",
+    # and that is the question that decides whether to care at all: `unstable` on a build artefact
+    # while a host-side build runs is expected, the same verdict on a source file is not. The remedy
+    # is identical either way, so this is diagnosis rather than action, which is why it is bounded.
+    local summary detail
+    summary="${out%%$'\n'*}"
+    case "$summary" in
+        *unstable=*|*nomap=*|*msyncfail=*)
+            warn "Share refresh finished with problems (${summary}); some files may still read stale in the guest."
+            while IFS= read -r detail; do
+                [[ -n "$detail" ]] && warn "  ${detail}"
+            done < <(printf '%s\n' "$out" | tail -n +2)
+            ;;
+        *) [[ "$summary" == *ok=* && "$quiet" != quiet ]] && info "Refreshed the guest's view of ${n} changed shared file(s) (${summary})." ;;
     esac
     return 0
 }
