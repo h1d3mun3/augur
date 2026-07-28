@@ -3338,7 +3338,6 @@ macos_share_sweep_marker() {
 macos_share_roots() {
     local vm="$1"
     printf '%s\t%s\n' "$MACOS_SHARE"                        "$WORKSPACE_DIR"
-    printf '%s\t%s\n' "gh-config"                           "$HOME/.config/gh"
     printf '%s\t%s\n' "$(agent_state_host_subdir)"          "$AUGUR_DIR/$(agent_state_host_subdir)/${vm}"
     printf '%s\t%s\n' "$(agent_state_agents_host_subdir)"   "$AUGUR_DIR/$(agent_state_agents_host_subdir)/${vm}"
     printf '%s\t%s\n' "$(agent_profile_host_subdir)"        "$AUGUR_DIR/$(agent_profile_host_subdir)"
@@ -3700,7 +3699,6 @@ cmd_up_macos() {
     # already confirmed above the VM isn't running. See resolve_macos_vm_cpu/_memory_mb.
     "$VM_CLI" set "$project_vm" --cpu "$(resolve_macos_vm_cpu)" --memory "$(resolve_macos_vm_memory_mb)"
 
-    mkdir -p "$HOME/.config/gh"
     # Per-VM isolated history parent (NOT the host's shared ~/.claude/projects): the
     # guest only ever sees its own project's transcripts, never other projects'.
     # AUGUR_AGENT_SEAM | per-VM history parent (share dir name = agent_state_host_subdir)
@@ -3740,10 +3738,18 @@ cmd_up_macos() {
         warn "Egress filtering OFF — guest has unrestricted network access (NAT)."
     fi
 
+    # NO gh-config share, deliberately — the one place the two engines diverge on it. Container mode
+    # mounts ~/.config/gh at /home/dev/.config/gh, the REAL path, so the guest's gh picks up the
+    # operator's aliases, git_protocol and GHE host. macOS mode had no equivalent: the share was
+    # mounted at /Volumes/My Shared Files/gh-config and NOTHING ever wired it to ~/.config/gh, so the
+    # config was never read. Measured in a live guest — ~/.config did not exist at all, while the
+    # share carried the host's real config.yml and hosts.yml. That is exposure without a feature.
+    # gh still works here: GH_TOKEN is the auth path on both engines (see the container comment on
+    # that mount — on macOS hosts gh keeps the token in the Keychain, not in hosts.yml). Wiring it
+    # properly would be a feature addition, not a fix, and belongs in its own change.
     "$VM_CLI" run $graphics_flag \
         ${net_args[@]+"${net_args[@]}"} \
         --dir="${MACOS_SHARE}:${WORKSPACE_DIR}" \
-        --dir="gh-config:${HOME}/.config/gh:ro" \
         --dir="$(agent_state_host_subdir):${AUGUR_DIR}/$(agent_state_host_subdir)/${project_vm}" \
         --dir="$(agent_state_agents_host_subdir):${AUGUR_DIR}/$(agent_state_agents_host_subdir)/${project_vm}" \
         --dir="$(agent_profile_host_subdir):${AUGUR_DIR}/$(agent_profile_host_subdir):ro" \

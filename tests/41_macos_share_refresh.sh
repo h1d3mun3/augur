@@ -106,10 +106,15 @@ section "the share inventory matches what --dir= actually mounts"
 
 roots="$(macos_share_roots "$VM")"
 n_roots="$(printf '%s\n' "$roots" | grep -c .)"
+# Count only the macOS argv: container mode uses -v, not --dir, so this is unambiguous.
 n_dirs="$(grep -c '^\s*--dir="' "$AUGUR")"
 if [[ "$n_roots" == "$n_dirs" ]]; then ok "macos_share_roots covers every --dir= share ($n_roots)"
 else fail "macos_share_roots covers every --dir= share" "roots=$n_roots but --dir= lines=$n_dirs — a share was added to one and not the other"; fi
-for _s in "$MACOS_SHARE" gh-config claude-projects claude-agents claude-profile; do
+# gh-config is deliberately NOT here: macOS mode does not share it (it was mounted and never wired
+# to ~/.config/gh, so it was exposure without a feature). Container mode still mounts it at the real
+# path. If it is ever wired properly for macOS it must reappear in BOTH the argv and the inventory,
+# which the count assertion above enforces.
+for _s in "$MACOS_SHARE" claude-projects claude-agents claude-profile; do
     if printf '%s\n' "$roots" | cut -f1 | grep -qx "$_s"; then ok "share '$_s' is in the inventory"
     else fail "share '$_s' is in the inventory" "$roots"; fi
 done
