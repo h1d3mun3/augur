@@ -91,13 +91,35 @@ implementation shipped the bug until a test caught it.
 | | Measured |
 |---|---|
 | Host-side detection | 0.31 s (`find -newer`, 12,626 files) |
+| Host-side list accumulation | ~130 µs per **changed** file (2026-07-28 snapshot, item 37) |
 | Guest-side invalidation | 0.23 ms per file |
 | Full blind sweep, all five shares | 2.87 s for 12,600 files, zero failures |
 | Realistic incremental sweep | ~10 ms for a few dozen files |
 
 There is deliberately **no cap** on the changed set. A legitimate one can be large (a host-side build,
-a branch switch), the worst case is bounded at a few seconds, and silently truncating the list would
-be the same class of failure the surrounding work exists to remove.
+a branch switch), and silently truncating the list would be the same class of failure the surrounding
+work exists to remove.
+
+The second row was **added after the fact** and it corrects this section. The original four rows did
+not measure the shell loop that builds the path list, which appends once per changed file and reopens
+the list file each time — ~99 % of the host-side cost. Adding it to the guest's 0.23 ms, both paid
+serially, one sweep costs **~0.36 ms per changed file end to end**, so past roughly **14,000** changed
+files a sweep outlasts the default 5 s interval and the loop below degrades into a rising duty cycle
+on one host core for the lifetime of the VM. That is reachable with no adversary — `npm install`, a
+large `git checkout`, a full build — and augur's own repo is 12,626 files. So "the worst case is
+bounded at a few seconds" was true of the sweep and false of the loop, and the answer is the operator
+dial in §4, not a cap.
+
+**How firm is 14,000, and why it does not contradict the blind-sweep row.** It does not, but only
+because the table has three independent measurements in it, not four: 2.87 s ÷ 12,600 = 0.228 ms, so
+the "guest-side invalidation 0.23 ms per file" row *is* the blind-sweep row, divided. Whatever
+host-side accumulation that one run paid is already inside both, and neither can be added to the
+other. That leaves a band rather than a number — 5 s ÷ 0.23 ms ≈ 22,000 changed files if the
+accumulation cost is already included, 5 s ÷ 0.36 ms ≈ 14,000 if it is additive — and **14,000 is the
+conservative end**, which is the one quoted in the code, `--help` and the README. The snapshot's own
+figure of 30–40k is a third thing again: it is the host-side term *alone*, with the guest's share
+excluded. Nothing here rests on the exact crossing; what it rests on is that a crossing exists at a
+count no adversary is needed to reach, which all three readings agree on.
 
 ## 3. Placement, and why the order is load-bearing
 
@@ -132,6 +154,27 @@ one identical rule at four call sites.
   The loop's exit condition is the guest's own liveness, checked before every tick, rather than
   trusting anyone to stop it: a crashed augur, a killed VM or a host reboot must not leave a process
   SSHing at a guest that no longer exists.
+
+  Because that cost scales with a count nobody bounds (§Cost), the three mechanisms are dialled at
+  launch with **`--share-refresh <continuous|attach|off>`**: `continuous` (default) is all three,
+  `attach` keeps the attach-time sweep and the tripwire and stops the loop, `off` stops all three
+  — including the tripwire, because verifying a refresh that did not happen is a misreport, not a
+  check. `attach` is the answer to "this repo is too big for a 5 s loop": the loop is the unattended,
+  repeated cost, while the attach sweep runs once in front of an operator who can read what it says.
+  Anything other than `continuous` warns on every attaching command, names #124/#135, and says how to
+  restore the default — a silently disabled freshness mechanism is the defect this series removed
+  from the refresher's own warnings. Because it warns on all four of those commands, all four also
+  **stop** a loop an earlier `up` left running: `cmd_claude_macos`, `cmd_shell_macos` and
+  `cmd_setup_token_macos` skip `cmd_up_macos` entirely against an already-running VM, so without a
+  reconcile of their own they would print "the loop is off for this run" over a loop that kept
+  sweeping — the misreport shape, not the cost, is what makes that unacceptable.
+  `--share-refresh-interval` sets the period (flag > `AUGUR_MACOS_REFRESH_INTERVAL` > 5), and both
+  layers are validated as positive integers: `0` used to reach `sleep 0` and spin, and it is now
+  **refused** rather than read as "off", because it would be a second spelling of a disable that
+  leaves the sweep and the tripwire running. The env layer is checked only on the commands that can
+  reach `sleep` (`up`/`claude`/`shell`/`setup-token`) — the same rule §5.3's teardown inventory
+  depends on: a stale export in a shell profile must not be able to refuse `augur down --macos`, which
+  is the one command that stops the loop it is spinning.
 
   It **polls** rather than watching. An FSEvents watcher would be event-driven and strictly cheaper,
   but there is no FSEvents binding in the shell or in the stdlib python this uses, and `fswatch` is
@@ -178,9 +221,14 @@ remove**, and its removal must be **detectable** rather than guessed at.
 The mitigation is inert when it is not needed — an unnecessary `msync` costs 0.23 ms and changes
 nothing — so there is no pressure to rip it out the day the signal appears. Prefer:
 
-1. **Stop the loop first.** `AUGUR_MACOS_REFRESH_INTERVAL` only sets the period, so add a disable
-   path or set it absurdly high locally, and run normally for a while. If nothing goes stale, the
-   platform really is fixed. This is the cheapest and most reversible step.
+1. **Stop the loop first.** `augur up --macos --share-refresh attach` does exactly this: the loop
+   stops (and a loop left running by an earlier `up` is stopped too, on `claude`/`shell` as well as
+   on `up`), while the attach-time sweep and the tripwire stay. Note that the mode is **run-scoped**:
+   it has to be passed on each attaching command, so the observation window is the runs you pass it
+   on, not "until further notice". Run normally for a while; if nothing goes stale between attaches,
+   the platform
+   really is fixed. This is the cheapest and most reversible step. Do **not** use `--share-refresh
+   off` for it — that also stops the tripwire, which is the instrument this observation depends on.
 2. **Keep the tripwire longest.** It is three SSH round trips on `up` and it is the only thing that
    would notice a *regression* in a later macOS. Delete it last, or keep it permanently as a cheap
    canary.
@@ -195,11 +243,16 @@ Not "one function". As shipped, in `augur`:
 | Sweep | `refresh_macos_shares`, `_refresh_macos_shares_locked`, `_macos_msync_program`, `macos_share_roots`, `macos_share_sweep_marker`, `_MACOS_SWEEP_TRIES` |
 | Tripwire | `verify_macos_share_freshness`, `_MACOS_FRESHNESS_PROBE` |
 | Loop | `start_share_refresher`, `stop_share_refresher`, `share_refresher_running`, `share_refresher_pidfile`, `share_refresher_logfile`, `_MACOS_REFRESH_INTERVAL` (and its `AUGUR_MACOS_REFRESH_INTERVAL` override) |
+| Dial | `_MACOS_REFRESH_MODE`, `share_refresh_enabled`, `share_refresh_loop_enabled`, `macos_refresh_interval_valid`, `validate_macos_refresh_interval`, `warn_macos_refresh_mode`, the `--share-refresh` / `--share-refresh-interval` arms of the global flag loop and the `$MACOS_MODE` block below it, the `share_refresh_loop_enabled \|\| stop_share_refresher` line in each of `cmd_claude_macos` / `cmd_shell_macos` / `cmd_setup_token_macos`, and the two `Share refresh:` lines in `cmd_status_macos` |
 
 Call sites: `refresh_macos_shares` ×4 (`cmd_up_macos` fresh + reconcile, `cmd_claude_macos`,
 `cmd_shell_macos`) plus once inside the loop; `verify_macos_share_freshness` ×2 and
 `start_share_refresher` ×2 (both `up` paths); `stop_share_refresher` ×2 (`cmd_down_macos`,
-`cmd_destroy_macos`). The reaping block in `cmd_destroy_macos` goes too.
+`cmd_destroy_macos`) plus once inside `start_share_refresher` itself and once in each of
+`cmd_claude_macos` / `cmd_shell_macos` / `cmd_setup_token_macos` — those three attach to an
+**already-running** VM without going through `cmd_up_macos`, so the mode reconcile has to be repeated
+there or it never happens on the commands an operator uses most. The reaping block in
+`cmd_destroy_macos` goes too.
 
 Host state to stop creating — and to clean up once from existing installs, since nothing will remove
 it afterwards: `$AUGUR_DIR/vm-state/<vm>.shares-swept` (plus `.pending` and the `.lock` **directory**),
@@ -255,6 +308,30 @@ the option is not re-litigated from scratch.
 where it applies, because it removes the dependency instead of managing it: no share means no cache
 to invalidate. It does not apply to the read-write workspace. Tracked separately for the small
 read-only shares.
+
+**A config file for the refresh mode, instead of the `--share-refresh` flag.** Both candidate layers
+were considered and rejected, and this is recorded because it will be proposed again.
+
+- `./.augur/allowlist.conf` — the project layer — lives **inside the mounted read-write workspace**,
+  so the guest can write it. A mode read from there would let a compromised guest, or a
+  prompt-injected agent, switch off the mechanism that keeps the operator's view of the guest's own
+  filesystem honest. It composes badly with the 2026-07-28 snapshot's item 39(a), where the sweep's
+  round trip invokes an unpinned `python3`: the guest could fabricate the refresh report *and*
+  disable the tripwire that would notice. The resources file is guest-writable on purpose, but that
+  asymmetry is deliberate — inflating your own VM is a self-serve request the operator sees applied,
+  whereas silencing a freshness mitigation is invisible by construction.
+- A **host-side per-project file** keyed by `workspace_path_hash` (the pattern every other piece of
+  per-project host state already uses) has no such hole. It was rejected on cost and on fit: it needs
+  a whole `augur config` surface before an operator can use it, and the right value depends on the
+  **host's** CPU as much as on the repo's file count, so a value committed with the project is wrong
+  on the next machine.
+
+A launch-time flag has neither problem — the value comes from the operator, in the clear, per run —
+and it is where this repo already puts run-scoped options (`--egress`, `--no-egress`, `--gui`).
+`AUGUR_MACOS_REFRESH_INTERVAL` keeps its env peer because it predates the flag and only tunes a
+period; no `AUGUR_MACOS_REFRESH` peer was added for the mode, because the one place an env var is set
+persistently is a shell profile, i.e. per **host** and across every project, which is the one scope
+at which "this repo is too big for a 5 s loop" is never the right answer.
 
 **Waiting.** The previous record advised `down --macos && up --macos` and described the delay as
 resolving "before the 10-minute mark". There is no timeout; waiting is the one thing that does not

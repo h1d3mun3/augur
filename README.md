@@ -276,6 +276,10 @@ augur status --macos    # show VM status, toolchain, and auth info
 augur list --macos      # list all VMs and their state
 augur update --macos    # update Claude Code in the base VM
 augur version --macos   # show augur version (macOS mode)
+
+augur up --macos --share-refresh attach            # keep the attach-time sweep, stop the 5s loop
+augur up --macos --share-refresh off               # stop the shared-file refresh entirely
+augur up --macos --share-refresh-interval 15       # same loop, longer period (default: 5)
 ```
 
 ### Authentication
@@ -325,6 +329,44 @@ warning, not a failed `up`. See
 > manually running `claude --worktree <name>` works today. Unlike container mode, its conversation history *does*
 > survive `augur down --macos`/`up --macos` (the VM's disk is stopped, not destroyed, until `augur destroy --macos`).
 > See `docs/decisions/0004-no-special-worktree-support.md`.
+
+### Shared-file refresh (`--share-refresh`)
+
+A macOS guest's virtiofs client keeps serving **stale file data** after you edit a file on the host —
+on every share, read-only and read-write alike, with **no timeout** (one measured file stayed stale
+for 904.9 s). Still present on **macOS 26.6**. So augur invalidates the guest's cache for the files
+that changed: at every attach (`up`/`claude`/`shell --macos`), and again every **5 s** for as long as
+the VM runs, which is the only thing that makes a host edit reach an agent that is *already running*.
+See [`docs/decisions/0016-shared-file-cache-refresh.md`](docs/decisions/0016-shared-file-cache-refresh.md).
+
+The cost scales with the number of **changed** files (~0.36 ms each, host + guest, paid serially), and
+nothing caps that number — past roughly 14,000 changed files one sweep outlasts the 5 s interval and
+the loop starts running most of the time on one core. An `npm install`, a big `git checkout` or a full
+build can get there. Two run-scoped flags, written after the command:
+
+| Flag | Attach-time sweep | 5 s loop | Freshness self-test |
+|---|---|---|---|
+| *(none)* / `--share-refresh continuous` | yes | yes | yes |
+| `--share-refresh attach` | yes | **no** | yes |
+| `--share-refresh off` | **no** | **no** | **no** |
+
+`attach` is usually what you want for a large repo: the loop is the unattended, repeated cost, while
+the attach sweep runs once, in front of you, and still leaves the guest fresh when work starts. `off`
+is the full escape hatch — with it the guest can read stale files indefinitely and nothing will say
+so, so `augur down --macos && augur up --macos` becomes the remedy again.
+
+The setting is **per run**, not remembered: pass it on each of `up`, `claude`, `shell` and
+`setup-token --macos`. Any of those will stop a loop an earlier `up` left running, so you can drop the
+cost mid-session by re-attaching with `augur claude --macos --share-refresh attach`. Anything but the
+default prints a warning on every such run, naming the issues and how to restore it.
+`augur status --macos` prints two lines: what *this* command line asks for, and — measured — whether a
+refresh loop is actually running and how long ago the last sweep completed.
+
+`--share-refresh-interval <seconds>` changes the loop's period (a positive integer; the env var
+`AUGUR_MACOS_REFRESH_INTERVAL` does the same and the flag wins). `0` is refused rather than treated as
+"off" — use `--share-refresh attach` or `off`, which say what they mean. A bad
+`AUGUR_MACOS_REFRESH_INTERVAL` is only refused on the commands that start the loop; `down`, `destroy`,
+`status` and `list` keep working, because those are how you stop a loop a bad value is spinning.
 
 ### Running `xcodebuild test`
 

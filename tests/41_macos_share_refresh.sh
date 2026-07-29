@@ -27,6 +27,10 @@
 #     classes and output format are behaviour, not text. It cannot reproduce virtiofs staleness
 #     offline (nothing can), but everything else about it is testable and is tested.
 #   • The program contains no single quote, because it is wrapped in one for the remote shell.
+#   • `--share-refresh off` stops the sweep, and does so INSIDE refresh_macos_shares — one gate
+#     covering all four attach sites and the loop, which is why the arm for it lives here. It must
+#     leave no marker and no lock either: a mode that skipped the guest while promoting the marker
+#     would record files as swept that were never invalidated.
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/.." && pwd)"
 source "$HERE/lib.sh"
 AUGUR="$REPO/augur"
@@ -295,6 +299,45 @@ else fail "the guest is invoked as \`python3 -c\`" "$(head -1 "$SSHLOG")"; fi
 if tail -1 "$SSHLOG" | grep -q " ${_MACOS_SWEEP_TRIES} ${_MACOS_SWEEP_DETAIL}$"; then
     ok "the retry count and the detail cap are passed, in that order"
 else fail "the retry count and the detail cap are passed, in that order" "$(tail -1 "$SSHLOG")"; fi
+
+section "--share-refresh off stops the sweep — at every call site at once"
+
+# `off` is enforced INSIDE refresh_macos_shares rather than by an `if` copied to the four attach call
+# sites plus the loop, so this one arm covers all five and a sixth caller cannot escape it.
+#
+# "No round trip" is not the whole property. A mode that skipped the guest but still promoted the
+# marker would silently record files as swept that were never invalidated — the permanent hole the
+# marker arms above exist for — so the state is asserted too.
+_saved_mode="$_MACOS_REFRESH_MODE"
+sleep 1; printf 'OFFMARK\n' > "$WORKSPACE_DIR/one"
+: > "$TMPD/ref-before-off"
+sleep 1        # whole-second `-nt` granularity, same reason as the reference above
+_MACOS_REFRESH_MODE=off
+: > "$SSHLOG"; : > "$STDINLOG"
+out="$( refresh_macos_shares "$VM" 2>&1 )"; rc=$?
+if [[ ! -s "$SSHLOG" ]]; then ok "off: no guest round trip at all"
+else fail "off: no guest round trip" "$(head -1 "$SSHLOG")"; fi
+if [[ $rc -eq 0 ]]; then ok "…and it returns 0, so the bring-up continues (best effort, like every path here)"
+else fail "off returns 0" "rc=$rc"; fi
+if [[ -z "$out" ]]; then ok "…and says nothing (the launch-time warning already said it once)"
+else fail "off says nothing" "$out"; fi
+if [[ ! "$(macos_share_sweep_marker "$VM")" -nt "$TMPD/ref-before-off" ]]; then
+    ok "…and does NOT advance the marker, so the edit is swept once the refresh is back on"
+else fail "off does not advance the marker" "a promoted marker would drop this edit permanently"; fi
+if [[ ! -d "$(macos_share_sweep_marker "$VM").lock" ]]; then ok "…and leaves no lock behind (it returns before taking one)"
+else fail "off leaves no lock behind" "a wedged lock would block the next sweep for two minutes"; fi
+
+# THE CONTROL. The same edit, the same fixture, with the mode restored to one that sweeps. Without
+# it every assertion above would also pass on a sweep broken for a completely unrelated reason —
+# and `attach` is the right control, because it must stop the LOOP and nothing else.
+_MACOS_REFRESH_MODE=attach
+: > "$SSHLOG"; : > "$STDINLOG"
+refresh_macos_shares "$VM" >/dev/null 2>&1
+if [[ -s "$SSHLOG" ]]; then ok "attach: the sweep still runs (that mode drops only the background loop)"
+else fail "attach: the sweep still runs" "the mode gate is stopping more than off should"; fi
+if fed | grep -qx "/Volumes/My Shared Files/${MACOS_SHARE}/one"; then ok "…and the file skipped while off is picked up"
+else fail "…and the file skipped while off is picked up" "$(fed | tr '\n' ' ')"; fi
+_MACOS_REFRESH_MODE="$_saved_mode"
 
 section "call-site ORDER — the refresh must precede the wiring"
 
