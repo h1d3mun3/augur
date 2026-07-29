@@ -245,6 +245,41 @@ else fail "the lock is released after a normal sweep"; fi
 if [[ -s "$SSHLOG" ]]; then ok "…and the sweep that released it did its work"
 else fail "…and the sweep that released it did its work"; fi
 
+section "the outcome statuses stop at the gate"
+
+# The ungated entry point reports WHAT HAPPENED in its exit status, so `augur refresh --macos` can
+# fail when it swept nothing or swept badly. The gated one must not: four of its five callers invoke
+# it as a bare command under `set -e`, so a non-zero here would abort `up --macos` between "SSH is
+# up" and the egress tripwire — the I1 shape this series spent a PR removing. One held lock, two
+# entry points, opposite answers; the manual half is pinned in tests/41, this is the automatic half.
+sleep 1; printf 'STATUS\n' > "$WORKSPACE_DIR/f"
+mkdir -p "$LOCK"
+_rc=0; refresh_macos_shares_now "$VM" >/dev/null 2>&1 || _rc=$?
+if [[ "$_rc" == "$_MACOS_SWEEP_BUSY" ]]; then ok "the UNGATED entry hands back _MACOS_SWEEP_BUSY when it cannot take the lock"
+else fail "the ungated entry reports a held lock" "rc=$_rc — \`augur refresh --macos\` cannot tell a skipped sweep from a clean one"; fi
+_rc=0; refresh_macos_shares "$VM" >/dev/null 2>&1 || _rc=$?
+if [[ "$_rc" == "0" ]]; then ok "…and the GATED entry still swallows it to 0 (the bring-up contract)"
+else fail "the gated entry swallows a held lock" "rc=$_rc — a lost lock race would abort a bring-up under set -e"; fi
+rmdir "$LOCK"
+_saved_ssh_status="$(declare -f ssh_macos)"
+ssh_macos() { printf '%s\n' "$*" >> "$SSHLOG"; cat >/dev/null; printf 'boom'; return 1; }
+_rc=0; refresh_macos_shares_now "$VM" >/dev/null 2>&1 || _rc=$?
+if [[ "$_rc" == "$_MACOS_SWEEP_FAILED" ]]; then ok "a dead round trip is _MACOS_SWEEP_FAILED at the ungated entry"
+else fail "a dead round trip is reported at the ungated entry" "rc=$_rc"; fi
+_rc=0; refresh_macos_shares "$VM" >/dev/null 2>&1 || _rc=$?
+if [[ "$_rc" == "0" ]]; then ok "…and 0 at the gated one, warning and all (best effort, unchanged)"
+else fail "a dead round trip is 0 at the gated entry" "rc=$_rc — this is exactly the abort #129 removed from the credential path"; fi
+eval "$_saved_ssh_status"
+# Nothing left to do is its own status too, and it is the one the manual command turns into a line
+# of its own rather than silence. It must not be mistaken for a failure by either caller.
+refresh_macos_shares "$VM" >/dev/null 2>&1          # consume the pending edit
+_rc=0; refresh_macos_shares_now "$VM" >/dev/null 2>&1 || _rc=$?
+if [[ "$_rc" == "$_MACOS_SWEEP_NOWORK" ]]; then ok "nothing-to-do is _MACOS_SWEEP_NOWORK, not 0 and not a failure"
+else fail "nothing-to-do is reported as its own status" "rc=$_rc"; fi
+_rc=0; refresh_macos_shares "$VM" >/dev/null 2>&1 || _rc=$?
+if [[ "$_rc" == "0" ]]; then ok "…and 0 at the gate, where every tick of the loop lands on it"
+else fail "nothing-to-do is 0 at the gate" "rc=$_rc — the loop would abort on its own quiet ticks"; fi
+
 section "quiet suppresses the report but never the warning"
 
 sleep 1; printf 'w\n' > "$WORKSPACE_DIR/f"
@@ -352,6 +387,37 @@ for _cmd in cmd_claude_macos cmd_shell_macos cmd_setup_token_macos; do
     else fail "continuous: $_cmd leaves the running loop alone" "the reconcile is stopping more than the two non-default modes"; fi
 done
 stop_share_refresher
+
+# `augur refresh --macos` is deliberately NOT one of them, and the absence is worth pinning because
+# it looks like an oversight next to the three above. Those three reconcile because they WARN about
+# the mode from the dispatch tail while skipping cmd_up_macos, so a surviving loop would make their
+# own warning false. cmd_refresh_macos is outside that gate and makes no claim about a loop — its one
+# `off` line is run-scoped ("this is a manual sweep; it does not turn the automatic refresh back on")
+# and stays true whatever an earlier `up` left running; `status --macos` is where the live half is
+# measured. Killing a background refresher as a side effect of a command called `refresh` is the same
+# class of surprise as booting a VM would be, which that command refuses to do for the same reason.
+_saved_now="$(declare -f refresh_macos_shares_now)"
+_saved_running_43="$(declare -f macos_vm_running)"
+_saved_host_43="$(declare -f macos_ssh_host)"
+refresh_macos_shares_now() { printf '%s\n' "manual" >> "$SWEEPLOG"; return 0; }
+macos_vm_running()         { return 0; }
+macos_ssh_host()           { echo 127.0.0.1; }
+_MACOS_REFRESH_MODE=continuous
+: > "$SWEEPLOG"
+start_share_refresher "$VM"
+_rpid="$(cat "$_PF" 2>/dev/null || true)"
+if [[ -n "$_rpid" ]] && kill -0 "$_rpid" 2>/dev/null; then ok "cmd_refresh_macos: a continuous refresher is live to begin with (the precondition)"
+else fail "cmd_refresh_macos: a continuous refresher is live to begin with" "the two arms below would prove nothing"; fi
+_MACOS_REFRESH_MODE=off
+cmd_refresh_macos >/dev/null 2>&1
+if grep -qx manual "$SWEEPLOG"; then ok "…and \`refresh --macos\` sweeps under \`off\`, which is why the command exists"
+else fail "\`refresh --macos\` sweeps under off" "recorded: $(tr '\n' ' ' < "$SWEEPLOG")"; fi
+if [[ -n "$_rpid" ]] && kill -0 "$_rpid" 2>/dev/null && share_refresher_running; then
+    ok "…and LEAVES the loop alone: it is not an attach, and it claims nothing about one"
+else fail "refresh --macos leaves the loop alone" "it stopped a background refresher as a side effect of a manual sweep — the three commands above stop one because they warn about it; this one does not warn"; fi
+stop_share_refresher
+eval "$_saved_now"; eval "$_saved_running_43"; eval "$_saved_host_43"
+
 _MACOS_REFRESH_MODE="$_saved_mode"
 eval "$_saved_attach_refresh"
 

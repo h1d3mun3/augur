@@ -270,6 +270,7 @@ augur up --macos --gui  # same, but also open a VM window (display + keyboard + 
 augur claude --macos    # launch Claude Code  (starts VM if not running)
 augur shell --macos     # open a bash shell   (starts VM if not running)
 augur setup-token --macos  # get a Claude subscription token (runs in the VM, saves on the host)
+augur refresh --macos   # push host-side edits into the running VM's view, now (never boots one)
 augur down --macos      # stop the VM (keeps the clone — next up is fast)
 augur destroy --macos   # stop and remove the project VM clone
 augur status --macos    # show VM status, toolchain, and auth info
@@ -367,6 +368,41 @@ refresh loop is actually running and how long ago the last sweep completed.
 "off" — use `--share-refresh attach` or `off`, which say what they mean. A bad
 `AUGUR_MACOS_REFRESH_INTERVAL` is only refused on the commands that start the loop; `down`, `destroy`,
 `status` and `list` keep working, because those are how you stop a loop a bad value is spinning.
+
+### Refreshing on demand (`augur refresh --macos`)
+
+```bash
+augur refresh --macos
+```
+
+Sweeps the shared directories once, against the VM that is **already running**, and says what
+happened on every path: the file count and the ones the guest could not invalidate by name, "nothing
+has changed since the last sweep", or the reason it swept nothing at all. This is the replacement
+for the loop when you turn it off: without it, the only ways to get a host-side edit into a running
+guest are to attach (`up`/`claude`/`shell`, all of which put you *in* the guest) or to wait, and
+waiting is the one thing that does not work.
+
+**Its exit status means something**, so `augur refresh --macos && swift test` is safe to write. It
+exits non-zero if the sweep did not happen (another sweep held the lock) or did not do its job (the
+round trip failed, or the guest declined to invalidate files — `msyncfail`/`nomap`). A file the guest
+reported as `unstable` — one a host-side build kept rewriting mid-sweep — is named but is not a
+failure. The automatic sweeps on `up`/`claude`/`shell` and in the loop stay best-effort and never
+fail their command: a stale share is degraded, not broken, and a bring-up must not die on one.
+
+It **never boots a VM.** If none is running it says so and stops: a stopped guest has no cache to
+invalidate, and the `up` that would start it sweeps on the way in anyway. If the VM is running but
+the host cannot reach it (gvproxy down), it says *that*, rather than reporting a sweep it could not
+make.
+
+It works under **`--share-refresh off`** — that mode means "don't refresh on your own", not "never
+refresh", so `augur refresh --macos --share-refresh off` still sweeps rather than silently doing
+nothing. (The mode is not remembered between runs: a plain `augur refresh --macos` is `continuous`
+for that one command whatever you launched the VM with, so it sweeps either way.) It then prints one
+line saying the automatic refresh is still off, so a successful manual sweep cannot be mistaken for
+`off` having lapsed. Unlike the attaching commands it does *not* stop a refresh loop an earlier `up`
+left running: it makes no claim about one, and `augur status --macos` is where that half is measured.
+Stopping the loop stays with `--share-refresh attach|off` on `up`/`claude`/`shell`, or with
+`augur down --macos`.
 
 ### Running `xcodebuild test`
 
