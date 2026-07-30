@@ -19,6 +19,11 @@ set +e                                    # augur enables `set -e`; restore lib.
 TMPD="$(mktemp -d)"
 trap 'kill $(jobs -p) 2>/dev/null; rm -rf "$TMPD"' EXIT
 AUGUR_PROXY_DIR="$TMPD"                    # keep the test off the real ~/.augur/proxy
+# …and off the real ~/.augur, now that a per-project file lives directly under it
+# (project_settings_file). Every other path captured below is under AUGUR_PROXY_DIR, so this
+# affects nothing else. It is a path COMPUTATION either way — project_settings_file deliberately
+# has no `mkdir -p`, unlike project_conf_hash_file — but a test must not depend on that.
+AUGUR_DIR="$TMPD/augur"
 
 section "Tier 1 — proxy identity is per (project, role)"
 
@@ -75,6 +80,15 @@ section "Tier 1 — host state is per (project PATH, role): two same-basename pr
 # already running and reused it), the vfkit socket, and the logs. workspace_path_hash is what
 # separates them now — and the slug assertion below is what proves the hash is doing that work
 # rather than an incidental difference in the directory names.
+#
+# THE LIST BELOW IS HARD-CODED, so a new per-project host-state file that is not added to it has
+# NOTHING pinning its keying. That is not hypothetical: the 2026-07-28 audit found exactly that gap
+# for the share-refresher pid/logfile, which this change closes here along with adding its own file.
+# Three of the entries are NOT egress state — refresher_pid, refresher_log and settings — which is
+# why the "stays under AUGUR_PROXY_DIR" loop further down no longer covers all of them: the settings
+# file lives one level up, directly under ~/.augur. The property that matters for it is the same one
+# (I7: written host-side, OUTSIDE the project tree) and it is asserted separately, against $AUGUR_DIR
+# and against the workspace.
 ORIG_WS="$WORKSPACE_DIR"
 mkdir -p "$TMPD/work/myapp" "$TMPD/archive/myapp"
 # Every per-project path this file owns, captured for one project at a time. Ports are NOT here:
@@ -89,6 +103,16 @@ capture_paths() {   # $1 = workspace dir → prints "<name>=<path>" lines
   echo "vm_log=$(macos_vm_log)"
   echo "socket=$(gvproxy_socket)"
   echo "network=$(egress_network_name)"
+  # The share refresher (ADR-0016). Not egress state, and the 2026-07-28 audit recorded that as the
+  # reason it was missing here — a refresher pointed at the wrong project's marker would sweep one
+  # project's shares against another's timestamp.
+  echo "refresher_pid=$(share_refresher_pidfile)"
+  echo "refresher_log=$(share_refresher_logfile)"
+  # …and the per-project SETTINGS file (`augur config`). Host-side under ~/.augur rather than in the
+  # workspace, because the guest can write the workspace and a guest that can set its own
+  # share_refresh can switch off the mechanism that keeps the operator's view of it honest. A
+  # slug-only key here would hand one project's refresh mode to an unrelated same-basename sibling.
+  echo "settings=$(project_settings_file)"
   for r in true false; do
     MACOS_MODE=$r
     echo "proxy_pid_$(proxy_role)=$(proxy_pidfile)"
@@ -106,16 +130,37 @@ eq "$(field slug "$a_paths")" "$(field slug "$b_paths")" \
 eq "myapp" "$(field slug "$a_paths")" "…and that shared slug is the basename, as before"
 
 for f in allowlist proxy_pid_macos proxy_pid_container proxy_log_macos proxy_log_container \
-         gvproxy_pid gvproxy_log vm_log socket network; do
+         gvproxy_pid gvproxy_log vm_log socket network refresher_pid refresher_log settings; do
   av="$(field "$f" "$a_paths")"; bv="$(field "$f" "$b_paths")"
   if [[ -n "$av" && "$av" != "$bv" ]]; then ok "$f differs between the two projects"
   else fail "$f must differ between the two projects" "both = [$av]"; fi
 done
 # Nothing escaped the host-side proxy dir while gaining the hash (I7: outside the project tree).
 for f in allowlist proxy_pid_macos proxy_pid_container proxy_log_macos proxy_log_container \
-         gvproxy_pid gvproxy_log vm_log socket; do
+         gvproxy_pid gvproxy_log vm_log socket refresher_pid refresher_log; do
   has "$(field "$f" "$a_paths")" "$AUGUR_PROXY_DIR/" "$f stays under AUGUR_PROXY_DIR"
 done
+# The settings file is the one entry that is NOT under AUGUR_PROXY_DIR — it is not egress state and
+# not proxy state, so it lives directly under ~/.augur beside project-hashes/. The I7 property it has
+# to satisfy is the substantive half of the loop above, and it is the whole reason the file is where
+# it is: written host-side, OUTSIDE the project tree, so the read-write share the guest owns cannot
+# reach it.
+_set_a="$(field settings "$a_paths")"
+has   "$_set_a" "$AUGUR_DIR/project-settings/" "settings stays under ~/.augur/project-settings"
+hasnt "$_set_a" "$TMPD/work/myapp"             "settings is OUTSIDE the project tree (the guest-writable share)"
+# …and outside the OTHER project's tree too. The arm above only proves it is not under the workspace
+# it was computed for; a path built from `$WORKSPACE_DIR/.augur/…` would satisfy that for project B
+# while still being guest-writable. An earlier cut asserted `hasnt "$_set_a" "/.augur/allowlist"`
+# here, which no mutation of project_settings_file could ever make true — it pinned nothing.
+hasnt "$(field settings "$b_paths")" "$TMPD/archive/myapp" "…for the second project as well, not just the one it was derived from"
+# The `.augur` in this path is ~/.augur, NOT the project's own ./.augur/ — the distinction the whole
+# location argument rests on. Asserted as a prefix of the absolute path, which a project-relative
+# `./.augur/…` cannot satisfy.
+case "$_set_a" in
+  "$HOME"/*) fail "settings must not be under the caller's real \$HOME in this fixture" "$_set_a" ;;
+  "$AUGUR_DIR"/*) ok "…and the \`.augur\` it sits in is the HOST's ~/.augur, not the project's ./.augur/" ;;
+  *) fail "settings is under \$AUGUR_DIR" "$_set_a" ;;
+esac
 
 section "Tier 1 — the egress PORTS and subnet are per project path too"
 
