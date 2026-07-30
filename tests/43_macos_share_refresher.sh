@@ -538,10 +538,19 @@ for _c in help version; do
 done
 # …and the same for the commands that DO need the backend, against a stub that owns no state. `down`
 # and `destroy` are the ones that matter: they are the escape from a loop a bad export is spinning.
+#
+# THE ASSERTION IS THE ABSENCE OF THE REFUSAL, NOT A ZERO EXIT, and that is not a weakening — it is
+# the only form that means the same thing on both CI platforms. `require_vz` refuses outright when
+# `uname` is not Darwin (augur:~1050), so on ubuntu these four can never exit 0 no matter what this
+# change does; a first cut asserted exit 0 and failed there for a reason that had nothing to do with
+# the env layer. What actually distinguishes "gated correctly" from "gated wrongly" is WHICH refusal
+# comes back: the Darwin one (fine — the host has no VM backend) or the interval one (the defect).
+# Ungate the check in the dispatch tail and all four print the interval refusal on both platforms.
 _VMSTUB="$TMPD/vmstub"; mkdir -p "$_VMSTUB"; printf '#!/bin/bash\nexit 0\n' > "$_VMSTUB/augur-vm"; chmod +x "$_VMSTUB/augur-vm"
 for _c in down destroy status list; do
-    if ( AUGUR_MACOS_REFRESH_INTERVAL=0 AUGUR_VM_BIN="$_VMSTUB/augur-vm" bash "$AUGUR" "$_c" --macos >/dev/null 2>&1 ); then ok "\`$_c --macos\` still runs with a stale export"
-    else fail "\`$_c --macos\` still runs with a stale export" "teardown and inspection are the wrong things to gate on a period nothing on this path uses"; fi
+    _sout="$( AUGUR_MACOS_REFRESH_INTERVAL=0 AUGUR_VM_BIN="$_VMSTUB/augur-vm" bash "$AUGUR" "$_c" --macos 2>&1 || true )"
+    if [[ "$_sout" != *"is not a positive whole number of seconds"* ]]; then ok "\`$_c --macos\` is not refused over a stale export"
+    else fail "\`$_c --macos\` is not refused over a stale export" "teardown and inspection are the wrong things to gate on a period nothing on this path uses: $_sout"; fi
 done
 if ( AUGUR_MACOS_REFRESH_INTERVAL=0 bash "$AUGUR" help >/dev/null 2>&1 ); then ok "container mode is untouched by it as well"
 else fail "container mode is untouched by it" "a macOS-only env var took a container-mode command down with it"; fi
