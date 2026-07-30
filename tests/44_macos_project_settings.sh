@@ -446,12 +446,38 @@ section "…and a broken file never makes the project untearable-down"
 # would be permanent — and would take away the very commands that stop the loop.
 _VMSTUB="$TMPD/vmstub"; mkdir -p "$_VMSTUB"
 printf '#!/bin/bash\nexit 0\n' > "$_VMSTUB/augur-vm"; chmod +x "$_VMSTUB/augur-vm"
+
+# WHAT "SURVIVED THE FILE" MEANS ON EACH PLATFORM, and why it cannot be an exit status.
+# `resolve_macos_refresh_settings` runs in the dispatch tail, ABOVE the dispatch `case`; `require_vz`
+# runs INSIDE it and refuses outright when `uname` is not Darwin. So on ubuntu these commands can
+# never exit 0 no matter what this change does — an earlier cut asserted exit 0 and failed there for
+# a reason that had nothing to do with settings files, exactly as tests/43 did before db36d00.
+#
+# The property is not "the command succeeds". It is that a broken FILE does not stop it ABOVE the
+# dispatch case, where nothing downstream can recover. Getting past it has three shapes here, and
+# which one you see is a property of the platform and the command, not of the code under test:
+#   rc 0                            the stubbed backend ran to completion  (macOS, `down`/`destroy`)
+#   "macOS VM mode requires macOS"  require_vz, which lives INSIDE dispatch (ubuntu, all of them)
+#   "Base VM"                       this fixture has no base VM            (macOS, `shell`)
+# A refusal in the dispatch TAIL exits above all three, so it can produce none of them.
+_reached_dispatch() {   # <captured output> <rc>
+    if [[ "$2" -eq 0 ]]; then return 0; fi
+    if [[ "$1" == *"macOS VM mode requires macOS"* ]]; then return 0; fi
+    if [[ "$1" == *"Base VM"* ]]; then return 0; fi
+    return 1
+}
 printf 'share_refresh=sometimes\nshare_refresh_interval=0\ngarbage\n' > "$SETTINGS"
 for _c in down destroy status list; do
-    ( cd "$WORKSPACE_DIR" && HOME="$HOME" AUGUR_VM_BIN="$_VMSTUB/augur-vm" bash "$AUGUR" "$_c" --macos ) >/dev/null 2>&1
-    if [[ $? -eq 0 ]]; then ok "\`$_c --macos\` still runs with a broken settings file"
-    else fail "\`$_c --macos\` broke on a broken settings file" "teardown and inspection are how an operator escapes a bad setting, and this file outlives destroy"; fi
+    _bout="$( cd "$WORKSPACE_DIR" && HOME="$HOME" AUGUR_VM_BIN="$_VMSTUB/augur-vm" bash "$AUGUR" "$_c" --macos 2>&1 || true )"
+    _bout="$(printf '%s' "$_bout" | sed $'s/\033\\[[0-9;]*m//g')"
+    if [[ "$_bout" != *"Fix it with"* && "$_bout" != *"Pass a positive integer instead"* ]]; then
+        ok "\`$_c --macos\` is not REFUSED over a broken settings file"
+    else fail "\`$_c --macos\` was refused over a broken settings file" "teardown and inspection are how an operator escapes a bad setting, and this file outlives destroy: $_bout"; fi
 done
+# …and the file really was read on that path, rather than the arms above passing because nothing
+# looked at it. The resolver's wording carries `— ignoring it`, which the hard refusal never does.
+if [[ "$_bout" == *"ignoring it"* ]]; then ok "…and the broken values were reported and dropped, not silently ignored"
+else fail "the broken settings file was never reported" "a value dropped without a word is the #148 defect with a different cause: $_bout"; fi
 for _c in help version; do
     ( cd "$WORKSPACE_DIR" && HOME="$HOME" bash "$AUGUR" "$_c" --macos ) >/dev/null 2>&1
     if [[ $? -eq 0 ]]; then ok "\`$_c --macos\` survives it too"
@@ -470,9 +496,10 @@ else fail "container mode is untouched by a broken macOS settings file"; fi
 # in place, deleting the other changed no behaviour, both mutations came back 148/148, and only
 # deleting BOTH was caught. A guard no mutation can fail is not a guard, it is a comment.
 chmod 000 "$SETTINGS" 2>/dev/null
-( cd "$WORKSPACE_DIR" && HOME="$HOME" AUGUR_VM_BIN="$_VMSTUB/augur-vm" bash "$AUGUR" down --macos ) >/dev/null 2>&1
-if [[ $? -eq 0 ]]; then ok "\`down --macos\` survives an UNREADABLE settings file (load_project_settings's \`return 0\`)"
-else fail "down --macos aborted on an unreadable settings file" "the loop's redirect failure propagated out of load_project_settings"; fi
+_uout="$( cd "$WORKSPACE_DIR" && HOME="$HOME" AUGUR_VM_BIN="$_VMSTUB/augur-vm" bash "$AUGUR" down --macos 2>&1 )"; _urc=$?
+_uout="$(printf '%s' "$_uout" | sed $'s/\033\\[[0-9;]*m//g')"
+if _reached_dispatch "$_uout" "$_urc"; then ok "\`down --macos\` survives an UNREADABLE settings file (load_project_settings's \`return 0\`)"
+else fail "down --macos aborted on an unreadable settings file" "the loop's redirect failure propagated out of load_project_settings, so nothing below the dispatch tail ran: $_uout"; fi
 chmod 644 "$SETTINGS" 2>/dev/null
 # A path that is a DIRECTORY exercises a different guard, and the claim this arm used to make about it
 # was simply wrong: it said "the read fails, not the open", but `[[ -f <dir> ]]` is FALSE, so
@@ -485,7 +512,7 @@ chmod 644 "$SETTINGS" 2>/dev/null
 rm -f "$SETTINGS"; mkdir -p "$SETTINGS"          # the path is now a directory where a file is expected
 ( cd "$WORKSPACE_DIR" && HOME="$HOME" AUGUR_VM_BIN="$_VMSTUB/augur-vm" bash "$AUGUR" down --macos ) > "$TMPD/raw" 2>&1
 _drc=$?; sed $'s/\033\\[[0-9;]*m//g' "$TMPD/raw" > "$COUT"
-if [[ $_drc -eq 0 ]]; then ok "…and survives the settings PATH being a directory"
+if _reached_dispatch "$(cout)" "$_drc"; then ok "…and survives the settings PATH being a directory"
 else fail "down --macos aborted on a settings path that is a directory" "$(cout)"; fi
 if ! grep -qi 'read error\|Is a directory' "$COUT"; then ok "…silently, because \`[[ -f ]]\` skips it before the loop can open it"
 else fail "a non-regular settings path leaked a shell diagnostic" "$(cout) — augur did not write this, and it names a file the operator is not told about"; fi
@@ -497,10 +524,16 @@ rmdir "$SETTINGS" 2>/dev/null
 # `resolve_macos_refresh_settings` from the dispatch tail left this file fully green before these two
 # arms existed, while the shipped augur ignored the settings file on `up`, `claude`, `shell`,
 # `status` and `refresh` alike.
-printf 'share_refresh=off\n' > "$SETTINGS"
-( cd "$WORKSPACE_DIR" && HOME="$HOME" AUGUR_VM_BIN="$_VMSTUB/augur-vm" bash "$AUGUR" status --macos ) \
-    > "$TMPD/raw" 2>&1; sed $'s/\033\\[[0-9;]*m//g' "$TMPD/raw" > "$COUT"
-has "$(cout)" "Share refresh: off (settings file)" "\`status --macos\` (a real process) sees the file — so the DISPATCH TAIL resolves it"
+#
+# The probe is an INVALID mode rather than `share_refresh=off`, and the marker is the resolver's own
+# warning rather than `status`'s rendering, because the rendering is printed by cmd_status_macos —
+# below `require_vz`, i.e. Darwin-only. The warning is printed by the dispatch tail itself, above the
+# dispatch case, so it is observable on every platform. Reading the file is what is under test here;
+# the "(settings file)" provenance label is pinned by the `config --show` arms further up.
+printf 'share_refresh=nonsense\n' > "$SETTINGS"
+( cd "$WORKSPACE_DIR" && HOME="$HOME" AUGUR_VM_BIN="$_VMSTUB/augur-vm" bash "$AUGUR" down --macos ) \
+    > "$TMPD/raw" 2>&1 || true; sed $'s/\033\\[[0-9;]*m//g' "$TMPD/raw" > "$COUT"
+has "$(cout)" "share_refresh='nonsense'" "a real process (not just \`config\`) reads the file — so the DISPATCH TAIL resolves it"
 # …and it resolves BEFORE the hard refusal, which is what makes "warn and drop" survivable: with a
 # bad period in the FILE, an attaching command must not be refused, because the file value was already
 # dropped. Ungated or applied late, this would refuse `shell --macos` over a file `destroy` cannot reap.
@@ -511,8 +544,10 @@ has "$(cout)" "Share refresh: off (settings file)" "\`status --macos\` (a real p
 # fixture's next failure) can only be printed by a run the settings file did not stop.
 printf 'share_refresh_interval=0\n' > "$SETTINGS"
 ( cd "$WORKSPACE_DIR" && HOME="$HOME" AUGUR_VM_BIN="$_VMSTUB/augur-vm" bash "$AUGUR" shell --macos ) \
-    > "$TMPD/raw" 2>&1; sed $'s/\033\\[[0-9;]*m//g' "$TMPD/raw" > "$COUT"
-has   "$(cout)" "Base VM"                            "an attaching command REACHES DISPATCH with a bad period in the FILE (it was dropped first)"
+    > "$TMPD/raw" 2>&1
+_src=$?; sed $'s/\033\\[[0-9;]*m//g' "$TMPD/raw" > "$COUT"
+if _reached_dispatch "$(cout)" "$_src"; then ok "an attaching command REACHES DISPATCH with a bad period in the FILE (it was dropped first)"
+else fail "an attaching command reaches dispatch with a bad period in the file" "the refusal exits above the dispatch case, so neither this fixture's \"Base VM\" nor augur's Darwin refusal can be printed by a run the file stopped: $(cout)"; fi
 hasnt "$(cout)" "unset AUGUR_MACOS_REFRESH_INTERVAL"  "…and is never sent to \`unset\` an export that is not the problem"
 has   "$(cout)" "share_refresh_interval='0'"          "…while the file's bad value is still reported, on the attaching path too"
 # CONTROL: the same bad value in the ENV var IS still refused, above dispatch. Without this the arm
