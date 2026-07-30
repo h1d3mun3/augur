@@ -4604,8 +4604,19 @@ cmd_status_macos() {
         # An `if` rather than `[[ … ]] && …`: the latter would be the last command of this branch, so
         # a `stat` that returned nothing would make the whole `if` return 1 and abort `status` under
         # `set -e`. An `if` whose condition is false returns 0.
-        rmt="$(stat -f %m "$rmark" 2>/dev/null || echo '')"
-        if [[ -n "$rmt" ]]; then rlast="last sweep $(( $(date +%s) - rmt ))s ago"; fi
+        #
+        # GNU form FIRST, then BSD, and then a numeric test — and the order is not interchangeable.
+        # `stat -c` does not exist on BSD, so macOS exits non-zero and the `||` fires. The reverse
+        # does NOT work: on GNU, `-f` means --file-system, so `stat -f %m <file>` treats `%m` as a
+        # second path, **exits 0**, and prints a filesystem report to stdout. `||` never fires, and
+        # `$(( … - rmt ))` then evaluates ` File: "…"` as arithmetic, where the bare word `File` is a
+        # variable name — `unbound variable` under `set -u` (augur:7), which aborts `status --macos`.
+        # This code path is macOS-only in production, but tests/43 drives it on both CI platforms, and
+        # `tests/41:256` already carries a comment warning about exactly this asymmetry. The numeric
+        # test is the part that closes the class rather than this one platform: whatever a future
+        # `stat` prints, only digits reach the arithmetic.
+        rmt="$(stat -c %Y "$rmark" 2>/dev/null || stat -f %m "$rmark" 2>/dev/null || true)"
+        if [[ "$rmt" =~ ^[0-9]+$ ]]; then rlast="last sweep $(( $(date +%s) - rmt ))s ago"; fi
     fi
     echo -e "${BOLD}Share refresh:${RESET} ${rmode} — this run: ${rwhat}"
     echo -e "               live: ${rloop}, ${rlast}"

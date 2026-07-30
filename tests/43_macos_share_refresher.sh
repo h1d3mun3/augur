@@ -634,6 +634,24 @@ touch "$_MARK"
 _st="$( cmd_status_macos 2>&1 )"
 if [[ "$_st" == *"last sweep"*"s ago"* ]]; then ok "a recorded sweep is reported as a measured age"
 else fail "a recorded sweep is reported as a measured age" "the marker mtime is the only thing here that answers \"is my edit through yet\": $_st"; fi
+
+# A `stat` that SUCCEEDS while printing something non-numeric. This is not hypothetical: `stat -f %m`
+# is BSD, and on GNU `-f` means --file-system, so the same argv treats `%m` as a second path, **exits
+# 0**, and prints a filesystem report. `||` never fires, and `$(( $(date +%s) - rmt ))` then evaluates
+# ` File: "…"` as arithmetic — where the bare word `File` is a variable name, so `set -u` (augur:7)
+# aborts `status --macos` outright. It took the four teardown/inspection arms above down with it on
+# ubuntu CI while passing on macOS. The remedy in cmd_status_macos is GNU-form-first plus a NUMERIC
+# test, and the numeric test is the half that closes the class rather than this one platform — so it
+# is what this arm pins. `stat` is an external command, not one of augur's own functions, so the
+# stub is removed with `unset -f` (the hazard recorded at the top of this file is unsetting a
+# function augur itself defines).
+stat() { printf '  File: "/somewhere"\n    ID: 0        Namelen: 255     Type: apfs\n'; return 0; }
+_st="$( set -e; cmd_status_macos 2>&1; echo SURVIVED )"
+unset -f stat
+if [[ "$_st" == *SURVIVED* ]]; then ok "a stat that succeeds with non-numeric output does not abort status"
+else fail "a stat that succeeds with non-numeric output does not abort status" "under set -u the bare word in ' File: \"…\"' is an unbound variable inside \$(( … )): $_st"; fi
+if [[ "$_st" == *"no sweep recorded"* ]]; then ok "…and the age is reported as unknown rather than as a bogus number"
+else fail "…and the age is reported as unknown" "a non-numeric mtime must not reach the arithmetic, and must not be dressed up as a measurement: $_st"; fi
 rm -f "$_MARK"
 
 echo yes > "$ALIVE"
