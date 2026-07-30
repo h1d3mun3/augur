@@ -1116,14 +1116,30 @@ load_project_settings() {
     # is a diagnostic augur did not write, about a file the operator is not told to look at.
     [[ -f "$f" ]] || return 0
     where="$(project_settings_display)"
-    # THE `return 0` AT THE END OF THIS FUNCTION IS THE ONLY THING KEEPING A BROKEN FILE FROM BEING
-    # FATAL, and it is now the only guard on this path — an earlier cut also had `|| true` on the
-    # `done` redirect, which was removed BECAUSE the two are individually sufficient and therefore
-    # individually untestable: with either one present, deleting the other changed no behaviour and no
-    # mutation could catch it. Measured, on this bash, with an unreadable file (four variants):
+    # UNREADABLE IS NOT ABSENT, and the trailing `return 0` does NOT cover it on every bash. A failed
+    # redirect on the `while` below aborts at the `while` on bash 5 — the function's last line is never
+    # reached — while stock macOS bash 3.2 carries on to it. The block comment further down measured
+    # only the 3.2 behaviour and concluded the two guards were interchangeable; they are not. Measured
+    # on ubuntu-latest CI: `augur down --macos` against a chmod-000 settings file printed one bare
+    # `augur: line NNNN: …: Permission denied` and stopped there, above the dispatch case — so augur
+    # could not even say why. A macOS operator with a Homebrew bash 5 first on PATH gets the same.
+    #
+    # Testing readability before opening it is the portable form, and unlike `|| true` it is
+    # observable: without this the caller aborts on bash 5 and says nothing on either.
+    if [[ ! -r "$f" ]]; then
+        warn "${where}: cannot read it — ignoring the project settings for this run."
+        warn "  Fix its permissions, or drop it with ${BOLD}rm ${f}${RESET}."
+        return 0
+    fi
+    # THE `return 0` AT THE END OF THIS FUNCTION keeps a broken file from being fatal on the paths the
+    # `-r` guard above does not cover. An earlier cut also had `|| true` on the `done` redirect and
+    # removed it as untestable; that reasoning was sound for the bash it was measured on and wrong in
+    # general — see the `-r` guard's comment. Measured on stock macOS bash 3.2, with an unreadable file:
     #     while … done < "$f"; return 0     → caller continues, script completes   rc=0
     #     while … done < "$f"               → caller ABORTS                        rc=1
     #     while … done < "$f" || true       → caller continues                     rc=0
+    # On bash 5 the first of those ALSO aborts, which is why readability is now checked up front
+    # rather than recovered from afterwards.
     # A failed redirect makes the `while` itself non-zero, and that does not abort AT the `while`; it
     # aborts the CALLER when the `while` is the function's last command, because
     # `load_project_settings` is called as a bare command under `set -e` (augur:7). `augur down

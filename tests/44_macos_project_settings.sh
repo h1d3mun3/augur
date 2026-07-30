@@ -498,7 +498,11 @@ else fail "container mode is untouched by a broken macOS settings file"; fi
 chmod 000 "$SETTINGS" 2>/dev/null
 _uout="$( cd "$WORKSPACE_DIR" && HOME="$HOME" AUGUR_VM_BIN="$_VMSTUB/augur-vm" bash "$AUGUR" down --macos 2>&1 )"; _urc=$?
 _uout="$(printf '%s' "$_uout" | sed $'s/\033\\[[0-9;]*m//g')"
-if _reached_dispatch "$_uout" "$_urc"; then ok "\`down --macos\` survives an UNREADABLE settings file (load_project_settings's \`return 0\`)"
+if [[ "$_uout" != *"Permission denied"* ]]; then ok "…and never lets bash report the file on augur's behalf"
+else fail "an unreadable settings file leaked a raw shell diagnostic" "augur did not write this, and on bash 5 the redirect that produced it also aborted the caller above the dispatch case: $_uout"; fi
+if [[ "$_uout" == *"cannot read it"* ]]; then ok "…and says so itself, rather than dropping the file in silence"
+else fail "an unreadable settings file was ignored silently" "a setting the operator wrote and augur ignored, with no word, is the #148 defect with a different cause: $_uout"; fi
+if _reached_dispatch "$_uout" "$_urc"; then ok "\`down --macos\` survives an UNREADABLE settings file (the \`-r\` guard)"
 else fail "down --macos aborted on an unreadable settings file" "the loop's redirect failure propagated out of load_project_settings, so nothing below the dispatch tail ran: $_uout"; fi
 chmod 644 "$SETTINGS" 2>/dev/null
 # A path that is a DIRECTORY exercises a different guard, and the claim this arm used to make about it
