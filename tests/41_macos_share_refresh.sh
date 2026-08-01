@@ -56,9 +56,26 @@ SSHLOG="$TMPD/sshlog"       # the remote command string, one per call
 STDINLOG="$TMPD/stdinlog"   # the NUL-separated path list it was fed
 : > "$SSHLOG"; : > "$STDINLOG"
 SSH_OUT="ok=3"; SSH_RC=0
-ssh_macos() {                 # only ever driven with the piped `python3 -c` shape here
+ssh_macos() {
     printf '%s\n' "$*" >> "$SSHLOG"
-    cat > "$STDINLOG"
+    # ONLY THE SWEEP IS PIPED FROM THE HOST. Its NUL-separated list arrives on this function's stdin;
+    # nothing else in this file does that. The header used to say "only ever driven with the piped
+    # `python3 -c` shape here" and an unconditional `cat` was correct while that held — it stopped
+    # holding when the mode-reconcile arms began driving `cmd_claude_macos` and `cmd_shell_macos`,
+    # which reach this stub as `-t` interactive shapes with nothing piped. There the `cat` drains
+    # whatever stdin the SUITE inherited: /dev/null under CI (invisible), a TTY on a developer's
+    # terminal (`make offline-tests` stops dead with no error and no timeout). That is precisely the
+    # failure tests/39 exists for, and it was live on main — see its header for the two files that
+    # shipped in this state before.
+    #
+    # `printf %s` is excluded ahead of the `python3 -c` arm rather than after it because the freshness
+    # tripwire's probes carry BOTH: their pipe is inside the remote command string, so from here they
+    # are unpiped like the interactive shapes. Matching `python3 -c` alone would regrow the bug the
+    # first time this file drives them.
+    case "$*" in
+        *"printf %s"*)  : ;;                    # tripwire probes — the pipe is REMOTE, not from us
+        *"python3 -c"*) cat > "$STDINLOG" ;;    # the sweep — the list comes from the host
+    esac
     printf '%s' "$SSH_OUT"
     return "$SSH_RC"
 }
