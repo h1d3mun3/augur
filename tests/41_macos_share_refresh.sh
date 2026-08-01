@@ -317,6 +317,26 @@ if tail -1 "$SSHLOG" | grep -q " ${_MACOS_SWEEP_TRIES} ${_MACOS_SWEEP_DETAIL}$";
     ok "the retry count and the detail cap are passed, in that order"
 else fail "the retry count and the detail cap are passed, in that order" "$(tail -1 "$SSHLOG")"; fi
 
+section "the sweep's interpreter cannot be shadowed through PATH"
+
+# THE MECHANISM, NOT THE CHECK. augur's own ~/.augur-env puts $HOME/.local/bin FIRST in the PATH of
+# every guest shell — including the non-login shell `ssh <host> <cmd>` runs, which still sources
+# ~/.zshenv — so an unpinned `python3` here is chosen by the guest. Shadowing the freshness tripwire
+# would make the self-test lie while real sweeps still worked; shadowing THIS makes the sweep print
+# `ok=N` while invalidating nothing, and the edit that then never lands may be the operator tightening
+# the rules on a guest that is misbehaving. verify_macos_egress_locked pins its own probes for the
+# same reason (augur:1748-1755); this arm is what keeps the two from drifting apart again.
+#
+# Asserted on the FIRST line, before `python3`, because order is the property: a pin appended after
+# the interpreter has already resolved is not a pin.
+if head -1 "$SSHLOG" | grep -q "export PATH=/usr/bin:/bin:/usr/sbin:/sbin; *python3 -c "; then
+    ok "the sweep pins PATH to system dirs ahead of \`python3\`"
+else fail "the sweep pins PATH to system dirs ahead of \`python3\`" "a guest-planted ~/.local/bin/python3 would decide what this round trip reports: $(head -1 "$SSHLOG")"; fi
+# The pin must not have cost the protocol: the program is still an ARGUMENT (stdin stays free for the
+# NUL list), and _macos_msync_program still contains no single quote of its own.
+if [[ "$(tr -dc '\0' < "$STDINLOG" | wc -c | tr -d ' ')" -gt 0 ]]; then ok "…without disturbing the NUL-separated list on stdin"
+else fail "…without disturbing the NUL-separated list on stdin" "the pin was added in a way that consumed stdin or broke the quoting"; fi
+
 section "--share-refresh off stops the sweep — at every call site at once"
 
 # `off` is enforced INSIDE refresh_macos_shares rather than by an `if` copied to the four attach call
