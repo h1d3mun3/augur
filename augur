@@ -1022,6 +1022,235 @@ require_safe_workspace() {
     exit 1
 }
 
+# ── Per-project settings, HOST-side: ~/.augur/project-settings/ (`augur config`) ──────────────
+#
+# One file per project, for the settings whose right value is a property of THE REPO rather than of
+# the run — today the two macOS share-refresh knobs, whose cost scales with the project's
+# changed-file count (~0.36 ms each, so past roughly 14,000 changed files one sweep outlasts the
+# default 5 s interval; see _MACOS_REFRESH_MODE). Without this, an operator whose repo is big enough
+# to need `--share-refresh attach` has to type it on every command, forever.
+#
+# WHY THIS IS NOT ./.augur/, and this is written out because the project layer WILL be proposed
+# again — it is where every other per-project knob in augur lives (allowlist.conf, resources.conf),
+# so it is the obvious guess, and it is the wrong one:
+#   • ./.augur/ is inside $WORKSPACE_DIR, which is mounted READ-WRITE into the guest (see
+#     require_safe_workspace's header for both engines' argv). The guest can therefore write it. A
+#     `share_refresh` read from there would let a compromised guest — or a prompt-injected agent —
+#     switch off the mechanism that keeps the operator's view of the guest's own filesystem honest.
+#     It composes with the 2026-07-28 snapshot's item 39(a), where the sweep's round trip runs an
+#     UNPINNED `python3` in the guest: the guest could fabricate the refresh report AND disable the
+#     tripwire that would notice the report was fiction.
+#   • That is not the same shape as AUGUR_PROJECT_RESOURCES_CONF being guest-writable on purpose.
+#     Inflating your own VM is a self-serve request the operator SEES applied on the next `up`;
+#     silencing a freshness mitigation is invisible by construction, which is the entire reason
+#     warn_macos_refresh_mode speaks on every single run (#148).
+#   • ~/.augur is reachable from no guest: it appears in none of cmd_up_macos's four `--dir=` shares
+#     and none of cmd_up's six `-v` mounts, and require_safe_workspace refuses any $WORKSPACE_DIR
+#     that is, contains, or lives inside it — so there is no arrangement in which a guest sees this
+#     file. Enumerated against both argv sites rather than assumed; tests/44 pins it.
+# ADR-0016 §6 rejected this file on cost and fit and now records why that reversed.
+#
+# Keyed EXACTLY like proxy_allowlist / proxy_pidfile / project_conf_hash_file below:
+# "$(workspace_slug)-$(workspace_path_hash)". The slug alone is a GUARANTEED collision for
+# ~/work/app vs ~/archive/app (see workspace_path_hash), and here that collision would hand one
+# project's refresh mode to an unrelated — possibly hostile — same-basename sibling.
+#
+# NO `mkdir -p` in the accessor, unlike project_conf_hash_file's just below. Every READ path calls
+# this — resolve_macos_refresh_settings runs on every macOS command, `help --macos` included — and a
+# path accessor with a side effect would have augur scatter empty project-settings/ directories for
+# projects that have no settings at all. The two WRITE paths mkdir explicitly.
+project_settings_dir()  { echo "$AUGUR_DIR/project-settings"; }
+project_settings_file() { echo "$(project_settings_dir)/$(workspace_slug)-$(workspace_path_hash).conf"; }
+
+# The file path as it should appear in a message. Every warning about this file has to name it — the
+# operator cannot fix a file they cannot find — and the literal path is long enough that abbreviating
+# $HOME keeps those warnings on one line. `${f#"$HOME"}` is quoted so a $HOME containing a glob
+# character is stripped literally rather than as a pattern.
+project_settings_display() {
+    local f; f="$(project_settings_file)"
+    if [[ "$f" == "$HOME"/* ]]; then printf '~%s' "${f#"$HOME"}"; else printf '%s' "$f"; fi
+}
+
+# The parsed file: the two keys this augur knows, plus everything it does not, read in ONE pass.
+#
+# RAW values — validation belongs to the layer that CONSUMES them
+# (resolve_macos_refresh_settings), because a rejected value has to be reported together with the
+# layer it came from and with the value used instead. A loader that quietly dropped a bad value
+# would make that impossible, and a setting that has no effect and says nothing is the #148 defect
+# with a different cause.
+#
+# The _SEEN flags are not redundant with "" . An ABSENT key must fall through to the env/default
+# layer; a present-but-empty one (`share_refresh=`) is malformed input that has to be reported. Both
+# arrive as "", so the flag is what tells them apart.
+_PROJECT_SETTINGS_REFRESH=""
+_PROJECT_SETTINGS_REFRESH_SEEN=false
+_PROJECT_SETTINGS_INTERVAL=""
+_PROJECT_SETTINGS_INTERVAL_SEEN=false
+_PROJECT_SETTINGS_OTHER=""          # unrecognised KEY=VALUE lines, verbatim, for the rewrite
+# READ ONCE PER PROCESS, because reading it is not silent: a malformed line WARNS, and two callers
+# reach this in one run — resolve_macos_refresh_settings from the dispatch tail, and cmd_config's
+# write path — so `augur config --macos --share-refresh attach` on a file with an unknown key
+# reported that key twice.
+#
+# ONCE HOLDS EVEN ACROSS A WRITE. `augur config` is the one command that changes the file mid-run,
+# and it does not need a re-read to see its own change: it mutates the variables above and
+# project_settings_write emits THEM, so the parsed state and the file agree by construction.
+# reset_macos_refresh_resolution therefore redoes the RESOLUTION and leaves this flag alone —
+# clearing it (an earlier cut did) bought nothing and made `config <setter> --show` report a
+# malformed line twice, which is the property this flag exists to hold. A new caller that genuinely
+# needs a fresh read has to clear the flag deliberately, rather than get one by accident, and owes
+# the operator an answer to "why is this file being complained about twice".
+_PROJECT_SETTINGS_LOADED=false
+load_project_settings() {
+    if $_PROJECT_SETTINGS_LOADED; then return 0; fi
+    _PROJECT_SETTINGS_LOADED=true
+    _PROJECT_SETTINGS_REFRESH="";  _PROJECT_SETTINGS_REFRESH_SEEN=false
+    _PROJECT_SETTINGS_INTERVAL=""; _PROJECT_SETTINGS_INTERVAL_SEEN=false
+    _PROJECT_SETTINGS_OTHER=""
+    local f where line raw k v
+    f="$(project_settings_file)"
+    # NOT A REGULAR FILE ⇒ NOTHING TO READ. `[[ -f ]]` is false for a directory, a dangling symlink
+    # and a FIFO alike, and skipping them here is what keeps the loop's redirect from opening
+    # something it cannot read: without this line a settings PATH that is a directory makes bash
+    # print `read error: … Is a directory` on every macOS command in that project (measured), which
+    # is a diagnostic augur did not write, about a file the operator is not told to look at.
+    [[ -f "$f" ]] || return 0
+    where="$(project_settings_display)"
+    # UNREADABLE IS NOT ABSENT, and the trailing `return 0` does NOT cover it on every bash. A failed
+    # redirect on the `while` below aborts at the `while` on bash 5 — the function's last line is never
+    # reached — while stock macOS bash 3.2 carries on to it. The block comment further down measured
+    # only the 3.2 behaviour and concluded the two guards were interchangeable; they are not. Measured
+    # on ubuntu-latest CI: `augur down --macos` against a chmod-000 settings file printed one bare
+    # `augur: line NNNN: …: Permission denied` and stopped there, above the dispatch case — so augur
+    # could not even say why. A macOS operator with a Homebrew bash 5 first on PATH gets the same.
+    #
+    # Testing readability before opening it is the portable form, and unlike `|| true` it is
+    # observable: without this the caller aborts on bash 5 and says nothing on either.
+    if [[ ! -r "$f" ]]; then
+        warn "${where}: cannot read it — ignoring the project settings for this run."
+        warn "  Fix its permissions, or drop it with ${BOLD}rm ${f}${RESET}."
+        return 0
+    fi
+    # THE `return 0` AT THE END OF THIS FUNCTION keeps a broken file from being fatal on the paths the
+    # `-r` guard above does not cover. An earlier cut also had `|| true` on the `done` redirect and
+    # removed it as untestable; that reasoning was sound for the bash it was measured on and wrong in
+    # general — see the `-r` guard's comment. Measured on stock macOS bash 3.2, with an unreadable file:
+    #     while … done < "$f"; return 0     → caller continues, script completes   rc=0
+    #     while … done < "$f"               → caller ABORTS                        rc=1
+    #     while … done < "$f" || true       → caller continues                     rc=0
+    # On bash 5 the first of those ALSO aborts, which is why readability is now checked up front
+    # rather than recovered from afterwards.
+    # A failed redirect makes the `while` itself non-zero, and that does not abort AT the `while`; it
+    # aborts the CALLER when the `while` is the function's last command, because
+    # `load_project_settings` is called as a bare command under `set -e` (augur:7). `augur down
+    # --macos` is one of those callers, and a settings file must never be able to make a project
+    # untearable-down — the exact failure direction the dispatch tail's gate exists to prevent for a
+    # stale env var, and sharper here, because `unset` fixes an export while this file survives
+    # `destroy --macos` by design. tests/44 pins it: deleting this `return 0` turns the
+    # unreadable-file arm red.
+    #
+    # The loop body runs in THIS shell (a redirect, not a pipe), so its assignments are what the
+    # caller reads; a `cat "$f" | while` here would silently discard every one of them.
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # THE RAW LINE IS KEPT, and that is not tidiness — it is what an unknown key is re-emitted
+        # from. Comment-stripping is right for the two keys this augur PARSES
+        # (`share_refresh=attach  # this repo is 40k files` has to work), and wrong for a key it only
+        # carries: `future_color=#ff0000` strips to `future_color=`, and a rewrite that re-emitted the
+        # stripped form would hand a NEWER augur back a value it never wrote, with no warning that
+        # anything was lost. That is strictly worse than the deletion this mechanism exists to
+        # prevent — a mangled setting is indistinguishable from operator error, a missing one is not.
+        raw="$line"
+        raw="${raw#"${raw%%[![:space:]]*}"}"; raw="${raw%"${raw##*[![:space:]]}"}"
+        line="${line%%#*}"
+        line="${line#"${line%%[![:space:]]*}"}"; line="${line%"${line##*[![:space:]]}"}"
+        [[ -n "$line" ]] || continue
+        case "$line" in
+            *=*) k="${line%%=*}"; v="${line#*=}" ;;
+            # Not a key at all. Reported for the same reason an unknown key is: the operator wrote
+            # something, and it is having no effect.
+            *)   warn "${where}: ignoring '${line}' — not a ${BOLD}KEY=VALUE${RESET} setting."
+                 continue ;;
+        esac
+        k="${k#"${k%%[![:space:]]*}"}"; k="${k%"${k##*[![:space:]]}"}"
+        v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+        case "$k" in
+            share_refresh)          _PROJECT_SETTINGS_REFRESH="$v";  _PROJECT_SETTINGS_REFRESH_SEEN=true ;;
+            share_refresh_interval) _PROJECT_SETTINGS_INTERVAL="$v"; _PROJECT_SETTINGS_INTERVAL_SEEN=true ;;
+            # FORWARD COMPATIBILITY, in both directions. A key a NEWER augur writes must not stop an
+            # older one dead, so it warns and continues rather than refusing — and it must survive
+            # this augur REWRITING the file, or "ignored" would quietly mean "deleted by your next
+            # `augur config`". Re-emitted from `$raw`, byte for byte apart from surrounding
+            # whitespace, so any `#` in the value survives the round trip; project_settings_write
+            # writes it back out unparsed.
+            *) warn "${where}: ignoring the unknown setting ${BOLD}${k}${RESET} (this augur knows share_refresh, share_refresh_interval)."
+               _PROJECT_SETTINGS_OTHER="${_PROJECT_SETTINGS_OTHER}${raw}"$'\n' ;;
+        esac
+    done < "$f"
+    return 0
+}
+
+# Rewrite the file from the loaded state. ONE writer behind `--share-refresh`,
+# `--share-refresh-interval` and `--unset`, because those three differ only in what they leave in the
+# variables above — three hand-rolled rewrites would be three chances to drop the other key.
+#
+# LINE 2 CARRIES THE RAW WORKSPACE PATH, which is not decoration. The FILENAME holds
+# `908d688ef046`, and a hash tells a human nothing: ~/.augur/project-hashes/ already has exactly that
+# problem, so an operator listing ~/.augur/project-settings/ to answer "which project is this?" has
+# no way back to the path. This comment is the only place that mapping exists.
+#
+# Hand-added COMMENTS are not preserved (unknown KEYS are). The header says the file is written by
+# `augur config`; keys are data, and a machine-rewritten file cannot promise to keep prose it has no
+# way to tell apart from its own header.
+project_settings_write() {
+    local f d tmp
+    f="$(project_settings_file)"; d="$(project_settings_dir)"
+    # Nothing left to record ⇒ REMOVE the file rather than leave a header with no settings under it.
+    # `--show` reports "none" for both, so keeping one would be a difference visible in `ls` and not
+    # in augur, and `--unset` of the last key would not be a return to the pristine state.
+    if ! $_PROJECT_SETTINGS_REFRESH_SEEN && ! $_PROJECT_SETTINGS_INTERVAL_SEEN \
+       && [[ -z "$_PROJECT_SETTINGS_OTHER" ]]; then
+        # Checked like the other three failure sites below, and for the same reason: this is a WRITE
+        # path, so a silent failure means `augur config --unset` reported success and changed nothing.
+        # Without the guard the bare `rm -f` also aborts the command under `set -e` with only the
+        # system's own `rm: …: Permission denied` to show for it — a diagnostic augur did not write,
+        # naming a path the operator was never told augur owns.
+        rm -f "$f" || { error "Cannot remove ${f}."; exit 1; }
+        return 0
+    fi
+    mkdir -p "$d" || { error "Cannot create ${d}."; exit 1; }
+    tmp="${f}.new.$$"
+    # Staged and moved into place: a file half-written by an interrupted `augur config` is what the
+    # NEXT command reads, and this layer's job is to warn about a broken file, not to author one. The
+    # rename is also what makes a read-only settings FILE in a writable directory updatable, which is
+    # the discriminator tests/44 uses to pin this shape against a direct `> "$f"`.
+    #
+    # `umask 077` in a subshell, matching macos_vm_log's staged write and save_oauth_token /
+    # container_fingerprint, rather than project_conf_hash_file's umask-dependent mode. The contents
+    # are not secret, but the file names the operator's workspace path and decides whether the
+    # freshness mitigation runs at all; a world-writable ~/.augur on a shared host should not be the
+    # thing standing between another account and `share_refresh=off`.
+    #
+    # `if` and not `[[ … ]] && echo …` for the two conditional lines, and the group ENDS IN AN
+    # UNCONDITIONAL `printf`. Both halves of that matter, in opposite directions. A false `[[ … ]] &&`
+    # as the last command of the group makes the group non-zero, so a write that succeeded reports
+    # failure — the trap this file documents at cmd_status_macos. But a group's status is its LAST
+    # command's, so a group ending in a false-conditioned `if` returns 0 and MASKS a failed `echo`
+    # above it (ENOSPC, quota), installing a truncated file; measured:
+    # `( { false; if [[ -z x ]]; then echo y; fi; } >/dev/null )` → rc 0. The unconditional `printf`
+    # — a no-op when there are no unknown keys — is what makes the group's status the write's status.
+    (
+        umask 077
+        {
+            echo "# augur project settings — written by \`augur config\`. Host-side; never read from the workspace."
+            echo "# workspace: ${WORKSPACE_DIR}"
+            if $_PROJECT_SETTINGS_REFRESH_SEEN;  then echo "share_refresh=${_PROJECT_SETTINGS_REFRESH}"; fi
+            if $_PROJECT_SETTINGS_INTERVAL_SEEN; then echo "share_refresh_interval=${_PROJECT_SETTINGS_INTERVAL}"; fi
+            printf '%s' "$_PROJECT_SETTINGS_OTHER"
+        } > "$tmp"
+    ) || { rm -f "$tmp"; error "Cannot write ${f}."; exit 1; }
+    mv -f "$tmp" "$f" || { rm -f "$tmp"; error "Cannot replace ${f}."; exit 1; }
+}
+
 # Host-side record of approved project-conf fingerprints (TOFU). Under ~/.augur — NEVER the
 # project tree or a mounted share — so the guest cannot forge its own approval. Keyed on the
 # FULL workspace path (slug + path hash), so a hostile repo that shares a basename with a
@@ -3392,14 +3621,42 @@ _MACOS_SWEEP_NOWORK=4    # nothing had changed since the last sweep, so the gues
 #     before it is usable — and the right value depends on the HOST's CPU as much as on the repo's
 #     file count, so a value committed with the project would be wrong on the next machine.
 # A launch-time flag has neither problem: the value comes from the operator, in the clear, per run.
-# The next person to propose the config file should start from these two paragraphs.
-_MACOS_REFRESH_MODE=continuous
+#
+# THE SECOND BULLET HAS SINCE BEEN BUILT — `augur config` exists, and the host-side per-project file
+# is project_settings_file(). Only the COST objection was answered; the security objection in the
+# first bullet stands unchanged and is the reason the file is under ~/.augur and not in the repo.
+# "Wrong on the next machine" is answered by the same fact: the file is host-side, so it never
+# travels with the project. The layering is at resolve_macos_refresh_settings; the flag still wins.
+#
+# WHICH LAYER put that value there is carried alongside it: default | file | flag. Not cosmetic, and
+# not derivable — a plain assignment leaves `--share-refresh continuous` and an empty command line in
+# identical states, so without it the settings-file layer below would overwrite an EXPLICIT
+# `--share-refresh continuous` and the flag would silently lose to the file for one of its three
+# values. See resolve_macos_refresh_settings. There is no `env` value here: the mode has no env peer
+# (ADR-0016 §6 — a shell profile is per HOST and across every project, which is the one scope at
+# which "this repo is too big for a 5 s loop" is never the right answer).
+#
+# A FUNCTION, for the same reason `_macos_refresh_interval_reset` is one: `augur config --unset …
+# --show` has to re-run the layers below the file after rewriting it, and a second hand-written copy
+# of "the default is continuous, provenance default" is how the two would eventually disagree about
+# what `--show` reports. The mode has one layer fewer than the period, which is exactly why the
+# duplicate was easy to miss.
+_macos_refresh_mode_reset() {
+    _MACOS_REFRESH_MODE=continuous
+    _MACOS_REFRESH_MODE_FROM=default
+}
+_macos_refresh_mode_reset
 
 # One predicate per decision, read at the point of use — the shape egress_enabled established. The
 # alternative (an `if` copied to each of the four attach call sites) is the arrangement a fifth call
 # site silently escapes, and this section already has four sites plus a loop.
 share_refresh_enabled()      { [[ "$_MACOS_REFRESH_MODE" != off ]]; }
 share_refresh_loop_enabled() { [[ "$_MACOS_REFRESH_MODE" == continuous ]]; }
+# The set of legal modes, in ONE place. Three layers now accept a mode — the flag, the settings file
+# and `augur config` writing it — and a copied `case` in each is how they drift: the day a fourth
+# mode lands, two of the three would keep refusing it. Same reason macos_refresh_interval_valid holds
+# the period's rule for its own three layers.
+macos_refresh_mode_valid() { case "$1" in continuous|attach|off) return 0 ;; *) return 1 ;; esac; }
 
 # Per-VM marker: the instant of the last successful sweep. Mirrors macos_profile_marker_file, and
 # lives beside it so `destroy --macos` reaps both.
@@ -3761,10 +4018,33 @@ verify_macos_share_freshness() {
 # next optimisation; it is not worth a Swift component in the first cut.
 #
 # The period, lowest precedence first: built-in default 5 < AUGUR_MACOS_REFRESH_INTERVAL < the
-# --share-refresh-interval flag, which overwrites this variable from the global flag loop further
-# down — the same three-layer shape and the same mechanism AUGUR_EGRESS / --egress / --no-egress use
-# (the env-derived assignment happens at parse time, the flag runs after it and simply wins).
-_MACOS_REFRESH_INTERVAL="${AUGUR_MACOS_REFRESH_INTERVAL:-5}"
+# per-project settings file < the --share-refresh-interval flag, which overwrites this variable from
+# the global flag loop further down — the same mechanism AUGUR_EGRESS / --egress / --no-egress use
+# (the env-derived assignment happens at parse time, the flag runs after it and simply wins). The
+# file layer cannot work that way (it needs to lose to the flag while beating the env var), so it is
+# applied by resolve_macos_refresh_settings in the dispatch tail; read that for the ordering argument.
+#
+# THE ENV LAYER IS APPLIED HERE, AT SOURCE TIME, AND NOW SAYS SO. This was
+# `${AUGUR_MACOS_REFRESH_INTERVAL:-5}` — one expansion, in which "env said 5" and "nobody said
+# anything" were the same state. A layer that has to sit BETWEEN the env var and the flag cannot be
+# built on that: it has to know whether the value in front of it came from anywhere. `:-` semantics
+# are preserved exactly, so an empty export still means "unset" and nothing about the existing env
+# behaviour changes; only its provenance is now recorded. It stays at SOURCE time rather than moving
+# into the resolver so that everything sourcing augur (tests/43 exports the period and then spawns
+# the real loop) still sees the env value without running the dispatch tail.
+#
+# A function, and called immediately, because `augur config --unset … --show` has to re-run the two
+# layers below the file after rewriting it (see reset_macos_refresh_resolution). Two copies of these
+# four lines is how the env layer and its provenance would eventually disagree.
+_macos_refresh_interval_reset() {
+    _MACOS_REFRESH_INTERVAL=5
+    _MACOS_REFRESH_INTERVAL_FROM=default
+    if [[ -n "${AUGUR_MACOS_REFRESH_INTERVAL:-}" ]]; then
+        _MACOS_REFRESH_INTERVAL="$AUGUR_MACOS_REFRESH_INTERVAL"
+        _MACOS_REFRESH_INTERVAL_FROM=env
+    fi
+}
+_macos_refresh_interval_reset
 
 # A POSITIVE integer, and nothing else, whichever layer it came from.
 #
@@ -3805,14 +4085,166 @@ validate_macos_refresh_interval() {   # <value> <where it came from, for the mes
     exit 1
 }
 
+# ── The four layers, resolved once: flag > settings file > env > built-in default ──────────────
+#
+# THE TWO THINGS THAT HAD TO BE FIXED BEFORE A FILE LAYER COULD EXIST AT ALL. Both were invisible
+# while there were only two layers, and both would have made the file layer silently wrong:
+#
+#  1. "FLAG GIVEN" WAS INDISTINGUISHABLE FROM "DEFAULT". `_MACOS_REFRESH_MODE=continuous` is a plain
+#     assignment, so after the flag loop `--share-refresh continuous` and an empty command line leave
+#     the variable in the same state. A file layer that overwrote it whenever it held the default
+#     would therefore overwrite an EXPLICIT `--share-refresh continuous` too: the flag would lose to
+#     the file for one of its three values, and for exactly the value an operator passes to escape a
+#     persisted `off`. Fixed with a provenance variable per setting, written by whichever layer set
+#     the value; the layers below test the provenance instead of comparing against the default.
+#  2. THE ENV LAYER WAS COLLAPSED INTO THE DEFAULT: `${AUGUR_MACOS_REFRESH_INTERVAL:-5}` made "env
+#     said 5" and "nobody said anything" one state. Same fix, at the assignment itself. It also
+#     removes a live mis-attribution: the dispatch tail used to blame AUGUR_MACOS_REFRESH_INTERVAL by
+#     HARDCODED STRING, which with a third layer above the default would name the env var for a bad
+#     value that came out of the settings file, and send the operator to `unset` something that was
+#     not the problem. The blame is derived from the provenance now.
+#
+# WHY THE FILE BEATS THE ENV VAR. There IS an env-vs-file precedent in this file and it points the
+# OTHER way — resolve_macos_vm_cpu puts AUGUR_MACOS_VM_CPU above ./.augur/resources.conf's MACOS_CPU
+# — but its reason does not transfer, and the reason is stated at clamp_resource_int: "an explicit
+# AUGUR_* env override is operator intent and stays unclamped". That is a TRUST ordering. The
+# resources file is guest-writable and the export is the operator's, so the trusted layer has to win.
+# This file is host-side and written only by `augur config` (see project_settings_file), so it is
+# exactly as trusted as the export, and what is left to order on is SCOPE:
+#   • AUGUR_MACOS_REFRESH_INTERVAL is set persistently in one place — a shell profile — which is per
+#     HOST and across every project. ADR-0016 §6 already gives that as the reason no env peer was
+#     added for the MODE: it is "the one scope at which 'this repo is too big for a 5 s loop' is
+#     never the right answer". A layer that reasoning rejects as wrongly scoped for the mode cannot
+#     outrank a per-project file for the period either.
+#   • The file is per project and DELIBERATE: it exists only because someone ran `augur config` in
+#     that directory, and it records the directory's raw path on line 2.
+#   • The concrete case is the one the dispatch tail below already complains about — a stale
+#     AUGUR_MACOS_REFRESH_INTERVAL left in a shell profile. Under env > file that stale export would
+#     silently override the value the operator set for the one repo that needed it, in every shell
+#     they own, which is the failure this layer exists to remove rather than to reproduce.
+# The inversion is never SILENT in either direction: `augur config --show` names the winning layer
+# for every key, and `status --macos` names it for the mode. That is what makes the ordering
+# debuggable rather than folklore, and it is why provenance is a printed value and not an internal.
+#
+# IT RUNS FOR EVERY macOS COMMAND, not only the attaching ones. The mode is consumed by
+# `status --macos` (its Share refresh line) and by `refresh --macos` as well as by the four attach
+# points and the loop, and a `status` reporting `continuous` for a project configured `attach` would
+# be precisely the misreport that line was split in two to prevent. That is safe at this width for
+# ONE reason: IT CANNOT FAIL. Every malformed value warns and is dropped in favour of the layer
+# below; nothing here exits, and nothing returns non-zero. The dispatch tail's hard refusal keeps its
+# `up|claude|shell|setup-token` gate exactly as it was, so a broken FILE cannot do what a stale env
+# var was stopped from doing — take `down`/`destroy`/`status --macos` away from the operator. That
+# matters more for a file than for an export: `unset` fixes an export, while this file survives
+# `destroy --macos` by design (see cmd_destroy_macos), so a refusal here would be permanent.
+#
+# WARN, NEVER SILENT. Someone who wrote a setting and sees no effect concludes the feature is broken
+# — #148 with a different cause — so every rejected value names the file, the value, what is being
+# used instead, and the `augur config` line that clears it.
+_MACOS_REFRESH_RESOLVED=false
+resolve_macos_refresh_settings() {
+    # Idempotent: `augur config` resolves for its own `--show` and the dispatch tail resolves for
+    # everything else, and on `augur config --macos --show` both run. Re-reading is harmless but
+    # re-WARNING is not — a broken file would report itself twice on one command.
+    if $_MACOS_REFRESH_RESOLVED; then return 0; fi
+    _MACOS_REFRESH_RESOLVED=true
+    load_project_settings
+    local where; where="$(project_settings_display)"
+
+    # MODE: flag > file > default. No env layer at all, deliberately (ADR-0016 §6).
+    if [[ "$_MACOS_REFRESH_MODE_FROM" == flag ]]; then
+        :   # the operator said it on THIS command line; nothing below is allowed to overrule that
+    elif $_PROJECT_SETTINGS_REFRESH_SEEN; then
+        if macos_refresh_mode_valid "$_PROJECT_SETTINGS_REFRESH"; then
+            _MACOS_REFRESH_MODE="$_PROJECT_SETTINGS_REFRESH"
+            _MACOS_REFRESH_MODE_FROM=file
+        else
+            warn "${where}: ${BOLD}share_refresh='${_PROJECT_SETTINGS_REFRESH}'${RESET} is not continuous, attach or off — ignoring it."
+            warn "  Using ${BOLD}${_MACOS_REFRESH_MODE}${RESET} (the built-in default) for this run. Set it with"
+            warn "  ${BOLD}augur config --share-refresh attach${RESET}, or drop it with ${BOLD}augur config --unset share_refresh${RESET}."
+        fi
+    fi
+
+    # PERIOD: flag > file > env > default. The env and default layers were applied at the
+    # _MACOS_REFRESH_INTERVAL assignment above, each recording its provenance, so all this has to
+    # decide is whether the FILE outranks whatever is already there — which it does for everything
+    # except the flag.
+    if [[ "$_MACOS_REFRESH_INTERVAL_FROM" == flag ]]; then
+        :
+    elif $_PROJECT_SETTINGS_INTERVAL_SEEN; then
+        if macos_refresh_interval_valid "$_PROJECT_SETTINGS_INTERVAL"; then
+            _MACOS_REFRESH_INTERVAL="$_PROJECT_SETTINGS_INTERVAL"
+            _MACOS_REFRESH_INTERVAL_FROM=file
+        else
+            # A WARN where the identical bad value on the command line is a hard refusal, and the
+            # asymmetry is the point: a flag is a typo in front of the operator, while this file is
+            # not on the command line and is not reaped by `destroy --macos`, so refusing would wedge
+            # every macOS command behind a file until they found it. The value is DROPPED, so nothing
+            # malformed can reach `sleep` — which is all the refusal was ever protecting.
+            warn "${where}: ${BOLD}share_refresh_interval='${_PROJECT_SETTINGS_INTERVAL}'${RESET} is not a positive whole number of seconds — ignoring it."
+            warn "  Using ${BOLD}${_MACOS_REFRESH_INTERVAL}${RESET}s ($(macos_refresh_interval_source_label)) for this run. Set it with"
+            warn "  ${BOLD}augur config --share-refresh-interval 30${RESET}, or drop it with ${BOLD}augur config --unset share_refresh_interval${RESET}."
+        fi
+    fi
+    return 0
+}
+
+# Throw the resolution away and re-run the layers BELOW the flag. Exactly one caller needs this, and
+# it needs it for a reason no other command has: `augur config` REWRITES the settings file mid-run,
+# after the dispatch tail has already resolved the old contents. Without this,
+# `augur config --unset share_refresh --show` printed `off (settings file)` for a key it had just
+# deleted — the resolution was cached and the guard above (correctly) refused to redo it. A `--show`
+# that reports the state before its own write is worse than one that prints no provenance at all.
+#
+# The FLAG layer is preserved: the flag is still on the command line, so it still wins, and clobbering
+# it would make `augur config --share-refresh off --show` report `continuous`.
+#
+# `_PROJECT_SETTINGS_LOADED` IS DELIBERATELY *NOT* CLEARED, and an earlier cut that cleared it was
+# wrong twice over. The parsed state is not stale: `cmd_config` mutates `_PROJECT_SETTINGS_*` and then
+# `project_settings_write` writes THOSE VARIABLES out, so after the write the in-memory state IS the
+# file. Re-reading it therefore changes no value — and reading this file is not silent, so the only
+# thing the re-read actually did was report a malformed or unknown line a SECOND time on the one
+# command line that both writes and shows. Measured, on a file carrying one unknown key:
+#   augur config --macos --share-refresh attach          → 1 × "ignoring the unknown setting"
+#   augur config --macos --share-refresh attach --show   → 2 ×   (before this)
+# which is the exact property `_PROJECT_SETTINGS_LOADED` was introduced to hold, defeated by the one
+# caller that clears it. What has to be redone is the RESOLUTION (which layer wins), not the parse.
+reset_macos_refresh_resolution() {
+    _MACOS_REFRESH_RESOLVED=false
+    if [[ "$_MACOS_REFRESH_MODE_FROM" != flag ]]; then
+        _macos_refresh_mode_reset
+    fi
+    if [[ "$_MACOS_REFRESH_INTERVAL_FROM" != flag ]]; then _macos_refresh_interval_reset; fi
+}
+
+# Provenance token → the name to SHOW or to BLAME. One mapping, used by `augur config --show`, by
+# `status --macos` and by the interval validator's error message, so those three can never disagree
+# about which layer won — a `--show` that named a different layer than the refusal did would be worse
+# than printing no provenance at all.
+macos_refresh_source_label() {   # <provenance token> <the flag's spelling, for `flag`>
+    case "$1" in
+        flag) printf '%s' "$2" ;;
+        file) printf 'settings file' ;;
+        env)  printf 'AUGUR_MACOS_REFRESH_INTERVAL' ;;
+        *)    printf 'default' ;;
+    esac
+}
+macos_refresh_mode_source_label()     { macos_refresh_source_label "$_MACOS_REFRESH_MODE_FROM" '--share-refresh'; }
+# The `env` arm is what validate_macos_refresh_interval's remedy branch keys on, so this is also the
+# thing that keeps that attribution honest: `AUGUR_MACOS_REFRESH_INTERVAL` is now returned only when
+# the value really came from the export.
+macos_refresh_interval_source_label() { macos_refresh_source_label "$_MACOS_REFRESH_INTERVAL_FROM" '--share-refresh-interval'; }
+
 # WHY THIS WARNS ON EVERY RUN rather than once. A freshness mechanism that is off and says nothing
 # about it is the defect #148 removed (the refresher's warnings went to /dev/null, so an hour of
-# failing sweeps was indistinguishable from a healthy session). "Once" would need host-side state to
-# remember it had spoken — the per-project config surface this flag exists to avoid — and it would go
-# quiet for the operator who passes the flag habitually, who is precisely the one who forgets it is
-# set. The cost of repeating it is four lines on a command the operator just typed the flag onto, so
-# it reads as an acknowledgement rather than as noise. Warnings, not errors: this is a legitimate
-# choice, and it is `warn` for the same reason the sweep's own failures are — degraded, not unsafe.
+# failing sweeps was indistinguishable from a healthy session). "Once" would go quiet for the
+# operator who has the mode set habitually, who is precisely the one who forgets it is set — and that
+# argument got STRONGER when the mode became persistable: a flag is on the command line in front of
+# you, while `augur config --share-refresh off`, set once months ago, is not on any command line at
+# all. Host-side state to remember it had spoken now exists (project_settings_file), so the reason it
+# is not used for that is this one and not the absence of a place to put it. The cost of repeating it
+# is four lines on an attaching command, so it reads as an acknowledgement rather than as noise.
+# Warnings, not errors: this is a legitimate choice, and it is `warn` for the same reason the sweep's
+# own failures are — degraded, not unsafe.
 warn_macos_refresh_mode() {
     if share_refresh_loop_enabled; then return 0; fi
     if [[ "$_MACOS_REFRESH_MODE" == attach ]]; then
@@ -3825,7 +4257,19 @@ warn_macos_refresh_mode() {
         warn "  Remedy while off: \`augur down --macos && augur up --macos\` (a reboot empties the guest's cache)."
     fi
     warn "  The defect this mitigates (issues #124/#135) is ${BOLD}still present on macOS 26.6 (25G72)${RESET} — reconfirmed 2026-07-29."
-    warn "  Restore the default with ${BOLD}--share-refresh continuous${RESET}, or by omitting the flag. See ADR-0016."
+    # THE REMEDY DEPENDS ON THE LAYER, and naming the wrong one is the misreport shape
+    # validate_macos_refresh_interval already guards against a few lines above. "or by omitting the
+    # flag" is simply FALSE for a mode that came out of the settings file: omitting the flag is what
+    # got the operator here, so they would omit it, see this same warning again, and conclude augur
+    # was ignoring them. It also has to name the FILE — a persistent setting whose source the
+    # operator cannot see is the state #148 was about, and it survives `destroy --macos` by design.
+    if [[ "$_MACOS_REFRESH_MODE_FROM" == file ]]; then
+        warn "  Set for this project in ${BOLD}$(project_settings_display)${RESET}, not on this command line."
+        warn "  Clear it with ${BOLD}augur config --unset share_refresh${RESET}, or override just this run with"
+        warn "  ${BOLD}--share-refresh continuous${RESET}. See ADR-0016."
+    else
+        warn "  Restore the default with ${BOLD}--share-refresh continuous${RESET}, or by omitting the flag. See ADR-0016."
+    fi
 }
 
 share_refresher_pidfile() { echo "$AUGUR_PROXY_DIR/$(workspace_slug)-$(workspace_path_hash)-refresher.pid"; }
@@ -4272,18 +4716,25 @@ cmd_shell_macos() {
 # virtiofs cache to invalidate, and the `up` that would start it sweeps on the way in anyway. So this
 # refuses and names that command, which is the shorter path to what the operator asked for.
 #
-# IT WORKS UNDER `--share-refresh off`, by calling the UNGATED entry point directly (see the two
-# entry points at refresh_macos_shares for why that is not a hole in the gate). Refusing here would
-# mean `augur refresh --macos --share-refresh off` did nothing while claiming a mode, and would make
-# the escape hatch the trap. Be exact about the size of that, because the ADR's first draft was not:
-# _MACOS_REFRESH_MODE has NO env layer (only the interval does) and is re-derived per run, so an
-# operator who launched with `off` and later types a bare `augur refresh --macos` is in `continuous`
-# for that command and would sweep through the GATED entry anyway. The ungated entry is load-bearing
-# for exactly one command line — the one that repeats the flag — and the reason to keep it is
-# consistency, not rescue: a flag that describes the automatic mechanism must not silently cancel the
-# manual act. It says so on the way past: an operator who saw a manual refresh succeed and nothing
-# else could reasonably conclude that `off` had stopped applying, and a freshness mechanism whose
-# state the operator cannot see is #148's defect with a different cause.
+# IT WORKS UNDER `off`, by calling the UNGATED entry point directly (see the two entry points at
+# refresh_macos_shares for why that is not a hole in the gate). Refusing here would mean `augur
+# refresh --macos --share-refresh off` did nothing while claiming a mode, and would make the escape
+# hatch the trap.
+#
+# THE SIZE OF THAT CHANGED WHEN THE MODE BECAME PERSISTABLE, and the reasoning here is rewritten
+# rather than trimmed, because what replaced it inverts the conclusion. It used to read: the mode has
+# no env layer and is re-derived per run, so an operator who LAUNCHED with `off` and later types a
+# bare `augur refresh --macos` is in `continuous` for that command and would sweep through the gated
+# entry anyway — leaving the ungated entry load-bearing for exactly one command line, the one that
+# repeats the flag. A settings file removes the "per run" premise the whole paragraph rested on:
+# `share_refresh=off` written once is resolved by the dispatch tail for EVERY macOS command in that
+# project, so a bare `augur refresh --macos` is in `off` too, `share_refresh_enabled` is false, and
+# the gated entry sweeps nothing. The ungated entry is now load-bearing for every manual refresh in a
+# configured project — i.e. for the ordinary use of this command, not an edge case — and that makes
+# it the mechanism that keeps `augur config --share-refresh off` a setting rather than a one-way
+# door. It says so on the way past: an operator who saw a manual refresh succeed and nothing else
+# could reasonably conclude that `off` had stopped applying, and a freshness mechanism whose state
+# the operator cannot see is #148's defect with a different cause.
 #
 # IT DOES NOT PASS `quiet`. Only the loop does, and only because nobody is watching it. This one was
 # typed by a human who wants the answer — how many files, and which ones the guest could not
@@ -4344,14 +4795,23 @@ cmd_refresh_macos() {
         error "  which boots a fresh datapath and sweeps the shares on the way in."
         exit 1
     fi
-    # One line, under `off` only — `attach` needs none, because its attach-time sweep and its
-    # tripwire are both still running and nothing about this command contradicts what it was told.
+    # Under `off` only — `attach` needs none, because its attach-time sweep and its tripwire are both
+    # still running and nothing about this command contradicts what it was told.
     #
-    # RUN-SCOPED, and it says so, for the reason cmd_status_macos splits its two lines: the mode is
-    # re-derived from THIS command line and nothing records what a running session was launched with.
-    # So this claims only what it can know — that the flag on this line does not re-enable anything —
-    # and deliberately does NOT say "nothing else will sweep", which would be a statement about a
-    # loop an earlier `up` may well have left running. `status --macos` measures that half.
+    # IT NAMES THE LAYER, exactly as warn_macos_refresh_mode does, and this is the SAME defect in its
+    # sibling: "off for this run" was written when the mode could only come from this command line,
+    # and for a mode out of the settings file it is a false scope with no remedy attached. An operator
+    # who set `off` months ago and now runs `augur refresh --macos` would be told about "this run" —
+    # about a flag they did not type — with nothing pointing at the file that is actually in force.
+    # Worse here than in the launch warning, because this command is the escape hatch FROM that
+    # setting: it is the one place an operator arrives already asking "what is off, and where did that
+    # come from". The two branches are pinned as a pair, so a future edit cannot drop one.
+    #
+    # The FLAG branch stays run-scoped and says so, for the reason cmd_status_macos splits its two
+    # lines: nothing records what a running session was launched with. So it claims only what it can
+    # know — that the flag on this line does not re-enable anything — and deliberately does NOT say
+    # "nothing else will sweep", which would be a statement about a loop an earlier `up` may well have
+    # left running. `status --macos` measures that half.
     #
     # This command also does NOT stop such a loop, unlike cmd_claude_macos / cmd_shell_macos /
     # cmd_setup_token_macos. Those three reconcile because they WARN about the mode from the dispatch
@@ -4360,7 +4820,13 @@ cmd_refresh_macos() {
     # a side effect of a command called `refresh` is the same kind of surprise as booting a VM would
     # be. Stopping the loop stays where it already is: an attaching command, or `down --macos`.
     if ! share_refresh_enabled; then
-        warn "Shared-file refresh: ${BOLD}off${RESET} for this run — this is a manual sweep; it does not turn the automatic refresh back on."
+        if [[ "$_MACOS_REFRESH_MODE_FROM" == file ]]; then
+            warn "Shared-file refresh: ${BOLD}off${RESET} for this project — this is a manual sweep; it does not turn the automatic refresh back on."
+            warn "  Set in ${BOLD}$(project_settings_display)${RESET}, not on this command line. Clear it with"
+            warn "  ${BOLD}augur config --unset share_refresh${RESET}."
+        else
+            warn "Shared-file refresh: ${BOLD}off${RESET} for this run — this is a manual sweep; it does not turn the automatic refresh back on."
+        fi
     fi
     # A lead-in line, because the sweep is legitimately SILENT on the path where nothing changed: it
     # never contacts the guest and prints nothing at all, and a command whose entire job is this,
@@ -4534,6 +5000,18 @@ cmd_destroy_macos() {
     rm -f "$(macos_share_sweep_marker "$project_vm")" "$(macos_share_sweep_marker "$project_vm").pending"
     rmdir "$(macos_share_sweep_marker "$project_vm").lock" 2>/dev/null || true
     rm -f "$(share_refresher_logfile)" 2>/dev/null || true
+    # project_settings_file() is DELIBERATELY NOT REAPED HERE, and "why does destroy not clean this
+    # up?" is the review question, so: everything this function removes is VM STATE — a clone, its
+    # pinned host key, two markers that describe that clone's caches, a lock and one logfile. Every
+    # one of them is meaningless once the clone is gone, and several are actively harmful if they
+    # outlive it (see the two comments above). The settings file is not in that class: it is OPERATOR
+    # INTENT about this PROJECT, recorded because the project's changed-file count made the default
+    # loop too expensive — a fact about the repo that a destroy/re-clone does not change. A setting
+    # that evaporated when you recreated the VM would be worthless, and worse than worthless here:
+    # `destroy --macos && up --macos` is the remedy this very feature's warnings recommend for a stale
+    # guest, so reaping it would silently undo the operator's configuration on the exact command line
+    # augur told them to run. It is removed by `augur config --unset` and by nothing else. Pinned in
+    # tests/44 — the assertion is that the file still exists after this function returns.
     success "VM '${project_vm}' has been removed."
 }
 
@@ -4576,12 +5054,19 @@ cmd_status_macos() {
     # "Why is my edit not showing up in the guest?" is answered here or nowhere — and the honest
     # answer needs TWO LINES, because the two halves have different scopes and neither substitutes
     # for the other:
-    #   • THIS RUN (line 1) is run-scoped and re-derived from THIS command line. Nothing persists the
-    #     mode or the period a running session was launched with, so this says what the next
-    #     `up`/`claude`/`shell` typed the same way would do — NOT what the live VM is doing. It is
-    #     labelled "this run" for that reason. Presenting it as the session's state is precisely the
-    #     misreport this feature exists to remove: `status --macos` in a bare shell would have said
-    #     "continuous" for a VM launched `--share-refresh off`.
+    #   • THIS RUN (line 1) is run-scoped and re-derived from THIS command line PLUS this project's
+    #     settings file. Nothing persists the mode or the period a running session was launched with,
+    #     so this says what the next `up`/`claude`/`shell` typed the same way would do — NOT what the
+    #     live VM is doing. It is labelled "this run" for that reason. Presenting it as the session's
+    #     state is precisely the misreport this feature exists to remove: `status --macos` in a bare
+    #     shell would have said "continuous" for a VM launched `--share-refresh off`.
+    #     It NAMES THE LAYER the mode came from, because with four of them the mode alone no longer
+    #     answers the question this line exists for: an operator whose `augur config --share-refresh
+    #     attach` from months ago is in force sees "attach" on a command line that says nothing of the
+    #     kind, and has no way from here to the file. `augur config --show` carries both keys'
+    #     provenance; only the MODE's is repeated here, because the mode is the half that changes what
+    #     runs (no loop / no sweep at all) while the period is a tuning number, and the live clause
+    #     below is deliberately kept free of run-scoped values.
     #   • LIVE (line 2) is measured: a host process, and the marker the sweep advances on success.
     #     That is the half that answers the operator's actual question. The run-scoped INTERVAL is
     #     deliberately not interpolated into it — a running loop's period is whatever the `up` that
@@ -4618,7 +5103,7 @@ cmd_status_macos() {
         rmt="$(stat -c %Y "$rmark" 2>/dev/null || stat -f %m "$rmark" 2>/dev/null || true)"
         if [[ "$rmt" =~ ^[0-9]+$ ]]; then rlast="last sweep $(( $(date +%s) - rmt ))s ago"; fi
     fi
-    echo -e "${BOLD}Share refresh:${RESET} ${rmode} — this run: ${rwhat}"
+    echo -e "${BOLD}Share refresh:${RESET} ${rmode} ($(macos_refresh_mode_source_label)) — this run: ${rwhat}"
     echo -e "               live: ${rloop}, ${rlast}"
     echo ""
 
@@ -5691,6 +6176,199 @@ EOF
     fi
 }
 
+# ── `augur config` — the per-project settings surface (project_settings_file) ──────────────────
+#
+#     augur config --share-refresh <continuous|attach|off>
+#     augur config --share-refresh-interval <seconds>
+#     augur config --unset <key>
+#     augur config --show                       (also what a bare `augur config` prints)
+#
+# THE TWO SETTERS ARRIVE BY TWO ROUTES, and that surprises every reader, so it is written out.
+# `--share-refresh` and `--share-refresh-interval` are already GLOBAL flags (see the flag loop in the
+# dispatch tail), and that loop runs before any command's own argv and stops at the first word it does
+# not recognise. So:
+#   • `augur config --share-refresh attach`         → the flag loop consumes the pair. This function
+#                                                     receives NO arguments; the value and its
+#                                                     provenance (`flag`) are already in
+#                                                     _MACOS_REFRESH_MODE.
+#   • `augur config --show --share-refresh attach`  → the loop stops at `--show`, so the pair reaches
+#                                                     the loop BELOW, which parses it identically.
+# Both routes end in the same two locals, so nothing downstream can tell them apart. Reusing the
+# global spelling rather than inventing a second one is deliberate, and worth the double parse:
+#   • the persisted setting is spelled EXACTLY like the run-scoped flag, so
+#     `augur config --share-refresh attach` and `augur up --macos --share-refresh attach` cannot
+#     drift apart and nobody learns a second name for one knob;
+#   • validation is the same code either way (macos_refresh_mode_valid /
+#     validate_macos_refresh_interval), so a bad mode or period is refused by the same message with
+#     the same remedy, before anything is written;
+#   • `augur config --share-refresh attach --share-refresh-interval 30` writes both at once, in one
+#     atomic replacement of the file.
+# Handling only the provenance route was the first cut, and it made the command ORDER-DEPENDENT:
+# `--share-refresh off --show` worked and `--show --share-refresh off` died on "unknown option". That
+# is a defensible rule for the CLI at large (global flags first), and a bad one for the one command
+# whose entire argv is options — so both orders work here.
+#
+# NO `--macos` REQUIREMENT, unlike `refresh` (which is macOS-only and refuses by name in container
+# mode). `refresh` had no choice: it SSHes into a running guest, has no container implementation, and
+# mitigates a defect that does not exist in container mode. This command writes a text file under
+# ~/.augur and boots nothing, so `require_vz` would refuse it on a host that simply has no VM
+# backend, for a file that host can perfectly well hold. The precedent to match is `init-conf`, which
+# is dispatched in BOTH blocks from ONE implementation while scaffolding MACOS_CPU / MACOS_MEMORY_MB
+# — macOS-only keys — for exactly this reason. Both of today's keys being macOS-only is a fact about
+# the current key set, not about the command; baking it into the command's identity would have to be
+# undone, as a breaking change to a documented surface, by the first container-mode key.
+#
+# NO `require_safe_workspace`, and this is a second exception to nothing: that gate is about handing
+# THIS DIRECTORY to a guest (see its own comment, and cmd_refresh_macos for why the sweep counts as
+# handing it over). This command mounts nothing, starts nothing and reads $WORKSPACE_DIR only to
+# derive the slug+hash key. Adding it would also point the wrong way: it would refuse
+# `augur config --show` inside a checkout that happens to live under ~/.augur, taking away an
+# INSPECTION command, which is the failure direction that gate's own comment rules out for
+# down/destroy/list/status. A junk settings file written from $HOME is inert — the `up` that would
+# read it is refused by the gate.
+cmd_config() {
+    local do_show=false wrote=false unset_refresh=false unset_interval=false k
+    # ROUTE 1: the flags the global loop already ate, recovered from their provenance. Trap 1's
+    # provenance variable is doing double duty here — without it there would be no way to tell
+    # `augur config --share-refresh continuous` from `augur config --show`.
+    local set_mode="" set_interval=""
+    if [[ "$_MACOS_REFRESH_MODE_FROM"     == flag ]]; then set_mode="$_MACOS_REFRESH_MODE"; fi
+    if [[ "$_MACOS_REFRESH_INTERVAL_FROM" == flag ]]; then set_interval="$_MACOS_REFRESH_INTERVAL"; fi
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --show) do_show=true; shift ;;
+            # ROUTE 2: the same two flags reaching this loop because a non-flag word (`--show`,
+            # `--unset`) stopped the global one first. Same validators, same locals — see the header.
+            --share-refresh)
+                set_mode="${2:?'--share-refresh requires a mode: continuous, attach or off'}"
+                if ! macos_refresh_mode_valid "$set_mode"; then
+                    error "--share-refresh: unknown mode '${set_mode}' (expected: continuous, attach or off)."; exit 1
+                fi
+                # The run-scoped variables too, exactly as the global loop sets them, so the two routes
+                # are indistinguishable in the OUTPUT as well as in the locals: without this,
+                # `--share-refresh off --show` reported `(--share-refresh)` and
+                # `--show --share-refresh off` reported `(settings file)` for the same command.
+                _MACOS_REFRESH_MODE="$set_mode"; _MACOS_REFRESH_MODE_FROM=flag
+                shift 2
+                ;;
+            --share-refresh-interval)
+                validate_macos_refresh_interval "${2:?'--share-refresh-interval requires a whole number of seconds'}" "--share-refresh-interval"
+                set_interval="$2"
+                _MACOS_REFRESH_INTERVAL="$set_interval"; _MACOS_REFRESH_INTERVAL_FROM=flag
+                shift 2
+                ;;
+            --unset)
+                k="${2:?'--unset requires a key: share_refresh or share_refresh_interval'}"
+                case "$k" in
+                    share_refresh)          unset_refresh=true ;;
+                    share_refresh_interval) unset_interval=true ;;
+                    # Named rather than accepted-and-ignored: `--unset share-refresh` (hyphens, the
+                    # flag's spelling) is the typo this catches, and silently succeeding on it would
+                    # leave the operator believing the setting was gone. A key this augur does not
+                    # know is refused for the same reason, and the message says how to remove one
+                    # anyway — load_project_settings PRESERVES unknown keys, so they cannot be
+                    # stranded, only hand-edited out.
+                    *) error "augur config --unset: unknown key '${k}'."
+                       error "  Known keys: ${BOLD}share_refresh${RESET}, ${BOLD}share_refresh_interval${RESET}."
+                       error "  To remove a key this augur does not know, delete its line from $(project_settings_display)."
+                       exit 1 ;;
+                esac
+                shift 2
+                ;;
+            # Accepted and ignored on purpose. This command is mode-independent, so `--macos` means
+            # nothing to it — but both of its keys are macOS-only, so operators WILL type it, and the
+            # flag loop only consumes it BEFORE the first non-flag word: `augur config --macos --show`
+            # is absorbed there while `augur config --show --macos` is not, and a positional gotcha is
+            # a poor answer to a command line that is otherwise unambiguous.
+            --macos) shift ;;
+            *) error "augur config: unknown option '$1'."
+               error "  Usage: ${BOLD}augur config --share-refresh <continuous|attach|off>${RESET}"
+               error "         ${BOLD}augur config --share-refresh-interval <seconds>${RESET}"
+               error "         ${BOLD}augur config --unset <share_refresh|share_refresh_interval>${RESET}"
+               error "         ${BOLD}augur config --show${RESET}"
+               exit 1 ;;
+        esac
+    done
+
+    # The writes. `load_project_settings` first, always, so a rewrite carries the OTHER key and any
+    # key a newer augur wrote; then one `project_settings_write` for the whole command, so
+    # `--share-refresh x --share-refresh-interval y` is a single atomic replacement rather than two.
+    if [[ -n "$set_mode" || -n "$set_interval" ]] || $unset_refresh || $unset_interval; then
+        load_project_settings
+        # A setter and an --unset for the SAME key on one command line is not a preference to
+        # resolve, it is a contradiction: whichever won, the operator would be told something they
+        # did not ask for. Refuse before writing anything.
+        if $unset_refresh && [[ -n "$set_mode" ]]; then
+            error "augur config: ${BOLD}--share-refresh${RESET} and ${BOLD}--unset share_refresh${RESET} contradict each other."; exit 1
+        fi
+        if $unset_interval && [[ -n "$set_interval" ]]; then
+            error "augur config: ${BOLD}--share-refresh-interval${RESET} and ${BOLD}--unset share_refresh_interval${RESET} contradict each other."; exit 1
+        fi
+        if [[ -n "$set_mode" ]]; then
+            _PROJECT_SETTINGS_REFRESH="$set_mode"; _PROJECT_SETTINGS_REFRESH_SEEN=true
+        fi
+        if [[ -n "$set_interval" ]]; then
+            _PROJECT_SETTINGS_INTERVAL="$set_interval"; _PROJECT_SETTINGS_INTERVAL_SEEN=true
+        fi
+        # `--unset` of a key that is not set is a no-op and NOT an error: it is the state the operator
+        # asked for, and refusing would make `augur config --unset share_refresh` unsafe to run twice.
+        if $unset_refresh;  then _PROJECT_SETTINGS_REFRESH="";  _PROJECT_SETTINGS_REFRESH_SEEN=false;  fi
+        if $unset_interval; then _PROJECT_SETTINGS_INTERVAL=""; _PROJECT_SETTINGS_INTERVAL_SEEN=false; fi
+        project_settings_write
+        wrote=true
+        if [[ -n "$set_mode" ]];     then success "share_refresh=${BOLD}${set_mode}${RESET} for this project."; fi
+        if [[ -n "$set_interval" ]]; then success "share_refresh_interval=${BOLD}${set_interval}${RESET} for this project."; fi
+        if $unset_refresh;  then success "share_refresh unset for this project."; fi
+        if $unset_interval; then success "share_refresh_interval unset for this project."; fi
+        if [[ -f "$(project_settings_file)" ]]; then
+            info "Written to ${BOLD}$(project_settings_display)${RESET} (host-side; the guest cannot read or write it)."
+        else
+            info "No settings remain for this project; ${BOLD}$(project_settings_display)${RESET} removed."
+        fi
+        # A persisted setting must announce itself the way the flag does, or it is the #148 shape with
+        # a longer fuse: `off` written once, and every later attach quietly skipping the mitigation.
+        # warn_macos_refresh_mode is deliberately NOT reused — it describes THIS RUN, and this command
+        # is talking about every future one — so the claim is written for the right scope.
+        # Gated on the MODE having been set by THIS command line, not on the file's current contents:
+        # `augur config --share-refresh-interval 30` against a project already set to `off` would
+        # otherwise print "From now on…" about a mode this command did not touch.
+        if [[ -n "$set_mode" && "$set_mode" != continuous ]]; then
+            warn "From now on, every ${BOLD}up/claude/shell --macos${RESET} in this project starts in ${BOLD}${set_mode}${RESET}"
+            warn "  and says so. The defect this weakens (issues #124/#135) is still present on macOS 26.6 (25G72)."
+            warn "  ${BOLD}augur refresh --macos${RESET} sweeps on demand; ${BOLD}augur config --unset share_refresh${RESET} undoes this."
+        fi
+    fi
+
+    # `--show` is the load-bearing half, and a bare `augur config` gets it too: with four layers an
+    # operator cannot debug "why is my edit not showing up" from the effective values alone — the
+    # question is always WHICH LAYER WON. Printing it after a write as well means `augur config
+    # --share-refresh attach --show` confirms what it did from the same code path that would report it
+    # tomorrow, rather than from the success line's memory of what it meant to do.
+    if $do_show || ! $wrote; then
+        # Resolution reads the file, applies the layers and warns about anything malformed — the same
+        # call the dispatch tail makes, so `--show` cannot report a different winner than the run
+        # would use. Idempotent, so the dispatch tail having already run it (`config --macos`) is fine
+        # — except after a WRITE, which is the one thing that makes an earlier resolution stale.
+        if $wrote; then reset_macos_refresh_resolution; fi
+        resolve_macos_refresh_settings
+        local f; f="$(project_settings_file)"
+        echo ""
+        echo -e "  ${BOLD}Project:${RESET}                ${WORKSPACE_DIR}"
+        if [[ -f "$f" ]]; then
+            echo -e "  ${BOLD}Settings file:${RESET}          $(project_settings_display)"
+        else
+            echo -e "  ${BOLD}Settings file:${RESET}          ${YELLOW}none${RESET}  ($(project_settings_display))"
+        fi
+        echo ""
+        printf '  %-22s  %-10s  (%s)\n' share_refresh          "$_MACOS_REFRESH_MODE"     "$(macos_refresh_mode_source_label)"
+        printf '  %-22s  %-10s  (%s)\n' share_refresh_interval "$_MACOS_REFRESH_INTERVAL" "$(macos_refresh_interval_source_label)"
+        echo ""
+        echo -e "  Precedence: ${BOLD}--flag${RESET} > settings file > ${BOLD}AUGUR_MACOS_REFRESH_INTERVAL${RESET} > built-in default."
+        echo -e "  Both keys apply to ${BOLD}macOS VM mode${RESET} only (issues #124/#135, ADR-0016)."
+        echo ""
+    fi
+}
+
 # ── Help ──────────────────────────────────────────────────────────────────────
 
 cmd_help() {
@@ -5711,6 +6389,7 @@ cmd_help() {
     echo -e "    augur ${CYAN}update${RESET}  [--swift VERSION]  Rebuild image with latest versions"
     echo -e "    augur ${CYAN}version${RESET}                    Show augur version"
     echo -e "    augur ${CYAN}init-conf${RESET}                  Scaffold ./.augur/{allowlist,resources}.conf + ~/.augur/provision/*"
+    echo -e "    augur ${CYAN}config${RESET} [--show]            Per-project settings, host-side (~/.augur/project-settings/)"
     echo ""
     echo -e "  ${BOLD}MACOS VM MODE${RESET}  ${YELLOW}(macOS VM — full Xcode, xcodebuild, Simulator)${RESET}"
     echo -e "    augur ${CYAN}build${RESET}  --macos --ipsw <path> --xcode-xip <path> [--platforms <list>]  Build base VM (one-time)"
@@ -5726,6 +6405,8 @@ cmd_help() {
     echo -e "    augur ${CYAN}list${RESET}    --macos                                   List all VMs and their state"
     echo -e "    augur ${CYAN}update${RESET}  --macos                                   Update CLI tools in base VM"
     echo -e "    augur ${CYAN}version${RESET} --macos                                   Show augur version (macOS mode)"
+    echo -e "    augur ${CYAN}config${RESET}  --share-refresh <mode>                    Persist the refresh mode for THIS project"
+    echo -e "    augur ${CYAN}config${RESET}  --show                                    Show the effective settings and which layer set each"
     echo ""
     echo -e "  ${BOLD}OPTIONS${RESET}"
     echo -e "    --swift VERSION    Swift version for container mode (default: ${CYAN}latest${RESET})"
@@ -5737,6 +6418,8 @@ cmd_help() {
     echo -e "                       ${CYAN}attach${RESET} keeps the sweep at each attach but stops the background loop;"
     echo -e "                       ${CYAN}off${RESET} stops all of it, including the freshness self-test (issues #124/#135)"
     echo -e "    --share-refresh-interval <seconds>        Period of that loop (default: ${CYAN}5${RESET}; positive integer)"
+    echo -e "                       Both are run-scoped here and persist per project via ${BOLD}augur config${RESET};"
+    echo -e "                       precedence: flag > settings file > env > default (${BOLD}augur config --show${RESET})"
     echo -e "    --ipsw <path>      macOS IPSW file  (for: augur build --macos)"
     echo -e "    --xcode-xip <path> Xcode XIP file   (for: augur build --macos)"
     echo -e "    --platforms <list> Simulator platforms to bake into the base VM (for: augur build --macos)"
@@ -5752,8 +6435,10 @@ cmd_help() {
     echo -e "    AUGUR_MACOS_VM_CPU       macOS VM vCPU count; overrides .augur/resources.conf; default: 4"
     echo -e "    AUGUR_MACOS_VM_MEMORY_MB macOS VM memory in MB; overrides .augur/resources.conf; default: 8192"
     echo -e "    AUGUR_MACOS_REFRESH_INTERVAL  Period of the macOS shared-file refresh loop, in seconds"
-    echo -e "                             (default: 5). --share-refresh-interval overrides it; a positive"
-    echo -e "                             integer only — 0 is refused, use --share-refresh attach|off"
+    echo -e "                             (default: 5). Both --share-refresh-interval AND this project's"
+    echo -e "                             settings file override it (it is global to the shell, they are"
+    echo -e "                             not); a positive integer only — 0 is refused, use"
+    echo -e "                             --share-refresh attach|off"
     echo ""
     echo -e "  ${BOLD}NOTES${RESET}"
     echo -e "    • Container mode runs on ${CYAN}container${RESET} (Apple Container), on macOS 26+."
@@ -5776,6 +6461,13 @@ cmd_help() {
     echo -e "      attaching. It works under ${CYAN}--share-refresh off${RESET} too (it says so), and it never boots a VM."
     echo -e "      Unlike the automatic sweeps it FAILS when it swept nothing (another sweep held the lock) or"
     echo -e "      the guest could not invalidate, so ${CYAN}augur refresh --macos && swift test${RESET} means what it reads."
+    echo -e "    • ${BOLD}augur config${RESET} persists both refresh knobs ${BOLD}per project${RESET} — the changed-file count that"
+    echo -e "      decides the right value is a property of the repo, so an operator whose repo needs"
+    echo -e "      ${CYAN}attach${RESET} should not retype it on every command. The file is HOST-side"
+    echo -e "      (${CYAN}~/.augur/project-settings/<slug>-<hash>.conf${RESET}), deliberately NOT ${CYAN}./.augur/${RESET}: that lives"
+    echo -e "      inside the read-write share, so a compromised guest could switch off the mechanism that keeps"
+    echo -e "      your view of the guest honest. It is not reaped by ${BOLD}destroy --macos${RESET} (it is your intent about"
+    echo -e "      the project, not the VM's state). ${BOLD}augur config --show${RESET} names the layer each value came from."
     echo -e "    • Container mode: current directory mounted at /workspace-<project> (Linux container)"
     echo -e "    • macOS VM mode:  current directory exposed at ~/workspace-<project> (macOS VM)"
     echo -e "    • macOS VM mode requires: augur-vm (the bundled Swift VM backend)"
@@ -5834,24 +6526,31 @@ while [[ $# -gt 0 ]]; do
         --egress)    AUGUR_EGRESS=1; shift ;;
         --no-egress) AUGUR_EGRESS=0; shift ;;
         # macOS shared-file refresh (issues #124/#135, ADR-0016). Run-scoped and here in the global
-        # flag loop, beside --egress/--no-egress, because the value is the operator's per-run choice
-        # and the alternative — a file — is either guest-writable or needs a config surface that does
-        # not exist. The long version of that reasoning is at _MACOS_REFRESH_MODE.
+        # flag loop, beside --egress/--no-egress, because the value is the operator's per-run choice.
+        # The alternative — a file — now exists as well, host-side and per project; it sits one layer
+        # BELOW this one, and `_FROM=flag` is what makes that ordering enforceable (see
+        # resolve_macos_refresh_settings, and _MACOS_REFRESH_MODE for why the file is not in the repo).
+        #
+        # This is also the parse for `augur config --share-refresh <mode>`: the flag loop runs before
+        # any command's own argv, so `config` reads the value and the provenance from here rather than
+        # parsing a second spelling of the same flag. See cmd_config.
         --share-refresh)
             _MACOS_REFRESH_MODE="${2:?'--share-refresh requires a mode: continuous, attach or off'}"
-            case "$_MACOS_REFRESH_MODE" in
-                continuous|attach|off) ;;
-                *) error "--share-refresh: unknown mode '${_MACOS_REFRESH_MODE}' (expected: continuous, attach or off)."; exit 1 ;;
-            esac
+            if ! macos_refresh_mode_valid "$_MACOS_REFRESH_MODE"; then
+                error "--share-refresh: unknown mode '${_MACOS_REFRESH_MODE}' (expected: continuous, attach or off)."; exit 1
+            fi
+            _MACOS_REFRESH_MODE_FROM=flag
             shift 2
             ;;
         # Validated HERE, in both modes, rather than down with the macOS-only env check: a malformed
         # value on the command line is a typo the operator can only have meant for this run, and
         # nothing has been cloned, booted or written yet. Assigned after the check so an `exit 1`
-        # cannot leave a rejected value in the variable.
+        # cannot leave a rejected value in the variable — which now matters twice over, because
+        # `augur config --share-refresh-interval` reaches the FILE through this assignment.
         --share-refresh-interval)
             validate_macos_refresh_interval "${2:?'--share-refresh-interval requires a whole number of seconds'}" "--share-refresh-interval"
             _MACOS_REFRESH_INTERVAL="$2"
+            _MACOS_REFRESH_INTERVAL_FROM=flag
             shift 2
             ;;
         --swift)
@@ -5914,10 +6613,31 @@ case "$COMMAND" in up|claude|shell|setup-token) require_safe_workspace ;; esac
 # `status --macos` is not in the set for the warning either — it prints a Share refresh line of its
 # own, which is the better answer there — and `down`/`destroy` are not, because a warning about a
 # mechanism being off while tearing it down is noise and stop_share_refresher runs there regardless.
+#
+# THE SETTINGS-FILE LAYER IS RESOLVED FIRST AND IS *NOT* IN THE GATE, and the two halves are separate
+# for exactly the reason this comment gives. Resolution reads
+# ~/.augur/project-settings/<slug>-<hash>.conf, applies it between the flag and the env var, and
+# WARNS about anything malformed; it cannot exit and cannot return non-zero, so running it for every
+# macOS command is safe — and necessary, because `status --macos` and `refresh --macos` both consume
+# the mode and would otherwise report and act on the built-in default for a configured project. What
+# stays inside the gate is the HARD REFUSAL, which is the part that can take a command away from the
+# operator. A broken settings file is worse to refuse on than a bad export, not better: `unset` fixes
+# an export, while this file survives `destroy --macos` by design, so a refusal would be permanent
+# and `down --macos` would be gone with it.
+# THE BLAME PASSED TO THE VALIDATOR BELOW IS DERIVED from the provenance, not the hardcoded
+# "AUGUR_MACOS_REFRESH_INTERVAL" it used to be. With the env var as the only unvalidated layer that
+# string was right by accident; with a file layer above it, it would have named the EXPORT for a value
+# that came out of the settings file and sent the operator to `unset` something that was not the
+# problem. Only `env` can actually reach the refusal — the flag was validated in the loop above, the
+# file layer drops what it rejects, and the default is 5 — but that is now true by construction rather
+# than by argument. Kept immediately adjacent to the gate: tests/43 asserts the gate and the warning
+# are within a few lines of each other, which is what makes "wired to the attaching commands"
+# checkable at all, so long prose belongs here and not inside the block.
 if $MACOS_MODE; then
+    resolve_macos_refresh_settings
     case "$COMMAND" in
         up|claude|shell|setup-token)
-            validate_macos_refresh_interval "$_MACOS_REFRESH_INTERVAL" "AUGUR_MACOS_REFRESH_INTERVAL"
+            validate_macos_refresh_interval "$_MACOS_REFRESH_INTERVAL" "$(macos_refresh_interval_source_label)"
             warn_macos_refresh_mode
             ;;
     esac
@@ -5936,6 +6656,10 @@ if $MACOS_MODE; then
         destroy)        cmd_destroy_macos ;;
         status)         cmd_status_macos ;;
         init-conf)      cmd_init_conf ;;
+        # In BOTH dispatch blocks from ONE implementation, the shape `init-conf` already uses for a
+        # config-writing command that carries macOS-only keys. See cmd_config for why it is not
+        # macOS-gated the way `refresh` is.
+        config)         cmd_config "$@" ;;
         list)           cmd_list_macos ;;
         update)         cmd_update_macos ;;
         version)        cmd_version_macos ;;
@@ -5966,6 +6690,11 @@ else
         destroy)        cmd_destroy ;;
         status)         cmd_status ;;
         init-conf)      cmd_init_conf ;;
+        # Same implementation as the macOS block's. Today's two keys are macOS-only, so `--show` here
+        # reports settings this mode will not act on — and says so, on its own last line. That is the
+        # right trade for a command that writes a host-side file: `refresh`'s named refusal exists
+        # because it has no container implementation at all, which is not true of writing a file.
+        config)         cmd_config "$@" ;;
         list)           cmd_list ;;
         update)         cmd_update ;;
         version)        cmd_version ;;
