@@ -47,6 +47,9 @@ AUGUR_DIR="$TMPD/augur"
 AUGUR_PROXY_DIR="$TMPD/proxy"; mkdir -p "$AUGUR_PROXY_DIR"
 unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN
 WORKSPACE_DIR="$TMPD/ws"; mkdir -p "$WORKSPACE_DIR"
+# A fixed share name for the sandbox workspace above, so every path assertion in this file can be
+# written out in full. It also MASKS the seam defect the first section below is about — which is why
+# that section runs augur in a subprocess instead of relying on anything set here.
 MACOS_SHARE="workspace-testslug"
 VM=testvm
 
@@ -81,6 +84,49 @@ ssh_macos() {
 }
 fed() { tr '\0' '\n' < "$STDINLOG"; }               # the paths, one per line
 nfed() { fed | grep -c . ; }
+
+section "the sweep is reachable through the source seam at all"
+
+# THE ARM THAT WOULD HAVE CAUGHT IT. macos_share_roots reads $MACOS_SHARE on its first line, and
+# MACOS_SHARE was assigned in augur's dispatch tail — 54 lines BELOW the AUGUR_SOURCE_ONLY return.
+# So through the seam every tests/NN_*.sh uses, it was unset, and under the `set -u` augur enables at
+# its line 7 this function died with `MACOS_SHARE: unbound variable`. Nothing here could reach the
+# sweep at all, which is exactly why no arm in this file was the one that noticed.
+#
+# IT HAS TO BE A SUBPROCESS, and that is the reason it could not simply be added above: this file
+# assigns MACOS_SHARE itself in its fixture (as tests/36/38/44 do), which hides the defect completely
+# from every other arm here. Only a bare `source` with nothing else set can see it — so this is the
+# reproduction verbatim, not a paraphrase of it.
+#
+# The consequence was not a loud failure, which is the part worth pinning. The sweep reads the
+# inventory through a PROCESS SUBSTITUTION — `done < <(macos_share_roots "$vm")` — so the death
+# killed only that subshell: the loop got no input, the changed count stayed 0, and the sweep took
+# its "nothing changed" early return, promoting the marker and never contacting the guest. A
+# refresher started that way on an Apple Silicon host ran a day and a half reporting healthy through
+# share_refresher_running and msyncing nothing, and idempotence then kept every later `up --macos`
+# from replacing it. The measurement and the scope — an EXECUTED augur bound MACOS_SHARE before
+# dispatch even then, so the unbound window was the sourcing path — are at augur's assignment.
+_seam_out="$( cd "$WORKSPACE_DIR" && HOME="$TMPD/home" bash -c 'AUGUR_SOURCE_ONLY=1 source "$1"; macos_share_roots testvm' _ "$AUGUR" 2>&1 )"; _seam_rc=$?
+if [[ $_seam_rc -eq 0 ]]; then ok "macos_share_roots runs after a bare \`AUGUR_SOURCE_ONLY=1 source\` (no fixture, nothing pre-set)"
+else fail "macos_share_roots runs after a bare source" "rc=$_seam_rc: '$_seam_out' — offline coverage of the sweep is impossible, and at the sweep itself this dies inside a process substitution the caller cannot see"; fi
+if [[ "$(printf '%s\n' "$_seam_out" | grep -c .)" == "4" ]]; then ok "…and emits all four share rows"
+else fail "…and emits all four share rows" "'$_seam_out'"; fi
+# The share name it minted is the one the sourcing process's OWN cwd implies — i.e. augur bound it
+# before the seam from $WORKSPACE_DIR, rather than a caller having had to guess it afterwards.
+has "$_seam_out" "workspace-ws	" "…naming the workspace share from the cwd augur was sourced in"
+
+# The guard, which is the other half: an unset or empty MACOS_SHARE must produce a NAMED error and
+# must produce it on STDERR. On stdout it would be parsed as a `<name>\t<root>` share row by the one
+# caller there is, and the guest would be handed a path built out of a sentence.
+_saved_share="$MACOS_SHARE"; MACOS_SHARE=""
+_g_out="$( macos_share_roots "$VM" 2>/dev/null )"; _g_rc=$?
+_g_err="$( macos_share_roots "$VM" 2>&1 >/dev/null )"
+MACOS_SHARE="$_saved_share"
+if [[ $_g_rc -ne 0 ]]; then ok "an empty MACOS_SHARE makes macos_share_roots FAIL (rc=$_g_rc), not emit half an inventory"
+else fail "an empty MACOS_SHARE makes macos_share_roots fail" "rc=0 with output '$_g_out' — a share row with no name reaches the guest"; fi
+if [[ -z "$_g_out" ]]; then ok "…printing nothing at all on stdout (the caller parses stdout as share rows)"
+else fail "…printing nothing on stdout" "'$_g_out'"; fi
+has "$_g_err" "MACOS_SHARE" "…and naming the variable on stderr, where the sweep's own report cannot swallow it"
 
 section "the guest program — run for real, against local files"
 
@@ -296,6 +342,92 @@ else fail "the pending marker is cleaned up after a failure"; fi
 : > "$STDINLOG"; refresh_macos_shares "$VM" >/dev/null 2>&1
 if fed | grep -qx "/Volumes/My Shared Files/${MACOS_SHARE}/one"; then ok "the file skipped by the failed sweep IS swept on the next one"
 else fail "the file skipped by the failed sweep is swept on the next one" "$(fed | tr '\n' ' ')"; fi
+
+section "an enumeration that produced NOTHING is a failure, not \"nothing changed\""
+
+# The two meanings the changed-file count used to carry, and only one of them is good news. "No file
+# matched \`find -newer\`" is the normal, quiet, correct outcome and MUST promote the marker — it is
+# the most common outcome of all once the 5 s loop is running. "The inventory produced nothing to
+# scan" is a bug: the sweep did not observe that nothing changed, it observed nothing at all, and
+# promoting the marker there puts every host edit made during the broken window permanently behind
+# \`find -newer\` — never swept again, not even after the bug is fixed.
+#
+# That is not a hypothetical pairing. It is exactly what the MACOS_SHARE-below-the-seam defect did:
+# macos_share_roots died inside the process substitution, the loop read an empty stream, and this
+# early return reported the healthy outcome and advanced the marker on every tick, for as long as
+# the refresher lived. The shape, the measurement and the contexts it could reach are written out
+# once, at augur's MACOS_SHARE assignment.
+#
+# Both halves are asserted on the MARKER as well as on the message, because the message alone is the
+# cheap half: a version that warns and still promotes reads identically in the log and loses the
+# edits anyway.
+_saved_roots="$(declare -f macos_share_roots)"
+
+# (a) AN EMPTY INVENTORY — what a died-in-the-subshell macos_share_roots looks like from the caller,
+# which is to say indistinguishable from a clean stream that happened to be empty.
+sleep 1; printf 'EMPTY-ROOTS\n' > "$WORKSPACE_DIR/one"
+: > "$TMPD/ref-before-empty"
+sleep 1        # whole-second `-nt` granularity, same reason as the reference above
+macos_share_roots() { return 1; }
+: > "$SSHLOG"
+out="$( refresh_macos_shares "$VM" 2>&1 )"; rc=$?
+eval "$_saved_roots"
+if [[ $rc -eq 0 ]]; then ok "empty inventory: still best effort (rc=0 — a stale share must never end a bring-up)"
+else fail "empty inventory still returns 0" "rc=$rc — this is the I1 shape: \`up --macos\` would abort between SSH-is-up and the egress tripwire"; fi
+if [[ "$out" == *"NOTHING was swept"* ]]; then ok "…but it WARNS, instead of passing as \"nothing changed\""
+else fail "empty inventory warns" "silence here is the dead refresher of the incident, reporting healthy the whole time: '$out'"; fi
+if [[ ! -s "$SSHLOG" ]]; then ok "…and makes no round trip (it had nothing to send)"
+else fail "…and makes no round trip" "$(head -1 "$SSHLOG")"; fi
+# `-nt` is FALSE when its left operand does not exist, so the marker's existence is asserted too:
+# without it, an implementation that deleted the marker on this path would satisfy the arm below
+# without the property it is here for. (Deleting it would be conservative rather than harmful — it
+# forces a full re-sweep — but the arm should say what it actually checks.)
+if [[ -f "$(macos_share_sweep_marker "$VM")" && ! "$(macos_share_sweep_marker "$VM")" -nt "$TMPD/ref-before-empty" ]]; then
+    ok "…and does NOT advance the marker, so the edit is still swept once enumeration works again"
+else fail "empty inventory does not advance the marker" "the marker moved past an edit that was never sent — permanent, and invisible"; fi
+if [[ ! -f "$(macos_share_sweep_marker "$VM").pending" ]]; then ok "…and leaves no pending marker behind"
+else fail "…and leaves no pending marker behind"; fi
+# THE PROOF that the edit really did survive, not merely that a timestamp did.
+: > "$SSHLOG"; : > "$STDINLOG"
+refresh_macos_shares "$VM" >/dev/null 2>&1
+if fed | grep -qx "/Volumes/My Shared Files/${MACOS_SHARE}/one"; then ok "…and the skipped edit IS swept by the next sweep"
+else fail "the skipped edit is swept by the next sweep" "$(fed | tr '\n' ' ')"; fi
+
+# (b) ROWS, BUT NOTHING TO SCAN. The other half of "swept nothing": an inventory whose rows are not
+# directories scans exactly as much as an empty one does, which is nothing — and it is why the
+# predicate is "how many rows named an existing directory" rather than "how many rows arrived". The
+# two get different sentences only so the log says which of them happened.
+sleep 1; printf 'DEAD-ROOTS\n' > "$WORKSPACE_DIR/one"
+: > "$TMPD/ref-before-dead"
+sleep 1
+macos_share_roots() { printf '%s\t%s\n' "$MACOS_SHARE" "$TMPD/no-such-root"; }
+: > "$SSHLOG"
+out="$( refresh_macos_shares "$VM" 2>&1 )"
+eval "$_saved_roots"
+if [[ "$out" == *"NOTHING was swept"* ]]; then ok "roots that are not directories: warns too"
+else fail "roots that are not directories warn" "'$out'"; fi
+if [[ "$out" == *"exists as a directory"* ]]; then ok "…and says which of the two happened (rows arrived; none was a directory)"
+else fail "…and says which of the two happened" "one message for two causes sends the next reader to the wrong place: '$out'"; fi
+if [[ -f "$(macos_share_sweep_marker "$VM")" && ! "$(macos_share_sweep_marker "$VM")" -nt "$TMPD/ref-before-dead" ]]; then
+    ok "…and does not advance the marker either"
+else fail "non-directory roots do not advance the marker" "the marker moved past an edit that was never sent"; fi
+
+# (c) THE CONTROL — a genuinely empty change set, which must stay QUIET and MUST promote the marker.
+# Without it every arm above passes on a version that treats every quiet sweep as broken: a warning
+# on each tick of the 5 s loop, which is how a real one stops being read.
+: > "$SSHLOG"; : > "$STDINLOG"
+refresh_macos_shares "$VM" >/dev/null 2>&1     # drain the pending edit, so the next run has nothing
+: > "$TMPD/ref-before-quiet"
+sleep 1
+: > "$SSHLOG"
+out="$( refresh_macos_shares "$VM" 2>&1 )"
+if [[ -z "$out" ]]; then ok "nothing changed: the sweep stays completely silent"
+else fail "nothing changed: the sweep stays silent" "'$out'"; fi
+if [[ ! -s "$SSHLOG" ]]; then ok "…and still makes no round trip (the two look identical from the guest's side)"
+else fail "…and still makes no round trip" "$(head -1 "$SSHLOG")"; fi
+if [[ "$(macos_share_sweep_marker "$VM")" -nt "$TMPD/ref-before-quiet" ]]; then
+    ok "…and DOES advance the marker, which is what keeps the next sweep incremental"
+else fail "nothing changed advances the marker" "without it every sweep re-scans from the same point and the incremental path is dead"; fi
 
 section "reported problems are named, not swallowed"
 
