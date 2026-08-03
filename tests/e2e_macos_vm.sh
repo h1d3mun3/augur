@@ -44,10 +44,14 @@ cd "$PROJECT" || { fail "cannot cd into project '$PROJECT'"; finish; exit $?; }
 AUGUR_SOURCE_ONLY=1 source "$AUGUR"
 set +e                                    # augur enables `set -e`; restore lib.sh assert-and-continue
 vm="$(macos_project_vm)"
-# augur derives MACOS_SHARE only in its dispatch tail (AFTER the AUGUR_SOURCE_ONLY return), so
-# sourcing does NOT set it — recompute it here from augur's own workspace_slug, identical to what
-# `up --macos` will use for this PROJECT. (set -u is still active from the sourced augur, so an
-# unbound MACOS_SHARE would otherwise abort the script before any assertion runs.)
+# augur binds MACOS_SHARE ABOVE the AUGUR_SOURCE_ONLY return, so the `source` above already set it
+# — and because the `cd` into $PROJECT happened first, it is already the value `up --macos` will use
+# for this PROJECT. Recomputed here anyway, from augur's own workspace_slug: this line is what makes
+# that agreement checkable rather than assumed, and it is cheap. It used to be load-bearing — the
+# assignment lived in the dispatch tail, sourcing left MACOS_SHARE unset, and under the sourced
+# augur's `set -u` an unbound MACOS_SHARE aborted this script before any assertion ran. This gate is
+# one of the two sourcing contexts that window covered; the same unset variable silently killed the
+# share sweep for anything that reached it from here. See tests/41's first section.
 MACOS_SHARE="workspace-$(workspace_slug)"
 [[ -n "$vm" && -n "$MACOS_SHARE" ]] || { fail "derive VM + share names from augur" "vm='$vm' share='$MACOS_SHARE'"; finish; exit $?; }
 vssh() { ssh_macos "$vm" "$@"; }          # run a command in the VM via augur's real SSH path
