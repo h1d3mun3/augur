@@ -155,8 +155,8 @@ eval "$_saved_refresh"
 section "the mode gate on the loop — --share-refresh attach|off"
 
 # The loop is the UNATTENDED, repeated cost: it sweeps for the whole lifetime of the VM with nobody
-# watching, and its price scales with a changed-file count nobody caps (~0.36 ms per changed file,
-# host + guest, both paid serially — past ~14,000 one sweep outlasts the default 5 s interval). So it
+# watching, and its price scales with a changed-file count nobody caps (~0.29 ms per changed file,
+# host + guest, both paid serially — past ~17,000 one sweep outlasts the default 5 s interval). So it
 # is the mechanism an operator turning the refresh down is actually paying for, and both non-default
 # modes stop it. The attach-time sweep is tests/41's subject, not this file's.
 _saved_mode="$_MACOS_REFRESH_MODE"
