@@ -3331,76 +3331,6 @@ _MACOS_SWEEP_TRIES=3
 # `unstable`, and the attach-path warnings go to the operator's terminal.
 _MACOS_SWEEP_DETAIL=5
 
-# WHAT THE SWEEP DID, as an exit status — for `augur refresh --macos` and for nothing else.
-#
-# The five AUTOMATIC callers must never see any of these: refresh_macos_shares maps every one of
-# them to 0, because a stale share is degraded and not uncontained, and a sweep that could fail a
-# bring-up would abort `up --macos` between "SSH is up" and the egress tripwire. That is the I1
-# shape, and it is why these codes stop at the gate.
-#
-# The MANUAL command needs them, because its whole job is the round trip and it has no next tick to
-# fall back on. Without them it printed "Refreshing the guest's view…" and exited 0 on three
-# different paths that swept nothing or swept badly — a warning under a success status, which is the
-# defect (#147, #151) this series exists to remove rather than to add another instance of.
-_MACOS_SWEEP_BUSY=2      # another sweeper holds the lock; this call did nothing at all
-_MACOS_SWEEP_FAILED=3    # it tried and did not finish: no writable state dir, no round trip, or the
-                         # guest reported files it could not invalidate
-_MACOS_SWEEP_NOWORK=4    # nothing had changed since the last sweep, so the guest was never contacted
-
-# ── How much of this runs: --share-refresh (issues #124 / #135) ───────────────────────────────
-#
-# WHY THERE IS A DIAL AT ALL. The "no cap" paragraph above is right about the SWEEP and wrong about
-# the whole. It measures the guest-side invalidation (0.23 ms/file) and the host-side `find` (0.31 s
-# for 12,626 files) and concludes "bounded at seconds" — but it never measured the host-side loop
-# that ACCUMULATES the list (see _refresh_macos_shares_locked, which appends once per changed file
-# and reopens the list file every iteration). The 2026-07-28 security snapshot did: ~130 µs per
-# changed file, i.e. ~99% of the host-side cost. Added to the 0.23 ms the guest pays for the same
-# file, and both are paid serially, one sweep costs ~0.36 ms per changed file end to end. Past
-# roughly 14,000 changed files a single sweep therefore exceeds the default 5 s interval, and the
-# loop — which sleeps THEN sweeps — degrades into a rising duty cycle on one host core for the
-# lifetime of the VM. 14,000 needs no adversary: `npm install`, a large `git checkout` or a full
-# build reach it, and augur's own repo is 12,626 files.
-#
-# THREE MECHANISMS, and an operator turning the cost down has to be able to say WHICH:
-#
-#   mode                  attach sweep (4 sites)   the 5 s loop   the freshness tripwire
-#   continuous (default)  on                       on             on
-#   attach                on                       OFF            on
-#   off                   OFF                      OFF            OFF
-#
-# `attach` is the interesting one, and it is the answer to "this repo is too big for a 5 s loop":
-# the loop is the UNATTENDED, repeated cost, while the attach sweep runs once, in front of an
-# operator who is watching it and can see what it reported. Keeping the sweep keeps the guest fresh
-# at the moment work starts, which is the guarantee ADR-0016 §4 calls "fresh as of the last attach".
-# `off` is the full escape hatch and reinstates #124/#135 in their entirety.
-#
-# Under `off` the TRIPWIRE must not run either. It reports "Shared-file refresh verified" — and a
-# verification of a refresh that never happened is the misreport class this series has already
-# closed twice (#147, #151). Nothing refreshed, so there is nothing to verify; say nothing.
-#
-# WHY A LAUNCH-TIME FLAG AND NOT A CONFIG FILE. Both file layers were considered and rejected:
-#   • `./.augur/allowlist.conf` (the project layer) lives INSIDE the mounted read-write workspace,
-#     so the guest can write it. A setting read from there would let a compromised guest — or a
-#     prompt-injected agent — switch off the mechanism that keeps the operator's view of its own
-#     filesystem honest, and it would compose with the unpinned `python3` in the sweep's own round
-#     trip (snapshot item 39(a)) into "the guest fabricates the refresh report AND disables the
-#     check that would notice". Resource knobs are guest-writable on purpose (see
-#     AUGUR_PROJECT_RESOURCES_CONF) because inflating your own VM is a self-serve request the
-#     operator sees applied; silencing a freshness mitigation is not the same shape.
-#   • A HOST-side per-project file keyed by workspace_path_hash (the pattern every other piece of
-#     per-project host state uses) has no such hole, but it needs a whole `augur config` surface
-#     before it is usable — and the right value depends on the HOST's CPU as much as on the repo's
-#     file count, so a value committed with the project would be wrong on the next machine.
-# A launch-time flag has neither problem: the value comes from the operator, in the clear, per run.
-# The next person to propose the config file should start from these two paragraphs.
-_MACOS_REFRESH_MODE=continuous
-
-# One predicate per decision, read at the point of use — the shape egress_enabled established. The
-# alternative (an `if` copied to each of the four attach call sites) is the arrangement a fifth call
-# site silently escapes, and this section already has four sites plus a loop.
-share_refresh_enabled()      { [[ "$_MACOS_REFRESH_MODE" != off ]]; }
-share_refresh_loop_enabled() { [[ "$_MACOS_REFRESH_MODE" == continuous ]]; }
-
 # Per-VM marker: the instant of the last successful sweep. Mirrors macos_profile_marker_file, and
 # lives beside it so `destroy --macos` reaps both.
 macos_share_sweep_marker() {
@@ -3479,47 +3409,8 @@ PYEOF
 # timestamp taken before the winner's scan, which silently drops every file changed in between.
 # `mkdir` is the atomic primitive here; skipping the tick is correct, because whoever holds the lock
 # is scanning the same trees against the same marker and will cover this tick's work.
-#
-# TWO ENTRY POINTS, and the split IS the enforcement of `--share-refresh off`:
-#
-#   refresh_macos_shares      GATED. Every AUTOMATIC caller comes through here — the four attach
-#                             sites and the loop — so `off` stops all five in one place and a sixth
-#                             site cannot forget the check. The gate returns BEFORE the lock, so
-#                             `off` leaves no marker and no lock directory behind either; a later run
-#                             without the flag then sweeps everything that changed while it was off,
-#                             which is the conservative direction.
-#   refresh_macos_shares_now  The same sweep with the gate removed, and the only place the
-#                             _MACOS_SWEEP_* outcome statuses escape. `cmd_refresh_macos`
-#                             (`augur refresh --macos`) is the only thing that may call it.
-#
-# The wrapper also SWALLOWS the outcome status, deliberately and explicitly. It returned 0 on every
-# path before the split and it must keep doing so: four of the five automatic callers invoke it as a
-# bare command under `set -e`, so a sweep that reported "the guest could not invalidate 3 files" by
-# returning non-zero would abort `up --macos` between "SSH is up" and the egress tripwire — the I1
-# shape exactly. Best effort is the contract there; the manual command is where the truth is told.
-#
-# The ungated entry is not a hole in the gate; it is what lets the gate stay this strict. `off` means
-# "do not refresh on your own", NOT "never refresh". Without a manual sweep, the operator who chose
-# `off` (or `attach`) because one sweep outlasts the interval has no way at all to make a host-side
-# edit visible: attaching boots or enters the guest as a side effect, and waiting is the one thing
-# #124 measured as not working (904.9 s stale, no timeout). A manual sweep is that operator asking,
-# in the clear, once — which is a different act from the mechanism running unattended, and it is the
-# act the mode flag was never about.
-#
-# WHY A SECOND FUNCTION rather than a `force` argument on the first. A bypass has to be visible in
-# the CALL, not in an argument: `grep -n refresh_macos_shares_now augur` is the complete list of code
-# that can skip the mode check — two call sites, one of which is the gate itself. A boolean parameter
-# would make a bypass read exactly like the five ordinary call sites it sits among, which is how the
-# check would eventually be bypassed by accident. Same reason the mode predicates are one-liners read
-# at the point of use rather than an `if` copied about.
 refresh_macos_shares() {
-    if ! share_refresh_enabled; then return 0; fi
-    refresh_macos_shares_now "$@" || true
-    return 0
-}
-
-refresh_macos_shares_now() {
-    local vm="$1" quiet="${2:-}" lock rc=0
+    local vm="$1" quiet="${2:-}" lock rc
     lock="$(macos_share_sweep_marker "$vm").lock"
     if ! mkdir "$lock" 2>/dev/null; then
         # A crashed augur would otherwise wedge every future sweep behind a directory nobody owns.
@@ -3527,30 +3418,27 @@ refresh_macos_shares_now() {
         # files measures 2.87 s), then try once more; a genuine holder keeps its lock.
         if [[ -n "$(find "$lock" -maxdepth 0 -mmin +2 2>/dev/null)" ]]; then
             rmdir "$lock" 2>/dev/null || true
-            mkdir "$lock" 2>/dev/null || return "$_MACOS_SWEEP_BUSY"
+            mkdir "$lock" 2>/dev/null || return 0
         else
-            return "$_MACOS_SWEEP_BUSY"
+            return 0
         fi
     fi
-    # `|| rc=$?` and NOT a bare subshell followed by `rc=$?`: under `set -e` the bare form aborts the
-    # whole script the moment the sweep reports anything but 0, before the assignment ever runs
-    # (verified). It was invisible while every path returned 0, and became a live abort the moment
-    # the outcome statuses above did not.
     ( trap 'rmdir '"$(printf %q "$lock")"' 2>/dev/null || true' EXIT
-      _refresh_macos_shares_locked "$vm" "$quiet" ) || rc=$?
+      _refresh_macos_shares_locked "$vm" "$quiet" )
+    rc=$?
     rmdir "$lock" 2>/dev/null || true
     return $rc
 }
 
 _refresh_macos_shares_locked() {
-    local vm="$1" quiet="${2:-}" marker pending name root rel f n=0 out rc=0
+    local vm="$1" quiet="${2:-}" marker pending name root rel f n=0 out
     marker="$(macos_share_sweep_marker "$vm")"
     pending="${marker}.pending"
 
     # Stamp BEFORE scanning, and only promote it after the guest confirms. An edit landing during the
     # sweep is then still newer than the promoted marker and gets caught next time, instead of
     # falling into the gap between "scanned" and "stamped".
-    : > "$pending" 2>/dev/null || { warn "Cannot write $(dirname "$pending"); skipping the share refresh."; return "$_MACOS_SWEEP_FAILED"; }
+    : > "$pending" 2>/dev/null || { warn "Cannot write $(dirname "$pending"); skipping the share refresh."; return 0; }
 
     # No marker yet means no basis for an incremental sweep, so sweep everything. That is the
     # conservative direction and it is bounded (2.87 s measured for 12,600 files); it happens once,
@@ -3564,7 +3452,7 @@ _refresh_macos_shares_locked() {
     # under "/Volumes/My Shared Files/", so any whitespace-separated protocol is broken by
     # construction, which is the same trap that cost the 105-arm experiment ten of its arms.
     local list="${pending}.list"
-    : > "$list" 2>/dev/null || { warn "Cannot write $(dirname "$list"); skipping the share refresh."; rm -f "$pending"; return "$_MACOS_SWEEP_FAILED"; }
+    : > "$list" 2>/dev/null || { warn "Cannot write $(dirname "$list"); skipping the share refresh."; rm -f "$pending"; return 0; }
     while IFS=$'\t' read -r name root; do
         [[ -d "$root" ]] || continue
         while IFS= read -r -d '' f; do
@@ -3574,7 +3462,7 @@ _refresh_macos_shares_locked() {
         done < <(find "$root" -type f ${find_age[@]+"${find_age[@]}"} -print0 2>/dev/null)
     done < <(macos_share_roots "$vm")
 
-    if (( n == 0 )); then rm -f "$list"; mv -f "$pending" "$marker" 2>/dev/null || true; return "$_MACOS_SWEEP_NOWORK"; fi
+    if (( n == 0 )); then rm -f "$list"; mv -f "$pending" "$marker" 2>/dev/null || true; return 0; fi
     (( n > 2000 )) && [[ "$quiet" != quiet ]] && info "Refreshing ${n} changed shared file(s) in the guest — this takes a moment."
 
     # One round trip: the program is an argument, so stdin stays free for the NUL-separated list.
@@ -3582,7 +3470,7 @@ _refresh_macos_shares_locked() {
         warn "Could not refresh the guest's view of the shared files: ${out%%$'\n'*}"
         warn "  Host-side edits may not be visible in the guest (issues #124/#135). \`down --macos && up --macos\` clears it."
         rm -f "$pending" "$list" 2>/dev/null || true
-        return "$_MACOS_SWEEP_FAILED"
+        return 0
     }
     rm -f "$list" 2>/dev/null || true
     mv -f "$pending" "$marker" 2>/dev/null || true
@@ -3603,18 +3491,10 @@ _refresh_macos_shares_locked() {
             while IFS= read -r detail; do
                 [[ -n "$detail" ]] && warn "  ${detail}"
             done < <(printf '%s\n' "$out" | tail -n +2)
-            # …and only two of those three are a FAILURE of this sweep. `nomap` and `msyncfail` are
-            # the guest declining to invalidate a file it was handed: the one thing this mechanism
-            # is for did not happen, and `augur refresh --macos` must not exit 0 on it. `unstable`
-            # is a file that kept changing size across every retry — a live host-side writer, which
-            # is expected during a build and will be swept again when it stops — so it is named and
-            # nothing more. Both stay best-effort for the five automatic callers; the gate above
-            # maps this back to 0 for them.
-            case "$summary" in *nomap=*|*msyncfail=*) rc="$_MACOS_SWEEP_FAILED" ;; esac
             ;;
         *) [[ "$summary" == *ok=* && "$quiet" != quiet ]] && info "Refreshed the guest's view of ${n} changed shared file(s) (${summary})." ;;
     esac
-    return $rc
+    return 0
 }
 
 # ── Tripwire for the refresh above ────────────────────────────────────────────────────────────
@@ -3648,11 +3528,6 @@ _refresh_macos_shares_locked() {
 _MACOS_FRESHNESS_PROBE=".augur-freshness-probe"
 verify_macos_share_freshness() {
     local vm="$1" host_dir guest_path a b warm before after _ignored
-    # Under `--share-refresh off` no sweep ran, so there is nothing to verify — and every verdict
-    # this function can print would be a lie about a mechanism that is switched off, including the
-    # success one. Silence is the honest answer; the operator was already warned at launch. Same
-    # reason #147 and #151 exist: a check that reports on work it did not do is worse than no check.
-    if ! share_refresh_enabled; then return 0; fi
     host_dir="$AUGUR_DIR/$(agent_state_agents_host_subdir)/${vm}"
     guest_path="/Volumes/My Shared Files/$(agent_state_agents_host_subdir)/${_MACOS_FRESHNESS_PROBE}"
     [[ -d "$host_dir" ]] || return 0
@@ -3759,74 +3634,7 @@ verify_macos_share_freshness() {
 # there is no FSEvents binding in the shell or in the stdlib python this uses, and `fswatch` is not a
 # dependency augur has. Event-driven is strictly better and is recorded in ADR-0016 as the obvious
 # next optimisation; it is not worth a Swift component in the first cut.
-#
-# The period, lowest precedence first: built-in default 5 < AUGUR_MACOS_REFRESH_INTERVAL < the
-# --share-refresh-interval flag, which overwrites this variable from the global flag loop further
-# down — the same three-layer shape and the same mechanism AUGUR_EGRESS / --egress / --no-egress use
-# (the env-derived assignment happens at parse time, the flag runs after it and simply wins).
 _MACOS_REFRESH_INTERVAL="${AUGUR_MACOS_REFRESH_INTERVAL:-5}"
-
-# A POSITIVE integer, and nothing else, whichever layer it came from.
-#
-# What this closes: AUGUR_MACOS_REFRESH_INTERVAL reached `sleep` unchecked. `=0` made `sleep 0`
-# return instantly, so the loop spun as fast as `find` could walk every share — one host core, for
-# the lifetime of the VM, with no output. A non-numeric value made `sleep` fail once per tick into
-# the refresher log forever, which looks identical to a healthy session unless you read the log.
-#
-# 0 is REJECTED, not reinterpreted as "off". Reading it as a mode would give the operator a second
-# spelling of a disable that means something DIFFERENT from `--share-refresh off` — the attach sweep
-# and the tripwire would still run — and a number silently becoming a mode is exactly the "it did
-# something other than what it said" shape this series keeps removing. So the message names the flag
-# that really does it instead.
-#
-# The pattern is `^[1-9][0-9]*$` rather than `^[0-9]+$` plus a zero check, because a leading zero
-# means two different things in the two places this value is used: bash `(( 010 ))` is 8 (octal)
-# while `sleep 010` waits ten seconds. A value the validator and the consumer would read differently
-# has no business passing validation.
-macos_refresh_interval_valid() { [[ "$1" =~ ^[1-9][0-9]*$ ]]; }
-validate_macos_refresh_interval() {   # <value> <where it came from, for the message>
-    if macos_refresh_interval_valid "$1"; then return 0; fi
-    error "${2}: '${1}' is not a positive whole number of seconds."
-    # THE REMEDY HAS TO CLEAR THIS ERROR. The mode flags below do not — they never touch the
-    # interval, so `--share-refresh off` on the same command line leaves the bad value in place and
-    # reproduces the refusal verbatim. Naming a remedy that does not work is the same misreport shape
-    # as #147/#151, so the fix is named for the LAYER the value actually came from, and the mode
-    # flags are offered only as what they are: the answer to "I wanted to turn it off", not to this.
-    if [[ "$2" == AUGUR_MACOS_REFRESH_INTERVAL ]]; then
-        error "  Fix it with ${BOLD}unset AUGUR_MACOS_REFRESH_INTERVAL${RESET}, or export a positive integer."
-    else
-        error "  Pass a positive integer instead, e.g. ${BOLD}--share-refresh-interval 15${RESET}."
-    fi
-    if [[ "$1" == 0 ]]; then
-        error "  0 does not mean 'off' — it would make the refresh loop spin. To stop the loop and keep"
-        error "  the attach-time sweep: ${BOLD}--share-refresh attach${RESET}. To stop everything: ${BOLD}--share-refresh off${RESET}."
-        error "  Either of those is a separate flag: it does not un-set the interval this refusal is about."
-    fi
-    exit 1
-}
-
-# WHY THIS WARNS ON EVERY RUN rather than once. A freshness mechanism that is off and says nothing
-# about it is the defect #148 removed (the refresher's warnings went to /dev/null, so an hour of
-# failing sweeps was indistinguishable from a healthy session). "Once" would need host-side state to
-# remember it had spoken — the per-project config surface this flag exists to avoid — and it would go
-# quiet for the operator who passes the flag habitually, who is precisely the one who forgets it is
-# set. The cost of repeating it is four lines on a command the operator just typed the flag onto, so
-# it reads as an acknowledgement rather than as noise. Warnings, not errors: this is a legitimate
-# choice, and it is `warn` for the same reason the sweep's own failures are — degraded, not unsafe.
-warn_macos_refresh_mode() {
-    if share_refresh_loop_enabled; then return 0; fi
-    if [[ "$_MACOS_REFRESH_MODE" == attach ]]; then
-        warn "Shared-file refresh: ${BOLD}attach${RESET} — the every-${_MACOS_REFRESH_INTERVAL}s refresh loop is OFF for this run."
-        warn "  Each augur attach still sweeps, so the guest is fresh when work starts; a host edit made"
-        warn "  WHILE the agent is running will not reach it until the next \`up\`/\`claude\`/\`shell\`."
-    else
-        warn "Shared-file refresh: ${BOLD}off${RESET} — no attach-time sweep, no refresh loop, no freshness self-test."
-        warn "  The guest may serve STALE file data indefinitely after a host edit, with no error anywhere."
-        warn "  Remedy while off: \`augur down --macos && augur up --macos\` (a reboot empties the guest's cache)."
-    fi
-    warn "  The defect this mitigates (issues #124/#135) is ${BOLD}still present on macOS 26.6 (25G72)${RESET} — reconfirmed 2026-07-29."
-    warn "  Restore the default with ${BOLD}--share-refresh continuous${RESET}, or by omitting the flag. See ADR-0016."
-}
 
 share_refresher_pidfile() { echo "$AUGUR_PROXY_DIR/$(workspace_slug)-$(workspace_path_hash)-refresher.pid"; }
 # A background loop has nowhere to warn TO — the operator is inside `claude`, not watching the shell
@@ -3845,16 +3653,6 @@ share_refresher_running() {
 
 start_share_refresher() {
     local vm="$1" pf lf
-    # `attach` and `off` both end here — this loop is the unattended, repeated cost, and it is what
-    # an operator turning the refresh down is actually paying for.
-    #
-    # It STOPS a live refresher rather than merely declining to start one, and that is the whole
-    # point on the reconcile path: `up --macos --share-refresh attach` against an ALREADY-RUNNING VM
-    # arrives here with a loop from an earlier `up` still sweeping every 5 s under the old mode. A
-    # bare `return 0` would leave it running while augur had just told the operator the loop was
-    # off — reporting one thing and doing another, the class #147/#151 closed. Idempotent: stopping
-    # a refresher that is not running is already a no-op.
-    if ! share_refresh_loop_enabled; then stop_share_refresher; return 0; fi
     pf="$(share_refresher_pidfile)"; lf="$(share_refresher_logfile)"
     share_refresher_running && return 0
     mkdir -p "$AUGUR_PROXY_DIR"
@@ -4209,16 +4007,6 @@ cmd_claude_macos() {
     # BEFORE the wiring below, not after: ensure_macos_claude_profile copies out of the profile
     # share, and a stale copy survives until the next attach. See the fresh path for the full note.
     refresh_macos_shares "$project_vm"
-    # …and the same rule applied to the LOOP, which is the half `--share-refresh` actually turns off.
-    # start_share_refresher is the only place a live refresher is reconciled with the requested mode,
-    # and it lives in cmd_up_macos — which the line above skipped. Without this, `claude --macos
-    # --share-refresh attach` prints "the refresh loop is OFF for this run" (the dispatch tail warns
-    # before this function is even called) while a loop an earlier `up` started keeps sweeping the
-    # guest every 5 s for the whole session: reporting one thing and doing another, the class #147
-    # and #151 each closed once, and the operator who re-attaches to escape the cost keeps paying it.
-    # `||` rather than an `if` so the left side's non-zero under `continuous` is set -e-exempt;
-    # stop_share_refresher is idempotent and cannot fail.
-    share_refresh_loop_enabled || stop_share_refresher
     ensure_macos_workspace "$project_vm"
     ensure_macos_claude_projects "$project_vm"
     ensure_macos_claude_agents "$project_vm"
@@ -4244,9 +4032,6 @@ cmd_shell_macos() {
     sync_macos_guest_clock "$project_vm"
     # Same reason as cmd_claude_macos': the wiring below reads the shares.
     refresh_macos_shares "$project_vm"
-    # Same reason as cmd_claude_macos' too: this path never reaches start_share_refresher, so without
-    # this line the launch warning would claim a loop was off while an earlier `up`'s kept sweeping.
-    share_refresh_loop_enabled || stop_share_refresher
     ensure_macos_workspace "$project_vm"
     ensure_macos_claude_projects "$project_vm"
     ensure_macos_claude_agents "$project_vm"
@@ -4255,154 +4040,6 @@ cmd_shell_macos() {
     warn_if_macos_egress_pinned "$project_vm"
     info "Opening shell in '${project_vm}'..."
     ssh_macos "$project_vm" -t "cd ~/${MACOS_SHARE} && exec zsh -l"
-}
-
-# ── `augur refresh --macos` — sweep the shares once, now (issues #124/#135) ───────────────────
-#
-# WHY IT EXISTS. Until this there was no way to sweep ON DEMAND. The only ways to make a host-side
-# edit visible in a running guest were to attach — `up`/`claude`/`shell`, all of which put the
-# operator INSIDE the guest as a side effect — or to wait for the loop. That left `--share-refresh
-# attach` and `off` half-built: an operator who stops the loop because their repo is big enough that
-# one sweep outlasts the interval had no replacement for it, and was pushed back to `continuous` or
-# to reading stale files. This is the replacement.
-#
-# IT DOES NOT FALL BACK TO cmd_up_macos, unlike cmd_claude_macos and cmd_shell_macos, whose job is to
-# put the operator in the guest and which therefore boot one if needed. Booting a VM as a side effect
-# of "refresh" is a surprise; it is also pointless, twice over — a guest that is not running holds no
-# virtiofs cache to invalidate, and the `up` that would start it sweeps on the way in anyway. So this
-# refuses and names that command, which is the shorter path to what the operator asked for.
-#
-# IT WORKS UNDER `--share-refresh off`, by calling the UNGATED entry point directly (see the two
-# entry points at refresh_macos_shares for why that is not a hole in the gate). Refusing here would
-# mean `augur refresh --macos --share-refresh off` did nothing while claiming a mode, and would make
-# the escape hatch the trap. Be exact about the size of that, because the ADR's first draft was not:
-# _MACOS_REFRESH_MODE has NO env layer (only the interval does) and is re-derived per run, so an
-# operator who launched with `off` and later types a bare `augur refresh --macos` is in `continuous`
-# for that command and would sweep through the GATED entry anyway. The ungated entry is load-bearing
-# for exactly one command line — the one that repeats the flag — and the reason to keep it is
-# consistency, not rescue: a flag that describes the automatic mechanism must not silently cancel the
-# manual act. It says so on the way past: an operator who saw a manual refresh succeed and nothing
-# else could reasonably conclude that `off` had stopped applying, and a freshness mechanism whose
-# state the operator cannot see is #148's defect with a different cause.
-#
-# IT DOES NOT PASS `quiet`. Only the loop does, and only because nobody is watching it. This one was
-# typed by a human who wants the answer — how many files, and which ones the guest could not
-# invalidate (the bounded per-file naming #150 added) — so the sweep reports normally.
-#
-# IT REPORTS THE OUTCOME IN ITS EXIT STATUS, which the five automatic callers deliberately do not
-# (see _MACOS_SWEEP_BUSY and the note at refresh_macos_shares). `augur refresh --macos && run_tests`
-# has to mean something, and without this it did not: the sweep swallows a held lock, an unwritable
-# state dir, a dead round trip and a guest that refused to invalidate, and returns 0 on all four
-# because a bring-up must survive them. This command has no next tick to fall back on — under
-# `attach` and `off` it IS the next tick — so it distinguishes them and exits 1 on the three that
-# mean the operator's edit is still invisible in the guest.
-#
-# require_safe_workspace is called HERE rather than added to the dispatch-tail gate that covers
-# `up`/`claude`/`shell`/`setup-token`: this command exists only in macOS mode, and from that gate it
-# would run before the container-mode refusal below, refusing `augur refresh` in a $HOME checkout for
-# a reason that has nothing to do with what is actually wrong with that command line. Same set of
-# reasons the guard states for itself — it is about handing THIS directory to a guest, which is
-# exactly what a sweep of these shares does. It therefore runs AFTER require_vz here, which inverts
-# the order that gate's comment gives as one of its reasons ("the refusal names the workspace rather
-# than the host OS"). That is the right inversion for this one command and only this one: `refresh`
-# has no container-mode implementation at all, so on a host where require_vz fails the missing VM
-# backend is the whole of what is wrong with the command line, and naming the workspace first would
-# answer a question the operator cannot act on.
-cmd_refresh_macos() {
-    require_vz
-    require_safe_workspace
-    local project_vm
-    project_vm="$(macos_project_vm)"
-    if ! macos_vm_running "$project_vm"; then
-        error "VM '${project_vm}' is not running — there is nothing to refresh."
-        error "  The stale data this clears lives in a RUNNING guest's virtiofs cache; a stopped VM has none."
-        error "  Start it with ${BOLD}augur up --macos${RESET}, which sweeps the shares as it attaches."
-        exit 1
-    fi
-    # THE TRANSPORT, checked before the sweep and separately — the #137 remedy, in the shape
-    # verify_macos_egress_locked established a few hundred lines above. `ssh_macos` does not RETURN
-    # when it cannot name a host for the VM, it `exit 1`s the script. Inside the sweep that exit is
-    # contained (it happens in `out="$(ssh_macos …)"`, a command-substitution subshell, so it becomes
-    # an ordinary non-zero status), and the sweep does the right thing for the callers it was written
-    # for: warn, and return 0 so a bring-up continues. That is the wrong answer for a command whose
-    # ONLY job is the round trip — the operator would get a warning under a SUCCESS exit status, and
-    # if nothing changed since the last sweep the guest is never contacted at all, so there would be
-    # no diagnostic whatsoever and `refresh` would exit 0 having verified nothing.
-    #
-    # The state is reachable, not theoretical, and it is precisely the one the check above has just
-    # confirmed half of: a RUNNING VM with gvproxy DOWN (tests/37's header predicted it; `make e2e`
-    # reproduced it on 2026-07-26). macos_ssh_host then falls back to `augur-vm ip`, which a
-    # vfkit-networked guest has no DHCP lease to answer, and prints nothing.
-    #
-    # Checked here rather than fixed in ssh_macos for the reason recorded there: turning that `exit`
-    # into a `return` changes the failure mode of all 47 call sites at once, many of which rely on
-    # `set -e` aborting the operation.
-    if [[ -z "$(macos_ssh_host "$project_vm")" ]]; then
-        error "No SSH transport to '${project_vm}' — the VM is running, but nothing on the host can reach it."
-        error "  gvproxy is not running, and it cannot be restarted under a live VM (its unixgram socket"
-        error "  IS the guest's NIC). Restart the guest with ${BOLD}augur down --macos && augur up --macos${RESET},"
-        error "  which boots a fresh datapath and sweeps the shares on the way in."
-        exit 1
-    fi
-    # One line, under `off` only — `attach` needs none, because its attach-time sweep and its
-    # tripwire are both still running and nothing about this command contradicts what it was told.
-    #
-    # RUN-SCOPED, and it says so, for the reason cmd_status_macos splits its two lines: the mode is
-    # re-derived from THIS command line and nothing records what a running session was launched with.
-    # So this claims only what it can know — that the flag on this line does not re-enable anything —
-    # and deliberately does NOT say "nothing else will sweep", which would be a statement about a
-    # loop an earlier `up` may well have left running. `status --macos` measures that half.
-    #
-    # This command also does NOT stop such a loop, unlike cmd_claude_macos / cmd_shell_macos /
-    # cmd_setup_token_macos. Those three reconcile because they WARN about the mode from the dispatch
-    # tail while skipping cmd_up_macos, so a surviving loop would make their warning false. This one
-    # is outside that gate on purpose and makes no such claim — and killing a background refresher as
-    # a side effect of a command called `refresh` is the same kind of surprise as booting a VM would
-    # be. Stopping the loop stays where it already is: an attaching command, or `down --macos`.
-    if ! share_refresh_enabled; then
-        warn "Shared-file refresh: ${BOLD}off${RESET} for this run — this is a manual sweep; it does not turn the automatic refresh back on."
-    fi
-    # A lead-in line, because the sweep is legitimately SILENT on the path where nothing changed: it
-    # never contacts the guest and prints nothing at all, and a command whose entire job is this,
-    # printing nothing, is indistinguishable from one that did not run. Saying what it is about to do
-    # is the honest fix; making the sweep itself announce it is not, because that line would then
-    # print on every `up`, `claude` and `shell` as well, where it is pure noise.
-    #
-    # It is a lead-in and NOT a claim of success, which is why every outcome below gets its own line.
-    # A first cut printed this and exited 0 with the lock held by another sweeper — announcing work
-    # it had not done, which is worse than the silence it was added to fix.
-    info "Refreshing the guest's view of the shared files in '${project_vm}'..."
-    # Ungated on purpose, and the only call to this entry point outside its own gate. `|| rc=$?`
-    # rather than a bare call, because these statuses are non-zero by design and a bare call would
-    # end the script at `set -e` before the report below.
-    local rc=0
-    refresh_macos_shares_now "$project_vm" || rc=$?
-    if (( rc == _MACOS_SWEEP_BUSY )); then
-        # The sweep skips a tick it cannot lock, and for the LOOP that is exactly right: the holder
-        # is scanning the same trees against the same marker, so the work is covered. For a one-shot
-        # manual sweep it is not right at all, and the reasoning that justifies it does not carry
-        # over. The holder stamped its pending marker and ran its `find` BEFORE the operator's edit,
-        # so that edit is not in the in-flight list; it is covered by the NEXT sweep, and under
-        # `attach`/`off` this command IS the next sweep. So it says so and fails, rather than
-        # reporting a success that consists of having done nothing.
-        error "Another sweep is already in progress — this run did nothing."
-        error "  A refresh loop tick or a concurrent ${BOLD}up${RESET}/${BOLD}claude${RESET}/${BOLD}shell${RESET} holds the lock. It is scanning against"
-        error "  a list taken before your edit, so it will not cover it. Re-run ${BOLD}augur refresh --macos${RESET}."
-        exit 1
-    fi
-    if (( rc == _MACOS_SWEEP_NOWORK )); then
-        # Not a failure, and worth a line of its own: on a manual run this is the most common outcome
-        # of all, and it is the one the operator most needs told apart from a sweep that fell over.
-        info "No shared file has changed since the last sweep — nothing to invalidate."
-        return 0
-    fi
-    if (( rc != 0 )); then
-        # The sweep has already said what went wrong and named the files, in its own voice, which is
-        # the same text a bring-up would print. All this adds is the status, because the report was
-        # never the missing half — exiting 0 after it was.
-        error "The shared files were NOT fully refreshed (see above); the guest may still read stale data."
-        exit 1
-    fi
 }
 
 # macOS counterpart of cmd_setup_token: run `claude setup-token` in the VM and save
@@ -4416,10 +4053,6 @@ cmd_setup_token_macos() {
     # already-running VM is left untouched.
     local started_here=false
     if ! macos_vm_running "$project_vm"; then cmd_up_macos; started_here=true; fi
-    # Same reason as cmd_claude_macos': an already-running VM skips cmd_up_macos, which is where a
-    # live refresher is reconciled with the requested mode — and this command warns about that mode
-    # from the dispatch tail, so leaving the loop up would make the warning false here too.
-    share_refresh_loop_enabled || stop_share_refresher
     ensure_macos_claude_bin "$project_vm"
     # A2: the guest is root and can replace its claude binary; setup-token attaches it to
     # the operator's TTY. Refuse an unsigned/lookalike binary (the build pins the Anthropic
@@ -4573,53 +4206,6 @@ cmd_status_macos() {
     else
         echo -e "${BOLD}Egress:${RESET}        ${YELLOW}off${RESET} (disabled via --no-egress or AUGUR_EGRESS=0)"
     fi
-    # "Why is my edit not showing up in the guest?" is answered here or nowhere — and the honest
-    # answer needs TWO LINES, because the two halves have different scopes and neither substitutes
-    # for the other:
-    #   • THIS RUN (line 1) is run-scoped and re-derived from THIS command line. Nothing persists the
-    #     mode or the period a running session was launched with, so this says what the next
-    #     `up`/`claude`/`shell` typed the same way would do — NOT what the live VM is doing. It is
-    #     labelled "this run" for that reason. Presenting it as the session's state is precisely the
-    #     misreport this feature exists to remove: `status --macos` in a bare shell would have said
-    #     "continuous" for a VM launched `--share-refresh off`.
-    #   • LIVE (line 2) is measured: a host process, and the marker the sweep advances on success.
-    #     That is the half that answers the operator's actual question. The run-scoped INTERVAL is
-    #     deliberately not interpolated into it — a running loop's period is whatever the `up` that
-    #     started it was given, which nothing records, so "loop running" and "5s" in one clause read
-    #     as one claim and the second half of it would be a guess.
-    local rmode="${GREEN}continuous${RESET}" rwhat="attach sweep + background loop + freshness self-test"
-    # Only the ENV layer can be invalid here: the flag was validated in the flag loop, and the env
-    # check is gated to the commands that can reach `sleep` (see the dispatch tail), which excludes
-    # this one on purpose. So print the period only when it is a period.
-    macos_refresh_interval_valid "$_MACOS_REFRESH_INTERVAL" \
-        && rwhat="attach sweep + ${_MACOS_REFRESH_INTERVAL}s loop + freshness self-test"
-    case "$_MACOS_REFRESH_MODE" in
-        attach) rmode="${YELLOW}attach${RESET}";  rwhat="attach sweep + freshness self-test, no loop (issues #124/#135)" ;;
-        off)    rmode="${YELLOW}off${RESET}";     rwhat="none of it — host edits may read stale in the guest (issues #124/#135)" ;;
-    esac
-    local rloop="${YELLOW}loop not running${RESET}"; share_refresher_running && rloop="${GREEN}loop running${RESET}"
-    local rmark rmt rlast="no sweep recorded for this VM"
-    rmark="$(macos_share_sweep_marker "$project_vm")"
-    if [[ -f "$rmark" ]]; then
-        # An `if` rather than `[[ … ]] && …`: the latter would be the last command of this branch, so
-        # a `stat` that returned nothing would make the whole `if` return 1 and abort `status` under
-        # `set -e`. An `if` whose condition is false returns 0.
-        #
-        # GNU form FIRST, then BSD, and then a numeric test — and the order is not interchangeable.
-        # `stat -c` does not exist on BSD, so macOS exits non-zero and the `||` fires. The reverse
-        # does NOT work: on GNU, `-f` means --file-system, so `stat -f %m <file>` treats `%m` as a
-        # second path, **exits 0**, and prints a filesystem report to stdout. `||` never fires, and
-        # `$(( … - rmt ))` then evaluates ` File: "…"` as arithmetic, where the bare word `File` is a
-        # variable name — `unbound variable` under `set -u` (augur:7), which aborts `status --macos`.
-        # This code path is macOS-only in production, but tests/43 drives it on both CI platforms, and
-        # `tests/41:256` already carries a comment warning about exactly this asymmetry. The numeric
-        # test is the part that closes the class rather than this one platform: whatever a future
-        # `stat` prints, only digits reach the arithmetic.
-        rmt="$(stat -c %Y "$rmark" 2>/dev/null || stat -f %m "$rmark" 2>/dev/null || true)"
-        if [[ "$rmt" =~ ^[0-9]+$ ]]; then rlast="last sweep $(( $(date +%s) - rmt ))s ago"; fi
-    fi
-    echo -e "${BOLD}Share refresh:${RESET} ${rmode} — this run: ${rwhat}"
-    echo -e "               live: ${rloop}, ${rlast}"
     echo ""
 
     if macos_vm_exists "$MACOS_BASE_VM"; then
@@ -5719,7 +5305,6 @@ cmd_help() {
     echo -e "    augur ${CYAN}shell${RESET}  --macos                                   Open bash shell"
     echo -e "    augur ${CYAN}setup-token${RESET} --macos                              Get a Claude token in the VM, save it on the host"
     echo -e "    augur ${CYAN}install-cert${RESET} --macos <cert.crt>                   Trust a custom CA (PEM X.509) in the base VM"
-    echo -e "    augur ${CYAN}refresh${RESET} --macos                                   Refresh the guest's view of the shared files, now"
     echo -e "    augur ${CYAN}down${RESET}    --macos                                   Stop the VM (keep the clone)"
     echo -e "    augur ${CYAN}destroy${RESET} --macos                                   Stop and remove the VM clone"
     echo -e "    augur ${CYAN}status${RESET}  --macos                                   Check VM status and toolchain"
@@ -5733,10 +5318,6 @@ cmd_help() {
     echo -e "    --gui              Open a VM window in macOS VM mode (for: augur up --macos)"
     echo -e "    --egress           Force the egress allowlist on (re-enables if AUGUR_EGRESS=0)"
     echo -e "    --no-egress        Disable the egress allowlist for this run"
-    echo -e "    --share-refresh <continuous|attach|off>   macOS shared-file refresh (default: ${CYAN}continuous${RESET})"
-    echo -e "                       ${CYAN}attach${RESET} keeps the sweep at each attach but stops the background loop;"
-    echo -e "                       ${CYAN}off${RESET} stops all of it, including the freshness self-test (issues #124/#135)"
-    echo -e "    --share-refresh-interval <seconds>        Period of that loop (default: ${CYAN}5${RESET}; positive integer)"
     echo -e "    --ipsw <path>      macOS IPSW file  (for: augur build --macos)"
     echo -e "    --xcode-xip <path> Xcode XIP file   (for: augur build --macos)"
     echo -e "    --platforms <list> Simulator platforms to bake into the base VM (for: augur build --macos)"
@@ -5751,9 +5332,6 @@ cmd_help() {
     echo -e "    AUGUR_CONTAINER_MEMORY   Apple Container memory (e.g. 4g); overrides .augur/resources.conf; default: 4g"
     echo -e "    AUGUR_MACOS_VM_CPU       macOS VM vCPU count; overrides .augur/resources.conf; default: 4"
     echo -e "    AUGUR_MACOS_VM_MEMORY_MB macOS VM memory in MB; overrides .augur/resources.conf; default: 8192"
-    echo -e "    AUGUR_MACOS_REFRESH_INTERVAL  Period of the macOS shared-file refresh loop, in seconds"
-    echo -e "                             (default: 5). --share-refresh-interval overrides it; a positive"
-    echo -e "                             integer only — 0 is refused, use --share-refresh attach|off"
     echo ""
     echo -e "  ${BOLD}NOTES${RESET}"
     echo -e "    • Container mode runs on ${CYAN}container${RESET} (Apple Container), on macOS 26+."
@@ -5765,17 +5343,6 @@ cmd_help() {
     echo -e "    • macOS VM sizing: defaults to 4 vCPU / 8192 MB regardless of host power. Set ${CYAN}MACOS_CPU=${RESET}/"
     echo -e "      ${CYAN}MACOS_MEMORY_MB=${RESET} in ${CYAN}.augur/resources.conf${RESET} or override per-run with ${CYAN}AUGUR_MACOS_VM_CPU${RESET}/"
     echo -e "      ${CYAN}AUGUR_MACOS_VM_MEMORY_MB${RESET}. Applied on every ${BOLD}augur up --macos${RESET}, no destroy/re-clone needed."
-    echo -e "    • macOS shared-file refresh: a macOS guest's virtiofs client serves ${BOLD}stale file data${RESET} after a"
-    echo -e "      host edit, with no timeout (issues #124/#135; still present on macOS 26.6). augur invalidates"
-    echo -e "      the changed files at each attach and every ${CYAN}5${RESET}s while the VM runs. Cost scales with the"
-    echo -e "      CHANGED-file count (~0.36 ms each, host + guest), so a repo where one sweep outlasts the"
-    echo -e "      interval should use ${CYAN}--share-refresh attach${RESET} (sweep on attach, no loop) rather than a longer"
-    echo -e "      interval. ${CYAN}--share-refresh off${RESET} disables the mitigation entirely. See ADR-0016."
-    echo -e "    • ${BOLD}augur refresh --macos${RESET} sweeps once, on demand, against the VM that is already running —"
-    echo -e "      the replacement for the loop when you stop it, and the only way to refresh without also"
-    echo -e "      attaching. It works under ${CYAN}--share-refresh off${RESET} too (it says so), and it never boots a VM."
-    echo -e "      Unlike the automatic sweeps it FAILS when it swept nothing (another sweep held the lock) or"
-    echo -e "      the guest could not invalidate, so ${CYAN}augur refresh --macos && swift test${RESET} means what it reads."
     echo -e "    • Container mode: current directory mounted at /workspace-<project> (Linux container)"
     echo -e "    • macOS VM mode:  current directory exposed at ~/workspace-<project> (macOS VM)"
     echo -e "    • macOS VM mode requires: augur-vm (the bundled Swift VM backend)"
@@ -5833,27 +5400,6 @@ while [[ $# -gt 0 ]]; do
         --gui)   MACOS_GUI=true; shift ;;
         --egress)    AUGUR_EGRESS=1; shift ;;
         --no-egress) AUGUR_EGRESS=0; shift ;;
-        # macOS shared-file refresh (issues #124/#135, ADR-0016). Run-scoped and here in the global
-        # flag loop, beside --egress/--no-egress, because the value is the operator's per-run choice
-        # and the alternative — a file — is either guest-writable or needs a config surface that does
-        # not exist. The long version of that reasoning is at _MACOS_REFRESH_MODE.
-        --share-refresh)
-            _MACOS_REFRESH_MODE="${2:?'--share-refresh requires a mode: continuous, attach or off'}"
-            case "$_MACOS_REFRESH_MODE" in
-                continuous|attach|off) ;;
-                *) error "--share-refresh: unknown mode '${_MACOS_REFRESH_MODE}' (expected: continuous, attach or off)."; exit 1 ;;
-            esac
-            shift 2
-            ;;
-        # Validated HERE, in both modes, rather than down with the macOS-only env check: a malformed
-        # value on the command line is a typo the operator can only have meant for this run, and
-        # nothing has been cloned, booted or written yet. Assigned after the check so an `exit 1`
-        # cannot leave a rejected value in the variable.
-        --share-refresh-interval)
-            validate_macos_refresh_interval "${2:?'--share-refresh-interval requires a whole number of seconds'}" "--share-refresh-interval"
-            _MACOS_REFRESH_INTERVAL="$2"
-            shift 2
-            ;;
         --swift)
             SWIFT_VERSION="${2:?'--swift requires a version (e.g. --swift 6.0)'}"
             shift 2
@@ -5884,44 +5430,7 @@ MACOS_SHARE="workspace-$(workspace_slug)"
 # container/VM a pre-fix augur made in $HOME can still be cleaned up; init-conf/build/update/
 # install-cert/version/help never hand this directory to a guest (`build` uses $SCRIPT_DIR as
 # its context).
-# ONE EXCEPTION, and it is the only one: `refresh` (macOS-only) calls require_safe_workspace from
-# INSIDE cmd_refresh_macos. It does hand this directory to a guest — a sweep of these shares is
-# exactly that — so it is guarded; it is not listed here because from here the guard would run
-# before the container-mode refusal below and answer the wrong question, complaining about a $HOME
-# checkout when what is wrong with `augur refresh` is the missing `--macos`. So the "single site"
-# rule above now reads: one site for every command that exists in BOTH modes. A second command with
-# a mode-specific guard belongs here, not there — the reasons are written out at cmd_refresh_macos,
-# and the cost of the exception (require_vz's refusal comes first for that one command) is recorded
-# there too.
 case "$COMMAND" in up|claude|shell|setup-token) require_safe_workspace ;; esac
-
-# The macOS shared-file refresh, resolved once, here, for the same reason SWIFT_IMAGE_TAG is above:
-# this is the first point at which the flag loop has run, so the env layer and the flag layer are
-# both known. macOS mode only — the refresh does not exist in container mode. The flag layer was
-# already validated in the loop above, so what this checks is the ENV layer. Still nothing cloned,
-# booted or written at this line, so `exit 1` from here costs nothing.
-#
-# GATED TO THE ATTACHING COMMANDS, and that gate is the point, not a detail. It is the same set
-# require_safe_workspace uses ten lines above, for a related reason — those are the commands that
-# hand this workspace to a guest, and `setup-token --macos` is in it because it calls cmd_up_macos
-# itself — but here it is also the ONLY set that can reach `sleep`: nothing else starts the loop, so
-# nothing else can be harmed by a bad period. Ungated, this block turned a stale
-# AUGUR_MACOS_REFRESH_INTERVAL in a shell profile into a refusal on `down --macos`, `destroy --macos`,
-# `status --macos`, `list --macos`, `version` and `help` — i.e. it took away the one command that
-# stops the very loop the bad value was spinning, in exactly the population this flag exists for
-# (`=0` is the guess the operator makes first). That is the wrong failure direction, and the same
-# rule augur:5605 states for require_safe_workspace: teardown and inspection must keep working.
-# `status --macos` is not in the set for the warning either — it prints a Share refresh line of its
-# own, which is the better answer there — and `down`/`destroy` are not, because a warning about a
-# mechanism being off while tearing it down is noise and stop_share_refresher runs there regardless.
-if $MACOS_MODE; then
-    case "$COMMAND" in
-        up|claude|shell|setup-token)
-            validate_macos_refresh_interval "$_MACOS_REFRESH_INTERVAL" "AUGUR_MACOS_REFRESH_INTERVAL"
-            warn_macos_refresh_mode
-            ;;
-    esac
-fi
 
 if $MACOS_MODE; then
     case "$COMMAND" in
@@ -5931,7 +5440,6 @@ if $MACOS_MODE; then
         shell)          cmd_shell_macos ;;
         setup-token)    cmd_setup_token_macos ;;
         install-cert)   cmd_install_cert_macos "$@" ;;
-        refresh)        cmd_refresh_macos ;;
         down)           cmd_down_macos ;;
         destroy)        cmd_destroy_macos ;;
         status)         cmd_status_macos ;;
@@ -5949,19 +5457,6 @@ else
         shell)          cmd_shell ;;
         setup-token)    cmd_setup_token ;;
         install-cert)   cmd_install_cert "$@" ;;
-        # macOS-only, and named rather than left to fall through to "Unknown command: 'refresh'" —
-        # which would be true of this dispatch and false of augur. The defect it mitigates is in the
-        # macOS guest's virtiofs CLIENT, not in the mechanism: a Linux container guest reading the
-        # same host directory over a mount that is also virtiofs sees current content live
-        # (ADR-0016 §1, measured), so there is nothing to invalidate here and never was. Same voice
-        # as install-cert's "--macos in the wrong position" refusal: say what to type, and do not
-        # print the whole help over it.
-        refresh)
-            error "${BOLD}augur refresh${RESET} exists in macOS VM mode only: ${BOLD}augur refresh --macos${RESET}."
-            error "  A Linux container guest sees host-side edits live; the stale-cache defect is the macOS"
-            error "  guest's virtiofs client (issues #124/#135), so there is nothing to refresh here."
-            exit 1
-            ;;
         down)           cmd_down ;;
         destroy)        cmd_destroy ;;
         status)         cmd_status ;;

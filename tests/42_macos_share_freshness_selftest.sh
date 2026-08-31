@@ -21,11 +21,6 @@
 #                                to look like a probe that passed.
 #   otherwise                  → verified.
 #
-# …and a fifth outcome that is the absence of one: under `--share-refresh off` no sweep ran, so every
-# verdict above would be a statement about a mechanism that is switched off — including the good one.
-# "Shared-file refresh verified" when nothing refreshed is the misreport class #147 and #151 each
-# closed once. The right output is nothing at all, and that arm is pinned here.
-#
 # …plus the property that separates this from the egress self-test: it is NEVER fatal. That one gates
 # a security invariant and tears the VM down. This one gates a freshness mitigation — a stale share
 # is degraded, not uncontained, and ending an operator's bring-up over it is the shape #129 removed.
@@ -272,36 +267,6 @@ else fail "…and the caller survives" "$out"; fi
 if [[ ! -s "$SSHLOG" ]]; then ok "…without attempting a single probe"
 else fail "…without attempting a probe" "$(head -1 "$SSHLOG")"; fi
 [[ -n "$_saved_host" ]] && eval "$_saved_host" || unset -f macos_ssh_host
-
-section "--share-refresh off silences the tripwire too"
-
-# WHY THIS ARM MATTERS MORE THAN IT LOOKS. Under `off` no sweep ran, so EVERY verdict this function
-# can reach is a statement about a mechanism that is switched off — and the one it would actually
-# reach here is the good one: a fixture whose guest answers correctly makes it print "Shared-file
-# refresh verified". Reporting a refresh as verified when no refresh happened is the misreport class
-# #147 and #151 each closed once already. The right output is nothing at all.
-_saved_mode="$_MACOS_REFRESH_MODE"
-_MACOS_REFRESH_MODE=off
-set_modes noop fresh stale fresh          # a healthy guest: the verified verdict, if it ran
-: > "$SSHLOG"; run
-if [[ -z "$out" ]]; then ok "off: no verdict of any kind is printed"
-else fail "off: no verdict is printed" "a check that reports on work it did not do is worse than no check: $out"; fi
-if [[ "$out" != *"verified"* ]]; then ok "…and in particular it does not claim the refresh was verified"
-else fail "…it must not claim the refresh was verified" "$out"; fi
-if [[ ! -s "$SSHLOG" ]]; then ok "…and it costs no round trip (three of them, on a mechanism that is off)"
-else fail "off costs no round trip" "$(head -1 "$SSHLOG")"; fi
-if [[ $rc -eq 0 ]]; then ok "…and returns 0, like every other path here"
-else fail "off returns 0" "rc=$rc"; fi
-
-# THE CONTROL, on the identical fixture: `attach` keeps the tripwire, because the attach-time sweep
-# it verifies still runs in that mode. Without this arm the assertions above would pass just as well
-# on a function that had stopped working for an unrelated reason.
-_MACOS_REFRESH_MODE=attach
-set_modes noop fresh stale fresh
-: > "$SSHLOG"; run
-if [[ "$out" == *"Shared-file refresh verified"* ]]; then ok "attach: the tripwire still runs and still reports"
-else fail "attach: the tripwire still runs" "only \`off\` may silence it: '$out'"; fi
-_MACOS_REFRESH_MODE="$_saved_mode"
 
 section "call sites — the two \`up\` paths only"
 
