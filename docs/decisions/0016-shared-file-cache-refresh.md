@@ -1,7 +1,16 @@
-# ADR-0016 — Refresh the guest's view of shared files with `msync(MS_INVALIDATE)`
+# ADR-0016 — ~~Refresh the guest's view of shared files with `msync(MS_INVALIDATE)`~~
 
-**Status:** accepted (2026-07-28)
-**Relates to:** [#124](https://github.com/h1d3mun3/augur/issues/124), [#135](https://github.com/h1d3mun3/augur/issues/135), ADR-0013 (which this corrects), ADR-0015 (the sibling mitigation)
+**Status:** **Superseded by [`0017`](./0017-accept-virtiofs-staleness.md) (2026-08-31).** The
+mitigation this describes was **removed from `main`**; augur no longer refreshes the guest's view of
+shared files. Kept for the historical rationale and — more importantly — for the **measurements** in
+§1, which are the evidence 0017 accepts the defect on. The implementation is preserved on the
+`topic/virtiofs-cache` branch, and §5 remains the removal procedure of record should it ever be
+brought back.
+**Relates to:** [#124](https://github.com/h1d3mun3/augur/issues/124), [#135](https://github.com/h1d3mun3/augur/issues/135), ADR-0013, ADR-0015 (the sibling mitigation)
+
+> **Everything below describes code that is no longer in `main`.** Function names, line numbers and
+> the `--share-refresh` surface refer to the withdrawn implementation. The **defect** in §1 is
+> unchanged and still unfixed; only augur's response to it changed. See 0017.
 
 ## 1. The defect
 

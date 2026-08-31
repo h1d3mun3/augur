@@ -132,24 +132,12 @@ What you get instead is a directory you populate on purpose:
   `<name>.pre-profile` rather than replacing it (an empty one is simply dropped).
 - **macOS VM mode caveat — profile edits need a VM restart.** The profile works there (it is shared
   read-only into the VM and wired the same way), but macOS mode reaches it over a **virtiofs share**
-  rather than a bind mount, and the macOS guest's virtiofs client keeps serving **stale file data**
-  after a host-side edit. A 105-arm experiment measured it: a file stayed stale for **904.9 s** with
-  no natural refresh, and then every share went fresh together **10.3 s after a guest vnode reclaim
-  was forced**. The delay is therefore not a timeout you can wait out — nothing expires.
-  Two things this document used to claim are wrong and are corrected here: it is **not** specific to
-  read-only shares (the read-write workspace share behaves identically — see
-  [issue #135](https://github.com/h1d3mun3/augur/issues/135)), and content does **not** reliably
-  become visible "before the 10-minute mark".
-  So if you change the profile while a VM is running, run `augur down --macos && augur up --macos`
-  to pick it up. That works because the guest **reboots with an empty vnode cache**, not because a
-  fresh `vm run` rebuilds the share device — a distinction that matters to anyone trying to fix
-  this. Container mode is unaffected, and that is diagnostic rather than incidental: a Linux guest
-  reading the same host directory over a mount that is *also* virtiofs sees current content live, so
-  the defect is in the **guest-side** client, not in the sharing mechanism or in `readOnly`.
-  **augur warns you when this applies**: `augur claude --macos` / `shell --macos` check host-side
-  whether the profile changed since the VM booted, and print the remedy if so — so the failure is
-  never silent. See [issue #124](https://github.com/h1d3mun3/augur/issues/124) and
-  [issue #135](https://github.com/h1d3mun3/augur/issues/135).
+  rather than a bind mount, and a read-only virtiofs share serves the guest **stale content for
+  minutes** after a host-side edit. Measured on real hardware: still stale 2 minutes after the
+  write; visible some time before the 10-minute mark. So if you change the profile while a VM is
+  running, run `augur down --macos && augur up --macos` to pick it up — a fresh `vm run` rebuilds
+  the share device and is guaranteed to see current content. Container mode is unaffected.
+  See [issue #124](https://github.com/h1d3mun3/augur/issues/124).
 
 Your **repository's** own `.claude/settings.json`, `CLAUDE.md`, `.claude/commands/`,
 `.claude/skills/` and `.mcp.json` already work with no setup — they arrive inside the workspace
@@ -270,22 +258,12 @@ augur up --macos --gui  # same, but also open a VM window (display + keyboard + 
 augur claude --macos    # launch Claude Code  (starts VM if not running)
 augur shell --macos     # open a bash shell   (starts VM if not running)
 augur setup-token --macos  # get a Claude subscription token (runs in the VM, saves on the host)
-augur refresh --macos   # push host-side edits into the running VM's view, now (never boots one)
 augur down --macos      # stop the VM (keeps the clone — next up is fast)
 augur destroy --macos   # stop and remove the project VM clone
 augur status --macos    # show VM status, toolchain, and auth info
 augur list --macos      # list all VMs and their state
 augur update --macos    # update Claude Code in the base VM
 augur version --macos   # show augur version (macOS mode)
-
-augur up --macos --share-refresh attach            # keep the attach-time sweep, stop the 5s loop
-augur up --macos --share-refresh off               # stop the shared-file refresh entirely
-augur up --macos --share-refresh-interval 15       # same loop, longer period (default: 5)
-
-augur config --share-refresh attach                # …and persist that, for THIS project only
-augur config --share-refresh-interval 30           # (host-side; the guest cannot read or write it)
-augur config --show                                # effective values + which layer set each
-augur config --unset share_refresh                 # back to the default
 ```
 
 ### Authentication
@@ -335,124 +313,6 @@ warning, not a failed `up`. See
 > manually running `claude --worktree <name>` works today. Unlike container mode, its conversation history *does*
 > survive `augur down --macos`/`up --macos` (the VM's disk is stopped, not destroyed, until `augur destroy --macos`).
 > See `docs/decisions/0004-no-special-worktree-support.md`.
-
-### Shared-file refresh (`--share-refresh`)
-
-A macOS guest's virtiofs client keeps serving **stale file data** after you edit a file on the host —
-on every share, read-only and read-write alike, with **no timeout** (one measured file stayed stale
-for 904.9 s). Still present on **macOS 26.6**. So augur invalidates the guest's cache for the files
-that changed: at every attach (`up`/`claude`/`shell --macos`), and again every **5 s** for as long as
-the VM runs, which is the only thing that makes a host edit reach an agent that is *already running*.
-See [`docs/decisions/0016-shared-file-cache-refresh.md`](docs/decisions/0016-shared-file-cache-refresh.md).
-
-The cost scales with the number of **changed** files (~0.36 ms each, host + guest, paid serially), and
-nothing caps that number — past roughly 14,000 changed files one sweep outlasts the 5 s interval and
-the loop starts running most of the time on one core. An `npm install`, a big `git checkout` or a full
-build can get there. Two run-scoped flags, written after the command:
-
-| Flag | Attach-time sweep | 5 s loop | Freshness self-test |
-|---|---|---|---|
-| *(none)* / `--share-refresh continuous` | yes | yes | yes |
-| `--share-refresh attach` | yes | **no** | yes |
-| `--share-refresh off` | **no** | **no** | **no** |
-
-`attach` is usually what you want for a large repo: the loop is the unattended, repeated cost, while
-the attach sweep runs once, in front of you, and still leaves the guest fresh when work starts. `off`
-is the full escape hatch — with it the guest can read stale files indefinitely and nothing will say
-so, so `augur down --macos && augur up --macos` becomes the remedy again.
-
-As a **flag** the setting is per run: pass it on each of `up`, `claude`, `shell` and
-`setup-token --macos`. Any of those will stop a loop an earlier `up` left running, so you can drop the
-cost mid-session by re-attaching with `augur claude --macos --share-refresh attach`. Anything but the
-default prints a warning on every such run, naming the issues and how to restore it.
-`augur status --macos` prints two lines: what *this* command line asks for (and which layer it came
-from), and — measured — whether a refresh loop is actually running and how long ago the last sweep
-completed. To stop retyping it, persist it with `augur config` (below).
-
-`--share-refresh-interval <seconds>` changes the loop's period (a positive integer). `0` is refused
-rather than treated as "off" — use `--share-refresh attach` or `off`, which say what they mean. A bad
-`AUGUR_MACOS_REFRESH_INTERVAL` is only refused on the commands that start the loop; `down`, `destroy`,
-`status` and `list` keep working, because those are how you stop a loop a bad value is spinning.
-
-### Persisting it per project (`augur config`)
-
-The right mode depends on **how many files your repo changes**, which is a property of the repo, not
-of the run — so an operator who needs `attach` should not retype it forever:
-
-```bash
-augur config --share-refresh attach          # for this project, from now on
-augur config --share-refresh-interval 30
-augur config --show
-augur config --unset share_refresh
-```
-
-```
-Project:                /Users/hidemune/GitHub/big-monorepo
-Settings file:          ~/.augur/project-settings/big-monorepo-908d688ef046.conf
-
-share_refresh           attach      (settings file)
-share_refresh_interval  5           (default)
-```
-
-**Precedence: flag > settings file > `AUGUR_MACOS_REFRESH_INTERVAL` > built-in default**, and
-`--show` names the winning layer for each key — with four of them, "which layer won" is the only
-useful answer to "why is my edit not showing up". The file beats the env var because the export's one
-persistent home is a shell profile, i.e. every project in every shell, while the file is one project
-you chose; a stale export must not quietly override it.
-
-The file is **host-side**, under `~/.augur/project-settings/`, keyed on the project's full path — and
-deliberately **not** `./.augur/`. That directory is inside the read-write share, so the guest can
-write it, and a guest that can set its own `share_refresh` can switch off the mechanism that keeps
-your view of that guest honest. `~/.augur` is in no share, in either engine. `.augur/resources.conf`
-being guest-writable is not a counter-example: inflating its own VM is a request you *see applied*,
-while silencing a freshness check is invisible by construction. See ADR-0016 §6.1.
-
-`augur config` needs no `--macos` (it writes a file and boots nothing) and is not a VM command, so it
-works on a host with no VM backend. A malformed value in the file **warns and is ignored** — it never
-refuses a command, because unlike an export this file survives `destroy --macos`, so a refusal would
-be permanent and would take `augur down --macos` with it. Unknown keys are warned about, ignored, and
-preserved on rewrite, so an older augur cannot eat a newer one's setting.
-
-`destroy --macos` does **not** delete it. It reaps VM state; this is your intent about the project,
-and `destroy --macos && up --macos` is a remedy augur itself recommends. `augur config --unset`
-is the only thing that removes it.
-
-### Refreshing on demand (`augur refresh --macos`)
-
-```bash
-augur refresh --macos
-```
-
-Sweeps the shared directories once, against the VM that is **already running**, and says what
-happened on every path: the file count and the ones the guest could not invalidate by name, "nothing
-has changed since the last sweep", or the reason it swept nothing at all. This is the replacement
-for the loop when you turn it off: without it, the only ways to get a host-side edit into a running
-guest are to attach (`up`/`claude`/`shell`, all of which put you *in* the guest) or to wait, and
-waiting is the one thing that does not work.
-
-**Its exit status means something**, so `augur refresh --macos && swift test` is safe to write. It
-exits non-zero if the sweep did not happen (another sweep held the lock) or did not do its job (the
-round trip failed, or the guest declined to invalidate files — `msyncfail`/`nomap`). A file the guest
-reported as `unstable` — one a host-side build kept rewriting mid-sweep — is named but is not a
-failure. The automatic sweeps on `up`/`claude`/`shell` and in the loop stay best-effort and never
-fail their command: a stale share is degraded, not broken, and a bring-up must not die on one.
-
-It **never boots a VM.** If none is running it says so and stops: a stopped guest has no cache to
-invalidate, and the `up` that would start it sweeps on the way in anyway. If the VM is running but
-the host cannot reach it (gvproxy down), it says *that*, rather than reporting a sweep it could not
-make.
-
-It works under **`off`** — that mode means "don't refresh on your own", not "never refresh", so
-`augur refresh --macos` sweeps rather than silently doing nothing. That matters most for a mode you
-**persisted**: `augur config --share-refresh off` applies to every command in the project, so this is
-the command that gets an edit into the guest without turning the loop back on, and it is what keeps
-`off` a setting rather than a one-way door. It then prints one line saying the automatic refresh is
-still off — naming the settings file and `augur config --unset share_refresh` if that is where the
-mode came from, rather than talking about a flag you did not type — so a successful manual sweep
-cannot be mistaken for `off` having lapsed. Unlike the attaching commands it does *not* stop a refresh loop an earlier `up`
-left running: it makes no claim about one, and `augur status --macos` is where that half is measured.
-Stopping the loop stays with `--share-refresh attach|off` on `up`/`claude`/`shell`, or with
-`augur down --macos`.
 
 ### Running `xcodebuild test`
 

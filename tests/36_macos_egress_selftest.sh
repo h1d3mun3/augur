@@ -62,12 +62,7 @@ unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN
 gh() { return 1; }                        # no host gh token: keeps the credential-helper wiring a no-op
 
 # Assigned in the dispatch tail the AUGUR_SOURCE_ONLY seam returns before; mint them exactly as it
-# does, because augur runs under `set -u` (same reason tests/34 and 35 mint theirs). MACOS_SHARE is
-# the one of the five cmd_up_macos actually interpolates — and it is no longer unset after a source:
-# augur binds it ABOVE the seam now, precisely so the sweep is reachable from a sourced augur at all
-# (see tests/41's first section). This file does not substitute $WORKSPACE_DIR, so the line below
-# re-derives the value augur already bound; it is kept beside its four neighbours rather than left
-# as the one silent exception in the list.
+# does (cmd_up_macos interpolates MACOS_SHARE, and augur runs under `set -u`).
 SWIFT_IMAGE_TAG="${SWIFT_VERSION:-latest}"
 IMAGE_NAME="augur:swift-${SWIFT_IMAGE_TAG}"
 CONTAINER_NAME="$(make_container_name)"
@@ -269,11 +264,6 @@ egress_enabled()                { return 0; }
 check_project_conf_approved()   { echo "gate" >> "$LOG"; }
 start_proxy()                   { echo "start_proxy $1" >> "$LOG"; }
 start_gvproxy()                 { echo "start_gvproxy" >> "$LOG"; }
-# Stubbed for the same reason start_proxy is: it spawns a real background process. Left unstubbed,
-# its loop polls the stubbed macos_vm_running (permanently true) forever and the suite never ends.
-# The real function is exercised in tests/43_macos_share_refresher.sh.
-start_share_refresher()         { echo "start_share_refresher" >> "$LOG"; }
-stop_share_refresher()          { echo "stop_share_refresher" >> "$LOG"; }
 resolve_macos_vm_cpu()          { echo 4; }
 resolve_macos_vm_memory_mb()    { echo 8192; }
 wait_for_macos_ssh()            { return 0; }
