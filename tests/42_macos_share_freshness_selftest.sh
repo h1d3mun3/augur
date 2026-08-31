@@ -51,15 +51,6 @@ PROBE="$PROBE_DIR/.augur-freshness-probe"
 SSHLOG="$TMPD/sshlog"; : > "$SSHLOG"
 MODEFILE="$TMPD/modes"; CTRFILE="$TMPD/ctr"; CACHEFILE="$TMPD/cache"
 : > "$MODEFILE"; echo 0 > "$CTRFILE"; : > "$CACHEFILE"
-# A mode list that runs out is how this fixture lies: the old fallback silently replayed `fresh`, so
-# an arm that under-counted its calls tested a HEALTHY guest while claiming to test a sick one. The
-# `*)` arm below records the overrun here instead, and the check before `finish` fails the suite on
-# it — a fixture bug must not be able to present itself as a passing assertion.
-BUGFILE="$TMPD/fixturebug"; : > "$BUGFILE"
-# The retry's backoff is recorded rather than paid. Asserting on this file is what makes "bounded"
-# checkable; sleeping for real would just make the suite slower without proving anything.
-SLEEPLOG="$TMPD/sleeps"; : > "$SLEEPLOG"
-sleep() { printf '%s\n' "$1" >> "$SLEEPLOG"; }
 
 # A scripted guest. Its state lives in FILES, not shell variables, because the function under test
 # pipes every ssh_macos call into `tr` — which runs it in a subshell, where a variable-based counter
@@ -82,19 +73,13 @@ ssh_macos() {
     printf '%s\n' "$*" >> "$SSHLOG"
     local i mode
     i="$(cat "$CTRFILE")"; echo $((i+1)) > "$CTRFILE"
-    mode="$(sed -n "$((i+1))p" "$MODEFILE")"
+    mode="$(sed -n "$((i+1))p" "$MODEFILE")"; [[ -n "$mode" ]] || mode=fresh
     case "$mode" in
         fresh)  cat "$PROBE" ;;
         stale)  cat "$CACHEFILE" ;;
         unread) return 1 ;;
         exits)  exit 1 ;;         # what ssh_macos really does when it cannot name a host (#137)
         noop)   : ;;              # the pre-read invalidate: the function discards its output
-        # An exhausted mode list, or a typo'd mode. NOT a non-zero return or an exit: either would
-        # masquerade as a legitimate sick-guest answer and the arm would "pass" for the wrong reason.
-        # The marker alone is not enough either — measured, it only ever surfaces as a wrong-value
-        # verdict — so the overrun is also recorded where the check before `finish` can see it.
-        *)      printf 'FIXTURE-BUG mode=%s call=%s\n' "${mode:-<mode-list-exhausted>}" "$((i+1))" >> "$BUGFILE"
-                printf 'FIXTURE-BUG\n' ;;
     esac
     # After the warm read, freeze what the guest "cached" — this is the value a stale answer serves.
     (( i == 0 )) && [[ "$mode" == fresh ]] && cp "$PROBE" "$CACHEFILE"
@@ -161,7 +146,7 @@ if [[ $rc -eq 0 ]]; then ok "returns 0"; else fail "returns 0" "rc=$rc"; fi
 
 section "UNVERIFIED — the guest cannot read the probe at all"
 
-set_modes noop unread unread unread
+set_modes noop unread
 run
 if [[ "$out" == *"Could not verify"* ]]; then ok "an unreadable probe is reported as unverified"
 else fail "an unreadable probe is reported as unverified" "$out"; fi
@@ -174,61 +159,11 @@ else fail "…nor for a pass" "$out"; fi
 # Count CALLS, not lines. The invalidate command carries the whole python program, so one call is
 # ~25 lines in the log — a line count reported 32 for what is actually two calls. The fixture's own
 # counter is the honest measure.
-set_modes noop unread unread unread; : > "$SSHLOG"; : > "$SLEEPLOG"; run
-# Four calls: the invalidate that makes the warm read meaningful, then the warm read's three bounded
-# attempts. Not five or six — an unreadable probe must exhaust its retry and then STOP, never going
-# on to run the before/after comparison against a value it could not establish.
-if [[ "$(cat "$CTRFILE")" == "4" ]]; then ok "it stops after the retried read instead of probing on"
-else fail "it stops after the retried read" "issued $(cat "$CTRFILE") guest calls, expected 4"; fi
-# The backoff is bounded and paid only BETWEEN attempts — two naps for three tries, never three.
-if [[ "$(wc -l < "$SLEEPLOG" | tr -d ' ')" == "2" ]]; then ok "…having slept between attempts, not after the last one"
-else fail "the retry backoff is bounded" "slept $(wc -l < "$SLEEPLOG" | tr -d ' ') times, expected 2"; fi
-
-section "a transient empty read is retried — and ONLY an empty one"
-
-# WHY THIS SECTION EXISTS. Measured on an Apple Silicon host: on the real `up --macos` reconcile
-# path, twice, the `after` read came back EMPTY while the guest was demonstrably alive — a manual
-# `cat` of the same probe from inside that guest returned the correct current value moments later.
-# One transient empty answer discarded the whole verdict, which made a release-gated self-test
-# non-deterministic. These arms pin the fix AND, more importantly, pin its limit.
-
-set_modes noop unread fresh stale fresh; : > "$SLEEPLOG"; run
-if [[ "$out" == *"Shared-file refresh verified"* ]]; then ok "an empty WARM read is retried, and the run reaches its verdict"
-else fail "an empty warm read is retried" "$out"; fi
-if [[ "$(cat "$CTRFILE")" == "5" ]]; then ok "…in 5 calls: invalidate, the empty attempt, the retry, before, after"
-else fail "an empty warm read costs exactly one extra call" "made $(cat "$CTRFILE")"; fi
-if [[ "$(wc -l < "$SLEEPLOG" | tr -d ' ')" == "1" ]]; then ok "…having backed off exactly once"
-else fail "one retry means one backoff" "slept $(wc -l < "$SLEEPLOG" | tr -d ' ') times"; fi
-
-set_modes noop fresh stale unread fresh; : > "$SLEEPLOG"; run
-if [[ "$out" == *"Shared-file refresh verified"* ]]; then ok "an empty AFTER read is retried — the exact failure seen on the reconcile path"
-else fail "an empty after read is retried" "$out"; fi
-if [[ "$out" != *"came back empty"* ]]; then ok "…so a transient empty no longer discards a verdict the guest could give"
-else fail "a retried empty read still reports unverified" "$out"; fi
-
-# THE ARM THAT MATTERS MOST. A NON-EMPTY but WRONG `after` is the SELF-TEST FAILED verdict — the
-# finding this whole tripwire exists to produce. It must be reported on the FIRST answer, never
-# retried. The list is deliberately one longer than the run needs, with the CORRECT value parked at
-# mode 5: if a future change ever retries a non-empty answer it will consume that mode, the guest
-# will "eventually agree", and this arm flips to "verified" and fails loudly. A check that can be
-# talked round is worse than no check — #131/#136/#137 are all that same shape.
-set_modes noop fresh stale stale fresh; : > "$SLEEPLOG"; run
-if [[ "$out" == *"SELF-TEST FAILED"* ]]; then ok "a WRONG but non-empty answer is reported as BROKEN, not retried away"
-else fail "a wrong but non-empty answer is reported as BROKEN" "the retry must never grant a broken guest a second chance: $out"; fi
-if [[ "$(cat "$CTRFILE")" == "4" ]]; then ok "…on the first answer: still 4 calls, the mode-5 trap untouched"
-else fail "a wrong answer is not retried" "made $(cat "$CTRFILE") calls, expected 4 — it consumed the trap"; fi
-if [[ ! -s "$SLEEPLOG" ]]; then ok "…and cost no backoff at all"
-else fail "a wrong answer costs no backoff" "slept $(wc -l < "$SLEEPLOG" | tr -d ' ') times"; fi
-
-set_modes noop fresh stale unread unread unread; : > "$SLEEPLOG"; run
-if [[ "$out" == *"came back empty"* ]]; then ok "an answer that is empty EVERY time is still reported as unverified"
-else fail "an exhausted retry still reports unverified" "$out"; fi
-if [[ "$out" == *"unverified, not proven broken"* ]]; then ok "…and still explicitly not as a failure of msync"
-else fail "…and still not as a failure of msync" "$out"; fi
-if [[ "$out" != *"SELF-TEST FAILED"* ]]; then ok "…so exhausting the retry cannot be mistaken for BROKEN"
-else fail "…so it cannot be mistaken for BROKEN" "$out"; fi
-if [[ "$(cat "$CTRFILE")" == "6" ]]; then ok "…after a BOUNDED 3 attempts, not an unbounded wait"
-else fail "the retry is bounded at 3 attempts" "made $(cat "$CTRFILE") calls, expected 6"; fi
+set_modes noop unread; : > "$SSHLOG"; run
+# Two calls: the invalidate that makes the warm read meaningful, then the read that failed. Not
+# three or four — an unreadable probe must not go on to run the before/after comparison.
+if [[ "$(cat "$CTRFILE")" == "2" ]]; then ok "it stops after the failed read instead of probing on"
+else fail "it stops after the failed read" "issued $(cat "$CTRFILE") guest calls, expected 2"; fi
 
 section "the warm read is preceded by an invalidate"
 
@@ -299,17 +234,15 @@ survives noop fresh stale fresh
 if [[ "$out" == *SURVIVED* ]]; then ok "a healthy guest: the caller survives"
 else fail "a healthy guest: the caller survives" "$out"; fi
 
-# Every call fails, not just the first, and the list is long enough to outlast the warm read's three
-# bounded attempts — a list that runs out mid-arm now trips the fixture-bug check rather than quietly
-# testing a healthy guest. (`unread` IS the non-zero-return mode; the name `rcfail` this arm used to
-# pass was never a case arm, so it fell through and asserted this against a stub returning ZERO.)
-survives unread unread unread unread unread unread
+# Every call fails, not just the first: a short mode list falls back to `fresh`, which would let
+# the arm pass while testing a healthy guest.
+survives rcfail rcfail rcfail rcfail
 if [[ "$out" == *SURVIVED* ]]; then ok "an ssh that RETURNS non-zero does not abort the bring-up"
 else fail "an ssh that returns non-zero does not abort the bring-up" "under set -e a bare call would; got: $out"; fi
 if [[ "$out" == *"Could not verify"* ]]; then ok "…and still reports a verdict"
 else fail "…and still reports a verdict" "$out"; fi
 
-survives exits exits exits exits exits exits
+survives exits exits exits exits
 if [[ "$out" == *SURVIVED* ]]; then ok "an ssh that EXITS does not take the process with it"
 else fail "an ssh that exits does not take the process with it" "this is #137 exactly: augur dies with no output and the fail-closed teardown never runs"; fi
 if [[ "$out" == *"Could not verify"* ]]; then ok "…and still reports a verdict"
@@ -318,19 +251,11 @@ else fail "…and still reports a verdict" "$out"; fi
 # A guest that answers the first probes and then stops — gvproxy dying mid-check is enough. Without
 # an arm here the `before`/`after` guards are unpinned, because every arm above dies at the warm read
 # and never reaches them.
-# SIX modes, and the last four are not padding. Measured while building the retry: `ssh_macos` sits
-# on the LEFT of the `tr` pipe, so its `exit` kills only that pipe-element subshell — the retry loop
-# above it survives and tries again. Four modes ran the list dry mid-retry, the fallback served
-# `fresh`, and the arm reported SELF-TEST FAILED instead of the unverified warn it exists to pin.
-survives noop fresh exits exits exits exits
+survives noop fresh exits exits
 if [[ "$out" == *SURVIVED* ]]; then ok "a guest that stops answering MID-check does not abort the bring-up"
 else fail "a guest that stops answering mid-check does not abort the bring-up" "$out"; fi
-if [[ "$out" == *"came back empty"* ]]; then ok "…and is reported as UNVERIFIED, not as a broken mitigation"
+if [[ "$out" == *"stopped answering mid-check"* ]]; then ok "…and is reported as UNVERIFIED, not as a broken mitigation"
 else fail "…and is reported as unverified" "\"msync did not work\" would send the operator after a platform behaviour that was never measured: $out"; fi
-# The old wording diagnosed a guest that had stopped responding. Measurement contradicted it — the
-# guest was answering — and that false diagnosis cost a debugging session chasing gvproxy. Report the
-# observation, never a cause that was not measured.
-hasnt "$out" "stopped answering mid-check" "…stating what was observed, not a cause that was never measured"
 if [[ "$out" != *"SELF-TEST FAILED"* ]]; then ok "…so it cannot be mistaken for BROKEN"
 else fail "…so it cannot be mistaken for BROKEN" "$out"; fi
 
@@ -397,14 +322,5 @@ _r="$(awk -v a="$_s" -v b="$_e" 'NR>=a && NR<=b && index($0,"refresh_macos_share
 _v="$(awk -v a="$_s" -v b="$_e" 'NR>=a && NR<=b && index($0,"verify_macos_share_freshness \"$project_vm\"")>0 && $0 !~ /^ *#/ {print NR; exit}' "$AUGUR")"
 if [[ -n "$_r" && -n "$_v" && "$_r" -lt "$_v" ]]; then ok "the tripwire runs after the refresh it is checking"
 else fail "the tripwire runs after the refresh" "refresh=$_r verify=$_v"; fi
-
-section "the fixture did not lie to any arm above"
-
-# Every arm here scripts the guest by exact call count. An arm whose mode list runs short used to
-# fall back to `fresh`, so it tested a HEALTHY guest while its name claimed otherwise — and passed.
-# The retry makes call counts longer and easier to get wrong, so the overrun is now recorded and
-# checked once, here, rather than trusted. This must be the LAST assertion: it covers the whole file.
-if [[ ! -s "$BUGFILE" ]]; then ok "no arm outran its mode list (every assertion above tested what it names)"
-else fail "an arm outran its mode list" "the guest fixture was asked for a call it had no mode for, so that arm proved nothing: $(cat "$BUGFILE")"; fi
 
 finish

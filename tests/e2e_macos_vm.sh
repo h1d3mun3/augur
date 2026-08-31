@@ -230,18 +230,7 @@ case "$reout" in
   *"no longer need"*)
     skip "the freshness self-test" "it reports the guest was ALREADY current before any msync — the platform may be fixed (ADR-0016 §5)" ;;
   *)
-    # Three of the four outcomes that land here DO print something — no transport, an unreadable
-    # probe and an empty read all emit "Could not verify the shared-file refresh: …". Reporting "no
-    # verdict at all" for those sent an investigator looking for silence when the output already
-    # contained the answer, and cost a real debugging session. Surface the line; claim silence only
-    # when there genuinely is none. Still a `fail` either way — this is a release gate, and a
-    # mitigation that could not be verified is not a mitigation that passed.
-    _unv="$(printf '%s\n' "$reout" | grep -m1 'Could not verify the shared-file refresh' || true)"
-    if [[ -n "$_unv" ]]; then
-      fail "the freshness self-test reached a verdict" "it could not measure anything, and said so: ${_unv#*] }"
-    else
-      fail "the freshness self-test ran" "no verdict of any kind in the up output — not even a \`Could not verify\` line"
-    fi ;;
+    fail "the freshness self-test ran" "no verdict in the up output at all" ;;
 esac
 
 # The gh-config share was removed: mounted, never wired, and carrying the host's real config.

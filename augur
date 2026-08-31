@@ -3927,72 +3927,6 @@ _refresh_macos_shares_locked() {
 # Runs on the two `up` paths only, mirroring where the boot self-test runs — three extra round trips
 # on the heavier command, none on `claude`/`shell`, and the platform cannot change mid-boot anyway.
 _MACOS_FRESHNESS_PROBE=".augur-freshness-probe"
-
-# ── Why the two VALUE-BEARING reads retry, and why only on an EMPTY answer ────────────────────────
-#
-# WHAT WAS MEASURED. Three runs on one Apple Silicon host, same machine, same VM. Issued as separate
-# ssh connections the tripwire reproduced staleness and its `after` read was correct — the "verified"
-# verdict. Run as a tight twelve-iteration loop the `before` read came back ALREADY CURRENT every
-# single time — the "no longer need" verdict, twelve for twelve. And on the real `up --macos`
-# reconcile path, twice, the `after` read came back EMPTY while the guest was demonstrably alive: a
-# manual `cat` of the same probe from inside that guest, moments later, returned the correct current
-# value. So this tripwire is timing-sensitive, and one transient empty read was enough to discard the
-# whole verdict. That made a release-gated self-test non-deterministic, which is its own defect — a
-# check whose answer depends on scheduling teaches the operator to ignore it.
-#
-# THE CAUSE OF THE EMPTY READ WAS NOT ESTABLISHED, and this comment does not pretend otherwise. The
-# reproductions that DID read the probe successfully all differed from `up` in ways never narrowed
-# down — most obviously that `up` runs a full-share sweep immediately before this function, which
-# none of them did. What IS established is the shape: the answer came back empty while the guest was
-# alive, and one such answer was terminal. That is enough to justify retrying it and not enough to
-# name a mechanism, so what follows defends against the observation, not against a theory.
-#
-# WHY RETRYING IS CONSISTENT WITH THE REST OF THE STACK rather than a new indulgence: every other
-# layer here already retries. The sweep runs the msync program `_MACOS_SWEEP_TRIES` times, and the
-# program itself loops internally while the file's size keeps moving. These two reads were the only
-# single-shot step left.
-#
-# ONLY ON EMPTY, and this is the part that must never be relaxed. A NON-EMPTY but WRONG `after` IS
-# the SELF-TEST FAILED verdict — the finding this entire tripwire exists to produce. Retrying that
-# would hand a broken guest three chances to eventually agree, converting "the mitigation no longer
-# works on this guest OS" into a clean pass. That is a strictly worse defect than the flake being
-# removed here, and it is the #131/#136/#137 class exactly: a check that cannot fail. Empty means
-# nothing was measured; wrong means something was measured and it was wrong. Only the first is a
-# retryable condition, so the loop below breaks on the first NON-EMPTY answer whatever it says.
-#
-# NOT the `before` read, deliberately, and not as an oversight. Its EXPECTED value is the stale one,
-# so "empty" there is not distinguishable from the outcome the check is hoping for — and worse, every
-# extra attempt hands the guest more wall clock in which to refresh on its own, which would bias the
-# run toward the "no longer need" verdict for a reason that is this function's own latency rather
-# than the platform's behaviour.
-#
-# THREE ATTEMPTS AND 0.2 s, and both numbers are borrowed rather than invented: three matches
-# `_MACOS_SWEEP_TRIES`, and 0.2 s matches the guest-poll backoff used elsewhere in this script. The
-# ceiling this adds to `up --macos` is 0.4 s of sleep per retrying read — 0.8 s if both retry to
-# exhaustion — plus the ssh time, and it is only ever paid on a run that would otherwise have printed
-# a verdict measurement says is wrong. A longer backoff is not free in the other direction: it buys
-# the guest enough time to refresh unaided, which perturbs the very measurement this function takes.
-_MACOS_FRESHNESS_READ_TRIES=3
-_MACOS_FRESHNESS_READ_PAUSE=0.2
-_macos_freshness_read() {
-    local vm="$1" cmd="$2" try out=""
-    for (( try = 1; try <= _MACOS_FRESHNESS_READ_TRIES; try++ )); do
-        # `|| true` on EVERY attempt, for the two reasons the caller's comment block sets out at
-        # length: `set -e` on a probe that merely RETURNS non-zero, and `set -o pipefail` turning a
-        # failure on the LEFT of the `tr` pipe into the pipeline's status. Without it the loop would
-        # not survive its own first failed attempt, which is precisely the case it was added for.
-        # The caller keeps its own `|| true` as well, and that one is not redundant: `ssh_macos`
-        # EXITS rather than returns when it cannot name a host (#137). Measured while building this:
-        # that `exit` kills only the PIPE-ELEMENT subshell, not this loop — so an exiting guest is
-        # retried like any other empty answer, and the caller's guard still catches the status
-        # pipefail hands back out of the substitution.
-        out="$(ssh_macos "$vm" "$cmd" 2>/dev/null | tr -d '\r\n')" || true
-        if [[ -n "$out" ]]; then break; fi
-        if (( try < _MACOS_FRESHNESS_READ_TRIES )); then sleep "$_MACOS_FRESHNESS_READ_PAUSE"; fi
-    done
-    printf '%s' "$out"
-}
-
 verify_macos_share_freshness() {
     local vm="$1" host_dir guest_path a b warm before after _ignored
     # Under `--share-refresh off` no sweep ran, so there is nothing to verify — and every verdict
@@ -4042,25 +3976,12 @@ verify_macos_share_freshness() {
     # here with NO output at all — and therefore skipped the fail-closed teardown, leaving a running
     # VM with a live NIC. `make e2e` caught it; nothing offline could, because every offline suite
     # runs with `set +e` and calls this inside `$( … )`, which neutralises both mechanisms.
-    # PATH-PINNED for the reason the sweep's own probe gives in full above `_refresh_macos_shares_locked`'s
-    # ssh call — augur's `~/.augur-env` puts `$HOME/.local/bin` FIRST in every guest shell, including
-    # the non-login one `ssh <host> <cmd>` runs — and that comment's closing line, "The sibling's pin
-    # has the same hole", names this function. The same disclaimer applies verbatim and is not
-    # softened here: this stops a PATH-resolved `python3`; it does NOT stop a shell function or an
-    # alias in `~/.zshenv`, the file augur itself appends to.
-    _ignored="$(ssh_macos "$vm" "export PATH=/usr/bin:/bin:/usr/sbin:/sbin; printf %s '${guest_path}' | python3 -c '$(_macos_msync_program)' ${_MACOS_SWEEP_TRIES}" 2>&1)" || true
-    warm="$(_macos_freshness_read "$vm" "cat '${guest_path}'")" || true
+    _ignored="$(ssh_macos "$vm" "printf %s '${guest_path}' | python3 -c '$(_macos_msync_program)' ${_MACOS_SWEEP_TRIES}" 2>&1)" || true
+    warm="$(ssh_macos "$vm" "cat '${guest_path}'" 2>/dev/null | tr -d '\r\n')" || true
     if [[ "$warm" != "$a" ]]; then
         # The guest cannot see the probe at all. That is not a verdict about msync — say so rather
         # than reporting either control, which is the mistake #137's transport probe could not avoid.
-        # The two ways to get here are NOT the same observation and are no longer reported as one: an
-        # empty answer means nothing came back across the bounded retry above, while a non-empty one
-        # means the guest read the file and got something other than what the host had just written.
-        if [[ -z "$warm" ]]; then
-            warn "Could not verify the shared-file refresh: the guest's read of the probe came back empty (up to ${_MACOS_FRESHNESS_READ_TRIES} attempts)."
-        else
-            warn "Could not verify the shared-file refresh: the guest read the probe but not the value just written to it."
-        fi
+        warn "Could not verify the shared-file refresh: the guest cannot read the probe file."
         warn "  Host-side edits may not be visible in the guest (issues #124/#135); this is unverified, not proven broken."
         return 0
     fi
@@ -4069,19 +3990,14 @@ verify_macos_share_freshness() {
     before="$(ssh_macos "$vm" "cat '${guest_path}'" 2>/dev/null | tr -d '\r\n')" || true
     # Invalidate and re-read in one round trip, through the SAME program the sweep uses — a self-test
     # that exercised its own copy of the mechanism would pass while the shipped one was broken.
-    after="$(_macos_freshness_read "$vm" "export PATH=/usr/bin:/bin:/usr/sbin:/sbin; printf %s '${guest_path}' | python3 -c '$(_macos_msync_program)' ${_MACOS_SWEEP_TRIES} >/dev/null 2>&1; cat '${guest_path}'")" || true
+    after="$(ssh_macos "$vm" "printf %s '${guest_path}' | python3 -c '$(_macos_msync_program)' ${_MACOS_SWEEP_TRIES} >/dev/null 2>&1; cat '${guest_path}'" 2>/dev/null | tr -d '\r\n')" || true
 
-    # An empty answer is what was OBSERVED; it is not a diagnosis, and this used to claim one. The
-    # previous wording said "the guest stopped answering mid-check", which measurement contradicts:
-    # on the two `up --macos` reconcile runs that produced it, the guest was answering fine — a manual
-    # `cat` of this same probe from inside it returned the correct current value moments later.
-    # Naming a cause that was never measured sends the operator after gvproxy when all that happened
-    # is that the read came back empty. It stays UNVERIFIED rather than broken for the reason #137
-    # forced on the egress self-test: nothing was measured, so neither control may be reported.
-    # "up to" N attempts, not a flat N: `ssh_macos` can `exit` and cut the retry short, and claiming a
-    # count that was not necessarily reached would be the same overclaiming this change removes.
+    # Empty means the guest stopped answering partway through — gvproxy dying mid-check is enough.
+    # That is UNVERIFIED, not broken: reporting "msync did not work" would send the operator after a
+    # platform behaviour when the truth is that nothing could be measured. Same distinction #137
+    # forced on the egress self-test, for the same reason.
     if [[ -z "$after" ]]; then
-        warn "Could not verify the shared-file refresh: the guest's read of the probe came back empty (up to ${_MACOS_FRESHNESS_READ_TRIES} attempts)."
+        warn "Could not verify the shared-file refresh: the guest stopped answering mid-check."
         warn "  Host-side edits may not be visible in the guest (issues #124/#135); this is unverified, not proven broken."
         return 0
     fi
