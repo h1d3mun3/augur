@@ -3670,26 +3670,6 @@ macos_share_sweep_marker() {
 # share there and it must be added here; the test pins that they agree.
 macos_share_roots() {
     local vm="$1"
-    # A NAMED failure instead of `set -u` killing this function where nobody can see it. Not
-    # hypothetical: MACOS_SHARE was assigned 54 lines BELOW the AUGUR_SOURCE_ONLY seam until it was
-    # moved above it, so every sourcing caller reached this line with it unset — and the caller reads
-    # this function through `done < <(macos_share_roots "$vm")`, a process substitution, so the death
-    # took only that subshell. The loop saw an empty stream, the sweep concluded "nothing changed",
-    # and a refresher started from such a caller reported healthy for a day and a half while
-    # invalidating nothing (the measurement, and which contexts were affected, are recorded once at
-    # the MACOS_SHARE assignment). Moving the assignment fixes THAT cause; this guard is what
-    # makes the NEXT one — a caller that substitutes a workspace and forgets the share name, a future
-    # edit that moves the assignment back down — say so instead of turning quiet again.
-    #
-    # STDERR, deliberately, and this is the reason it is `error` and not `warn`: warn writes to
-    # STDOUT, and this function's stdout is the `<name>\t<root>` list its caller parses. A warning
-    # printed there would be read as a share, and the sweep would send the guest a path built from a
-    # sentence. The caller's own "the inventory produced nothing" branch is what turns this non-zero
-    # return into an operator-visible outcome; here it only has to be loud and out of band.
-    if [[ -z "${MACOS_SHARE:-}" || -z "${WORKSPACE_DIR:-}" ]]; then
-        error "macos_share_roots: MACOS_SHARE and WORKSPACE_DIR must both be set; cannot enumerate the shares to refresh."
-        return 1
-    fi
     printf '%s\t%s\n' "$MACOS_SHARE"                        "$WORKSPACE_DIR"
     printf '%s\t%s\n' "$(agent_state_host_subdir)"          "$AUGUR_DIR/$(agent_state_host_subdir)/${vm}"
     printf '%s\t%s\n' "$(agent_state_agents_host_subdir)"   "$AUGUR_DIR/$(agent_state_agents_host_subdir)/${vm}"
@@ -3820,7 +3800,7 @@ refresh_macos_shares_now() {
 }
 
 _refresh_macos_shares_locked() {
-    local vm="$1" quiet="${2:-}" marker pending name root rel f n=0 out rc=0 roots=0 scanned=0
+    local vm="$1" quiet="${2:-}" marker pending name root rel f n=0 out rc=0
     marker="$(macos_share_sweep_marker "$vm")"
     pending="${marker}.pending"
 
@@ -3842,64 +3822,14 @@ _refresh_macos_shares_locked() {
     # construction, which is the same trap that cost the 105-arm experiment ten of its arms.
     local list="${pending}.list"
     : > "$list" 2>/dev/null || { warn "Cannot write $(dirname "$list"); skipping the share refresh."; rm -f "$pending"; return "$_MACOS_SWEEP_FAILED"; }
-    # `roots` and `scanned` count the ENUMERATION, not the result: how many share rows arrived, and
-    # how many of them named a path that stats as a directory. They are what tells the two
-    # meanings of `n == 0` apart below. Both accumulate in the CURRENT shell — `while … done < <(…)`
-    # runs its body here and only the producer in a subshell — which is the same fact `n` already
-    # relies on, and the same fact that made the original defect invisible from the caller's side.
     while IFS=$'\t' read -r name root; do
-        roots=$((roots+1))
         [[ -d "$root" ]] || continue
-        scanned=$((scanned+1))
         while IFS= read -r -d '' f; do
             rel="${f#"$root"/}"
             printf '/Volumes/My Shared Files/%s/%s\0' "$name" "$rel" >> "$list"
             n=$((n+1))
         done < <(find "$root" -type f ${find_age[@]+"${find_age[@]}"} -print0 2>/dev/null)
     done < <(macos_share_roots "$vm")
-
-    # `n == 0` used to mean two different things, and only one of them is good news:
-    #   • nothing matched `find -newer $marker` — normal, quiet, correct, and the most common outcome
-    #     of all once the loop is running. Promote the marker and say nothing.
-    #   • the enumeration produced nothing to scan — a bug. The sweep did not observe "no changes";
-    #     it observed NOTHING. That is the shape the MACOS_SHARE-below-the-seam defect took: a died
-    #     macos_share_roots left the loop an empty stream, and this early return reported the healthy
-    #     outcome on every tick for a day and a half (the measurement is at the MACOS_SHARE
-    #     assignment, which is the one site that owns it).
-    #
-    # THE MARKER MUST NOT ADVANCE ON THIS PATH, and that is the whole point of splitting the branch.
-    # `pending` was stamped before the scan, so promoting it here would put every host edit made
-    # during the broken window permanently behind `find -newer` — they would never be swept again,
-    # not even after the bug is fixed. Same rule the path where the round trip ITSELF failed (below)
-    # already follows, for the same reason; the PARTIAL-failure path at the very end deliberately
-    # does not, because there the list was delivered and only individual files were refused. Non-fatal
-    # all the same: this returns a status, the gate maps it to 0 for the five automatic callers, and a
-    # stale share stays DEGRADED rather than uncontained (see this function's header — it must never
-    # end a bring-up).
-    #
-    # The predicate is `scanned`, not `roots`: an inventory that produced rows none of which is even a
-    # directory swept exactly as much as an empty one did, and the two get different sentences only so
-    # the log says which happened. `scanned` is no stronger than the `-d` above it: a root that stats
-    # as a directory but cannot be opened, or a `find` that fails for any other reason, still counts
-    # as walked and still lets the marker advance below. That hole is pre-existing and unlikely — the
-    # roots are user-owned paths under $WORKSPACE_DIR and ~/.augur — but the sentence should not claim
-    # a completeness the counter does not have.
-    #
-    # Three lines per occurrence, into the refresher's unrotated log, which is a real per-tick cost in
-    # a broken window: deliberate, and the same choice the sibling failure path below makes. The state
-    # being reported is one where NOTHING is reaching the guest, and the defect this replaces proved
-    # what the quiet version of it costs.
-    if (( scanned == 0 )); then
-        if (( roots == 0 )); then
-            warn "Share refresh: the share inventory produced nothing — no shared root was scanned, so NOTHING was swept."
-        else
-            warn "Share refresh: none of the ${roots} shared root(s) exists as a directory — NOTHING was swept."
-        fi
-        warn "  Host-side edits are not reaching the guest (issues #124/#135). The sweep marker is deliberately left"
-        warn "  where it is, so those edits are still swept once this works again; \`down --macos && up --macos\` clears it."
-        rm -f "$list" "$pending" 2>/dev/null || true
-        return "$_MACOS_SWEEP_FAILED"
-    fi
 
     if (( n == 0 )); then rm -f "$list"; mv -f "$pending" "$marker" 2>/dev/null || true; return "$_MACOS_SWEEP_NOWORK"; fi
     (( n > 2000 )) && [[ "$quiet" != quiet ]] && info "Refreshing ${n} changed shared file(s) in the guest — this takes a moment."
@@ -6687,69 +6617,6 @@ cmd_help() {
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-# Per-project virtiofs share name for macOS VM mode. The automount exposes it at
-# "/Volumes/My Shared Files/<name>", which is the path Claude actually records as cwd (it resolves
-# the ~/workspace-<slug> symlink), so a per-project name keeps each project's history under a distinct slug.
-#
-# ABOVE THE SEAM, and that is load-bearing rather than tidiness. It sat with SWIFT_IMAGE_TAG and the
-# three names below it — i.e. 54 lines BELOW the AUGUR_SOURCE_ONLY return — so in every context that
-# reaches these functions by SOURCING this file (the seam every tests/NN_*.sh uses, and the e2e gate)
-# MACOS_SHARE was unset, and macos_share_roots, which reads it on its first line, died on
-# `MACOS_SHARE: unbound variable` under the `set -u` this script enables at line 7.
-#
-# WHICH CONTEXTS, exactly — the scope matters, because an EXECUTED augur was never affected. Even at
-# the old site the assignment ran before dispatch (old line 6595, ahead of the require_safe_workspace
-# gate at 6619), and the refresher loop is a plain `( … ) &` subshell of that same process, not a
-# re-exec, so it inherited the binding. No shipped component sources this file. The unbound window
-# was therefore exactly the SOURCING path: tests/NN_*.sh, tests/e2e_macos_vm.sh, and any refresher a
-# sourced harness starts from there.
-#
-# TWO CONSEQUENCES, and the second is why that window is not merely a test-harness wart:
-#   • No offline coverage of the sweep was POSSIBLE. _refresh_macos_shares_locked calls
-#     macos_share_roots, and every offline caller arrives through the seam, so the whole sweep path
-#     was structurally untestable — which is precisely why nothing caught this.
-#   • A SILENTLY DEAD REFRESHER, which then OUTLIVED the harness that started it. The sweep consumes
-#     the roots as `done < <(macos_share_roots "$vm")` — a PROCESS SUBSTITUTION — so the
-#     unbound-variable death killed only that subshell. The `while read` loop simply got no input,
-#     the changed-file count stayed 0, and the sweep took its "nothing changed" early return: marker
-#     promoted, guest never contacted, exit status NOWORK. Measured on an Apple Silicon host: a
-#     refresher started in that state ran ~31 hours logging the unbound-variable line every 5 s
-#     (1.1 MB — the log names the sourced path, which is how the sourcing origin is known), reported
-#     healthy through share_refresher_running the whole time, and msynced nothing. That is where a
-#     harness-only defect became a real one: start_share_refresher is idempotent on a live pidfile,
-#     so every subsequent `up --macos` — an executed augur, with MACOS_SHARE perfectly well bound —
-#     found a "running" refresher and left the dead one in place. The live e2e arm "a host edit
-#     became visible in the running guest" failed for the full 30 s budget; with the stale refresher
-#     cleared, the same arm passes in 5 s.
-#
-# SAFE TO EVALUATE THIS EARLY — checked, not assumed. workspace_slug reads exactly one input,
-# $WORKSPACE_DIR, which is assigned ONCE (line 12, `$(pwd)`) and never again anywhere in this file:
-# there is no `--dir`-style flag, the global flag loop below writes only MACOS_MODE / MACOS_GUI /
-# AUGUR_EGRESS / SWIFT_VERSION and the two refresh knobs, no `cd` runs in the dispatch tail, and
-# require_safe_workspace resolves the physical path into a LOCAL precisely because $WORKSPACE_DIR
-# itself must not change (its header says so, and workspace_path_hash depends on that). The value
-# computed here is therefore byte-identical to the one the old site computed.
-#
-# ONLY THIS ONE MOVES. Three of the four it used to sit with (SWIFT_IMAGE_TAG, IMAGE_NAME,
-# CONTAINER_NAME) read SWIFT_VERSION, which `--swift` DOES rewrite in the flag loop below, so moving
-# them up would silently pin them to the default. WORKSPACE_MOUNT has no such dependency and could
-# move — it is left where it is because nothing reachable through the seam reads it, and a variable
-# hoisted above the seam is a promise that its inputs are final by then. Make that promise once,
-# where a caller actually needs it.
-#
-# WHAT IT DOES NOT BUY: this binds the share name for the process's own cwd. A caller that reassigns
-# $WORKSPACE_DIR after sourcing (tests/38/41/44 all do, to a sandbox) still has to re-derive
-# MACOS_SHARE for the workspace it substituted; nothing here tracks a later change of mind. And it
-# TRADES one failure mode for another for exactly that caller: before the move, a substituted
-# workspace with no re-derived share name died loudly on `set -u`; after it, MACOS_SHARE is always
-# non-empty, so the same omission is a share name quietly naming the wrong workspace. Re-deriving it
-# is now a fixture obligation rather than something the shell enforces — tests/38 says so at its own
-# assignment. The guard in macos_share_roots is the other half, and deliberately only a presence
-# check: it makes the next unset/empty gap report itself rather than disappear into a process
-# substitution again, but it cannot police a MISMATCHED pair, because a legitimate one exists
-# (tests/41 pairs a fixed share name with a sandbox workspace on purpose).
-MACOS_SHARE="workspace-$(workspace_slug)"
-
 # Test seam (mirrors the existing AUGUR_TEST_* seams used by tests/): allow a harness to
 # `source` this script purely to REUSE its functions — e.g. ssh_macos for the local macOS-VM
 # e2e gate (tests/e2e_macos_vm.sh) — without running a command. Never set in normal use, so
@@ -6806,8 +6673,10 @@ SWIFT_IMAGE_TAG="${SWIFT_VERSION:-latest}"
 IMAGE_NAME="augur:swift-${SWIFT_IMAGE_TAG}"
 CONTAINER_NAME="$(make_container_name)"
 WORKSPACE_MOUNT="$(make_workspace_mount)"
-# MACOS_SHARE used to be minted here, with these four. It is now bound ABOVE the test seam instead —
-# the reasons, and why it is the only one of the five that can move, are written out there.
+# Per-project virtiofs share name for macOS VM mode. The automount exposes it at
+# "/Volumes/My Shared Files/<name>", which is the path Claude actually records as cwd (it resolves
+# the ~/workspace-<slug> symlink), so a per-project name keeps each project's history under a distinct slug.
+MACOS_SHARE="workspace-$(workspace_slug)"
 
 # ONE containment gate for BOTH modes, deliberately here in the shared dispatch tail rather
 # than inside cmd_up/cmd_up_macos. Two reasons:
