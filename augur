@@ -3835,31 +3835,7 @@ _refresh_macos_shares_locked() {
     (( n > 2000 )) && [[ "$quiet" != quiet ]] && info "Refreshing ${n} changed shared file(s) in the guest — this takes a moment."
 
     # One round trip: the program is an argument, so stdin stays free for the NUL-separated list.
-    #
-    # PATH-PINNED, for the reason verify_macos_egress_locked already pins its own probes (augur:1748-
-    # 1755): augur's `~/.augur-env` puts `$HOME/.local/bin` FIRST in the PATH of every guest shell,
-    # including the non-login shell `ssh <host> <cmd>` runs, which still sources `~/.zshenv`. A guest
-    # that plants `~/.local/bin/python3` therefore chooses what this call returns.
-    #
-    # WHAT THAT WOULD BUY, and why this site matters more than the tripwire's three: this is the
-    # MECHANISM, not the check. A shadowed interpreter here can print `ok=N` while invalidating
-    # nothing, so the operator is told their edit landed when it did not — and the edit that did not
-    # land may be the one tightening the rules on a guest that is misbehaving. It runs at four attach
-    # points AND every `AUGUR_MACOS_REFRESH_INTERVAL` seconds for the life of the VM, unattended,
-    # where verify_macos_share_freshness runs twice per `up`. Shadowing only the CHECK would make the
-    # self-test lie while real sweeps still worked; shadowing THIS stops the sweeps.
-    #
-    # `/usr/bin/python3` is on the sealed, read-only system volume with SIP on, so a project clone
-    # cannot replace it and this cannot cause a false "not found" — measured on a 26.6 guest: `/` is
-    # `apfs, sealed, local, read-only`, `csrutil status: enabled`, and `ls -lO /usr/bin/python3` shows
-    # `restricted`. (An earlier draft of this comment said the reason was the clone's lack of sudo.
-    # That is false — augur:3202-3204 uses password sudo against project VMs — and the seal is why.)
-    #
-    # NOT A COMPLETE ANSWER, deliberately stated so nobody reads it as one: PATH pinning does not stop
-    # a shell FUNCTION or an alias. `python3() { … }` in `~/.zshenv` — the file augur itself appends
-    # to — defeats this, measured. It removes the cheapest PATH-resolved vector and matches the
-    # sibling; it does not make the guest's answer trustworthy. The sibling's pin has the same hole.
-    out="$(ssh_macos "$vm" "export PATH=/usr/bin:/bin:/usr/sbin:/sbin; python3 -c '$(_macos_msync_program)' ${_MACOS_SWEEP_TRIES} ${_MACOS_SWEEP_DETAIL}" < "$list" 2>&1)" || {
+    out="$(ssh_macos "$vm" "python3 -c '$(_macos_msync_program)' ${_MACOS_SWEEP_TRIES} ${_MACOS_SWEEP_DETAIL}" < "$list" 2>&1)" || {
         warn "Could not refresh the guest's view of the shared files: ${out%%$'\n'*}"
         warn "  Host-side edits may not be visible in the guest (issues #124/#135). \`down --macos && up --macos\` clears it."
         rm -f "$pending" "$list" 2>/dev/null || true

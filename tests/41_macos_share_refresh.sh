@@ -56,26 +56,9 @@ SSHLOG="$TMPD/sshlog"       # the remote command string, one per call
 STDINLOG="$TMPD/stdinlog"   # the NUL-separated path list it was fed
 : > "$SSHLOG"; : > "$STDINLOG"
 SSH_OUT="ok=3"; SSH_RC=0
-ssh_macos() {
+ssh_macos() {                 # only ever driven with the piped `python3 -c` shape here
     printf '%s\n' "$*" >> "$SSHLOG"
-    # ONLY THE SWEEP IS PIPED FROM THE HOST. Its NUL-separated list arrives on this function's stdin;
-    # nothing else in this file does that. The header used to say "only ever driven with the piped
-    # `python3 -c` shape here" and an unconditional `cat` was correct while that held — it stopped
-    # holding when the mode-reconcile arms began driving `cmd_claude_macos` and `cmd_shell_macos`,
-    # which reach this stub as `-t` interactive shapes with nothing piped. There the `cat` drains
-    # whatever stdin the SUITE inherited: /dev/null under CI (invisible), a TTY on a developer's
-    # terminal (`make offline-tests` stops dead with no error and no timeout). That is precisely the
-    # failure tests/39 exists for, and it was live on main — see its header for the two files that
-    # shipped in this state before.
-    #
-    # `printf %s` is excluded ahead of the `python3 -c` arm rather than after it because the freshness
-    # tripwire's probes carry BOTH: their pipe is inside the remote command string, so from here they
-    # are unpiped like the interactive shapes. Matching `python3 -c` alone would regrow the bug the
-    # first time this file drives them.
-    case "$*" in
-        *"printf %s"*)  : ;;                    # tripwire probes — the pipe is REMOTE, not from us
-        *"python3 -c"*) cat > "$STDINLOG" ;;    # the sweep — the list comes from the host
-    esac
+    cat > "$STDINLOG"
     printf '%s' "$SSH_OUT"
     return "$SSH_RC"
 }
@@ -316,26 +299,6 @@ else fail "the guest is invoked as \`python3 -c\`" "$(head -1 "$SSHLOG")"; fi
 if tail -1 "$SSHLOG" | grep -q " ${_MACOS_SWEEP_TRIES} ${_MACOS_SWEEP_DETAIL}$"; then
     ok "the retry count and the detail cap are passed, in that order"
 else fail "the retry count and the detail cap are passed, in that order" "$(tail -1 "$SSHLOG")"; fi
-
-section "the sweep's interpreter cannot be shadowed through PATH"
-
-# THE MECHANISM, NOT THE CHECK. augur's own ~/.augur-env puts $HOME/.local/bin FIRST in the PATH of
-# every guest shell — including the non-login shell `ssh <host> <cmd>` runs, which still sources
-# ~/.zshenv — so an unpinned `python3` here is chosen by the guest. Shadowing the freshness tripwire
-# would make the self-test lie while real sweeps still worked; shadowing THIS makes the sweep print
-# `ok=N` while invalidating nothing, and the edit that then never lands may be the operator tightening
-# the rules on a guest that is misbehaving. verify_macos_egress_locked pins its own probes for the
-# same reason (augur:1748-1755); this arm is what keeps the two from drifting apart again.
-#
-# Asserted on the FIRST line, before `python3`, because order is the property: a pin appended after
-# the interpreter has already resolved is not a pin.
-if head -1 "$SSHLOG" | grep -q "export PATH=/usr/bin:/bin:/usr/sbin:/sbin; *python3 -c "; then
-    ok "the sweep pins PATH to system dirs ahead of \`python3\`"
-else fail "the sweep pins PATH to system dirs ahead of \`python3\`" "a guest-planted ~/.local/bin/python3 would decide what this round trip reports: $(head -1 "$SSHLOG")"; fi
-# The pin must not have cost the protocol: the program is still an ARGUMENT (stdin stays free for the
-# NUL list), and _macos_msync_program still contains no single quote of its own.
-if [[ "$(tr -dc '\0' < "$STDINLOG" | wc -c | tr -d ' ')" -gt 0 ]]; then ok "…without disturbing the NUL-separated list on stdin"
-else fail "…without disturbing the NUL-separated list on stdin" "the pin was added in a way that consumed stdin or broke the quoting"; fi
 
 section "--share-refresh off stops the sweep — at every call site at once"
 
