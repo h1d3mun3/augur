@@ -903,4 +903,35 @@ else fail "…without printing the whole help" "say what to type; the command li
 if grep -q 'augur ${CYAN}refresh${RESET} --macos' "$AUGUR"; then ok "…and \`--help\` lists it among the macOS commands"
 else fail "…and \`--help\` lists it" "a command nobody can discover does not close the gap it was written for"; fi
 
+section "the path list is opened once per ROOT, not once per changed FILE"
+
+# WHY THIS IS PINNED STRUCTURALLY, when nothing else in this file is pinned on cost. A revert is
+# INVISIBLE to every other arm here: the output is byte-for-byte identical (checked against paths
+# containing spaces, tabs, embedded newlines, quotes, non-ASCII and a leading dash — same bytes, same
+# NUL count), so the whole suite stays green while the sweep silently costs twice what it should.
+# What a revert costs, re-measured through _refresh_macos_shares_locked itself with ssh_macos stubbed:
+# 122.0 us per changed file against 64.7, i.e. 1541 ms against 817 ms for a full blind sweep of a
+# 12,628-file tree. ADR-0016 §Cost carries the amendment and the caveat on the absolute numbers.
+read -r _rs _re <<<"$(fn_range _refresh_macos_shares_locked)"
+_pf="$(first_in "$_rs" "$_re" "printf '/Volumes/My Shared Files/%s/%s")"
+_inner="$(first_in "$_rs" "$_re" 'done < <(find "$root" -type f')"
+_outer="$(first_in "$_rs" "$_re" 'done < <(macos_share_roots "$vm")')"
+if [[ -n "$_pf" && -n "$_inner" && -n "$_outer" ]]; then
+    ok "the accumulation loop is locatable (printf $_pf, inner done $_inner, outer done $_outer)"
+else fail "the accumulation loop is locatable" "printf='$_pf' inner='$_inner' outer='$_outer' — the three arms below would assert nothing"; fi
+
+if ! sed -n "${_pf}p" "$AUGUR" | grep -qF '>>'; then ok "the \`printf\` carries no redirect of its own"
+else fail "the \`printf\` carries no redirect of its own" "it reopens \$list once per CHANGED FILE, which is ~2x the host-side cost of every sweep (ADR-0016 §Cost)"; fi
+
+if sed -n "${_inner}p" "$AUGUR" | grep -qF '>> "$list"'; then ok "…because the redirect is on the inner loop, so \$list opens once per root"
+else fail "…because the redirect is on the inner loop" "$(sed -n "${_inner}p" "$AUGUR")"; fi
+
+# THE NEGATIVE CONTROL, and it guards something worse than cost. `warn` writes to STDOUT (augur:123),
+# so hoisting the redirect one level further — onto the loop over the SHARE ROOTS — would put any
+# warning added to that body INTO the NUL path list, and the guest would be handed a path built from
+# a sentence. macos_share_roots documents the same trap at its own `error`-not-`warn` line. One open
+# per root is already almost all of the win, so the remaining three opens do not buy that risk.
+if ! sed -n "${_outer}p" "$AUGUR" | grep -qF '>>'; then ok "…and NOT on the outer loop, where a \`warn\` would land in the NUL list"
+else fail "…and NOT on the outer loop" "warn writes to stdout, so a warning in that body becomes a path the guest is told to msync"; fi
+
 finish

@@ -97,7 +97,7 @@ implementation shipped the bug until a test caught it.
 | | Measured |
 |---|---|
 | Host-side detection | 0.31 s (`find -newer`, 12,626 files) |
-| Host-side list accumulation | ~130 µs per **changed** file (2026-07-28 snapshot, item 37) |
+| Host-side list accumulation | ~130 µs per **changed** file (2026-07-28 snapshot, item 37) — **superseded 2026-08-05, see the amendment at the end of this section** |
 | Guest-side invalidation | 0.23 ms per file |
 | Full blind sweep, all five shares | 2.87 s for 12,600 files, zero failures |
 | Realistic incremental sweep | ~10 ms for a few dozen files |
@@ -106,7 +106,10 @@ There is deliberately **no cap** on the changed set. A legitimate one can be lar
 a branch switch), and silently truncating the list would be the same class of failure the surrounding
 work exists to remove.
 
-The second row was **added after the fact** and it corrects this section. The original four rows did
+The second row was **added after the fact** and it corrects this section. *(This paragraph and the one
+after it are kept as written; the reopen they describe was removed on 2026-08-05 and their figures are
+superseded by the amendment at the end of this section. They are the reasoning the amendment reversed,
+and are the reason the dial exists at all.)* The original four rows did
 not measure the shell loop that builds the path list, which appends once per changed file and reopens
 the list file each time — ~99 % of the host-side cost. Adding it to the guest's 0.23 ms, both paid
 serially, one sweep costs **~0.36 ms per changed file end to end**, so past roughly **14,000** changed
@@ -126,6 +129,39 @@ conservative end**, which is the one quoted in the code, `--help` and the README
 figure of 30–40k is a third thing again: it is the host-side term *alone*, with the guest's share
 excluded. Nothing here rests on the exact crossing; what it rests on is that a crossing exists at a
 count no adversary is needed to reach, which all three readings agree on.
+
+**Amendment (2026-08-05): the accumulation row was a defect, not a floor.** The loop that builds the
+path list held its `>> "$list"` redirect on the `printf`, so it reopened the list file once per
+changed file. Moving the redirect onto the enclosing `while … done` — one open per **root** instead
+of one per **file** — is the entire change. Re-measured through `_refresh_macos_shares_locked` itself
+with `ssh_macos` stubbed, so the reading is the host half alone; 12,628 files across four roots,
+bash 3.2, best of three runs:
+
+| | before | after |
+|---|---|---|
+| Host-side term (`find` + accumulation) | 122.0 µs per changed file | **64.7 µs** |
+| Full blind sweep of a 12,628-file tree | 1541 ms | **817 ms** |
+| End to end, with the guest's 0.23 ms | ~0.35 ms per changed file | **~0.29 ms** |
+| Crossing point against the 5 s interval | ~14,200 changed files | **~17,000** |
+
+**It does not retire the dial**, and that is the part worth keeping in view: the guest's 0.23 ms is
+untouched by any host-side change and is now ~78% of the total, so halving the host half bought ~20%
+on the crossing point and nothing more. §4's `--share-refresh` argument stands unchanged. It also
+does not help the common case — a realistic incremental sweep is a few dozen files, where the saving
+is well under a millisecond. What it helps is the large sweep: a branch switch, a build, and the
+first blind sweep on a fresh marker.
+
+The redirect sits on the **inner** loop, not the outer one, and that is load-bearing rather than
+stylistic: `warn` writes to **stdout**, so a redirect spanning the outer body would put any warning
+added there into the NUL path list and hand the guest a path built from a sentence. That is the same
+trap `macos_share_roots` documents at its own `error`-not-`warn` line. Byte-equivalence with the
+per-`printf` form was checked against paths containing spaces, tabs, embedded newlines, quotes,
+non-ASCII and a leading dash — identical bytes, identical NUL count.
+
+**Measured in a Virtualization.framework guest (`hw.model VirtualMac2,1`) on its local APFS, not on a
+real host.** That is the one caveat on the absolute figures; the *ratio* is a property of the shell
+loop and does not depend on it. The 122.0 µs "before" reading corroborates the snapshot's ~130 µs
+from a different machine and a different method, which is what makes the comparison usable at all.
 
 ## 3. Placement, and why the order is load-bearing
 

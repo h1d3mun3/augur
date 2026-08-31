@@ -345,8 +345,8 @@ that changed: at every attach (`up`/`claude`/`shell --macos`), and again every *
 the VM runs, which is the only thing that makes a host edit reach an agent that is *already running*.
 See [`docs/decisions/0016-shared-file-cache-refresh.md`](docs/decisions/0016-shared-file-cache-refresh.md).
 
-The cost scales with the number of **changed** files (~0.36 ms each, host + guest, paid serially), and
-nothing caps that number — past roughly 14,000 changed files one sweep outlasts the 5 s interval and
+The cost scales with the number of **changed** files (~0.29 ms each, host + guest, paid serially), and
+nothing caps that number — past roughly 17,000 changed files one sweep outlasts the 5 s interval and
 the loop starts running most of the time on one core. An `npm install`, a big `git checkout` or a full
 build can get there. Two run-scoped flags, written after the command:
 

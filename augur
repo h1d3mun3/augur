@@ -1026,7 +1026,7 @@ require_safe_workspace() {
 #
 # One file per project, for the settings whose right value is a property of THE REPO rather than of
 # the run — today the two macOS share-refresh knobs, whose cost scales with the project's
-# changed-file count (~0.36 ms each, so past roughly 14,000 changed files one sweep outlasts the
+# changed-file count (~0.29 ms each, so past roughly 17,000 changed files one sweep outlasts the
 # default 5 s interval; see _MACOS_REFRESH_MODE). Without this, an operator whose repo is big enough
 # to need `--share-refresh attach` has to type it on every command, forever.
 #
@@ -3581,14 +3581,21 @@ _MACOS_SWEEP_NOWORK=4    # nothing had changed since the last sweep, so the gues
 # WHY THERE IS A DIAL AT ALL. The "no cap" paragraph above is right about the SWEEP and wrong about
 # the whole. It measures the guest-side invalidation (0.23 ms/file) and the host-side `find` (0.31 s
 # for 12,626 files) and concludes "bounded at seconds" — but it never measured the host-side loop
-# that ACCUMULATES the list (see _refresh_macos_shares_locked, which appends once per changed file
-# and reopens the list file every iteration). The 2026-07-28 security snapshot did: ~130 µs per
-# changed file, i.e. ~99% of the host-side cost. Added to the 0.23 ms the guest pays for the same
-# file, and both are paid serially, one sweep costs ~0.36 ms per changed file end to end. Past
-# roughly 14,000 changed files a single sweep therefore exceeds the default 5 s interval, and the
-# loop — which sleeps THEN sweeps — degrades into a rising duty cycle on one host core for the
-# lifetime of the VM. 14,000 needs no adversary: `npm install`, a large `git checkout` or a full
-# build reach it, and augur's own repo is 12,626 files.
+# that ACCUMULATES the list. The 2026-07-28 security snapshot did: ~130 µs per changed file, i.e.
+# ~99% of the host-side cost — because that loop reopened the list file once per changed file. IT NO
+# LONGER DOES: the redirect now sits on the loop rather than on the printf (see
+# _refresh_macos_shares_locked), and the host-side term re-measured through that same function is
+# 64.7 µs per changed file, down from 122.0. Added to the 0.23 ms the guest pays for the same file,
+# both still paid serially, one sweep now costs ~0.29 ms per changed file end to end, down from
+# ~0.35 ms. Past roughly 17,000 changed files a single sweep therefore exceeds the default 5 s
+# interval — it was ~14,200 before that fix — and the loop, which sleeps THEN sweeps, degrades into
+# a rising duty cycle on one host core for the lifetime of the VM.
+#
+# THE FIX DID NOT RETIRE THIS DIAL and the numbers are quoted above so that stays checkable: the
+# guest's 0.23 ms per file is untouched by anything host-side and is now ~78% of the total, so
+# halving the host half bought ~20% on the crossing point and nothing more. 17,000 still needs no
+# adversary: `npm install`, a large `git checkout` or a full build reach it, and augur's own repo is
+# 12,626 files.
 #
 # THREE MECHANISMS, and an operator turning the cost down has to be able to say WHICH:
 #
@@ -3851,11 +3858,32 @@ _refresh_macos_shares_locked() {
         roots=$((roots+1))
         [[ -d "$root" ]] || continue
         scanned=$((scanned+1))
+        # THE REDIRECT IS ON THE LOOP, NOT ON THE `printf`, so `$list` is opened once per ROOT
+        # instead of once per CHANGED FILE. That reopen was most of the host-side cost and it is what
+        # ADR-0016 §Cost's "~130 us per changed file" measured. Re-measured through this very function
+        # (ssh_macos stubbed, so it is the host half only), 12,628 files across four roots, bash 3.2:
+        # 122.0 -> 64.7 us per changed file, 1541 -> 817 ms for a full blind sweep of a repo this size.
+        #
+        # It does NOT retire the dial, and saying so here is the point: the guest's own 0.23 ms per
+        # file is untouched by this and is ~78% of what is left, so the crossing point where one sweep
+        # outlasts the 5 s interval moves only ~14,200 -> ~17,000 changed files. ADR-0016 §Cost carries
+        # the arithmetic and the caveat that this reading was taken in a guest, not on a real host.
+        #
+        # NOT on the OUTER loop, and that is not a style choice. `warn` writes to STDOUT (augur:123),
+        # so a redirect spanning the outer body would put any warning added there INTO the NUL path
+        # list, and the guest would be handed a path built from a sentence — the exact trap
+        # macos_share_roots documents at its own `error`-not-`warn` line. This body is one
+        # assignment, one printf and one increment, and can be checked by eye to emit nothing else.
+        #
+        # Still no subshell: a redirection on a compound command does not fork, so `n`, `roots` and
+        # `scanned` keep accumulating in the CURRENT shell, which is what the comment above relies on.
+        # Byte-equivalence with the per-printf form was checked against paths containing spaces, tabs,
+        # embedded newlines, quotes, non-ASCII and a leading dash: identical bytes, identical NUL count.
         while IFS= read -r -d '' f; do
             rel="${f#"$root"/}"
-            printf '/Volumes/My Shared Files/%s/%s\0' "$name" "$rel" >> "$list"
+            printf '/Volumes/My Shared Files/%s/%s\0' "$name" "$rel"
             n=$((n+1))
-        done < <(find "$root" -type f ${find_age[@]+"${find_age[@]}"} -print0 2>/dev/null)
+        done < <(find "$root" -type f ${find_age[@]+"${find_age[@]}"} -print0 2>/dev/null) >> "$list"
     done < <(macos_share_roots "$vm")
 
     # `n == 0` used to mean two different things, and only one of them is good news:
@@ -6631,7 +6659,7 @@ cmd_help() {
     echo -e "    • macOS shared-file refresh: a macOS guest's virtiofs client serves ${BOLD}stale file data${RESET} after a"
     echo -e "      host edit, with no timeout (issues #124/#135; still present on macOS 26.6). augur invalidates"
     echo -e "      the changed files at each attach and every ${CYAN}5${RESET}s while the VM runs. Cost scales with the"
-    echo -e "      CHANGED-file count (~0.36 ms each, host + guest), so a repo where one sweep outlasts the"
+    echo -e "      CHANGED-file count (~0.29 ms each, host + guest), so a repo where one sweep outlasts the"
     echo -e "      interval should use ${CYAN}--share-refresh attach${RESET} (sweep on attach, no loop) rather than a longer"
     echo -e "      interval. ${CYAN}--share-refresh off${RESET} disables the mitigation entirely. See ADR-0016."
     echo -e "    • ${BOLD}augur refresh --macos${RESET} sweeps once, on demand, against the VM that is already running —"
