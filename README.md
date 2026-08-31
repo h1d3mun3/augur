@@ -281,11 +281,6 @@ augur version --macos   # show augur version (macOS mode)
 augur up --macos --share-refresh attach            # keep the attach-time sweep, stop the 5s loop
 augur up --macos --share-refresh off               # stop the shared-file refresh entirely
 augur up --macos --share-refresh-interval 15       # same loop, longer period (default: 5)
-
-augur config --share-refresh attach                # …and persist that, for THIS project only
-augur config --share-refresh-interval 30           # (host-side; the guest cannot read or write it)
-augur config --show                                # effective values + which layer set each
-augur config --unset share_refresh                 # back to the default
 ```
 
 ### Authentication
@@ -361,61 +356,18 @@ the attach sweep runs once, in front of you, and still leaves the guest fresh wh
 is the full escape hatch — with it the guest can read stale files indefinitely and nothing will say
 so, so `augur down --macos && augur up --macos` becomes the remedy again.
 
-As a **flag** the setting is per run: pass it on each of `up`, `claude`, `shell` and
+The setting is **per run**, not remembered: pass it on each of `up`, `claude`, `shell` and
 `setup-token --macos`. Any of those will stop a loop an earlier `up` left running, so you can drop the
 cost mid-session by re-attaching with `augur claude --macos --share-refresh attach`. Anything but the
 default prints a warning on every such run, naming the issues and how to restore it.
-`augur status --macos` prints two lines: what *this* command line asks for (and which layer it came
-from), and — measured — whether a refresh loop is actually running and how long ago the last sweep
-completed. To stop retyping it, persist it with `augur config` (below).
+`augur status --macos` prints two lines: what *this* command line asks for, and — measured — whether a
+refresh loop is actually running and how long ago the last sweep completed.
 
-`--share-refresh-interval <seconds>` changes the loop's period (a positive integer). `0` is refused
-rather than treated as "off" — use `--share-refresh attach` or `off`, which say what they mean. A bad
+`--share-refresh-interval <seconds>` changes the loop's period (a positive integer; the env var
+`AUGUR_MACOS_REFRESH_INTERVAL` does the same and the flag wins). `0` is refused rather than treated as
+"off" — use `--share-refresh attach` or `off`, which say what they mean. A bad
 `AUGUR_MACOS_REFRESH_INTERVAL` is only refused on the commands that start the loop; `down`, `destroy`,
 `status` and `list` keep working, because those are how you stop a loop a bad value is spinning.
-
-### Persisting it per project (`augur config`)
-
-The right mode depends on **how many files your repo changes**, which is a property of the repo, not
-of the run — so an operator who needs `attach` should not retype it forever:
-
-```bash
-augur config --share-refresh attach          # for this project, from now on
-augur config --share-refresh-interval 30
-augur config --show
-augur config --unset share_refresh
-```
-
-```
-Project:                /Users/hidemune/GitHub/big-monorepo
-Settings file:          ~/.augur/project-settings/big-monorepo-908d688ef046.conf
-
-share_refresh           attach      (settings file)
-share_refresh_interval  5           (default)
-```
-
-**Precedence: flag > settings file > `AUGUR_MACOS_REFRESH_INTERVAL` > built-in default**, and
-`--show` names the winning layer for each key — with four of them, "which layer won" is the only
-useful answer to "why is my edit not showing up". The file beats the env var because the export's one
-persistent home is a shell profile, i.e. every project in every shell, while the file is one project
-you chose; a stale export must not quietly override it.
-
-The file is **host-side**, under `~/.augur/project-settings/`, keyed on the project's full path — and
-deliberately **not** `./.augur/`. That directory is inside the read-write share, so the guest can
-write it, and a guest that can set its own `share_refresh` can switch off the mechanism that keeps
-your view of that guest honest. `~/.augur` is in no share, in either engine. `.augur/resources.conf`
-being guest-writable is not a counter-example: inflating its own VM is a request you *see applied*,
-while silencing a freshness check is invisible by construction. See ADR-0016 §6.1.
-
-`augur config` needs no `--macos` (it writes a file and boots nothing) and is not a VM command, so it
-works on a host with no VM backend. A malformed value in the file **warns and is ignored** — it never
-refuses a command, because unlike an export this file survives `destroy --macos`, so a refusal would
-be permanent and would take `augur down --macos` with it. Unknown keys are warned about, ignored, and
-preserved on rewrite, so an older augur cannot eat a newer one's setting.
-
-`destroy --macos` does **not** delete it. It reaps VM state; this is your intent about the project,
-and `destroy --macos && up --macos` is a remedy augur itself recommends. `augur config --unset`
-is the only thing that removes it.
 
 ### Refreshing on demand (`augur refresh --macos`)
 
@@ -442,14 +394,12 @@ invalidate, and the `up` that would start it sweeps on the way in anyway. If the
 the host cannot reach it (gvproxy down), it says *that*, rather than reporting a sweep it could not
 make.
 
-It works under **`off`** — that mode means "don't refresh on your own", not "never refresh", so
-`augur refresh --macos` sweeps rather than silently doing nothing. That matters most for a mode you
-**persisted**: `augur config --share-refresh off` applies to every command in the project, so this is
-the command that gets an edit into the guest without turning the loop back on, and it is what keeps
-`off` a setting rather than a one-way door. It then prints one line saying the automatic refresh is
-still off — naming the settings file and `augur config --unset share_refresh` if that is where the
-mode came from, rather than talking about a flag you did not type — so a successful manual sweep
-cannot be mistaken for `off` having lapsed. Unlike the attaching commands it does *not* stop a refresh loop an earlier `up`
+It works under **`--share-refresh off`** — that mode means "don't refresh on your own", not "never
+refresh", so `augur refresh --macos --share-refresh off` still sweeps rather than silently doing
+nothing. (The mode is not remembered between runs: a plain `augur refresh --macos` is `continuous`
+for that one command whatever you launched the VM with, so it sweeps either way.) It then prints one
+line saying the automatic refresh is still off, so a successful manual sweep cannot be mistaken for
+`off` having lapsed. Unlike the attaching commands it does *not* stop a refresh loop an earlier `up`
 left running: it makes no claim about one, and `augur status --macos` is where that half is measured.
 Stopping the loop stays with `--share-refresh attach|off` on `up`/`claude`/`shell`, or with
 `augur down --macos`.

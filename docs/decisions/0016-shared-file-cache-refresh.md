@@ -397,8 +397,7 @@ to invalidate. It does not apply to the read-write workspace. Tracked separately
 read-only shares.
 
 **A config file for the refresh mode, instead of the `--share-refresh` flag.** Both candidate layers
-were considered and rejected, and this is recorded because it will be proposed again. **The second of
-the two has since been adopted — see §6.1 — and the first has not.**
+were considered and rejected, and this is recorded because it will be proposed again.
 
 - `./.augur/allowlist.conf` — the project layer — lives **inside the mounted read-write workspace**,
   so the guest can write it. A mode read from there would let a compromised guest, or a
@@ -412,8 +411,7 @@ the two has since been adopted — see §6.1 — and the first has not.**
   per-project host state already uses) has no such hole. It was rejected on cost and on fit: it needs
   a whole `augur config` surface before an operator can use it, and the right value depends on the
   **host's** CPU as much as on the repo's file count, so a value committed with the project is wrong
-  on the next machine. *(Both objections are answered in §6.1; this bullet is kept as written so the
-  reversal can be read against what it reversed.)*
+  on the next machine.
 
 A launch-time flag has neither problem — the value comes from the operator, in the clear, per run —
 and it is where this repo already puts run-scoped options (`--egress`, `--no-egress`, `--gui`).
@@ -425,103 +423,3 @@ at which "this repo is too big for a 5 s loop" is never the right answer.
 **Waiting.** The previous record advised `down --macos && up --macos` and described the delay as
 resolving "before the 10-minute mark". There is no timeout; waiting is the one thing that does not
 work. Corrected in ADR-0013 and `README.md`.
-
-### 6.1 The host-side per-project file, adopted — and why the repo layer is still refused
-
-The second bullet above was rejected on **cost** ("needs a whole `augur config` surface") and on
-**fit** ("a value committed with the project is wrong on the next machine"). The cost has been paid:
-`augur config` exists. The fit objection was answered by the same fact that removes the security
-hole — the file is **host-side**, so it never travels with the project, and a value set on one machine
-is a value set on that machine only. Neither objection ever applied to the *location*.
-
-    ~/.augur/project-settings/<slug>-<workspace_path_hash>.conf
-
-    # augur project settings — written by `augur config`. Host-side; never read from the workspace.
-    # workspace: /Users/hidemune/GitHub/big-monorepo
-    share_refresh=attach
-    share_refresh_interval=30
-
-Line 2 is not decoration. The filename carries a 12-character hash, which identifies nothing to a
-human; `~/.augur/project-hashes/` already has that problem, and this comment is the only place the
-hash → path mapping exists.
-
-**The first bullet stands, unchanged, and this is the paragraph to read before proposing `./.augur/`
-again.** It is the obvious guess — every other per-project knob in augur lives there — and it is
-wrong for one reason that has nothing to do with convenience: `./.augur/` is inside `$WORKSPACE_DIR`,
-which is mounted **read-write** into the guest, so the guest can write it. A `share_refresh` read from
-there lets a compromised guest, or a prompt-injected agent, **switch off the mechanism that keeps the
-operator's view of the guest's own filesystem honest** — and it composes with the 2026-07-28
-snapshot's item 39(a), where the sweep's round trip invokes an unpinned `python3` in the guest: the
-guest could fabricate the refresh report *and* disable the tripwire that would notice the report was
-fiction. `.augur/resources.conf` being guest-writable is not a precedent for it: inflating your own VM
-is a self-serve request the operator **sees applied** on the next `up`, whereas silencing a freshness
-mitigation is invisible by construction, which is the whole reason the mode warns on every run (#148).
-
-That `~/.augur` is out of the guest's reach is a property of the code and was verified against it
-rather than assumed: it appears in none of `cmd_up_macos`'s four `--dir=` shares and none of
-`cmd_up`'s six `-v` mounts, and `require_safe_workspace` refuses any `$WORKSPACE_DIR` that is,
-contains, or lives inside it. `tests/44_macos_project_settings.sh` re-derives the mount argv and
-tests containment, so a fifth share cannot land silently.
-
-**Precedence: `--flag` > settings file > `AUGUR_MACOS_REFRESH_INTERVAL` > built-in default.** The
-env-vs-file half is a real decision, and it **inverts** the only existing precedent in the codebase:
-`resolve_macos_vm_cpu` puts `AUGUR_MACOS_VM_CPU` *above* `.augur/resources.conf`'s `MACOS_CPU`. That
-ordering is a **trust** ordering, stated at `clamp_resource_int` — the resources file is
-guest-writable and the export is the operator's, so the trusted layer must win. This file is
-host-side and written only by an augur command, so it is exactly as trusted as the export, and what
-is left to order on is **scope**:
-
-- the export's one persistent home is a shell profile, i.e. per **host** and across every project.
-  §6 above already gives that as the reason no env peer was added for the *mode*: it is "the one scope
-  at which 'this repo is too big for a 5 s loop' is never the right answer". A layer that reasoning
-  rejects as wrongly scoped for the mode cannot outrank a per-project file for the period either.
-- the file is per project and deliberate: it exists only because someone ran `augur config` in that
-  directory, and it records that directory's path.
-- the concrete case is the one §2's dispatch-tail gate already complains about — a **stale**
-  `AUGUR_MACOS_REFRESH_INTERVAL` in a profile. Under env > file it would silently override the value
-  set for the one repo that needed it, in every shell the operator owns.
-
-Neither direction is silent: `augur config --show` names the winning layer for both keys, and
-`status --macos` names it for the mode.
-
-**Two traps had to be closed before any of this could work**, and both were invisible with only two
-layers. `_MACOS_REFRESH_MODE=continuous` was a plain assignment, so `--share-refresh continuous` and
-an empty command line were indistinguishable — a file layer would have overruled the *explicit* flag
-for exactly the value used to escape a persisted `off`. And
-`_MACOS_REFRESH_INTERVAL="${AUGUR_MACOS_REFRESH_INTERVAL:-5}"` collapsed the env layer into the
-default, which additionally made the validator's `AUGUR_MACOS_REFRESH_INTERVAL` attribution right only
-by accident: with a file layer above it, a bad *file* value would have sent the operator to `unset` an
-export that was not the problem. Both are closed by a per-setting provenance variable, which the
-`--show` output, the `status` line, the launch warning's remedy and the validator's blame all read
-from — so no two of them can name different layers.
-
-**A broken file warns; it does not refuse, and it does not fall back silently.** Silence is #148 with
-a different cause: someone who wrote a setting and sees no effect concludes the feature is broken. A
-refusal is worse than it is for a bad export, in the one direction that matters — `unset` fixes an
-export, while this file is deliberately **not** reaped by `destroy --macos`, so a refusal would be
-permanent and would take `down --macos` with it. Rejected values are therefore dropped in favour of
-the next layer down, named, and paired with the `augur config` line that clears them. The hard
-refusal keeps its existing `up|claude|shell|setup-token` gate untouched.
-
-**`destroy --macos` does not delete it.** Everything that command reaps is VM state — the clone, its
-pinned host key, the profile and sweep markers, a lock, the refresher logfile — and several are
-actively harmful if they outlive the clone. This file is operator intent about the *project*, recorded
-because the project's changed-file count made the default loop too expensive, which a re-clone does
-not change. Reaping it would also undo the operator's configuration on the exact command line these
-warnings recommend (`destroy --macos && up --macos`). `augur config --unset` is the only thing that
-removes it.
-
-**`augur refresh --macos` changes size, and the paragraph in §5 that sized it is now wrong.** That
-reasoning was: the mode has no env layer and is re-derived per run, so an operator who *launched*
-with `off` and later types a bare `augur refresh --macos` is back in `continuous` for that command
-and would sweep through the gated entry point anyway — leaving the ungated entry load-bearing for
-exactly one command line, the one that repeats the flag. A persisted mode removes the "per run"
-premise the whole argument rested on. `share_refresh=off` written once is resolved by the dispatch
-tail for **every** macOS command in that project, so a bare `augur refresh --macos` is in `off` too,
-`share_refresh_enabled` is false, and the gated entry sweeps nothing. The ungated entry is therefore
-load-bearing for **every manual refresh in a configured project** — the ordinary use of the command,
-not an edge case — and it is what keeps `augur config --share-refresh off` a setting rather than a
-one-way door. Its warning names the layer for the same reason the launch warning does: "off for this
-run" describes a flag, and a mode out of the file was never on the command line. This is the one
-command an operator reaches while already asking *what is off, and where did that come from*, so it
-answers both, and points at `augur config --unset share_refresh`.
