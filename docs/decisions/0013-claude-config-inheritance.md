@@ -147,23 +147,41 @@ who ships no `settings.json` never has one written.
 **Freshness is NOT symmetric across the two modes.** Container mode reaches the profile through an
 Apple Container **bind mount**, and a host-side edit is visible immediately (verified on real
 hardware). macOS VM mode reaches it through a **virtiofs share**
-(`VZVirtioFileSystemDeviceConfiguration` + `VZSharedDirectory(readOnly: true)`, see
-`augur-vm/Sources/augur-vm/RunSession.swift`), and there a host-side edit is **not** visible to the
-guest for minutes. Measured on real hardware: still stale 2 minutes after the write, visible some
-time before the 10-minute mark. augur holds no cache of its own — `ensure_macos_claude_profile` only
-`ln -sfn`s and `cp`s — and Virtualization.framework exposes **no** cache-control knob for these
-shares (Apple's documentation is silent on caching entirely; `isReadOnly` is documented purely as
-access control). The workaround is `down --macos && up --macos`, which is correct *by construction*:
-`cmd_up_macos` builds a brand-new VM and share device every time.
+(`VZVirtioFileSystemDeviceConfiguration`, see `augur-vm/Sources/augur-vm/RunSession.swift`), and
+there the guest's virtiofs client keeps serving stale file data after a host-side edit. augur holds
+no cache of its own — `ensure_macos_claude_profile` only `ln -sfn`s and `cp`s — and
+Virtualization.framework exposes **no** cache-control knob for these shares (Apple's documentation
+is silent on caching entirely; `isReadOnly` is documented purely as access control). The workaround
+is `down --macos && up --macos`.
+
+**This is a platform defect, and it is not about the profile.**
+[ADR-0017](./0017-accept-virtiofs-staleness.md) is the record of it, and supersedes what this
+paragraph originally claimed. Three corrections matter to anyone acting on this ADR:
+
+- It is **not** specific to read-only shares. The read-write workspace share behaves identically
+  ([#135](https://github.com/h1d3mun3/augur/issues/135)) — so do not go looking for a `readOnly`
+  knob, and do not assume the profile is the only affected surface.
+- There is **no timeout**. An earlier revision of this paragraph said the content becomes visible
+  "some time before the 10-minute mark"; measured, one arm stayed stale for 904.9 s with zero
+  natural refreshes and cleared only when a guest vnode reclaim was forced.
+- `down && up` works because the **guest reboots with an empty vnode cache**, not because
+  `cmd_up_macos` builds a new share device — this paragraph originally called that correct "by
+  construction", which pointed at the wrong layer. Virtualization.framework cannot rebuild a share
+  device on a live VM anyway (`config.directorySharingDevices` is assigned once, at boot).
+
+ADR-0017 carries the full measurements, the `msync(MS_INVALIDATE)` mitigation that was built
+([ADR-0016](./0016-shared-file-cache-refresh.md)) and then withdrawn, and the conditions that would
+bring it back.
 
 Accepted rather than fixed in this change, because the profile is not edited often, the workaround
 is exact, and the alternative is a real redesign — pushing the tree from the host over SSH instead
 of mounting it, which would also require re-implementing deletion tracking and the `.pre-profile`
 rescue. Tracked as a follow-up. Two things about it are worth recording now: that redesign would let
 the share be **dropped entirely** (stronger isolation than read-only, since the guest could no
-longer reach the host directory at all), and the same staleness plausibly affected the **former
-`gh-config` read-only share**, which had this property since `:ro` support landed (2026-06-28,
-`213aa24`) without anyone noticing — that share's content simply changed too rarely to surface it.
+longer reach the host directory at all), and the same staleness affected the **former `gh-config`
+read-only share** — recorded here as "plausible" and **confirmed 2026-07-28** — which had this
+property since `:ro` support landed (2026-06-28, `213aa24`) without anyone noticing, because that
+share's content changed too rarely to surface it.
 **That share is gone from macOS mode, 2026-08-31**: it was created and mounted, but nothing ever
 wired it to `~/.config/gh` inside the VM, so the host's `gh` aliases, `git_protocol` and GHE host
 were silently ignored there while `config.yml` and `hosts.yml` were readable by the guest — exposure
@@ -172,12 +190,21 @@ on a macOS host gh keeps the token in the Keychain rather than in `hosts.yml`. C
 untouched and is where the feature actually works, mounting at `/home/dev/.config/gh`, the real
 path. Wiring it properly for macOS would be a feature addition, not a fix.
 
-**UNVERIFIED and load-bearing for any future fix:** whether `readOnly: true` is the causal variable
-at all. No test has compared a read-write virtiofs share in the *same VM* against a read-only one.
-The read-write shares (workspace, `claude-projects`, `claude-agents`) are *presumed* live — strongly
-so, since a stale workspace would mean the agent reads stale source code, which macOS-mode users
-would have noticed — but presumption is not verification. An idle/time-based staleness affecting
-every share, read-only or not, has not been ruled out.
+**~~UNVERIFIED and load-bearing for any future fix:~~ REFUTED.** This ADR originally recorded that
+it was unknown whether `readOnly: true` is the causal variable, and that the read-write shares
+(workspace, `claude-projects`, `claude-agents`) were *presumed* live — "strongly so, since a stale
+workspace would mean the agent reads stale source code, which macOS-mode users would have noticed."
+
+Both halves were settled and both were wrong. `readOnly` is not causal: an Apple Container guest on
+the same host, reading the same directory over a mount that is *also* `virtiofs (ro,relatime)`, sees
+current content live, so the variable is the guest-side virtiofs client. And the read-write shares
+are not live — they go stale and come back together with the read-only ones
+([#135](https://github.com/h1d3mun3/augur/issues/135), ADR-0017).
+
+**The reasoning behind the presumption is the part worth keeping.** "Users would have noticed" felt
+like evidence and was not: the defect is silent, so there was nothing to notice. A stale read
+returns plausible bytes, and — measured — a stale file reports a *current* `size` and `mtime` while
+`read` returns the old contents, so even a check built on metadata agrees with the wrong answer.
 
 **Wiring is non-destructive.** A real `~/.claude/commands` or `~/.claude/skills` the *guest* created
 before the profile existed is moved aside to `<name>.pre-profile`, never deleted (an empty one is

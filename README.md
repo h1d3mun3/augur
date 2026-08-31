@@ -130,14 +130,29 @@ What you get instead is a directory you populate on purpose:
 - **Your own files are never deleted.** If the guest already had a real `~/.claude/commands` or
   `~/.claude/skills` when you first populate the profile, augur moves it aside to
   `<name>.pre-profile` rather than replacing it (an empty one is simply dropped).
-- **macOS VM mode caveat — profile edits need a VM restart.** The profile works there (it is shared
-  read-only into the VM and wired the same way), but macOS mode reaches it over a **virtiofs share**
-  rather than a bind mount, and a read-only virtiofs share serves the guest **stale content for
-  minutes** after a host-side edit. Measured on real hardware: still stale 2 minutes after the
-  write; visible some time before the 10-minute mark. So if you change the profile while a VM is
-  running, run `augur down --macos && augur up --macos` to pick it up — a fresh `vm run` rebuilds
-  the share device and is guaranteed to see current content. Container mode is unaffected.
-  See [issue #124](https://github.com/h1d3mun3/augur/issues/124).
+- **macOS VM mode caveat — host-side edits need a VM restart.** The profile works there (it is
+  shared read-only into the VM and wired the same way), but macOS mode reaches it over a **virtiofs
+  share** rather than a bind mount, and the macOS guest's virtiofs client keeps serving **stale file
+  data** after a host-side edit. So if you change the profile while a VM is running, run
+  `augur down --macos && augur up --macos` to pick it up. Container mode is unaffected.
+
+  Three things are worth knowing, because each is the opposite of what seems reasonable:
+
+  - **It is not specific to read-only shares.** The read-write workspace share behaves identically,
+    so this is not only about the profile — edit a source file on the host and a running guest may
+    keep reading the old bytes.
+  - **There is no timeout to wait out.** One measured case stayed stale for **904.9 s** with zero
+    natural refreshes; every share then went fresh together 10.3 s after a guest vnode reclaim was
+    forced. Waiting is the one remedy that does not work.
+  - **`down && up` works because the guest reboots with an empty vnode cache**, not because a fresh
+    `vm run` rebuilds the share device — Virtualization.framework cannot rebuild a share device on a
+    live VM in any case.
+
+  This is a platform defect, and augur accepts it rather than working around it — see
+  [ADR-0017](./docs/decisions/0017-accept-virtiofs-staleness.md) for the measurements, the
+  mitigation that was tried and withdrawn, and what would bring it back.
+  Issues [#124](https://github.com/h1d3mun3/augur/issues/124) and
+  [#135](https://github.com/h1d3mun3/augur/issues/135).
 
 Your **repository's** own `.claude/settings.json`, `CLAUDE.md`, `.claude/commands/`,
 `.claude/skills/` and `.mcp.json` already work with no setup — they arrive inside the workspace
