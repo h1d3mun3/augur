@@ -125,9 +125,6 @@ require_vz()        { :; }
 macos_vm_exists()   { return 0; }
 macos_vm_running()  { return 0; }
 start_gvproxy()     { echo "start_gvproxy" >> "$LOG"; }
-# Spawns a real background loop if left unstubbed — see tests/43 for its own coverage.
-start_share_refresher() { echo "start_share_refresher" >> "$LOG"; }
-stop_share_refresher()  { echo "stop_share_refresher" >> "$LOG"; }
 stop_gvproxy()      { :; }
 stop_proxy()        { :; }
 wait_for_macos_ssh() { return 1; }   # would fail loudly if the branch ever fell through
