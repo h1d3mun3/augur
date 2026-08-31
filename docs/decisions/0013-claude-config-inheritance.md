@@ -161,9 +161,16 @@ is exact, and the alternative is a real redesign — pushing the tree from the h
 of mounting it, which would also require re-implementing deletion tracking and the `.pre-profile`
 rescue. Tracked as a follow-up. Two things about it are worth recording now: that redesign would let
 the share be **dropped entirely** (stronger isolation than read-only, since the guest could no
-longer reach the host directory at all), and the same staleness plausibly affects the **existing
-`gh-config` read-only share**, which has had this property since `:ro` support landed (2026-06-28,
-`213aa24`) without anyone noticing — that share's content simply changes too rarely to surface it.
+longer reach the host directory at all), and the same staleness plausibly affected the **former
+`gh-config` read-only share**, which had this property since `:ro` support landed (2026-06-28,
+`213aa24`) without anyone noticing — that share's content simply changed too rarely to surface it.
+**That share is gone from macOS mode, 2026-08-31**: it was created and mounted, but nothing ever
+wired it to `~/.config/gh` inside the VM, so the host's `gh` aliases, `git_protocol` and GHE host
+were silently ignored there while `config.yml` and `hosts.yml` were readable by the guest — exposure
+without a feature. `gh` in the guest is unaffected: `GH_TOKEN` is the auth path on both engines, and
+on a macOS host gh keeps the token in the Keychain rather than in `hosts.yml`. Container mode is
+untouched and is where the feature actually works, mounting at `/home/dev/.config/gh`, the real
+path. Wiring it properly for macOS would be a feature addition, not a fix.
 
 **UNVERIFIED and load-bearing for any future fix:** whether `readOnly: true` is the causal variable
 at all. No test has compared a read-write virtiofs share in the *same VM* against a read-only one.

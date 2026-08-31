@@ -296,7 +296,7 @@ warning, not a failed `up`. See
 |------|-------------|
 | Current directory | exposed at `~/workspace-<project>` in the VM (read/write, virtiofs auto-mount) |
 | `~/.gitconfig` | **copied** on VM start (unlike container mode, which mounts it read-only). augur then rewrites `credential.https://github.com.helper` in **the guest's copy** so HTTPS `git push` works off `GH_TOKEN`; any helper the host set for `github.com` is replaced, including the pair `gh auth setup-git` writes, because those need a host path or the host Keychain the guest does not have. Your host file is never modified. |
-| `~/.config/gh/` | shared **read-only** (token also injected via `GH_TOKEN`) |
+| `~/.config/gh/` | **not shared** in macOS VM mode. It was, but nothing ever wired it to `~/.config/gh` inside the VM, so the config was never read — exposure without a feature. `gh` works there off the injected `GH_TOKEN`, which is the real auth path on a macOS host anyway (the token lives in the Keychain, not in `hosts.yml`). Container mode still mounts it read-only at the guest's real path, where it does work. |
 | Claude history | **only this project's** history is shared, in a per-VM isolated dir (`~/.augur/claude-projects/<vm>`), so other projects' transcripts stay invisible. Cross-mode (container↔macOS) resume is no longer shared. |
 | Claude auth | **not** shared — injected via env (the macOS Keychain is unreadable over SSH; see above) |
 | Everything else | **not visible to the VM** |
