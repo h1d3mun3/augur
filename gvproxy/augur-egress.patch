@@ -1,5 +1,5 @@
 diff --git a/cmd/gvproxy/config.go b/cmd/gvproxy/config.go
-index 7055e9e4..836e9f0c 100644
+index 0b736f14..5e9301e4 100644
 --- a/cmd/gvproxy/config.go
 +++ b/cmd/gvproxy/config.go
 @@ -12,6 +12,7 @@ import (
@@ -90,10 +90,10 @@ index 2588f028..eaa0bb9e 100644
  	if InDebugMode() {
  		g.Go(func() error {
 diff --git a/pkg/services/dns/dns.go b/pkg/services/dns/dns.go
-index 9f86fe8c..2cd329ab 100644
+index 3dd9a5ed..e8ad867c 100644
 --- a/pkg/services/dns/dns.go
 +++ b/pkg/services/dns/dns.go
-@@ -27,6 +27,7 @@ type dnsHandler struct {
+@@ -30,6 +30,7 @@ type dnsHandler struct {
  	zones     []types.Zone
  	zonesLock sync.RWMutex
  	upstream  upstreamResolver
@@ -101,7 +101,7 @@ index 9f86fe8c..2cd329ab 100644
  }
  
  func (h *dnsHandler) handle(w dns.ResponseWriter, r *dns.Msg, responseMessageSize int) {
-@@ -122,6 +123,24 @@ func (h *dnsHandler) addAnswers(m *dns.Msg) {
+@@ -127,6 +128,24 @@ func (h *dnsHandler) addAnswers(m *dns.Msg) {
  			return
  		}
  
@@ -126,7 +126,7 @@ index 9f86fe8c..2cd329ab 100644
  		resolver := h.upstream
  		switch q.Qtype {
  		case dns.TypeA:
-@@ -243,15 +262,21 @@ type Server struct {
+@@ -248,15 +267,21 @@ type Server struct {
  	handler *dnsHandler
  }
  
@@ -418,10 +418,10 @@ index 00000000..0e9194fd
 +	}
 +}
 diff --git a/pkg/services/dns/dns_test.go b/pkg/services/dns/dns_test.go
-index a8df2491..08bc6aef 100644
+index d7fb0f28..7cd0d2c1 100644
 --- a/pkg/services/dns/dns_test.go
 +++ b/pkg/services/dns/dns_test.go
-@@ -24,7 +24,7 @@ var _ = ginkgo.Describe("dns add test", func() {
+@@ -25,7 +25,7 @@ var _ = ginkgo.Describe("dns add test", func() {
  	var server *Server
  
  	ginkgo.BeforeEach(func() {
@@ -430,16 +430,34 @@ index a8df2491..08bc6aef 100644
  	})
  
  	ginkgo.It("should add dns zone with ip", func() {
-@@ -167,7 +167,7 @@ var _ = ginkgo.Describe("dns add test", func() {
+@@ -168,7 +168,7 @@ var _ = ginkgo.Describe("dns add test", func() {
  					},
  				},
  			},
 -		})
 +		}, nil)
- 		server.addZone(types.Zone{
+ 		gomega.Expect(server.addZone(types.Zone{
  			Name: "testing.",
  			Records: []types.Record{
-@@ -375,7 +375,7 @@ func startDNSServer(upstream upstreamResolver) (string, func(), error) {
+@@ -242,7 +242,7 @@ var _ = ginkgo.Describe("dns add test", func() {
+ 	ginkgo.It("should preserve Protected flag when merging into existing zone", func() {
+ 		server, _ = New(nil, nil, []types.Zone{
+ 			{Name: "system.internal.", Protected: true, DefaultIP: net.ParseIP("10.0.0.1")},
+-		})
++		}, nil)
+ 		err := server.addZone(types.Zone{
+ 			Name:    "system.internal.",
+ 			Records: []types.Record{{Name: "api", IP: net.ParseIP("10.0.0.2")}},
+@@ -277,7 +277,7 @@ var _ = ginkgo.Describe("dns zone validation", func() {
+ 				Protected: true,
+ 				DefaultIP: net.ParseIP("192.168.127.1"),
+ 			},
+-		})
++		}, nil)
+ 	})
+ 
+ 	ginkgo.It("should reject empty zone name", func() {
+@@ -603,7 +603,7 @@ func startDNSServer(upstream upstreamResolver) (string, func(), error) {
  		return "", nil, err
  	}
  
@@ -450,10 +468,10 @@ index a8df2491..08bc6aef 100644
  	}
 diff --git a/pkg/services/forwarder/socks_client.go b/pkg/services/forwarder/socks_client.go
 new file mode 100644
-index 00000000..139a641d
+index 00000000..83d1f169
 --- /dev/null
 +++ b/pkg/services/forwarder/socks_client.go
-@@ -0,0 +1,93 @@
+@@ -0,0 +1,106 @@
 +package forwarder
 +
 +// Minimal SOCKS5 client (RFC 1928, no auth) used by augur's egress mode to hand
@@ -466,6 +484,7 @@ index 00000000..139a641d
 +	"fmt"
 +	"io"
 +	"net"
++	"time"
 +
 +	"gvisor.dev/gvisor/pkg/tcpip"
 +)
@@ -473,9 +492,12 @@ index 00000000..139a641d
 +// socksDial connects to the SOCKS5 proxy at socksAddr and issues a CONNECT to the
 +// guest's intended destination (dst:port). The destination is passed as an IP
 +// literal (ATYP 1/4); augur-proxy peeks the TLS SNI / HTTP Host on the stream to
-+// recover the domain and applies its allowlist.
-+func socksDial(socksAddr string, dst tcpip.Address, port uint16) (net.Conn, error) {
-+	c, err := net.Dial("tcp", socksAddr)
++// recover the domain and applies its allowlist. timeout bounds both the dial and
++// the handshake below — without it, a hung/slow augur-proxy (or a peer that never
++// replies) would block this call forever, pinning one of TCP()'s maxInFlight
++// forwarder slots and eventually starving all guest egress.
++func socksDial(socksAddr string, dst tcpip.Address, port uint16, timeout time.Duration) (net.Conn, error) {
++	c, err := net.DialTimeout("tcp", socksAddr, timeout)
 +	if err != nil {
 +		return nil, err
 +	}
@@ -485,6 +507,9 @@ index 00000000..139a641d
 +			_ = c.Close()
 +		}
 +	}()
++	if err := c.SetDeadline(time.Now().Add(timeout)); err != nil {
++		return nil, err
++	}
 +
 +	// Greeting: VER=5, NMETHODS=1, METHOD=0 (no auth).
 +	if _, err := c.Write([]byte{0x05, 0x01, 0x00}); err != nil {
@@ -544,47 +569,53 @@ index 00000000..139a641d
 +		return nil, err
 +	}
 +
++	// Handshake is done; the deadline above must not apply to the data that
++	// flows over this conn afterward.
++	if err := c.SetDeadline(time.Time{}); err != nil {
++		return nil, err
++	}
++
 +	ok = true
 +	return c, nil
 +}
 diff --git a/pkg/services/forwarder/tcp.go b/pkg/services/forwarder/tcp.go
-index ae18ada5..2dd2f5a5 100644
+index 6a1f548a..6333f53d 100644
 --- a/pkg/services/forwarder/tcp.go
 +++ b/pkg/services/forwarder/tcp.go
-@@ -17,7 +17,12 @@ import (
+@@ -23,7 +23,12 @@ const (
+ 	defaultTCPConnectTimeout = 30 * time.Second
+ )
  
- const linkLocalSubnet = "169.254.0.0/16"
- 
--func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mutex, ec2MetadataAccess bool) *tcp.Forwarder {
+-func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mutex, ec2MetadataAccess bool, maxInFlight int, connectTimeout time.Duration) *tcp.Forwarder {
 +// TCP forwards guest TCP connections. When socksUpstream is non-empty (augur
 +// egress mode), every connection is dialed through that SOCKS5 proxy
 +// (augur-proxy) by destination IP instead of directly — so the proxy, not
 +// gvproxy, decides whether the connection is allowed. When empty, behavior is
-+// upstream's: a direct net.Dial.
-+func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mutex, ec2MetadataAccess bool, socksUpstream string) *tcp.Forwarder {
- 	return tcp.NewForwarder(s, 0, 10, func(r *tcp.ForwarderRequest) {
- 		localAddress := r.ID().LocalAddress
- 
-@@ -31,9 +36,16 @@ func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
++// upstream's: a direct net.DialTimeout.
++func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mutex, ec2MetadataAccess bool, maxInFlight int, connectTimeout time.Duration, socksUpstream string) *tcp.Forwarder {
+ 	if maxInFlight <= 0 {
+ 		maxInFlight = defaultTCPMaxInFlight
+ 	}
+@@ -43,9 +48,16 @@ func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
  			localAddress = replaced
  		}
  		natLock.Unlock()
--		outbound, err := net.Dial("tcp", net.JoinHostPort(localAddress.String(), fmt.Sprint(r.ID().LocalPort)))
+-		outbound, err := net.DialTimeout("tcp", net.JoinHostPort(localAddress.String(), fmt.Sprint(r.ID().LocalPort)), connectTimeout)
 +		target := net.JoinHostPort(localAddress.String(), fmt.Sprint(r.ID().LocalPort))
 +		var outbound net.Conn
 +		var err error
 +		if socksUpstream != "" {
-+			outbound, err = socksDial(socksUpstream, localAddress, r.ID().LocalPort)
++			outbound, err = socksDial(socksUpstream, localAddress, r.ID().LocalPort, connectTimeout)
 +		} else {
-+			outbound, err = net.Dial("tcp", target)
++			outbound, err = net.DialTimeout("tcp", target, connectTimeout)
 +		}
  		if err != nil {
--			log.Tracef("net.Dial() = %v", err)
+-			log.Tracef("net.DialTimeout() = %v", err)
 +			log.Tracef("egress dial(%s) = %v", target, err)
  			r.Complete(true)
  			return
  		}
-@@ -48,6 +60,7 @@ func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
+@@ -60,6 +72,7 @@ func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
  			} else {
  				log.Errorf("r.CreateEndpoint() = %v", tcpErr)
  			}
@@ -612,13 +643,13 @@ index 96eee3c6..e3d260d3 100644
  		packet := gopacket.NewPacket(buf, layers.LayerTypeEthernet, gopacket.Default)
  		log.Info(packet.String())
 diff --git a/pkg/types/configuration.go b/pkg/types/configuration.go
-index 0e6a051a..ed99c90f 100644
+index 613b32a1..439392ac 100644
 --- a/pkg/types/configuration.go
 +++ b/pkg/types/configuration.go
-@@ -59,6 +59,19 @@ type Configuration struct {
+@@ -65,6 +65,19 @@ type Configuration struct {
  
- 	// EC2 Metadata Service Access
- 	Ec2MetadataAccess bool `yaml:"ec2MetadataAccess,omitempty"`
+ 	// Timeout in seconds for outbound TCP connection attempts (default: 30)
+ 	TCPConnectTimeout int `yaml:"tcpConnectTimeout,omitempty"`
 +
 +	// augur egress mode. When SocksUpstream is set, all guest TCP is dialed
 +	// through that SOCKS5 proxy (the host-side augur-proxy) instead of directly,
@@ -636,15 +667,15 @@ index 0e6a051a..ed99c90f 100644
  
  type Protocol string
 diff --git a/pkg/virtualnetwork/services.go b/pkg/virtualnetwork/services.go
-index c7bc35c5..d6d01de2 100644
+index 876ff917..44fcafef 100644
 --- a/pkg/virtualnetwork/services.go
 +++ b/pkg/virtualnetwork/services.go
-@@ -25,12 +25,18 @@ func addServices(configuration *types.Configuration, s *stack.Stack, ipPool *tap
- 	var natLock sync.Mutex
+@@ -27,12 +27,18 @@ func addServices(configuration *types.Configuration, s *stack.Stack, ipPool *tap
  	translation := parseNATTable(configuration)
  
--	tcpForwarder := forwarder.TCP(s, translation, &natLock, configuration.Ec2MetadataAccess)
-+	tcpForwarder := forwarder.TCP(s, translation, &natLock, configuration.Ec2MetadataAccess, configuration.SocksUpstream)
+ 	tcpForwarder := forwarder.TCP(s, translation, &natLock, configuration.Ec2MetadataAccess,
+-		configuration.TCPMaxInFlight, time.Duration(configuration.TCPConnectTimeout)*time.Second)
++		configuration.TCPMaxInFlight, time.Duration(configuration.TCPConnectTimeout)*time.Second, configuration.SocksUpstream)
  	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpForwarder.HandlePacket)
 -	udpForwarder := forwarder.UDP(s, translation, &natLock, configuration.Ec2MetadataAccess)
 -	s.SetTransportProtocolHandler(udp.ProtocolNumber, udpForwarder.HandlePacket)
@@ -663,7 +694,7 @@ index c7bc35c5..d6d01de2 100644
  
  	dnsMux, err := dnsServer(configuration, s)
  	if err != nil {
-@@ -80,7 +86,7 @@ func dnsServer(configuration *types.Configuration, s *stack.Stack) (http.Handler
+@@ -82,7 +88,7 @@ func dnsServer(configuration *types.Configuration, s *stack.Stack) (http.Handler
  		return nil, err
  	}
  
