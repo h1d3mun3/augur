@@ -49,3 +49,6 @@ xcUserData/
 
 # OS
 Thumbs.db
+
+# gvproxy build output (gvproxy/build.sh's default OUT path)
+gvproxy/augur-gvproxy
