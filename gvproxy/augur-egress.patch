@@ -468,10 +468,10 @@ index d7fb0f28..7cd0d2c1 100644
  	}
 diff --git a/pkg/services/forwarder/socks_client.go b/pkg/services/forwarder/socks_client.go
 new file mode 100644
-index 00000000..139a641d
+index 00000000..83d1f169
 --- /dev/null
 +++ b/pkg/services/forwarder/socks_client.go
-@@ -0,0 +1,93 @@
+@@ -0,0 +1,106 @@
 +package forwarder
 +
 +// Minimal SOCKS5 client (RFC 1928, no auth) used by augur's egress mode to hand
@@ -484,6 +484,7 @@ index 00000000..139a641d
 +	"fmt"
 +	"io"
 +	"net"
++	"time"
 +
 +	"gvisor.dev/gvisor/pkg/tcpip"
 +)
@@ -491,9 +492,12 @@ index 00000000..139a641d
 +// socksDial connects to the SOCKS5 proxy at socksAddr and issues a CONNECT to the
 +// guest's intended destination (dst:port). The destination is passed as an IP
 +// literal (ATYP 1/4); augur-proxy peeks the TLS SNI / HTTP Host on the stream to
-+// recover the domain and applies its allowlist.
-+func socksDial(socksAddr string, dst tcpip.Address, port uint16) (net.Conn, error) {
-+	c, err := net.Dial("tcp", socksAddr)
++// recover the domain and applies its allowlist. timeout bounds both the dial and
++// the handshake below — without it, a hung/slow augur-proxy (or a peer that never
++// replies) would block this call forever, pinning one of TCP()'s maxInFlight
++// forwarder slots and eventually starving all guest egress.
++func socksDial(socksAddr string, dst tcpip.Address, port uint16, timeout time.Duration) (net.Conn, error) {
++	c, err := net.DialTimeout("tcp", socksAddr, timeout)
 +	if err != nil {
 +		return nil, err
 +	}
@@ -503,6 +507,9 @@ index 00000000..139a641d
 +			_ = c.Close()
 +		}
 +	}()
++	if err := c.SetDeadline(time.Now().Add(timeout)); err != nil {
++		return nil, err
++	}
 +
 +	// Greeting: VER=5, NMETHODS=1, METHOD=0 (no auth).
 +	if _, err := c.Write([]byte{0x05, 0x01, 0x00}); err != nil {
@@ -562,11 +569,17 @@ index 00000000..139a641d
 +		return nil, err
 +	}
 +
++	// Handshake is done; the deadline above must not apply to the data that
++	// flows over this conn afterward.
++	if err := c.SetDeadline(time.Time{}); err != nil {
++		return nil, err
++	}
++
 +	ok = true
 +	return c, nil
 +}
 diff --git a/pkg/services/forwarder/tcp.go b/pkg/services/forwarder/tcp.go
-index 6a1f548a..1bd19a2b 100644
+index 6a1f548a..6333f53d 100644
 --- a/pkg/services/forwarder/tcp.go
 +++ b/pkg/services/forwarder/tcp.go
 @@ -23,7 +23,12 @@ const (
@@ -592,7 +605,7 @@ index 6a1f548a..1bd19a2b 100644
 +		var outbound net.Conn
 +		var err error
 +		if socksUpstream != "" {
-+			outbound, err = socksDial(socksUpstream, localAddress, r.ID().LocalPort)
++			outbound, err = socksDial(socksUpstream, localAddress, r.ID().LocalPort, connectTimeout)
 +		} else {
 +			outbound, err = net.DialTimeout("tcp", target, connectTimeout)
 +		}
