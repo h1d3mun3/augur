@@ -90,7 +90,7 @@ that a different agent is writing (do not write the H2 yourself, do not write 2.
   ### 2.5 Workspace containment
 
 2.4 is the macOS VM engine's egress datapath (gvproxy). This is the part most likely to have
-changed recently: gvproxy was just re-pinned from 629a4a42 to d3d4f055 (closing issue #167 - see
+changed recently: gvproxy was just re-pinned from d3d4f055 to 50edb65e (closing issue #172 - see
 gvproxy/build.sh's PIN and gvproxy/augur-egress.patch), and a bug found by code review was fixed
 where the SOCKS dial path (pkg/services/forwarder/socks_client.go's socksDial) had no connect
 timeout unlike the direct-dial branch, now fixed by threading connectTimeout through. Describe the
