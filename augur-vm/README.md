@@ -18,6 +18,14 @@ Implemented:
 - `augur-vm set <name> [--cpu N] [--memory MB]` — adjust CPU / memory (memory in MB)
 - `augur-vm run <name> --no-graphics [--dir name:path ...] [--net-vfkit <socket>]` — boot headless with shared dirs
 - `augur-vm run <name>` — boot with a GUI window (display + keyboard + pointer) for Setup Assistant
+- `augur-vm run <name> --no-graphics --provision-username <user> --provision-password <pass> [--provision-full-name <name>]` —
+  on a macOS 27+ host, provisions the account automatically on the guest's first boot after
+  `create` (`VZMacGuestProvisioningOptions`: auto-login + Remote Login enabled, no manual Setup
+  Assistant) instead of waiting for a human at a GUI window. Has no effect on a guest whose
+  installed OS predates macOS 27 (see `guest-os-version` below) — the framework silently ignores
+  it there rather than erroring. See `docs/decisions/0018-macos27-unattended-provisioning.md`.
+- `augur-vm guest-os-version <name>` — print the installed guest's major macOS version, captured
+  from the IPSW's restore image at `create` time (empty/exit 1 for a bundle predating this field)
 - `augur-vm ip <name>` — print the guest IP (from `/var/db/dhcpd_leases`)
 - `augur-vm stop <name>` — graceful shutdown (SIGTERM to the run process; force-kill fallback)
 - `augur-vm delete <name>` — remove a VM bundle

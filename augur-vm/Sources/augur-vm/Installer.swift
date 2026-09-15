@@ -51,7 +51,10 @@ final class InstallSession {
         }
 
         do {
-            let config = try buildBundleAndConfig(requirements: requirements)
+            let config = try buildBundleAndConfig(
+                requirements: requirements,
+                restoreImageOSVersion: image.operatingSystemVersion
+            )
             try config.validate()
 
             let vm = VZVirtualMachine(configuration: config)
@@ -89,7 +92,10 @@ final class InstallSession {
 
     /// Create the bundle directory, disk image, NVRAM, persist config.json, and
     /// return the runtime configuration used to install (platform + boot + disk).
-    private func buildBundleAndConfig(requirements: VZMacOSConfigurationRequirements) throws -> VZVirtualMachineConfiguration {
+    private func buildBundleAndConfig(
+        requirements: VZMacOSConfigurationRequirements,
+        restoreImageOSVersion: OperatingSystemVersion
+    ) throws -> VZVirtualMachineConfiguration {
         let hardwareModel = requirements.hardwareModel
 
         let cpuCount = Clamp.cpuCount(min: requirements.minimumSupportedCPUCount)
@@ -120,7 +126,8 @@ final class InstallSession {
             diskSizeGB: diskSizeGB,
             hardwareModel: hardwareModel.dataRepresentation,
             machineIdentifier: machineIdentifier.dataRepresentation,
-            display: .default
+            display: .default,
+            guestOSMajorVersion: restoreImageOSVersion.majorVersion
         )
         try persisted.save(name)
 

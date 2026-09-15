@@ -19,6 +19,12 @@ final class RunSession: NSObject, VZVirtualMachineDelegate {
     /// Opt-in to unfiltered NAT. Without it (and without a vfkit socket) the VM
     /// refuses to boot rather than silently granting the guest full network access.
     private let netAllowNAT: Bool
+    /// Automated first-boot account setup (VZMacGuestProvisioningOptions, macOS 27+ host
+    /// only — see boot()). Both nil unless `augur-vm run --provision-username/--provision-password`
+    /// was given; Run.swift's validate() guarantees they're either both set or both nil.
+    private let provisionUsername: String?
+    private let provisionPassword: String?
+    private let provisionFullName: String
 
     var vm: VZVirtualMachine?
     var loadedConfig: VMConfig?
@@ -31,12 +37,18 @@ final class RunSession: NSObject, VZVirtualMachineDelegate {
     var isTerminating = false
     var terminateReply: (() -> Void)?
 
-    init(name: String, headless: Bool, dirs: [String], netVfkitSocket: String? = nil, netAllowNAT: Bool = false) {
+    init(
+        name: String, headless: Bool, dirs: [String], netVfkitSocket: String? = nil, netAllowNAT: Bool = false,
+        provisionUsername: String? = nil, provisionPassword: String? = nil, provisionFullName: String = "augur"
+    ) {
         self.name = name
         self.headless = headless
         self.dirs = dirs
         self.netVfkitSocket = netVfkitSocket
         self.netAllowNAT = netAllowNAT
+        self.provisionUsername = provisionUsername
+        self.provisionPassword = provisionPassword
+        self.provisionFullName = provisionFullName
     }
 
     /// Entry point: prepare, then either park headless or run the GUI app.
@@ -72,15 +84,56 @@ final class RunSession: NSObject, VZVirtualMachineDelegate {
             vm.delegate = self
             self.vm = vm
 
-            FileHandle.standardError.write(Data("[augur-vm] booting '\(name)'…\n".utf8))
-            vm.start { [self] result in
-                if case let .failure(error) = result {
-                    fail("failed to start VM: \(error.localizedDescription)")
+            if let username = provisionUsername, let password = provisionPassword {
+                // Only meaningful on the guest's FIRST boot after `create` — Virtualization
+                // ignores these options on every later boot, and on a guest whose installed
+                // OS predates macOS 27 (Run.swift's --no-graphics requirement plus this host
+                // check are the only gates here; augur's `cmd_build_macos` is what also checks
+                // the GUEST's OS version via `guest-os-version` before ever passing these flags —
+                // see ADR-0018).
+                guard #available(macOS 27, *) else {
+                    fail("--provision-username/--provision-password need a macOS 27+ host (Virtualization's automated guest provisioning is unavailable on this host)")
+                    return
+                }
+                FileHandle.standardError.write(Data(
+                    "[augur-vm] booting '\(name)'… (automated guest provisioning for '\(username)')\n".utf8))
+                let options = try provisioningStartOptions(username: username, password: password)
+                vm.start(options: options) { [self] errorOrNil in
+                    if let error = errorOrNil {
+                        fail("failed to start VM: \(error.localizedDescription)")
+                    }
+                }
+            } else {
+                FileHandle.standardError.write(Data("[augur-vm] booting '\(name)'…\n".utf8))
+                vm.start { [self] result in
+                    if case let .failure(error) = result {
+                        fail("failed to start VM: \(error.localizedDescription)")
+                    }
                 }
             }
         } catch {
             fail("\(error)")
         }
+    }
+
+    /// Builds start options that provision the guest's admin account on first boot
+    /// (`VZMacGuestProvisioningOptions`, macOS 27+ host and guest only — see boot()).
+    /// `logsInAutomatically` replaces augur's kcpassword hack (the legacy manual-Setup-
+    /// Assistant path in `cmd_build_macos` still needs that hack; this path doesn't), and
+    /// `enablesRemoteLogin` replaces the manual "System Settings → Sharing → Remote Login"
+    /// step, so the caller can go straight to a headless boot and wait for SSH.
+    @available(macOS 27, *)
+    private func provisioningStartOptions(username: String, password: String) throws -> VZMacOSVirtualMachineStartOptions {
+        let provisioning = VZMacGuestProvisioningOptions()
+        provisioning.fullName = provisionFullName
+        provisioning.username = username
+        provisioning.password = password
+        provisioning.logsInAutomatically = true
+        provisioning.enablesRemoteLogin = true
+
+        let options = VZMacOSVirtualMachineStartOptions()
+        try options.setGuestProvisioning(provisioning)
+        return options
     }
 
     /// Build the runtime configuration from the bundle. A graphics device (virtual
