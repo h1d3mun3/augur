@@ -19,11 +19,45 @@ On this path the account password is **generated randomly** per base-VM build (`
 
 Everything else is unchanged, and unconditionally so: **any other combination — host below
 macOS 27, or an IPSW installing a guest OS below macOS 27 — takes the exact manual Setup
-Assistant flow ADR-0007 already shipped**, with the fixed `admin`/`admin` credential. There is
-no flag to force one path or the other; `cmd_build_macos` decides from `sw_vers
--productVersion` (host) and `augur-vm guest-os-version` (the guest OS version captured from
+Assistant flow ADR-0007 already shipped**, with the fixed `admin`/`admin` credential.
+`cmd_build_macos` decides from `sw_vers -productVersion` (host) and `augur-vm
+guest-os-version` (the guest OS version captured from
 `VZMacOSRestoreImage.operatingSystemVersion` at `create` time and persisted in the VM's
-`config.json`).
+`config.json`), and `--manual-setup` forces the manual flow even when both sides qualify.
+
+The password reaches `augur-vm` on **stdin** (`--provision-password-stdin`), never as a command
+argument: argv is observable for the whole life of the boot, and this is the same shape augur
+already uses to hand credentials to a child process.
+
+## Amendment (2026-09-15, first live run)
+
+The original version of this decision shipped three defects that a first real build on a
+macOS 27 host found, all of them in the seam this ADR removed — the manual flow's operator
+prompts turned out to be load-bearing as *waits*, not just as instructions:
+
+1. **`create` → `run` raced on the auxiliary-storage lock.** Virtualization runs a guest inside
+   a `com.apple.Virtualization.VirtualMachine` XPC service that outlives the `create` process
+   which spawned it, so `nvram.bin` can still be flock'd after `create` has exited and printed
+   "created". The automated path's immediate `run` therefore failed with
+   `VZErrorDomain/2 "Failed to lock auxiliary storage."` (underlying `NSPOSIXErrorDomain/35`,
+   EAGAIN). The manual flow never hit it because its "press Enter to open the VM window" prompt
+   made a human sit out the window. Fixed in `RunSession.handleStartFailure`: that one failure
+   (matched on the underlying errno, not the localized string) is retried for ~30s.
+2. **A DHCP lease was treated as "SSH is ready."** `macos_vm_ip` only waits for an address;
+   `enablesRemoteLogin` brings sshd up well after the guest's NIC. The build went straight from
+   the IP to `ssh_macos_bootstrap` and got "Connection refused". The manual flow was gated on the
+   operator answering "Remote Login enabled?", which had already guaranteed sshd was listening.
+   Fixed by `macos_wait_for_ssh`, which polls TCP/22 itself.
+3. **The generated password was persisted before the VM proved it.** Written before the boot, a
+   failed boot left `~/.augur/macos-admin-password` describing a credential no VM ever had —
+   which a later `--manual-setup` build (whose account really is `admin`/`admin`) would then feed
+   to `sudo`. It is now written only after SSH answers, and the manual path removes any stale
+   file. The write also pairs `umask 077` with an explicit `chmod 600`, because `>` preserves an
+   existing file's mode (the pairing `cmd_setup_token` already used).
+
+Separately, the build VM's boot output no longer goes to `/dev/null`: it lands in
+`~/.augur/build-vm.vm.log` and the failure paths print its tail. Without that, defect 1 was
+indistinguishable from defect 2 — both surfaced only as "VM did not become reachable".
 
 ## Context
 
@@ -98,7 +132,7 @@ installing an older IPSW would silently fall through to a guest sitting at the l
 forever with no operator present to complete Setup Assistant, and `cmd_build_macos` would hang
 waiting for SSH that never comes up. Checking `augur-vm guest-os-version` (persisted from
 `VZMacOSRestoreImage.operatingSystemVersion` at `create` time — see `Installer.swift` and
-`VMConfig.guestOSMajorVersion`) before ever passing `--provision-username`/`--provision-password`
+`VMConfig.guestOSMajorVersion`) before ever passing `--provision-username`/`--provision-password-stdin`
 closes that gap: an older guest OS always takes the manual path, matching the framework's own
 "ignored, not enforced" semantics instead of assuming they apply.
 
@@ -124,10 +158,18 @@ for SSH — there is no GUI step to skip past.
   password itself grants nothing extra inside the guest; the difference is the host no longer
   ships a *guessable* value) — no change to augur's broader secret-storage model.
 - `augur-vm` gains one new subcommand (`guest-os-version`) and three new `run` flags
-  (`--provision-username`, `--provision-password`, `--provision-full-name`), all inert unless
-  `cmd_build_macos` decides to pass them.
+  (`--provision-username`, `--provision-password-stdin`, `--provision-full-name`), all inert
+  unless `cmd_build_macos` decides to pass them.
+- `augur build --macos` gains `--manual-setup`, the way back to the ADR-0007 flow on a host
+  where both sides qualify. It exists because the guest half of automated provisioning is
+  unattended and opaque: if a first boot does not complete, without this flag there is no way
+  to build a base VM at all.
+- `augur-vm run` now retries a start that fails *only* on auxiliary-storage lock contention,
+  which makes a back-to-back `create`/`run` safe for every caller, not just this build path.
 - Live coverage (an actual first boot completing unattended, on a real macOS 27 host) is
   necessarily local-only, same as the rest of macOS VM mode's live paths (no GitHub-hosted
   runner can boot a VZ guest — see the repo README's CI section). The offline suite
-  (`tests/41_macos_admin_password_unit.sh`) covers the two pure decision functions
+  (`tests/41_macos_admin_password_unit.sh`) covers the pure decision functions
   (`macos_admin_password`, `host_macos_major_version`) it's possible to test without a VM.
+  **This ADR's three amended defects were all outside that reach** — each needed a real first
+  boot on a macOS 27 host to show up, which is why they shipped.

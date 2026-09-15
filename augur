@@ -2754,9 +2754,13 @@ cmd_build_macos() {
         # enablesRemoteLogin (set in augur-vm's RunSession) means SSH is already up — no GUI,
         # no "enable Remote Login by hand" step. Keep the boot stderr on disk (not /dev/null)
         # so a failure below can show the real cause instead of just "not running".
-        "$VM_CLI" run --no-graphics --net-nat \
+        # The password goes in on STDIN, never as an argument: argv is observable (`ps`), and a
+        # boot lasts minutes. Same shape augur already uses to hand credentials to a child (see
+        # the ~/.augur-env push in cmd_up_macos). `$!` on a backgrounded pipeline is the LAST
+        # member — the `run` process — which is the pid stop_and_reap_macos_vm needs.
+        printf '%s' "$new_password" | "$VM_CLI" run --no-graphics --net-nat \
             --provision-username "$MACOS_SSH_USER" \
-            --provision-password "$new_password" \
+            --provision-password-stdin \
             --provision-full-name "augur" \
             "$MACOS_BUILD_VM" &>"$(macos_build_vm_log)" &
         vm_pid=$!

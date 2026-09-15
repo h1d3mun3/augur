@@ -1,5 +1,8 @@
 import ArgumentParser
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#endif
 
 /// `augur-vm run <name> [--no-graphics] [--dir=name:path ...]`
 /// Headless (`--no-graphics`) parks on dispatchMain; without it a GUI window opens.
@@ -31,11 +34,16 @@ struct Run: ParsableCommand {
     // meaningful on the guest's FIRST boot after `create` — the framework ignores these
     // once a guest has already been provisioned. See RunSession.swift and ADR-0018.
     @Option(name: .customLong("provision-username"),
-            help: "Create this account automatically on first boot instead of waiting for a manually-run Setup Assistant. Requires --provision-password, --no-graphics, and a macOS 27+ host; has no effect on a guest whose OS predates macOS 27 (see `augur-vm guest-os-version`).")
+            help: "Create this account automatically on first boot instead of waiting for a manually-run Setup Assistant. Requires --provision-password-stdin, --no-graphics, and a macOS 27+ host; has no effect on a guest whose OS predates macOS 27 (see `augur-vm guest-os-version`).")
     var provisionUsername: String?
 
-    @Option(name: .customLong("provision-password"), help: "Password for --provision-username.")
-    var provisionPassword: String?
+    // The password is read from stdin, never taken as an option: a process's arguments are
+    // observable (`ps`), so `--provision-password <secret>` would expose the new account's
+    // credential to anything running as this user for the lifetime of the boot. Mirrors how
+    // `augur` already hands secrets to a child — piped in, not spelled out on the command line.
+    @Flag(name: .customLong("provision-password-stdin"),
+          help: "Read the password for --provision-username from stdin (e.g. `printf %s \"$pw\" | augur-vm run …`). Trailing newlines are stripped.")
+    var provisionPasswordStdin = false
 
     @Option(name: .customLong("provision-full-name"), help: "Full name for --provision-username.")
     var provisionFullName: String = "augur"
@@ -47,18 +55,39 @@ struct Run: ParsableCommand {
         guard !Registry.isRunning(name) else {
             throw ValidationError("VM '\(name)' is already running.")
         }
-        guard (provisionUsername == nil) == (provisionPassword == nil) else {
-            throw ValidationError("--provision-username and --provision-password must be given together.")
+        guard (provisionUsername == nil) != provisionPasswordStdin else {
+            throw ValidationError("--provision-username and --provision-password-stdin must be given together.")
         }
         if provisionUsername != nil, !noGraphics {
-            throw ValidationError("--provision-username/--provision-password require --no-graphics (automated setup has no manual GUI step).")
+            throw ValidationError("--provision-username/--provision-password-stdin require --no-graphics (automated setup has no manual GUI step).")
+        }
+        // Without this, a --provision-password-stdin run launched from a terminal (no pipe)
+        // would block on a read that never sees EOF, looking like a VM that hangs before it
+        // boots rather than a caller that forgot to pipe the password in.
+        if provisionPasswordStdin, isatty(FileHandle.standardInput.fileDescriptor) == 1 {
+            throw ValidationError("--provision-password-stdin needs the password piped in, not a terminal.")
         }
     }
 
     func run() throws {
+        var password: String?
+        if provisionPasswordStdin {
+            let raw = FileHandle.standardInput.readDataToEndOfFile()
+            guard let text = String(data: raw, encoding: .utf8) else {
+                throw CLIError("the password on stdin is not valid UTF-8")
+            }
+            // Only trailing newlines: a password may legitimately start or end with other
+            // characters, and `printf '%s'` (what augur uses) sends none of these at all.
+            let trimmed = text.trimmingCharacters(in: CharacterSet(charactersIn: "\r\n"))
+            guard !trimmed.isEmpty else {
+                throw CLIError("no password was read from stdin")
+            }
+            password = trimmed
+        }
+
         let session = RunSession(
             name: name, headless: noGraphics, dirs: dirs, netVfkitSocket: netVfkit, netAllowNAT: netNAT,
-            provisionUsername: provisionUsername, provisionPassword: provisionPassword,
+            provisionUsername: provisionUsername, provisionPassword: password,
             provisionFullName: provisionFullName
         )
         RunSession.shared = session   // retain across the VM's lifetime
