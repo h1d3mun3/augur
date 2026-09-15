@@ -528,11 +528,40 @@ macos_vm_running() {
     "$VM_CLI" list 2>/dev/null | awk 'NR>1 {print $2, $NF}' | grep -qx "${1} running"
 }
 
-# Poll until VM IP is available (boot takes ~30s); prints IP on success
+# Poll until VM IP is available (boot takes ~30s); prints IP on success. Wall-clock budget,
+# default 90s — callers whose boot does extra work before the guest can even lease an address
+# (e.g. `augur-vm run` sitting out a locked auxiliary storage, see macos_wait_for_ssh and
+# RunSession.handleStartFailure) must pass a larger one, or they give up mid-boot and tear
+# down a VM that was still coming up.
 macos_vm_ip() {
-    local vm="$1" ip
-    for _ in {1..30}; do
+    local vm="$1" max_secs="${2:-90}" ip
+    local deadline=$(( SECONDS + max_secs ))
+    while (( SECONDS < deadline )); do
         ip=$("$VM_CLI" ip "$vm" 2>/dev/null) && [[ -n "$ip" ]] && { echo "$ip"; return 0; }
+        sleep 3
+    done
+    return 1
+}
+
+# Poll until the guest's SSH daemon actually accepts a TCP connection — NOT the same thing
+# macos_vm_ip checks (a DHCP-leased IP), and callers waiting for "SSH is ready" must not
+# conflate the two. Under the old manual Setup Assistant flow this distinction never mattered:
+# the operator's "Remote Login enabled? Ready to continue?" prompt already gated on a human
+# confirming sshd was up before that flow ever called macos_vm_ip. The automated provisioning
+# path (ADR-0018) has no such gate — the guest's network interface (hence its IP) routinely
+# comes up well before VZMacGuestProvisioningOptions finishes creating the account, logging it
+# in, and starting Remote Login — so a caller that stops at macos_vm_ip can start SSHing into
+# an IP with nothing listening on port 22 yet ("Connection refused"). Bash's /dev/tcp avoids a
+# dependency on `nc`. Wall-clock budget (mirrors wait_for_macos_ssh), not a fixed iteration
+# count, and generous: giving up early on a guest that is still legitimately mid-provisioning
+# makes the caller tear down (SIGKILL, per Stop.swift) a VM that was about to come up, turning
+# a slow boot into a failed build. Pass a larger budget for a cold first boot (see
+# cmd_build_macos's automated-provisioning call).
+macos_wait_for_ssh() {
+    local ip="$1" port="${2:-22}" max_secs="${3:-180}"
+    local deadline=$(( SECONDS + max_secs ))
+    while (( SECONDS < deadline )); do
+        (exec 3<>"/dev/tcp/${ip}/${port}") 2>/dev/null && return 0
         sleep 3
     done
     return 1
@@ -1430,6 +1459,23 @@ require_socket_path_fits() {
 # under AUGUR_DIR (always present) rather than the per-project proxy dir. Captures the
 # base VM's NAT boot stderr so an "SSH did not come up" failure can surface the real cause.
 macos_base_vm_log() { echo "$AUGUR_DIR/base-vm.vm.log"; }
+# cmd_build_macos's build-VM boot log (both the automated-provisioning and manual-Setup-
+# Assistant headless restart). Same rationale as macos_base_vm_log: the run is backgrounded,
+# so without this every boot failure augur-vm reports is discarded and the build can only say
+# "did not become reachable" — which is how a plain `vm.start` error went undiagnosed.
+macos_build_vm_log() { echo "$AUGUR_DIR/build-vm.vm.log"; }
+
+# Surface the otherwise-discarded cause of a build-VM boot/reachability failure (mirrors
+# cmd_update_macos's inline diagnostics). Called right before exiting on either "no IP" or
+# "IP but no SSH" — both leave whatever augur-vm printed sitting in macos_build_vm_log.
+macos_dump_build_vm_log() {
+    local log; log="$(macos_build_vm_log)"
+    error "  VM log: ${log}"
+    if [[ -s "$log" ]]; then
+        error "  ---- last VM lines ----"
+        tail -n 20 "$log" 2>/dev/null | while IFS= read -r _l; do error "  | $_l"; done
+    fi
+}
 
 gvproxy_running() {
     local pf; pf="$(gvproxy_pidfile)"
@@ -2613,12 +2659,18 @@ cmd_version() {
 cmd_build_macos() {
     require_vz
 
-    local ipsw_path="" xcode_xip_path="" platforms="iOS"
+    local ipsw_path="" xcode_xip_path="" platforms="iOS" manual_setup=false
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --ipsw)      ipsw_path="${2:?'--ipsw requires a file path'}";           shift 2 ;;
             --xcode-xip) xcode_xip_path="${2:?'--xcode-xip requires a file path'}"; shift 2 ;;
             --platforms) platforms="${2:?'--platforms requires a value'}";          shift 2 ;;
+            # Escape hatch out of ADR-0018's automated provisioning: take the manual Setup
+            # Assistant flow (ADR-0007) even on a macOS 27+ host/guest pair. ADR-0018 shipped
+            # with no way to opt out, which left a host where the automated first boot doesn't
+            # complete (for any reason — the guest side of it is opaque and unattended) with no
+            # way to build a base VM at all. The manual flow stays the known-good fallback.
+            --manual-setup) manual_setup=true; shift ;;
             *) error "Unknown option: $1"; exit 1 ;;
         esac
     done
@@ -2650,8 +2702,15 @@ cmd_build_macos() {
         "$VM_CLI" delete "$MACOS_BUILD_VM"
     fi
 
+    # AUGUR_KEEP_BUILD_VM=1 keeps the half-built VM on failure. Debugging aid only: a fresh
+    # build VM costs a 15–30 min IPSW install, so discarding it on every failed attempt makes
+    # iterating on a boot-time failure (see macos_build_vm_log) impractical. The VM is still
+    # replaced by the next build, so this only ever preserves the most recent failure.
     trap '
-        if macos_vm_exists "$MACOS_BUILD_VM"; then
+        if [[ "${AUGUR_KEEP_BUILD_VM:-}" == "1" ]]; then
+            macos_vm_running "$MACOS_BUILD_VM" && "$VM_CLI" stop "$MACOS_BUILD_VM" 2>/dev/null || true
+            warn "AUGUR_KEEP_BUILD_VM=1: keeping VM '"'"'${MACOS_BUILD_VM}'"'"' for inspection."
+        elif macos_vm_exists "$MACOS_BUILD_VM"; then
             macos_vm_running "$MACOS_BUILD_VM" && "$VM_CLI" stop "$MACOS_BUILD_VM" 2>/dev/null || true
             "$VM_CLI" delete "$MACOS_BUILD_VM" 2>/dev/null || true
         fi
@@ -2675,6 +2734,10 @@ cmd_build_macos() {
           && -n "$guest_major" && "$guest_major" -ge 27 ]]; then
         auto_setup=true
     fi
+    if $manual_setup && $auto_setup; then
+        info "--manual-setup given: skipping automated provisioning, using the Setup Assistant flow."
+        auto_setup=false
+    fi
 
     local vm_pid vm_ip
     if $auto_setup; then
@@ -2685,27 +2748,56 @@ cmd_build_macos() {
         # generators without re-auditing those call sites.
         local new_password
         new_password="$(openssl rand -base64 24)"
-        mkdir -p "$(dirname "$MACOS_ADMIN_PASSWORD_FILE")"
-        ( umask 077 && printf '%s' "$new_password" > "$MACOS_ADMIN_PASSWORD_FILE" )
 
         # Build/setup phases use plain NAT (gvproxy isn't running and no agent is present);
         # --net-nat is required now that egress-filtered networking is the fail-closed default.
         # enablesRemoteLogin (set in augur-vm's RunSession) means SSH is already up — no GUI,
-        # no "enable Remote Login by hand" step.
+        # no "enable Remote Login by hand" step. Keep the boot stderr on disk (not /dev/null)
+        # so a failure below can show the real cause instead of just "not running".
         "$VM_CLI" run --no-graphics --net-nat \
             --provision-username "$MACOS_SSH_USER" \
             --provision-password "$new_password" \
             --provision-full-name "augur" \
-            "$MACOS_BUILD_VM" &>/dev/null &
+            "$MACOS_BUILD_VM" &>"$(macos_build_vm_log)" &
         vm_pid=$!
 
         info "Waiting for SSH..."
-        vm_ip="$(macos_vm_ip "$MACOS_BUILD_VM")" || {
+        # 240s, not the default 90s: this boot follows `create` immediately, so `augur-vm run`
+        # may spend its first ~30s waiting out the installer's still-held auxiliary-storage
+        # lock (RunSession.handleStartFailure) before the guest even starts booting.
+        vm_ip="$(macos_vm_ip "$MACOS_BUILD_VM" 240)" || {
             stop_and_reap_macos_vm "$MACOS_BUILD_VM" "$vm_pid"
             error "VM did not become reachable after automated provisioning."
+            macos_dump_build_vm_log
             exit 1
         }
+        # The guest's IP shows up as soon as its network interface is up, which is routinely
+        # well before VZMacGuestProvisioningOptions finishes creating the account, logging it
+        # in, and starting Remote Login — see macos_wait_for_ssh. Generous 300s budget: this is
+        # a cold first boot doing real account-provisioning work, not a warm reboot.
+        macos_wait_for_ssh "$vm_ip" 22 300 || {
+            stop_and_reap_macos_vm "$MACOS_BUILD_VM" "$vm_pid"
+            error "VM got an IP but SSH never came up after automated provisioning."
+            macos_dump_build_vm_log
+            exit 1
+        }
+        # Persist the generated password only now that the guest demonstrably came up with it.
+        # Writing it before the boot would leave every later macos_admin_password() caller
+        # trusting a credential no VM ever had, if the boot failed — including a subsequent
+        # --manual-setup build, whose account really is the fixed ADR-0007 one.
+        # umask for the create, then chmod unconditionally — the same pairing cmd_setup_token
+        # uses, and for the same reason: `>` truncates an ALREADY-EXISTING file while keeping
+        # its mode, so umask alone leaves a rebuild writing the new password into whatever
+        # mode the old file happened to carry (e.g. a copy made by hand, or moved between
+        # Macs, at the operator's umask).
+        mkdir -p "$(dirname "$MACOS_ADMIN_PASSWORD_FILE")"
+        ( umask 077 && printf '%s' "$new_password" > "$MACOS_ADMIN_PASSWORD_FILE" )
+        chmod 600 "$MACOS_ADMIN_PASSWORD_FILE"
     else
+        # The account this flow creates is the fixed ADR-0007 admin/admin one, so drop any
+        # override left behind by an earlier automated build (or a failed attempt at one) —
+        # otherwise macos_admin_password() would keep feeding sudo a stale random password.
+        rm -f "$MACOS_ADMIN_PASSWORD_FILE"
         echo ""
         echo -e "${BOLD}── Setup Assistant (manual) ──────────────────────────────────────────────────${RESET}"
         echo ""
@@ -2728,15 +2820,23 @@ cmd_build_macos() {
         read -rp "$(echo -e "${CYAN}[augur]${RESET} Remote Login enabled? Ready to continue? [y/N] ")" yn
         [[ "$yn" == [yY] ]] || { info "Aborted."; exit 0; }
 
-        # Step 4: Restart headlessly and wait for SSH
+        # Step 4: Restart headlessly and wait for SSH. Keep the boot stderr on disk (not
+        # /dev/null) so a reachability failure below can show the real cause.
         info "Restarting VM headlessly..."
-        "$VM_CLI" run --no-graphics --net-nat "$MACOS_BUILD_VM" &>/dev/null &
+        "$VM_CLI" run --no-graphics --net-nat "$MACOS_BUILD_VM" &>"$(macos_build_vm_log)" &
         vm_pid=$!
 
         info "Waiting for SSH..."
         vm_ip="$(macos_vm_ip "$MACOS_BUILD_VM")" || {
             stop_and_reap_macos_vm "$MACOS_BUILD_VM" "$vm_pid"
             error "VM did not become reachable. Check that Remote Login is enabled."
+            macos_dump_build_vm_log
+            exit 1
+        }
+        macos_wait_for_ssh "$vm_ip" || {
+            stop_and_reap_macos_vm "$MACOS_BUILD_VM" "$vm_pid"
+            error "VM got an IP but SSH never came up. Check that Remote Login is enabled."
+            macos_dump_build_vm_log
             exit 1
         }
     fi
@@ -3238,9 +3338,10 @@ _MACOS_CLOCK_TOLERANCE_S=5
 # round-trip (tens of ms locally, and the read-back below bounds the total at
 # _MACOS_CLOCK_TOLERANCE_S), which is three orders of magnitude below the 5733s being fixed.
 #
-# The push shape is install_macos_managed_settings': `echo <user> | sudo -S -p ''`. A project clone
-# has NO passwordless sudo — cmd_build_macos revokes /etc/sudoers.d/augur before saving the base VM —
-# so `sudo -S` fed the documented fixed password (ADR-0007) is the established, and only, way augur
+# The push shape is install_macos_managed_settings': `echo <password> | sudo -S -p ''`. A project
+# clone has NO passwordless sudo — cmd_build_macos revokes /etc/sudoers.d/augur before saving the
+# base VM — so `sudo -S` fed the admin password (macos_admin_password: the fixed ADR-0007 one, or the
+# generated one from ADR-0018's automated build) is the established, and only, way augur
 # runs a privileged command in a project guest. This takes no privilege augur's build does not
 # already take, and ADR-0001's sudo-free rule is about the HOST (its examples are host `pf` rules and
 # the bridged-networking entitlement), which is untouched. `/bin/date` is absolute for the same
