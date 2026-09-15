@@ -506,6 +506,18 @@ host_macos_major_version() {
     sw_vers -productVersion 2>/dev/null | cut -d. -f1
 }
 
+# Does the resolved augur-vm actually carry ADR-0018's automated provisioning? The host's own
+# OS version is not evidence: `VZMacGuestProvisioningOptions` exists only in the macOS 27 SDK,
+# so augur-vm compiles the feature out when built against an older one (see Run.swift's
+# `#if compiler(>=6.4)`), and `install` builds it from whatever Xcode the host had AT THAT TIME.
+# A host upgraded to macOS 27 without re-running `bash install` therefore reports 27 while
+# running a binary that never had the flags. Asking the binary keeps that case on the manual
+# flow instead of failing the build with "Unknown option". (`--help` probing follows the
+# runnability probe pattern already used for the proxy binary.)
+vm_cli_supports_provisioning() {
+    "$VM_CLI" run --help 2>&1 | grep -q -- '--provision-password-stdin'
+}
+
 # Keyed on basename + workspace_path_hash (mirrors the container-mode
 # host_hist_dir key), not basename alone: two distinct directories that happen to
 # share a basename (e.g. ~/work/myapp and ~/archive/myapp) must never collide onto
@@ -2736,6 +2748,15 @@ cmd_build_macos() {
     fi
     if $manual_setup && $auto_setup; then
         info "--manual-setup given: skipping automated provisioning, using the Setup Assistant flow."
+        auto_setup=false
+    fi
+    # Never a silent downgrade: if both OSes qualify but this augur-vm was built without the
+    # feature, say so and name the fix, rather than quietly presenting the manual flow as if the
+    # host had not qualified.
+    if $auto_setup && ! vm_cli_supports_provisioning; then
+        warn "This augur-vm has no automated provisioning: it was built against an SDK older than macOS 27."
+        warn "  Re-run ${BOLD}bash install${RESET} with Xcode 27+ selected to enable it."
+        warn "  Falling back to the manual Setup Assistant flow for this build."
         auto_setup=false
     fi
 

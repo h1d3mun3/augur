@@ -31,9 +31,11 @@ already uses to hand credentials to a child process.
 
 ## Amendment (2026-09-15, first live run)
 
-The original version of this decision shipped three defects that a first real build on a
-macOS 27 host found, all of them in the seam this ADR removed — the manual flow's operator
-prompts turned out to be load-bearing as *waits*, not just as instructions:
+The original version of this decision shipped four defects. Three were found by the first real
+build on a macOS 27 host, and all three sat in the seam this ADR removed — the manual flow's
+operator prompts turned out to be load-bearing as *waits*, not just as instructions. The fourth
+(below) was found by CI, and was the opposite mistake: assuming a runtime gate could stand in
+for a compile-time one.
 
 1. **`create` → `run` raced on the auxiliary-storage lock.** Virtualization runs a guest inside
    a `com.apple.Virtualization.VirtualMachine` XPC service that outlives the `create` process
@@ -58,6 +60,47 @@ prompts turned out to be load-bearing as *waits*, not just as instructions:
 Separately, the build VM's boot output no longer goes to `/dev/null`: it lands in
 `~/.augur/build-vm.vm.log` and the failure paths print its tail. Without that, defect 1 was
 indistinguishable from defect 2 — both surfaced only as "VM did not become reachable".
+
+### The fourth defect: the feature did not compile on a macOS 26 SDK
+
+This ADR originally reasoned that `@available`/`#available` were enough to keep a pre-27 host
+working, and `Package.swift` said so ("a host below macOS 27 still builds"). That was **wrong**,
+and CI caught it: `@available` gates *runtime* availability — it lets a build that *has* a
+declaration call it only where the OS supports it. `VZMacGuestProvisioningOptions` is declared
+**only in the macOS 27 SDK**, so against the macOS 26 SDK the symbol does not exist and the
+build fails outright:
+
+```
+error: cannot find 'VZMacGuestProvisioningOptions' in scope
+error: value of type 'VZMacOSVirtualMachineStartOptions' has no member 'setGuestProvisioning'
+```
+
+That is not merely a CI problem. `install` builds `augur-vm` from source on **every** macOS host
+and augur supports **macOS 26+**, so an unguarded reference takes down all of `--macos` mode —
+not just automated provisioning — for every macOS 26 user, with `install` reporting it as a
+warning and moving on. The CI job on `macos-26` was reproducing exactly what those users get.
+
+The feature is therefore **compiled out** against an older SDK, gated on `#if compiler(>=6.4)`.
+Swift has no SDK-version conditional (`canImport(Virtualization)` is true on both SDKs), so the
+compiler version stands in for the SDK generation — Xcode ships them together (Xcode 26.6 →
+Swift 6.3.3 + macOS 26 SDK; Xcode 27 → Swift 6.4 + macOS 27 SDK). It is a source-level condition
+rather than a `-D` from a build script because `augur-vm` is built from three entry points
+(`install` → `scripts/build.sh`, the Makefile's `make unit`, and a plain `swift build`), and only
+a source-level one covers all three identically — a define that some paths miss would silently
+produce a binary whose capabilities depend on how it was built.
+
+`run`'s provisioning **flags** are gated too, not just their implementation, so `run --help` is
+an honest report of what the binary can do. `cmd_build_macos` probes exactly that
+(`vm_cli_supports_provisioning`) as a third condition beside the host and guest OS versions,
+because the host's version is not evidence about the binary: a host upgraded to macOS 27
+**without re-running `bash install`** reports 27 while running a binary built against the 26 SDK.
+That case now falls back to the manual flow with an explanatory warning, instead of failing the
+build with "Unknown option".
+
+Keeping a `macos-26` CI job is what holds this invariant: it is the only thing that compiles the
+`#else` side of the gate. The `xcode-27` runner image (public preview, macOS 27 + Xcode 27 beta)
+exists and would make the current failure disappear — which is precisely why switching to it
+alone was rejected: it would have made CI green while leaving macOS 26 users unable to build.
 
 ## Context
 
@@ -159,7 +202,13 @@ for SSH — there is no GUI step to skip past.
   ships a *guessable* value) — no change to augur's broader secret-storage model.
 - `augur-vm` gains one new subcommand (`guest-os-version`) and three new `run` flags
   (`--provision-username`, `--provision-password-stdin`, `--provision-full-name`), all inert
-  unless `cmd_build_macos` decides to pass them.
+  unless `cmd_build_macos` decides to pass them. The first two exist only in a build made
+  against the macOS 27 SDK; `run --help` is therefore the binary's own answer about whether it
+  can provision, and `vm_cli_supports_provisioning` asks it before the automated path is chosen.
+- Building `augur-vm` with Xcode 26 still works and still yields a fully functional
+  `--macos` mode — minus automated provisioning, which is what `--manual-setup` covers anyway.
+  Building with Xcode 27 is what enables it; re-running `bash install` after a host OS upgrade
+  is what turns it on.
 - `augur build --macos` gains `--manual-setup`, the way back to the ADR-0007 flow on a host
   where both sides qualify. It exists because the guest half of automated provisioning is
   unattended and opaque: if a first boot does not complete, without this flag there is no way

@@ -26,6 +26,10 @@ Implemented:
   it there rather than erroring. The password is read from stdin and has no option form, because
   argv is observable (`ps`) for the whole life of the boot.
   See `docs/decisions/0018-macos27-unattended-provisioning.md`.
+  **These two flags exist only when augur-vm is built against the macOS 27 SDK (Xcode 27+)** —
+  the symbol they need is absent from older SDKs, so the feature is compiled out rather than
+  failing the build (`#if compiler(>=6.4)`). `run --help` is the authoritative answer for a given
+  binary; everything else in `--macos` mode works either way.
   A `run` issued right after `create` may find the bundle's auxiliary storage still locked by the
   installer's VM (whose XPC service outlives the `create` process); that start is retried for
   ~30s rather than reported, so back-to-back `create`/`run` is safe.

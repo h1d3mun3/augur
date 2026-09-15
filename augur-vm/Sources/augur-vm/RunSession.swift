@@ -20,8 +20,10 @@ final class RunSession: NSObject, VZVirtualMachineDelegate {
     /// refuses to boot rather than silently granting the guest full network access.
     private let netAllowNAT: Bool
     /// Automated first-boot account setup (VZMacGuestProvisioningOptions, macOS 27+ host
-    /// only — see boot()). Both nil unless `augur-vm run --provision-username/--provision-password`
-    /// was given; Run.swift's validate() guarantees they're either both set or both nil.
+    /// only — see boot()). Both nil unless `augur-vm run --provision-username` plus
+    /// `--provision-password-stdin` was given (Run.swift's validate() guarantees they come as a
+    /// pair), and always nil in a build whose SDK predates macOS 27, where those flags and the
+    /// code behind them are compiled out entirely.
     private let provisionUsername: String?
     private let provisionPassword: String?
     private let provisionFullName: String
@@ -96,6 +98,12 @@ final class RunSession: NSObject, VZVirtualMachineDelegate {
             // Only the first attempt announces the boot; a retry is not a new boot.
             let announce = attemptsLeft == RunSession.auxLockRetryLimit
 
+            // Compiled out when building against an SDK older than macOS 27, which has no
+            // VZMacGuestProvisioningOptions to reference — see Run.swift for why the gate is
+            // `compiler(>=6.4)` and why `@available` cannot do this job. With the feature out,
+            // provisionUsername is always nil (its flags do not exist), so every boot takes the
+            // plain start below.
+            #if compiler(>=6.4)
             if let username = provisionUsername, let password = provisionPassword {
                 // Only meaningful on the guest's FIRST boot after `create` — Virtualization
                 // ignores these options on every later boot, and on a guest whose installed
@@ -104,7 +112,7 @@ final class RunSession: NSObject, VZVirtualMachineDelegate {
                 // the GUEST's OS version via `guest-os-version` before ever passing these flags —
                 // see ADR-0018).
                 guard #available(macOS 27, *) else {
-                    fail("--provision-username/--provision-password need a macOS 27+ host (Virtualization's automated guest provisioning is unavailable on this host)")
+                    fail("--provision-username/--provision-password-stdin need a macOS 27+ host (Virtualization's automated guest provisioning is unavailable on this host)")
                     return
                 }
                 if announce {
@@ -117,14 +125,16 @@ final class RunSession: NSObject, VZVirtualMachineDelegate {
                         handleStartFailure(error, attemptsLeft: attemptsLeft)
                     }
                 }
-            } else {
-                if announce {
-                    FileHandle.standardError.write(Data("[augur-vm] booting '\(name)'…\n".utf8))
-                }
-                vm.start { [self] result in
-                    if case let .failure(error) = result {
-                        handleStartFailure(error, attemptsLeft: attemptsLeft)
-                    }
+                return
+            }
+            #endif
+
+            if announce {
+                FileHandle.standardError.write(Data("[augur-vm] booting '\(name)'…\n".utf8))
+            }
+            vm.start { [self] result in
+                if case let .failure(error) = result {
+                    handleStartFailure(error, attemptsLeft: attemptsLeft)
                 }
             }
         } catch {
@@ -132,6 +142,7 @@ final class RunSession: NSObject, VZVirtualMachineDelegate {
         }
     }
 
+    #if compiler(>=6.4)
     /// Builds start options that provision the guest's admin account on first boot
     /// (`VZMacGuestProvisioningOptions`, macOS 27+ host and guest only — see boot()).
     /// `logsInAutomatically` replaces augur's kcpassword hack (the legacy manual-Setup-
@@ -151,6 +162,7 @@ final class RunSession: NSObject, VZVirtualMachineDelegate {
         try options.setGuestProvisioning(provisioning)
         return options
     }
+    #endif
 
     /// A start that failed *only* because another process still holds this bundle's
     /// auxiliary-storage (nvram.bin) lock is retried, not reported. The usual holder is the
