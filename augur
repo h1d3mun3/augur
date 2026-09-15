@@ -27,6 +27,13 @@ MACOS_BASE_VM="augur-macos-base"
 MACOS_BUILD_VM="augur-macos-build"
 MACOS_SSH_USER="admin"
 MACOS_SSH_KEY="$HOME/.augur/vm_key"
+# The base VM's admin account password. Fixed "admin"/"admin" (ADR-0007) UNLESS the base VM
+# was built via macOS 27's automated guest provisioning (ADR-0018), in which case
+# cmd_build_macos generates a random one and persists it here (0600) — every project VM is
+# an APFS clone of the base VM and inherits whichever password the base VM has, so this file
+# (or its absence) governs sudo/SSH auth for every clone, not just the build. See
+# macos_admin_password(). Must never contain a single quote — see that function.
+MACOS_ADMIN_PASSWORD_FILE="$HOME/.augur/macos-admin-password"
 
 # macOS VM backend binary (augur-vm, built from ./augur-vm). Override with AUGUR_VM_BIN.
 AUGUR_VM_BIN="${AUGUR_VM_BIN:-}"
@@ -491,6 +498,14 @@ require_vz() {
     fi
 }
 
+# Host's macOS major version (e.g. "27" for "27.0.1"), or empty if undetectable (non-Darwin,
+# or `sw_vers` missing). Used only to gate macOS 27's automated guest provisioning
+# (ADR-0018) — every other macOS-mode code path is version-independent.
+host_macos_major_version() {
+    command -v sw_vers &>/dev/null || { echo ""; return; }
+    sw_vers -productVersion 2>/dev/null | cut -d. -f1
+}
+
 # Keyed on basename + workspace_path_hash (mirrors the container-mode
 # host_hist_dir key), not basename alone: two distinct directories that happen to
 # share a basename (e.g. ~/work/myapp and ~/archive/myapp) must never collide onto
@@ -553,6 +568,17 @@ macos_ssh_port() {
 vm_known_hosts_file() {
     mkdir -p "$AUGUR_DIR/known_hosts"
     echo "$AUGUR_DIR/known_hosts/${1}"
+}
+
+# The base VM's admin account password — see MACOS_ADMIN_PASSWORD_FILE's comment. Defaults
+# to the fixed ADR-0007 credential when no override file exists (the common case: a base VM
+# built via the legacy manual Setup Assistant flow, or before this feature existed at all).
+macos_admin_password() {
+    if [[ -f "$MACOS_ADMIN_PASSWORD_FILE" ]]; then
+        cat "$MACOS_ADMIN_PASSWORD_FILE"
+    else
+        echo "$MACOS_SSH_USER"
+    fi
 }
 
 ssh_macos() {
@@ -624,9 +650,11 @@ ssh_macos_bootstrap() {
     askpass="$(mktemp "${TMPDIR:-/tmp}/augur-askpass.XXXXXX")" \
         || { error "Failed to create SSH askpass helper."; exit 1; }
     chmod 700 "$askpass"
-    # Embed the (already-public) password via %q; reply to password prompts only, else exit 1.
+    # Embed the password via %q (safe regardless of its content); reply to password prompts
+    # only, else exit 1. Fixed "admin" (ADR-0007) unless this base VM was built with macOS
+    # 27's automated provisioning (ADR-0018), in which case it's the generated random one.
     printf '#!/bin/bash\ncase "$1" in *[Pp]assword:*) printf "%%s\\n" %q ;; *) exit 1 ;; esac\n' \
-        "$MACOS_SSH_USER" > "$askpass"
+        "$(macos_admin_password)" > "$askpass"
     # Explicit cleanup (not `trap … RETURN`): a RETURN trap is not function-local — it would
     # persist and re-fire on the caller's return, where $askpass is out of scope (fatal under
     # `set -u`), and it also wouldn't fire when `set -e` aborts on a failed ssh (leaking the file).
@@ -2634,47 +2662,90 @@ cmd_build_macos() {
     "$VM_CLI" create "$MACOS_BUILD_VM" --from-ipsw "$(realpath "$ipsw_path")" --disk-size 120
     "$VM_CLI" set "$MACOS_BUILD_VM" --cpu 4 --memory 8192
 
-    # Step 3: Run with GUI for manual Setup Assistant completion
-    echo ""
-    echo -e "${BOLD}── Setup Assistant (manual) ──────────────────────────────────────────────────${RESET}"
-    echo ""
-    echo -e "  A VM window will open. Complete Setup Assistant, then:"
-    echo ""
-    echo -e "  1. Create a user account with these exact credentials:"
-    echo -e "       Username : ${CYAN}${MACOS_SSH_USER}${RESET}"
-    echo -e "       Password : ${CYAN}${MACOS_SSH_USER}${RESET}"
-    echo -e "  2. After reaching the desktop, enable Remote Login:"
-    echo -e "       System Settings → General → Sharing → Remote Login → ON"
-    echo -e "  3. Close the VM window."
-    echo ""
-    echo -e "${BOLD}─────────────────────────────────────────────────────────────────────────────${RESET}"
-    echo ""
-    read -rp "$(echo -e "${CYAN}[augur]${RESET} Press Enter to open the VM window...")"
-    # Build/setup phases use plain NAT (gvproxy isn't running and no agent is present);
-    # --net-nat is required now that egress-filtered networking is the fail-closed default.
-    "$VM_CLI" run --net-nat "$MACOS_BUILD_VM"
+    # Step 3: First boot. VZMacGuestProvisioningOptions only takes effect on a guest's FIRST
+    # boot after restore (and only if the HOST is macOS 27+; the framework silently ignores it
+    # on an older guest OS too), so this decision has to be made right here, before the very
+    # first `run` — see ADR-0018. When both sides qualify, provision the admin account
+    # automatically and go straight to a headless boot; otherwise fall back to the original
+    # manual Setup Assistant flow unchanged.
+    local host_major guest_major auto_setup=false
+    host_major="$(host_macos_major_version)"
+    guest_major="$("$VM_CLI" guest-os-version "$MACOS_BUILD_VM" 2>/dev/null || true)"
+    if [[ -n "$host_major" && "$host_major" =~ ^[0-9]+$ && "$host_major" -ge 27 \
+          && -n "$guest_major" && "$guest_major" -ge 27 ]]; then
+        auto_setup=true
+    fi
 
-    read -rp "$(echo -e "${CYAN}[augur]${RESET} Remote Login enabled? Ready to continue? [y/N] ")" yn
-    [[ "$yn" == [yY] ]] || { info "Aborted."; exit 0; }
+    local vm_pid vm_ip
+    if $auto_setup; then
+        info "Host and guest are both macOS 27+ — provisioning the admin account automatically (no manual Setup Assistant needed)."
+        # base64 on purpose: its alphabet ([A-Za-z0-9+/=]) has no shell metacharacters, so this
+        # value is safe to embed unescaped in the single-quoted "echo '<password>' | sudo -S"
+        # strings elsewhere in this file (macos_admin_password's callers) — do not switch
+        # generators without re-auditing those call sites.
+        local new_password
+        new_password="$(openssl rand -base64 24)"
+        mkdir -p "$(dirname "$MACOS_ADMIN_PASSWORD_FILE")"
+        ( umask 077 && printf '%s' "$new_password" > "$MACOS_ADMIN_PASSWORD_FILE" )
 
-    # Step 4: Restart headlessly and wait for SSH
-    info "Restarting VM headlessly..."
-    "$VM_CLI" run --no-graphics --net-nat "$MACOS_BUILD_VM" &>/dev/null &
-    local vm_pid=$!
+        # Build/setup phases use plain NAT (gvproxy isn't running and no agent is present);
+        # --net-nat is required now that egress-filtered networking is the fail-closed default.
+        # enablesRemoteLogin (set in augur-vm's RunSession) means SSH is already up — no GUI,
+        # no "enable Remote Login by hand" step.
+        "$VM_CLI" run --no-graphics --net-nat \
+            --provision-username "$MACOS_SSH_USER" \
+            --provision-password "$new_password" \
+            --provision-full-name "augur" \
+            "$MACOS_BUILD_VM" &>/dev/null &
+        vm_pid=$!
 
-    info "Waiting for SSH..."
-    local vm_ip
-    vm_ip="$(macos_vm_ip "$MACOS_BUILD_VM")" || {
-        stop_and_reap_macos_vm "$MACOS_BUILD_VM" "$vm_pid"
-        error "VM did not become reachable. Check that Remote Login is enabled."
-        exit 1
-    }
+        info "Waiting for SSH..."
+        vm_ip="$(macos_vm_ip "$MACOS_BUILD_VM")" || {
+            stop_and_reap_macos_vm "$MACOS_BUILD_VM" "$vm_pid"
+            error "VM did not become reachable after automated provisioning."
+            exit 1
+        }
+    else
+        echo ""
+        echo -e "${BOLD}── Setup Assistant (manual) ──────────────────────────────────────────────────${RESET}"
+        echo ""
+        echo -e "  A VM window will open. Complete Setup Assistant, then:"
+        echo ""
+        echo -e "  1. Create a user account with these exact credentials:"
+        echo -e "       Username : ${CYAN}${MACOS_SSH_USER}${RESET}"
+        echo -e "       Password : ${CYAN}${MACOS_SSH_USER}${RESET}"
+        echo -e "  2. After reaching the desktop, enable Remote Login:"
+        echo -e "       System Settings → General → Sharing → Remote Login → ON"
+        echo -e "  3. Close the VM window."
+        echo ""
+        echo -e "${BOLD}─────────────────────────────────────────────────────────────────────────────${RESET}"
+        echo ""
+        read -rp "$(echo -e "${CYAN}[augur]${RESET} Press Enter to open the VM window...")"
+        # Build/setup phases use plain NAT (gvproxy isn't running and no agent is present);
+        # --net-nat is required now that egress-filtered networking is the fail-closed default.
+        "$VM_CLI" run --net-nat "$MACOS_BUILD_VM"
+
+        read -rp "$(echo -e "${CYAN}[augur]${RESET} Remote Login enabled? Ready to continue? [y/N] ")" yn
+        [[ "$yn" == [yY] ]] || { info "Aborted."; exit 0; }
+
+        # Step 4: Restart headlessly and wait for SSH
+        info "Restarting VM headlessly..."
+        "$VM_CLI" run --no-graphics --net-nat "$MACOS_BUILD_VM" &>/dev/null &
+        vm_pid=$!
+
+        info "Waiting for SSH..."
+        vm_ip="$(macos_vm_ip "$MACOS_BUILD_VM")" || {
+            stop_and_reap_macos_vm "$MACOS_BUILD_VM" "$vm_pid"
+            error "VM did not become reachable. Check that Remote Login is enabled."
+            exit 1
+        }
+    fi
 
     # A fresh build always produces a new VM with a new SSH host key. Discard any stale
     # entry so the TOFU check below stores the new key cleanly.
     rm -f "$(vm_known_hosts_file "$MACOS_BUILD_VM")"
 
-    # Set up SSH key authentication FIRST. This is the ONLY step that needs the fixed admin
+    # Set up SSH key authentication FIRST. This is the ONLY step that needs the admin
     # password; augur feeds it non-interactively via SSH_ASKPASS (ssh_macos_bootstrap) — the
     # operator types nothing here. Installing the key is a plain write to the user's own ~/.ssh
     # (no sudo), so it can run first; every step after this uses key auth.
@@ -2690,10 +2761,10 @@ cmd_build_macos() {
 
     # Configure passwordless sudo so subsequent ssh_macos calls don't need a TTY. The key is
     # installed now, so this runs over key auth (no login-password prompt); the sudo password is
-    # still piped via `sudo -S`, and the account is still admin/admin at this point.
+    # still piped via `sudo -S`.
     info "Configuring passwordless sudo..."
     ssh_macos "$MACOS_BUILD_VM" \
-        "echo '${MACOS_SSH_USER}' | sudo -S -p '' bash -c \
+        "echo '$(macos_admin_password)' | sudo -S -p '' bash -c \
             'echo \"${MACOS_SSH_USER} ALL=(ALL) NOPASSWD:ALL\" > /etc/sudoers.d/augur \
              && chmod 440 /etc/sudoers.d/augur'"
 
@@ -2704,16 +2775,24 @@ cmd_build_macos() {
     # Enable auto-login so a GUI (Aqua) session exists at boot. `xcodebuild test` needs an Aqua
     # session to reach testmanagerd; a headless SSH login has none, so tests fail without this
     # (Apple: "Once a user is logged in, running xcodebuild from ssh works for all test types").
-    # `sysadminctl -autologin` is broken (error 22) on current macOS, so write kcpassword directly.
-    # The bytes are the literal password "admin" XOR'd with the kcpassword cipher — they match the
-    # MACOS_SSH_USER/password (admin/admin) set during Setup Assistant. (Method per cirruslabs.)
-    info "Enabling auto-login (required for headless xcodebuild test)..."
-    ssh_macos "$MACOS_BUILD_VM" "
-        echo '00000000: 1ced 3f4a bcbc ba2c caca 4e82' | sudo xxd -r - /etc/kcpassword
-        sudo chmod 600 /etc/kcpassword
-        sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser ${MACOS_SSH_USER}
-        sudo systemsetup -setsleep Off 2>/dev/null || true
-    "
+    if $auto_setup; then
+        # logsInAutomatically (set on the VZMacGuestProvisioningOptions passed to `run`) already
+        # configured this natively — the kcpassword hack below is unnecessary here.
+        info "Auto-login already configured by automated provisioning."
+    else
+        # `sysadminctl -autologin` is broken (error 22) on current macOS, so write kcpassword
+        # directly. The bytes are the literal password "admin" XOR'd with the kcpassword cipher —
+        # they match the MACOS_SSH_USER/password (admin/admin) set during Setup Assistant in the
+        # manual flow above. (Method per cirruslabs.) Only valid for that fixed credential, which
+        # is exactly the branch this runs in.
+        info "Enabling auto-login (required for headless xcodebuild test)..."
+        ssh_macos "$MACOS_BUILD_VM" "
+            echo '00000000: 1ced 3f4a bcbc ba2c caca 4e82' | sudo xxd -r - /etc/kcpassword
+            sudo chmod 600 /etc/kcpassword
+            sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser ${MACOS_SSH_USER}
+        "
+    fi
+    ssh_macos "$MACOS_BUILD_VM" "sudo systemsetup -setsleep Off 2>/dev/null || true"
 
     # Step 5: Install Xcode via SSH
     # Use a fixed safe remote filename to avoid shell injection via the source path's basename.
@@ -3043,9 +3122,10 @@ install_macos_managed_settings() {
         return 0
     }
     # `sudo -S` works whether or not the build-time NOPASSWD grant is still present, which is what
-    # lets `update --macos` reach a base VM that no longer has it. The password is the documented
-    # fixed one (ADR-0007) — no privilege here that augur's build does not already take.
-    ssh_macos "$vm" "echo '${MACOS_SSH_USER}' | sudo -S -p '' sh -c '
+    # lets `update --macos` reach a base VM that no longer has it. The password is whatever this
+    # base VM's admin account actually has — the documented fixed one (ADR-0007) unless it was
+    # built via automated provisioning (ADR-0018) — no privilege here augur's build doesn't already take.
+    ssh_macos "$vm" "echo '$(macos_admin_password)' | sudo -S -p '' sh -c '
         mkdir -p \"${parent}\" &&
         mv \"${staged}\" \"${dst}\" &&
         chown root:wheel \"${dst}\" &&
@@ -3212,7 +3292,7 @@ sync_macos_guest_clock() {
     # host side, so this line does not depend on BSD `date` (`date -r <seconds>` would have, and the
     # offline test tier runs on a Linux runner).
     stamp="$(date -u +%m%d%H%M%Y.%S)"
-    setout="$(ssh_macos "$vm" "echo '${MACOS_SSH_USER}' | sudo -S -p '' /bin/date -u '${stamp}'" 2>&1)" || {
+    setout="$(ssh_macos "$vm" "echo '$(macos_admin_password)' | sudo -S -p '' /bin/date -u '${stamp}'" 2>&1)" || {
         warn "Could not set the guest's clock (${drift}s off the host's): ${setout%%$'\n'*}"
         warn "  Tokens, TLS validity windows and commit timestamps in the guest will use that skewed clock."
         return 0
@@ -4557,10 +4637,11 @@ run_base_provisioning() {
     # Grant temporary passwordless sudo for this session (idempotent: cmd_build_macos's
     # mid-build VM already has this grant from its own Step 4; a standalone base-VM
     # 'augur update --macos' does not, since the original build already revoked it — this
-    # establishes it fresh in that case). Same fixed admin/admin credential the rest of the
-    # build already depends on (see cmd_build_macos Step 3/4).
+    # establishes it fresh in that case). Same admin credential the rest of the build already
+    # depends on (see cmd_build_macos and macos_admin_password) — fixed admin/admin (ADR-0007)
+    # unless this base VM was built via automated provisioning (ADR-0018).
     ssh_macos_provision "$vm" \
-        "echo '${MACOS_SSH_USER}' | sudo -S -p '' bash -c \
+        "echo '$(macos_admin_password)' | sudo -S -p '' bash -c \
             'echo \"${MACOS_SSH_USER} ALL=(ALL) NOPASSWD:ALL\" > /etc/sudoers.d/augur \
              && chmod 440 /etc/sudoers.d/augur'" \
         || provision_fail "Failed to grant temporary sudo for provisioning."

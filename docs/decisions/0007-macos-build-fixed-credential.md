@@ -1,6 +1,9 @@
 # ADR-0007 — macOS base-VM build keeps the fixed `admin`/`admin` credential, but stops making the operator type it
 
-- **Status:** Accepted.
+- **Status:** Accepted; narrowed by [ADR-0018](./0018-macos27-unattended-provisioning.md) for a
+  macOS 27+ host building a macOS 27+ guest, where the credential is now generated instead of
+  fixed. This record still governs every other case (older host, older guest IPSW, or a
+  pre-existing base VM) unchanged.
 - **Date:** 2026-07-20.
 - **Applies to:** macOS VM mode only (`cmd_build_macos` / the base-VM build path).
 
