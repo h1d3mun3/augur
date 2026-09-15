@@ -75,7 +75,16 @@ final class RunSession: NSObject, VZVirtualMachineDelegate {
 
     // MARK: - Boot (headless)
 
-    private func boot() {
+    /// How long `boot()` keeps retrying a start that failed *only* because another process
+    /// still holds the bundle's auxiliary-storage lock — see handleStartFailure. Kept well
+    /// under augur's own "waiting for SSH" budget so the caller never gives up (and tears the
+    /// VM down) while a retry is still pending.
+    private static let auxLockRetryLimit = 15
+    private static let auxLockRetryDelay: TimeInterval = 2
+
+    private func boot() { boot(attemptsLeft: RunSession.auxLockRetryLimit) }
+
+    private func boot(attemptsLeft: Int) {
         do {
             let config = try buildConfiguration()
             try config.validate()
@@ -83,6 +92,9 @@ final class RunSession: NSObject, VZVirtualMachineDelegate {
             let vm = VZVirtualMachine(configuration: config)
             vm.delegate = self
             self.vm = vm
+
+            // Only the first attempt announces the boot; a retry is not a new boot.
+            let announce = attemptsLeft == RunSession.auxLockRetryLimit
 
             if let username = provisionUsername, let password = provisionPassword {
                 // Only meaningful on the guest's FIRST boot after `create` — Virtualization
@@ -95,19 +107,23 @@ final class RunSession: NSObject, VZVirtualMachineDelegate {
                     fail("--provision-username/--provision-password need a macOS 27+ host (Virtualization's automated guest provisioning is unavailable on this host)")
                     return
                 }
-                FileHandle.standardError.write(Data(
-                    "[augur-vm] booting '\(name)'… (automated guest provisioning for '\(username)')\n".utf8))
+                if announce {
+                    FileHandle.standardError.write(Data(
+                        "[augur-vm] booting '\(name)'… (automated guest provisioning for '\(username)')\n".utf8))
+                }
                 let options = try provisioningStartOptions(username: username, password: password)
                 vm.start(options: options) { [self] errorOrNil in
                     if let error = errorOrNil {
-                        fail("failed to start VM: \(error.localizedDescription)")
+                        handleStartFailure(error, attemptsLeft: attemptsLeft)
                     }
                 }
             } else {
-                FileHandle.standardError.write(Data("[augur-vm] booting '\(name)'…\n".utf8))
+                if announce {
+                    FileHandle.standardError.write(Data("[augur-vm] booting '\(name)'…\n".utf8))
+                }
                 vm.start { [self] result in
                     if case let .failure(error) = result {
-                        fail("failed to start VM: \(error.localizedDescription)")
+                        handleStartFailure(error, attemptsLeft: attemptsLeft)
                     }
                 }
             }
@@ -134,6 +150,70 @@ final class RunSession: NSObject, VZVirtualMachineDelegate {
         let options = VZMacOSVirtualMachineStartOptions()
         try options.setGuestProvisioning(provisioning)
         return options
+    }
+
+    /// A start that failed *only* because another process still holds this bundle's
+    /// auxiliary-storage (nvram.bin) lock is retried, not reported. The usual holder is the
+    /// `create` installer's own VM: Virtualization runs a guest inside a
+    /// `com.apple.Virtualization.VirtualMachine` XPC service that outlives the `create`
+    /// process which spawned it, so the lock can still be held for a while after `create`
+    /// has exited and printed "created". A `run` issued immediately afterwards therefore
+    /// loses a race it wins a moment later. `cmd_build_macos`'s automated path does exactly
+    /// that; the manual Setup Assistant flow only ever got away with it because its
+    /// "press Enter to open the VM window" prompt made a human sit out the window.
+    private func handleStartFailure(_ error: Error, attemptsLeft: Int) {
+        guard attemptsLeft > 0, isAuxiliaryStorageLockContention(error) else {
+            fail(startFailureReport(error))
+            return
+        }
+        if attemptsLeft == RunSession.auxLockRetryLimit {
+            FileHandle.standardError.write(Data(
+                "[augur-vm] '\(name)' auxiliary storage is locked by another process; retrying…\n".utf8))
+        }
+        // Drop the half-started VM so the next attempt rebuilds the configuration (and with
+        // it the VZMacAuxiliaryStorage) from scratch rather than reusing a failed instance.
+        vm = nil
+        DispatchQueue.main.asyncAfter(deadline: .now() + RunSession.auxLockRetryDelay) { [self] in
+            boot(attemptsLeft: attemptsLeft - 1)
+        }
+    }
+
+    /// True for the one start failure worth retrying: VZ could not take the auxiliary
+    /// storage's advisory lock because someone else holds it. Keyed on the underlying POSIX
+    /// errno (EAGAIN/EWOULDBLOCK, what a non-blocking flock returns under contention), never
+    /// on the localized message, which is user-language dependent. The outer domain/code pair
+    /// is VZErrorDomain/2 (`VZErrorInvalidVirtualMachineConfiguration`) as observed from the
+    /// framework; matching it keeps an unrelated EAGAIN from being retried forever.
+    private func isAuxiliaryStorageLockContention(_ error: Error) -> Bool {
+        let ns = error as NSError
+        guard ns.domain == "VZErrorDomain", ns.code == 2 else { return false }
+        guard let underlying = ns.userInfo[NSUnderlyingErrorKey] as? NSError else { return false }
+        return underlying.domain == NSPOSIXErrorDomain && underlying.code == Int(EAGAIN)
+    }
+
+    /// Expand a `start` failure into something diagnosable (mirrors the install path's
+    /// reporting). `localizedDescription` alone collapses distinct causes into one string —
+    /// "Failed to lock auxiliary storage." says nothing about WHY the lock failed, while the
+    /// underlying POSIX error separates "another process holds it" (EAGAIN/EWOULDBLOCK) from
+    /// "we cannot open it for writing at all" (EACCES/EPERM).
+    private func startFailureReport(_ error: Error) -> String {
+        let ns = error as NSError
+        var msg = "failed to start VM: \(error.localizedDescription)"
+        msg += "\n  domain=\(ns.domain) code=\(ns.code)"
+        if let reason = ns.localizedFailureReason {
+            msg += "\n  reason: \(reason)"
+        }
+        // Bounded walk: this runs on the failure path, where spinning on a self-referential
+        // error chain would replace a diagnosable message with a hang.
+        var underlying = ns.userInfo[NSUnderlyingErrorKey] as? NSError
+        var depth = 0
+        while let u = underlying, depth < 5 {
+            msg += "\n  underlying: \(u.domain) code=\(u.code) — \(u.localizedDescription)"
+            underlying = u.userInfo[NSUnderlyingErrorKey] as? NSError
+            depth += 1
+        }
+        msg += "\n  nvram: \(Paths.nvram(name).path)"
+        return msg
     }
 
     /// Build the runtime configuration from the bundle. A graphics device (virtual
