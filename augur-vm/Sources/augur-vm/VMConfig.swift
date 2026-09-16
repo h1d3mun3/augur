@@ -11,6 +11,13 @@ struct VMConfig: Codable {
     var hardwareModel: Data       // VZMacHardwareModel.dataRepresentation
     var machineIdentifier: Data   // VZMacMachineIdentifier.dataRepresentation
     var display: Display
+    /// The installed guest's major OS version (e.g. 27 for macOS 27.x), captured from
+    /// `VZMacOSRestoreImage.operatingSystemVersion` at `create` time. Optional so bundles
+    /// created before this field existed still decode (Codable defaults a missing key to
+    /// nil for an Optional property). Used to decide whether the guest supports automated
+    /// `VZMacGuestProvisioningOptions` setup on its first boot (needs guest macOS 27+, in
+    /// addition to a macOS 27+ host) — see `guest-os-version` and ADR-0018.
+    var guestOSMajorVersion: Int? = nil
 
     struct Display: Codable {
         var width: Int

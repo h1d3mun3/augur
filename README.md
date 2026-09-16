@@ -244,7 +244,12 @@ augur build --macos --ipsw ~/Downloads/macOS.ipsw --xcode-xip ~/Downloads/Xcode.
 
 This will:
 1. Create a macOS VM from your IPSW (`augur-vm create --from-ipsw`)
-2. Open the VM window for manual Setup Assistant completion (credentials: `admin` / `admin`, Remote Login enabled)
+2. Provision the account — **automatically**, with no GUI window, when both this host and the
+   IPSW's guest OS are macOS 27+ (a randomly generated password is kept at
+   `~/.augur/macos-admin-password`, mode 600); otherwise open the VM window for manual Setup
+   Assistant completion (credentials: `admin` / `admin`, Remote Login enabled). Pass
+   `--manual-setup` to take the manual flow even on a macOS 27+ pair. See
+   [ADR-0018](docs/decisions/0018-macos27-unattended-provisioning.md).
 3. Install Xcode, Homebrew, GitHub CLI, and Claude Code
 4. Download the iOS Simulator runtime (Xcode installed from a XIP does not bundle it)
 5. Save the result as a reusable base VM (`augur-macos-base`)

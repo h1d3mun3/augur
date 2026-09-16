@@ -19,6 +19,14 @@ final class RunSession: NSObject, VZVirtualMachineDelegate {
     /// Opt-in to unfiltered NAT. Without it (and without a vfkit socket) the VM
     /// refuses to boot rather than silently granting the guest full network access.
     private let netAllowNAT: Bool
+    /// Automated first-boot account setup (VZMacGuestProvisioningOptions, macOS 27+ host
+    /// only — see boot()). Both nil unless `augur-vm run --provision-username` plus
+    /// `--provision-password-stdin` was given (Run.swift's validate() guarantees they come as a
+    /// pair), and always nil in a build whose SDK predates macOS 27, where those flags and the
+    /// code behind them are compiled out entirely.
+    private let provisionUsername: String?
+    private let provisionPassword: String?
+    private let provisionFullName: String
 
     var vm: VZVirtualMachine?
     var loadedConfig: VMConfig?
@@ -31,12 +39,18 @@ final class RunSession: NSObject, VZVirtualMachineDelegate {
     var isTerminating = false
     var terminateReply: (() -> Void)?
 
-    init(name: String, headless: Bool, dirs: [String], netVfkitSocket: String? = nil, netAllowNAT: Bool = false) {
+    init(
+        name: String, headless: Bool, dirs: [String], netVfkitSocket: String? = nil, netAllowNAT: Bool = false,
+        provisionUsername: String? = nil, provisionPassword: String? = nil, provisionFullName: String = "augur"
+    ) {
         self.name = name
         self.headless = headless
         self.dirs = dirs
         self.netVfkitSocket = netVfkitSocket
         self.netAllowNAT = netAllowNAT
+        self.provisionUsername = provisionUsername
+        self.provisionPassword = provisionPassword
+        self.provisionFullName = provisionFullName
     }
 
     /// Entry point: prepare, then either park headless or run the GUI app.
@@ -63,7 +77,16 @@ final class RunSession: NSObject, VZVirtualMachineDelegate {
 
     // MARK: - Boot (headless)
 
-    private func boot() {
+    /// How long `boot()` keeps retrying a start that failed *only* because another process
+    /// still holds the bundle's auxiliary-storage lock — see handleStartFailure. Kept well
+    /// under augur's own "waiting for SSH" budget so the caller never gives up (and tears the
+    /// VM down) while a retry is still pending.
+    private static let auxLockRetryLimit = 15
+    private static let auxLockRetryDelay: TimeInterval = 2
+
+    private func boot() { boot(attemptsLeft: RunSession.auxLockRetryLimit) }
+
+    private func boot(attemptsLeft: Int) {
         do {
             let config = try buildConfiguration()
             try config.validate()
@@ -72,15 +95,137 @@ final class RunSession: NSObject, VZVirtualMachineDelegate {
             vm.delegate = self
             self.vm = vm
 
-            FileHandle.standardError.write(Data("[augur-vm] booting '\(name)'…\n".utf8))
+            // Only the first attempt announces the boot; a retry is not a new boot.
+            let announce = attemptsLeft == RunSession.auxLockRetryLimit
+
+            // Compiled out when building against an SDK older than macOS 27, which has no
+            // VZMacGuestProvisioningOptions to reference — see Run.swift for why the gate is
+            // `compiler(>=6.4)` and why `@available` cannot do this job. With the feature out,
+            // provisionUsername is always nil (its flags do not exist), so every boot takes the
+            // plain start below.
+            #if compiler(>=6.4)
+            if let username = provisionUsername, let password = provisionPassword {
+                // Only meaningful on the guest's FIRST boot after `create` — Virtualization
+                // ignores these options on every later boot, and on a guest whose installed
+                // OS predates macOS 27 (Run.swift's --no-graphics requirement plus this host
+                // check are the only gates here; augur's `cmd_build_macos` is what also checks
+                // the GUEST's OS version via `guest-os-version` before ever passing these flags —
+                // see ADR-0018).
+                guard #available(macOS 27, *) else {
+                    fail("--provision-username/--provision-password-stdin need a macOS 27+ host (Virtualization's automated guest provisioning is unavailable on this host)")
+                    return
+                }
+                if announce {
+                    FileHandle.standardError.write(Data(
+                        "[augur-vm] booting '\(name)'… (automated guest provisioning for '\(username)')\n".utf8))
+                }
+                let options = try provisioningStartOptions(username: username, password: password)
+                vm.start(options: options) { [self] errorOrNil in
+                    if let error = errorOrNil {
+                        handleStartFailure(error, attemptsLeft: attemptsLeft)
+                    }
+                }
+                return
+            }
+            #endif
+
+            if announce {
+                FileHandle.standardError.write(Data("[augur-vm] booting '\(name)'…\n".utf8))
+            }
             vm.start { [self] result in
                 if case let .failure(error) = result {
-                    fail("failed to start VM: \(error.localizedDescription)")
+                    handleStartFailure(error, attemptsLeft: attemptsLeft)
                 }
             }
         } catch {
             fail("\(error)")
         }
+    }
+
+    #if compiler(>=6.4)
+    /// Builds start options that provision the guest's admin account on first boot
+    /// (`VZMacGuestProvisioningOptions`, macOS 27+ host and guest only — see boot()).
+    /// `logsInAutomatically` replaces augur's kcpassword hack (the legacy manual-Setup-
+    /// Assistant path in `cmd_build_macos` still needs that hack; this path doesn't), and
+    /// `enablesRemoteLogin` replaces the manual "System Settings → Sharing → Remote Login"
+    /// step, so the caller can go straight to a headless boot and wait for SSH.
+    @available(macOS 27, *)
+    private func provisioningStartOptions(username: String, password: String) throws -> VZMacOSVirtualMachineStartOptions {
+        let provisioning = VZMacGuestProvisioningOptions()
+        provisioning.fullName = provisionFullName
+        provisioning.username = username
+        provisioning.password = password
+        provisioning.logsInAutomatically = true
+        provisioning.enablesRemoteLogin = true
+
+        let options = VZMacOSVirtualMachineStartOptions()
+        try options.setGuestProvisioning(provisioning)
+        return options
+    }
+    #endif
+
+    /// A start that failed *only* because another process still holds this bundle's
+    /// auxiliary-storage (nvram.bin) lock is retried, not reported. The usual holder is the
+    /// `create` installer's own VM: Virtualization runs a guest inside a
+    /// `com.apple.Virtualization.VirtualMachine` XPC service that outlives the `create`
+    /// process which spawned it, so the lock can still be held for a while after `create`
+    /// has exited and printed "created". A `run` issued immediately afterwards therefore
+    /// loses a race it wins a moment later. `cmd_build_macos`'s automated path does exactly
+    /// that; the manual Setup Assistant flow only ever got away with it because its
+    /// "press Enter to open the VM window" prompt made a human sit out the window.
+    private func handleStartFailure(_ error: Error, attemptsLeft: Int) {
+        guard attemptsLeft > 0, isAuxiliaryStorageLockContention(error) else {
+            fail(startFailureReport(error))
+            return
+        }
+        if attemptsLeft == RunSession.auxLockRetryLimit {
+            FileHandle.standardError.write(Data(
+                "[augur-vm] '\(name)' auxiliary storage is locked by another process; retrying…\n".utf8))
+        }
+        // Drop the half-started VM so the next attempt rebuilds the configuration (and with
+        // it the VZMacAuxiliaryStorage) from scratch rather than reusing a failed instance.
+        vm = nil
+        DispatchQueue.main.asyncAfter(deadline: .now() + RunSession.auxLockRetryDelay) { [self] in
+            boot(attemptsLeft: attemptsLeft - 1)
+        }
+    }
+
+    /// True for the one start failure worth retrying: VZ could not take the auxiliary
+    /// storage's advisory lock because someone else holds it. Keyed on the underlying POSIX
+    /// errno (EAGAIN/EWOULDBLOCK, what a non-blocking flock returns under contention), never
+    /// on the localized message, which is user-language dependent. The outer domain/code pair
+    /// is VZErrorDomain/2 (`VZErrorInvalidVirtualMachineConfiguration`) as observed from the
+    /// framework; matching it keeps an unrelated EAGAIN from being retried forever.
+    private func isAuxiliaryStorageLockContention(_ error: Error) -> Bool {
+        let ns = error as NSError
+        guard ns.domain == "VZErrorDomain", ns.code == 2 else { return false }
+        guard let underlying = ns.userInfo[NSUnderlyingErrorKey] as? NSError else { return false }
+        return underlying.domain == NSPOSIXErrorDomain && underlying.code == Int(EAGAIN)
+    }
+
+    /// Expand a `start` failure into something diagnosable (mirrors the install path's
+    /// reporting). `localizedDescription` alone collapses distinct causes into one string —
+    /// "Failed to lock auxiliary storage." says nothing about WHY the lock failed, while the
+    /// underlying POSIX error separates "another process holds it" (EAGAIN/EWOULDBLOCK) from
+    /// "we cannot open it for writing at all" (EACCES/EPERM).
+    private func startFailureReport(_ error: Error) -> String {
+        let ns = error as NSError
+        var msg = "failed to start VM: \(error.localizedDescription)"
+        msg += "\n  domain=\(ns.domain) code=\(ns.code)"
+        if let reason = ns.localizedFailureReason {
+            msg += "\n  reason: \(reason)"
+        }
+        // Bounded walk: this runs on the failure path, where spinning on a self-referential
+        // error chain would replace a diagnosable message with a hang.
+        var underlying = ns.userInfo[NSUnderlyingErrorKey] as? NSError
+        var depth = 0
+        while let u = underlying, depth < 5 {
+            msg += "\n  underlying: \(u.domain) code=\(u.code) — \(u.localizedDescription)"
+            underlying = u.userInfo[NSUnderlyingErrorKey] as? NSError
+            depth += 1
+        }
+        msg += "\n  nvram: \(Paths.nvram(name).path)"
+        return msg
     }
 
     /// Build the runtime configuration from the bundle. A graphics device (virtual

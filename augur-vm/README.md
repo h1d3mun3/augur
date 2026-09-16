@@ -18,6 +18,23 @@ Implemented:
 - `augur-vm set <name> [--cpu N] [--memory MB]` — adjust CPU / memory (memory in MB)
 - `augur-vm run <name> --no-graphics [--dir name:path ...] [--net-vfkit <socket>]` — boot headless with shared dirs
 - `augur-vm run <name>` — boot with a GUI window (display + keyboard + pointer) for Setup Assistant
+- `printf %s "$pw" | augur-vm run <name> --no-graphics --provision-username <user> --provision-password-stdin [--provision-full-name <name>]` —
+  on a macOS 27+ host, provisions the account automatically on the guest's first boot after
+  `create` (`VZMacGuestProvisioningOptions`: auto-login + Remote Login enabled, no manual Setup
+  Assistant) instead of waiting for a human at a GUI window. Has no effect on a guest whose
+  installed OS predates macOS 27 (see `guest-os-version` below) — the framework silently ignores
+  it there rather than erroring. The password is read from stdin and has no option form, because
+  argv is observable (`ps`) for the whole life of the boot.
+  See `docs/decisions/0018-macos27-unattended-provisioning.md`.
+  **These two flags exist only when augur-vm is built against the macOS 27 SDK (Xcode 27+)** —
+  the symbol they need is absent from older SDKs, so the feature is compiled out rather than
+  failing the build (`#if compiler(>=6.4)`). `run --help` is the authoritative answer for a given
+  binary; everything else in `--macos` mode works either way.
+  A `run` issued right after `create` may find the bundle's auxiliary storage still locked by the
+  installer's VM (whose XPC service outlives the `create` process); that start is retried for
+  ~30s rather than reported, so back-to-back `create`/`run` is safe.
+- `augur-vm guest-os-version <name>` — print the installed guest's major macOS version, captured
+  from the IPSW's restore image at `create` time (empty/exit 1 for a bundle predating this field)
 - `augur-vm ip <name>` — print the guest IP (from `/var/db/dhcpd_leases`)
 - `augur-vm stop <name>` — graceful shutdown (SIGTERM to the run process; force-kill fallback)
 - `augur-vm delete <name>` — remove a VM bundle

@@ -24,6 +24,7 @@ struct AugurVM: ParsableCommand {
             SetCmd.self,   // M1
             Run.self,      // M2 (headless) / M3 (GUI)
             IP.self,       // M2
+            GuestOSVersionCommand.self,
             Stop.self,     // M4
             DeleteCmd.self,// M4
             Clone.self,    // M4
