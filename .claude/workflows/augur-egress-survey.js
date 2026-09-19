@@ -90,10 +90,14 @@ that a different agent is writing (do not write the H2 yourself, do not write 2.
   ### 2.5 Workspace containment
 
 2.4 is the macOS VM engine's egress datapath (gvproxy). This is the part most likely to have
-changed recently: gvproxy was just re-pinned from d3d4f055 to 50edb65e (closing issue #172 - see
-gvproxy/build.sh's PIN and gvproxy/augur-egress.patch), and a bug found by code review was fixed
-where the SOCKS dial path (pkg/services/forwarder/socks_client.go's socksDial) had no connect
-timeout unlike the direct-dial branch, now fixed by threading connectTimeout through. Describe the
+changed recently: gvproxy was just re-pinned from 50edb65e to b6bb07ed (closing issue #175 - see
+gvproxy/build.sh's PIN and gvproxy/augur-egress.patch). This re-pin needed an actual rebase, not
+just a straight re-apply: upstream's SOA/PTR/AAAA-forwarding fix (afe8c1b2) added a nameservers/
+client pair to dnsHandler and a default case in addAnswers's query-type switch, which collided
+with augur's allowlist field and New()/NewWithUpstreamResolver() signature change. The rebase is
+still semantically a no-op for the allowlist gate: the gate's own switch (only A/AAAA/CNAME fall
+through when armed) runs before addAnswers's switch, so the new SOA/PTR/CAA forwarding path is
+unreachable whenever --dns-allowlist is armed. Describe the
 current gvproxy pin, what augur-egress.patch does (--socks-upstream, --deny-direct,
 --dns-allowlist), and verify against pkg/virtualnetwork/services.go, pkg/services/forwarder/tcp.go,
 pkg/services/dns/dns.go that the wiring is as described - read those files inside
