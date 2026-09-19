@@ -90,18 +90,18 @@ index 2588f028..eaa0bb9e 100644
  	if InDebugMode() {
  		g.Go(func() error {
 diff --git a/pkg/services/dns/dns.go b/pkg/services/dns/dns.go
-index 3dd9a5ed..e8ad867c 100644
+index 1f7321ba..761f76a1 100644
 --- a/pkg/services/dns/dns.go
 +++ b/pkg/services/dns/dns.go
-@@ -30,6 +30,7 @@ type dnsHandler struct {
- 	zones     []types.Zone
- 	zonesLock sync.RWMutex
- 	upstream  upstreamResolver
-+	allowlist *dnsAllowlist // augur: nil => gate disabled (upstream behavior)
+@@ -35,6 +35,7 @@ type dnsHandler struct {
+ 	// look up directly (SOA, PTR, AAAA, CAA, ...).
+ 	nameservers []string
+ 	client      *dns.Client
++	allowlist   *dnsAllowlist // augur: nil => gate disabled (upstream behavior)
  }
  
  func (h *dnsHandler) handle(w dns.ResponseWriter, r *dns.Msg, responseMessageSize int) {
-@@ -127,6 +128,24 @@ func (h *dnsHandler) addAnswers(m *dns.Msg) {
+@@ -132,6 +133,24 @@ func (h *dnsHandler) addAnswers(m *dns.Msg) {
  			return
  		}
  
@@ -126,7 +126,7 @@ index 3dd9a5ed..e8ad867c 100644
  		resolver := h.upstream
  		switch q.Qtype {
  		case dns.TypeA:
-@@ -248,15 +267,21 @@ type Server struct {
+@@ -306,20 +325,26 @@ type Server struct {
  	handler *dnsHandler
  }
  
@@ -144,7 +144,12 @@ index 3dd9a5ed..e8ad867c 100644
  
 -func NewWithUpstreamResolver(udpConn net.PacketConn, tcpLn net.Listener, zones []types.Zone, upstream upstreamResolver) (*Server, error) {
 +func NewWithUpstreamResolver(udpConn net.PacketConn, tcpLn net.Listener, zones []types.Zone, upstream upstreamResolver, dnsAllowlistPatterns []string) (*Server, error) {
- 	handler := &dnsHandler{zones: zones, upstream: upstream}
+ 	handler := &dnsHandler{
+ 		zones:       zones,
+ 		upstream:    upstream,
+ 		nameservers: hostNameservers(),
+ 		client:      &dns.Client{},
+ 	}
 +	if dnsAllowlistPatterns != nil {
 +		handler.allowlist = newDNSAllowlist(dnsAllowlistPatterns)
 +	}
@@ -418,7 +423,7 @@ index 00000000..0e9194fd
 +	}
 +}
 diff --git a/pkg/services/dns/dns_test.go b/pkg/services/dns/dns_test.go
-index d7fb0f28..7cd0d2c1 100644
+index 75bdd45e..a0824fbb 100644
 --- a/pkg/services/dns/dns_test.go
 +++ b/pkg/services/dns/dns_test.go
 @@ -25,7 +25,7 @@ var _ = ginkgo.Describe("dns add test", func() {
@@ -457,7 +462,16 @@ index d7fb0f28..7cd0d2c1 100644
  	})
  
  	ginkgo.It("should reject empty zone name", func() {
-@@ -603,7 +603,7 @@ func startDNSServer(upstream upstreamResolver) (string, func(), error) {
+@@ -564,7 +564,7 @@ var _ = ginkgo.Describe("forwarding unhandled record types", func() {
+ 		}, false)
+ 		gomega.Expect(err).ToNot(gomega.HaveOccurred())
+ 
+-		server, err = New(nil, nil, []types.Zone{})
++		server, err = New(nil, nil, []types.Zone{}, nil)
+ 		gomega.Expect(err).ToNot(gomega.HaveOccurred())
+ 		// Point the raw forwarder at the mock upstream server.
+ 		server.handler.nameservers = []string{mockSrv.LocalAddr().String()}
+@@ -687,7 +687,7 @@ func startDNSServer(upstream upstreamResolver) (string, func(), error) {
  		return "", nil, err
  	}
  

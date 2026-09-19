@@ -10,7 +10,7 @@
 set -euo pipefail
 
 # Pinned upstream commit augur-egress.patch is written against.
-PIN="50edb65e946951352b1e722ab62f0ee1dde3bf30"
+PIN="b6bb07ed7a1a3884864d225580125134447b1e1c"
 REPO="https://github.com/containers/gvisor-tap-vsock"
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
