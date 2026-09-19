@@ -92,8 +92,9 @@ G_READ=1        # 1 = the clock is readable over SSH, 0 = ssh itself fails
 G_NOISE=0       # 1 = the guest prints a banner line before the epoch (a chatty ~/.zshenv)
 G_SET_RC=0      # what the privileged `date` set exits with
 G_SET_TO=0      # the offset the guest lands on after a successful set
+G_SET_BADREASON=0  # 1 = the set fails for a reason that is NOT a rejected password
 g_offset()     { printf '%s' "$1" > "$OFFSET_FILE"; }
-reset_guest()  { G_READ=1; G_NOISE=0; G_SET_RC=0; G_SET_TO=0; g_offset 0; }
+reset_guest()  { G_READ=1; G_NOISE=0; G_SET_RC=0; G_SET_TO=0; G_SET_BADREASON=0; g_offset 0; }
 reset_guest
 
 ssh_macos() {
@@ -108,7 +109,11 @@ ssh_macos() {
             return 0 ;;
         *"sudo -S -p ''"*)                                 # the privileged SET
             if [[ "$G_SET_RC" != 0 ]]; then
-                echo "Sorry, try again." >&2               # what `sudo -S` says to a bad password
+                if [[ "$G_SET_BADREASON" == 1 ]]; then
+                    echo "date: illegal time format" >&2   # a failure that is NOT a rejected password
+                else
+                    echo "Sorry, try again." >&2           # what `sudo -S` says to a bad password
+                fi
                 return "$G_SET_RC"
             fi
             g_offset "$G_SET_TO"
@@ -270,9 +275,18 @@ eq "0" "$rc" "set refused: returns 0 (\`up\` must not die with the VM already bo
 has "$out" "Could not set the guest's clock" "set refused: warns that the set failed"
 has "$out" "Sorry, try again." "set refused: surfaces sudo's own diagnostic (not swallowed)"
 has "$out" "Tokens, TLS validity windows and commit timestamps" "set refused: names what will be wrong"
+has "$out" "augur destroy && augur up --macos" "set refused: hints that a stale clone password can cause exactly this"
 hasnt "$out" "Guest clock synchronised with the host" "set refused: never claims success"
 # The recorded-call proof of the early return: the read-back must NOT be attempted after a failed set.
 eq "2" "$(n_calls)" "set refused: stops after the failed set (no pointless read-back)"
+
+# (a2) the set fails for some OTHER reason — the stale-password hint must not fire on every failure,
+# only on the one PAM message that actually means "the password was wrong".
+reset_guest; g_offset -5733; G_SET_RC=1; G_SET_BADREASON=1
+sync
+eq "0" "$rc" "set refused (other reason): returns 0"
+has "$out" "Could not set the guest's clock" "set refused (other reason): still warns that the set failed"
+hasnt "$out" "augur destroy && augur up --macos" "set refused (other reason): no stale-password hint on an unrelated failure"
 
 # (b) the guest is unreachable. Nothing may be sent — least of all a privileged command whose
 # argument would be derived from an unread clock.

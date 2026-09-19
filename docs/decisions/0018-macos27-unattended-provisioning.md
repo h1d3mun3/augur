@@ -102,6 +102,37 @@ Keeping a `macos-26` CI job is what holds this invariant: it is the only thing t
 exists and would make the current failure disappear — which is precisely why switching to it
 alone was rejected: it would have made CI green while leaving macOS 26 users unable to build.
 
+## Amendment (2026-09-19, stale-clone sudo password)
+
+`macos_admin_password()` is one file for the whole host (`~/.augur/macos-admin-password`),
+rewritten every time `cmd_build_macos` provisions a *fresh* base VM on the automated path. A
+project VM cloned from an earlier base has its real admin password frozen at whatever that base
+had when the clone was taken. If the base is rebuilt afterward — a host OS upgrade to macOS 27
+that re-runs `augur build --macos`, say — the file now holds a new random password that the
+older, still-running clone was never given. `sync_macos_guest_clock`'s `sudo -S` call against
+that clone (every `up`/`claude`/`shell --macos`) then authenticates with the wrong password and
+fails the same way a network hiccup would: a generic warning, no obvious cause.
+
+Verified directly against a live macOS 27 guest: `echo '<wrong password>' | sudo -S -p '' true`
+prints `Sorry, try again.` followed by `sudo: 1 incorrect password attempt`, `exit=1` — a signature
+distinct from every other reason that call can fail (guest unreachable, a malformed `date`
+argument, etc.).
+
+Fixed with a diagnostics-only change, not a migration mechanism: `warn_if_stale_admin_password()`
+inspects `sync_macos_guest_clock`'s captured sudo output for `Sorry, try again.` and, only then,
+appends a hint naming the likely cause and the remedy (`augur destroy && augur up --macos`,
+which re-clones from the current base and so gets the current password). Nothing tracks
+per-clone passwords, detects the mismatch proactively, or auto-recreates anything — in keeping
+with ADR-0007/0017's standing preference for accepting a rare, self-recoverable edge case over
+building machinery for it.
+
+`install_macos_managed_settings` and `run_base_provisioning`'s temporary sudo grant were
+checked and are **not** exposed to this: both authenticate against the base VM itself, at a
+moment `macos_admin_password()` is always correct for it, never against an already-existing
+project clone. Only `sync_macos_guest_clock` needed the hint. See the corrected "Why every
+clone..." section above, which named all three (plus `ssh_macos_bootstrap`) as clone-facing
+before this amendment.
+
 ## Context
 
 ADR-0007 removed the operator-typed SSH password prompt but explicitly kept the base VM's
@@ -142,17 +173,19 @@ where it's avoidable for free.
 ### Why every clone, not just the base VM, needs the password persisted
 
 Project VMs are APFS clones of the base VM, so a clone inherits whatever password its base VM's
-admin account actually has. Three call sites beyond the build itself authenticate as that
-account over `sudo -S` against a *running project clone*, not just during the base build:
-`install_macos_managed_settings` (pushes augur's managed Claude Code policy on every `up
---macos`), `sync_macos_guest_clock` (corrects guest drift on every `up`/`claude`/`shell
---macos`), and `run_base_provisioning`'s temporary sudo grant (`augur update --macos`
-provisioning). All three, plus `ssh_macos_bootstrap`'s SSH-key install during the build itself,
-now resolve the password through one function, `macos_admin_password()`, instead of assuming
-the constant `admin` string. `macos_admin_password()` reads `~/.augur/macos-admin-password` if
-it exists (a base VM built on the automated path) and falls back to the fixed `admin`/`admin`
-credential otherwise (a base VM built on the manual path, or one built before this ADR) — so a
-pre-existing base VM's clones keep working unchanged, with no migration step.
+admin account actually has. Four call sites beyond `ssh_macos_bootstrap`'s SSH-key install
+authenticate as that account over `sudo -S`, and — corrected 2026-09-19, see the amendment below
+— they do not all target the same thing. `install_macos_managed_settings` and
+`run_base_provisioning`'s temporary sudo grant both run against the base VM itself, inside
+`cmd_build_macos`/`cmd_update_macos`, where `macos_admin_password()` is always correct for that
+VM (it was just written this same build, or the base hasn't changed since). Only
+`sync_macos_guest_clock` runs against a **running project clone**, on every `up`/`claude`/`shell
+--macos`. All four now resolve the password through one function, `macos_admin_password()`,
+instead of assuming the constant `admin` string. `macos_admin_password()` reads
+`~/.augur/macos-admin-password` if it exists (a base VM built on the automated path) and falls
+back to the fixed `admin`/`admin` credential otherwise (a base VM built on the manual path, or
+one built before this ADR) — so a pre-existing base VM's clones keep working unchanged, with no
+migration step.
 
 ### Why base64 for the generated password
 

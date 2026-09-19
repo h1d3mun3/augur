@@ -622,6 +622,23 @@ macos_admin_password() {
     fi
 }
 
+# macos_admin_password() is ONE file for the whole host, rewritten every time `augur build --macos`
+# provisions a fresh base VM (ADR-0018). A project VM is an APFS clone taken at some earlier build,
+# so its real admin password is frozen at whatever the base had THEN — if the base has been rebuilt
+# since, sudo on that older clone is authenticating against a password that no longer matches what's
+# on disk, and sync_macos_guest_clock's `sudo -S` call fails the same way a network hiccup would.
+# "Sorry, try again." is PAM's immediate response to a rejected password specifically — measured
+# directly against a live macOS 27 guest (`echo <wrong> | sudo -S -p '' true`) — so grepping for it
+# is what tells a bad password apart from every other reason that call can fail.
+# $1 = the caller's captured stdout+stderr from the failed ssh_macos/sudo call.
+warn_if_stale_admin_password() {
+    [[ "$1" == *"Sorry, try again."* ]] || return 0
+    warn "  This looks like a rejected sudo password, not a network problem. If this VM was cloned"
+    warn "  from an older base VM, its admin password may no longer match \$HOME/.augur/macos-admin-password"
+    warn "  (rewritten the last time 'augur build --macos' provisioned a new base). Recreate this VM:"
+    warn "  augur destroy && augur up --macos"
+}
+
 ssh_macos() {
     local vm="$1"; shift
     local host port
@@ -3421,6 +3438,7 @@ sync_macos_guest_clock() {
     setout="$(ssh_macos "$vm" "echo '$(macos_admin_password)' | sudo -S -p '' /bin/date -u '${stamp}'" 2>&1)" || {
         warn "Could not set the guest's clock (${drift}s off the host's): ${setout%%$'\n'*}"
         warn "  Tokens, TLS validity windows and commit timestamps in the guest will use that skewed clock."
+        warn_if_stale_admin_password "$setout"
         return 0
     }
 
