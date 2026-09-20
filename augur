@@ -1838,7 +1838,6 @@ container_fingerprint() {
         echo "egress=${egress_state}"
         echo "wiring=${egress_wiring}"
         echo "memory=$(resolve_container_memory)"
-        echo "tz=$(host_timezone)"
         echo "workspace=${WORKSPACE_DIR}"
         echo "mount=${WORKSPACE_MOUNT}"
         # The operator-profile mount is baked at `run` like any other -v, so it belongs here by this
@@ -2167,11 +2166,14 @@ cmd_up() {
 
     # Container mode has no clock-skew defect (the guest shares the host kernel's clock — see
     # ADR-0015's scope note), but it DOES default to UTC like any bare Linux image: nothing here
-    # otherwise tells the guest what zone the host is in. Baked at `run`, not re-sent on `exec`,
-    # because engines carry a container's `-e` config into every later `exec` session (same reason
-    # HTTP_PROXY below is never re-injected in cmd_claude/cmd_shell). Read back into
-    # container_fingerprint so a host that changes zones (travel) recreates the container instead
-    # of leaving a stale TZ baked into a reused one.
+    # otherwise tells the guest what zone the host is in. Baked here so PID 1 and anything that
+    # never goes through `exec` still gets a sane starting value. Deliberately NOT in
+    # container_fingerprint: unlike egress/memory/credentials/mounts, a stale TZ doesn't need a
+    # recreate to fix — cmd_claude/cmd_shell refresh it on every `exec` (a running container's
+    # baked env can't be changed, but `exec -e` overrides it per call), which is enough for
+    # anything an operator or the agent actually reads. Fingerprinting it too would make a
+    # traveling host's NEXT `augur up` against an already-running container hard-fail over a
+    # mismatch that `exec` already fixes for free.
     run_args+=(-e "TZ=$(host_timezone)")
 
     # Egress allowlist: put the agent on an --internal network with NET_ADMIN dropped so
@@ -2360,6 +2362,12 @@ cmd_claude() {
     info "Launching $(agent_display_name) in '${CONTAINER_NAME}'..."
     # AUGUR_AGENT_SEAM | interactive launch (engine `exec`: argv array — safe by construction)
     local _env=() _argv=() kv
+    # Same gap `apply_guest_profile` above exists to close, applied to the TZ `cmd_up` bakes in at
+    # `run`: that value can't change without recreating the container, and this is the ONLY place
+    # it's kept current — a running container's baked TZ is otherwise whatever the host's zone was
+    # at `run` time, forever. `exec -e` overrides the baked env for just this session; cheap (one
+    # readlink, no engine round-trip) and safe to send unconditionally, running or not.
+    _env+=(-e "TZ=$(host_timezone)")
     for kv in $(agent_fixed_env); do _env+=(-e "$kv"); done
     read -ra _argv <<< "$(agent_launch_argv)"
     # empty-safe expansion (bash 3.2 + set -u) so a future agent_fixed_env="" can't crash this
@@ -2381,8 +2389,10 @@ cmd_shell() {
     # added/removed/replaced) is invisible until an intervening `down`.
     apply_guest_profile
     info "Opening bash shell in '${CONTAINER_NAME}'..."
+    # Same reasoning as cmd_claude's _env: the container's baked TZ can't change without a
+    # recreate, so refresh it per-session here instead.
     local _rc=0
-    eng exec -it "$CONTAINER_NAME" bash || _rc=$?
+    eng exec -it -e "TZ=$(host_timezone)" "$CONTAINER_NAME" bash || _rc=$?
     # Same snapshot-on-exit as cmd_claude: a `claude` run ad hoc from this shell writes the same
     # history file, and the container is still running here.
     save_guest_history
