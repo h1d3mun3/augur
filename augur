@@ -1783,6 +1783,21 @@ invalidate_persisted_container() {
     fi
 }
 
+# The host's IANA zone name (e.g. "Asia/Tokyo"), read off /etc/localtime the same way the rest of
+# macOS resolves it — NOT `date +%Z`, which gives an abbreviation ("JST") a Linux guest's tzdata
+# can't look up. Falls back to UTC (a safe no-op, not a guess) if the symlink is ever missing or
+# doesn't point into a zoneinfo tree; on a real Mac this has never been observed to happen.
+host_timezone() {
+    local link="" tz=""
+    link="$(readlink /etc/localtime 2>/dev/null)"
+    tz="${link##*/zoneinfo/}"
+    if [[ -z "$tz" || "$tz" == "$link" ]]; then
+        printf 'UTC'
+    else
+        printf '%s' "$tz"
+    fi
+}
+
 # ── Persisted-container reconcile (Apple Container mode keeps the container across `down`) ──
 # `down` STOPS the container instead of deleting it, so the next `up` can restart it for a fast,
 # cache-preserving resume. But a container's egress wiring, credentials, memory and mounts are
@@ -1821,6 +1836,7 @@ container_fingerprint() {
         echo "egress=${egress_state}"
         echo "wiring=${egress_wiring}"
         echo "memory=$(resolve_container_memory)"
+        echo "tz=$(host_timezone)"
         echo "workspace=${WORKSPACE_DIR}"
         echo "mount=${WORKSPACE_MOUNT}"
         # The operator-profile mount is baked at `run` like any other -v, so it belongs here by this
@@ -2146,6 +2162,15 @@ cmd_up() {
     # Apple `container`'s default per-container memory is ~1GB — too tight for an agent.
     # See resolve_container_memory for the override precedence.
     run_args+=(--memory "$(resolve_container_memory)")
+
+    # Container mode has no clock-skew defect (the guest shares the host kernel's clock — see
+    # ADR-0015's scope note), but it DOES default to UTC like any bare Linux image: nothing here
+    # otherwise tells the guest what zone the host is in. Baked at `run`, not re-sent on `exec`,
+    # because engines carry a container's `-e` config into every later `exec` session (same reason
+    # HTTP_PROXY below is never re-injected in cmd_claude/cmd_shell). Read back into
+    # container_fingerprint so a host that changes zones (travel) recreates the container instead
+    # of leaving a stale TZ baked into a reused one.
+    run_args+=(-e "TZ=$(host_timezone)")
 
     # Egress allowlist: put the agent on an --internal network with NET_ADMIN dropped so
     # the root agent can't re-route, and point all egress at the HOST augur-proxy reached
