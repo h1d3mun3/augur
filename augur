@@ -611,21 +611,6 @@ vm_known_hosts_file() {
     echo "$AUGUR_DIR/known_hosts/${1}"
 }
 
-# The host's IANA zone name (e.g. "Asia/Tokyo"), read off /etc/localtime the same way macOS
-# itself resolves it — NOT `date +%Z`, which gives an abbreviation ("JST") that -settimezone
-# does not accept. Falls back to UTC (a safe no-op, not a guess) if the symlink is ever missing
-# or doesn't point into a zoneinfo tree; on a real Mac this has never been observed to happen.
-host_timezone() {
-    local link="" tz=""
-    link="$(readlink /etc/localtime 2>/dev/null)"
-    tz="${link##*/zoneinfo/}"
-    if [[ -z "$tz" || "$tz" == "$link" ]]; then
-        printf 'UTC'
-    else
-        printf '%s' "$tz"
-    fi
-}
-
 # The base VM's admin account password — see MACOS_ADMIN_PASSWORD_FILE's comment. Defaults
 # to the fixed ADR-0007 credential when no override file exists (the common case: a base VM
 # built via the legacy manual Setup Assistant flow, or before this feature existed at all).
@@ -1798,10 +1783,12 @@ invalidate_persisted_container() {
     fi
 }
 
-# The host's IANA zone name (e.g. "Asia/Tokyo"), read off /etc/localtime the same way the rest of
-# macOS resolves it — NOT `date +%Z`, which gives an abbreviation ("JST") a Linux guest's tzdata
-# can't look up. Falls back to UTC (a safe no-op, not a guess) if the symlink is ever missing or
-# doesn't point into a zoneinfo tree; on a real Mac this has never been observed to happen.
+# The host's IANA zone name (e.g. "Asia/Tokyo"), read off /etc/localtime the same way macOS
+# itself resolves it — NOT `date +%Z`, which gives an abbreviation ("JST") that neither a Linux
+# container's tzdata lookup nor the macOS VM guest's `systemsetup -settimezone` accepts. Falls
+# back to UTC (a safe no-op, not a guess) if the symlink is ever missing or doesn't point into a
+# zoneinfo tree; on a real Mac this has never been observed to happen. Shared by both guest kinds
+# augur can run: the container's `-e TZ=` injection in cmd_up, and sync_macos_guest_timezone.
 host_timezone() {
     local link="" tz=""
     link="$(readlink /etc/localtime 2>/dev/null)"
