@@ -2358,6 +2358,13 @@ cmd_claude() {
     info "Launching $(agent_display_name) in '${CONTAINER_NAME}'..."
     # AUGUR_AGENT_SEAM | interactive launch (engine `exec`: argv array — safe by construction)
     local _env=() _argv=() kv
+    # Same gap `apply_guest_profile` above exists to close, applied to the TZ `cmd_up` bakes in at
+    # `run`: on the common path (container already running) `cmd_up` — and therefore
+    # container_fingerprint's tz= check — never runs, so a host that changed zones since this
+    # container was created would otherwise stay on a stale TZ until an explicit `down && up`.
+    # `exec -e` overrides the baked env for just this session; cheap (one readlink, no engine
+    # round-trip) and safe to send unconditionally, running or not.
+    _env+=(-e "TZ=$(host_timezone)")
     for kv in $(agent_fixed_env); do _env+=(-e "$kv"); done
     read -ra _argv <<< "$(agent_launch_argv)"
     # empty-safe expansion (bash 3.2 + set -u) so a future agent_fixed_env="" can't crash this
@@ -2379,8 +2386,10 @@ cmd_shell() {
     # added/removed/replaced) is invisible until an intervening `down`.
     apply_guest_profile
     info "Opening bash shell in '${CONTAINER_NAME}'..."
+    # Same reasoning as cmd_claude's _env: refresh TZ per-session since a running container never
+    # reaches cmd_up's fingerprint check.
     local _rc=0
-    eng exec -it "$CONTAINER_NAME" bash || _rc=$?
+    eng exec -it -e "TZ=$(host_timezone)" "$CONTAINER_NAME" bash || _rc=$?
     # Same snapshot-on-exit as cmd_claude: a `claude` run ad hoc from this shell writes the same
     # history file, and the container is still running here.
     save_guest_history
