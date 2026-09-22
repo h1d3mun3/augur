@@ -7,7 +7,7 @@ struct Version: ParsableCommand {
         abstract: "Print augur-vm version."
     )
     func run() {
-        print("augur-vm 0.0.1 (M0)")
+        print("augur-vm 0.0.1")
     }
 }
 
