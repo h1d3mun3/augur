@@ -18,7 +18,7 @@ SHELL := /usr/bin/env bash
 UNAME := $(shell uname)
 
 .PHONY: help unit swift-build swift-test shellcheck offline-tests version-smoke \
-        container-e2e stage image egress e2e
+        augur-vm-version-smoke container-e2e stage image egress e2e
 
 help:
 	@echo "augur make targets:"
@@ -26,10 +26,10 @@ help:
 	@echo "  make offline-tests  seam + command-construction shell tiers (CI: ubuntu-latest)"
 	@echo "  make container-e2e  LOCAL egress fail-closed E2E on Apple Container (needs macOS 26+)"
 	@echo "  make e2e            LOCAL macOS VM pre-release gate (boots a VM — never in CI)"
-	@echo "  components: swift-build  swift-test  shellcheck  offline-tests  version-smoke"
+	@echo "  components: swift-build  swift-test  shellcheck  offline-tests  version-smoke  augur-vm-version-smoke"
 
 # ── build-unit (macos-26) ─────────────────────────────────────────────────────
-unit: swift-build swift-test shellcheck version-smoke
+unit: swift-build swift-test shellcheck version-smoke augur-vm-version-smoke
 	@echo "== unit: all checks passed =="
 
 # augur-vm imports Virtualization.framework (macOS only) — build it only on Darwin. augur-proxy
@@ -75,6 +75,28 @@ offline-tests:
 version-smoke:
 	@echo "== version smoke =="
 	bash ./augur version
+
+# augur-vm has no test target (see swift-test above), so this is its equivalent of version-smoke:
+# runs the just-built binary and checks AugurVersion.swift's runtime VERSION-file lookup actually
+# resolved to the repo-root VERSION — `swift build` alone can't catch a regression here (a wrong
+# path walk or a missing Bundle.main.executableURL degrades silently to "unknown" without failing
+# the build). Darwin-only, like swift-build's augur-vm leg; a no-op elsewhere.
+# Depends on swift-build: `swift build --show-bin-path` only PRINTS where the binary would land,
+# it does not build it, so this must not be run standalone against a stale/absent binary.
+augur-vm-version-smoke: swift-build
+	@if [ "$(UNAME)" = "Darwin" ]; then \
+	  echo "== augur-vm version smoke =="; \
+	  bin="$$(cd augur-vm && swift build --show-bin-path)/augur-vm"; \
+	  got="$$("$$bin" --version)"; \
+	  want="$$(cat VERSION)"; \
+	  if [ "$$got" != "$$want" ]; then \
+	    echo "augur-vm --version ('$$got') does not match the repo VERSION file ('$$want')" >&2; \
+	    exit 1; \
+	  fi; \
+	  echo "augur-vm --version matches VERSION ($$got)"; \
+	else \
+	  echo "== augur-vm version smoke: skipping (macOS/Virtualization only) =="; \
+	fi
 
 # ── container-e2e (LOCAL — Apple Container, macOS 26+) ────────────────────────
 container-e2e: egress

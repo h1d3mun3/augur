@@ -13,21 +13,19 @@ struct AugurVM: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "augur-vm",
         abstract: "Minimal Virtualization.framework VM tool — the macOS VM backend for augur.",
-        version: "0.0.1 (M0)",
+        version: AugurVersion.string,
         subcommands: [
-            // Implemented in M0:
             Version.self,
             ListCmd.self,
             Smoke.self,
-            // Stubs (planned milestones):
-            Create.self,   // M1
-            SetCmd.self,   // M1
-            Run.self,      // M2 (headless) / M3 (GUI)
-            IP.self,       // M2
+            Create.self,
+            SetCmd.self,
+            Run.self,
+            IP.self,
             GuestOSVersionCommand.self,
-            Stop.self,     // M4
-            DeleteCmd.self,// M4
-            Clone.self,    // M4
+            Stop.self,
+            DeleteCmd.self,
+            Clone.self,
         ]
     )
 }
