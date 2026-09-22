@@ -131,13 +131,6 @@ final class InstallSession {
         )
         try persisted.save(name)
 
-        // Minimal install-time configuration: no network or graphics needed to
-        // install; `run` (M2/M3) rebuilds a full runtime config from the bundle.
-        //
-        // The installer needs the same device set a bootable macOS VM has — a minimal
-        // config (platform + boot + disk only) makes VZ trap (SIGTRAP) when the VM is
-        // constructed. Mirror Apple's install sample: graphics, NAT network, and USB
-        // keyboard + pointing device.
         let config = try VMConfigBuilder.build(
             hardwareModel: hardwareModel,
             machineIdentifier: machineIdentifier,
@@ -148,6 +141,11 @@ final class InstallSession {
             display: persisted.display
         )
 
+        // Fixed, unfiltered NAT: install time has no untrusted guest workload yet,
+        // and — like the graphics/keyboard/pointing devices VMConfigBuilder already
+        // attached above — VZ just needs a full device set to avoid trapping on VM
+        // construction. `run` (M2/M3) rebuilds a full runtime config, including the
+        // real network choice, from the persisted bundle.
         let network = VZVirtioNetworkDeviceConfiguration()
         network.attachment = VZNATNetworkDeviceAttachment()
         if let mac = VZMACAddress(string: macAddress) {

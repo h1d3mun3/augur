@@ -44,6 +44,17 @@ enum VMConfigBuilder {
             )
         ]
 
+        // Both callers need this device set — graphics, keyboard, and pointing —
+        // even when running headless. At install time, a minimal config (platform +
+        // boot + disk only) makes VZ trap (SIGTRAP) when the VM is constructed;
+        // mirroring Apple's install sample, the installer needs the same device set
+        // a bootable macOS VM has. At run time, macOS only brings up an Aqua (GUI)
+        // login session when a framebuffer exists, and `xcodebuild test` needs that
+        // Aqua session to reach testmanagerd — without a display device, auto-login
+        // never produces a console session and tests fail at launch with
+        // "com.apple.testmanagerd.control ... No such process". (`headless` only
+        // suppresses the host-side AppKit window — see RunSession.run() — not this
+        // guest-side display device.)
         let graphics = VZMacGraphicsDeviceConfiguration()
         graphics.displays = [
             VZMacGraphicsDisplayConfiguration(
