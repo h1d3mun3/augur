@@ -13,7 +13,7 @@ struct AugurVM: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "augur-vm",
         abstract: "Minimal Virtualization.framework VM tool — the macOS VM backend for augur.",
-        version: "0.0.1",
+        version: AugurVersion.string,
         subcommands: [
             Version.self,
             ListCmd.self,
