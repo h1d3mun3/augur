@@ -242,21 +242,21 @@ final class RunSession: NSObject, VZVirtualMachineDelegate {
             throw CLIError("config.json has an invalid machine identifier")
         }
 
-        let platform = VZMacPlatformConfiguration()
-        platform.hardwareModel = hardwareModel
-        platform.machineIdentifier = machineIdentifier
-        platform.auxiliaryStorage = VZMacAuxiliaryStorage(contentsOf: Paths.nvram(name))
-
-        let config = VZVirtualMachineConfiguration()
-        config.platform = platform
-        config.bootLoader = VZMacOSBootLoader()
-        config.cpuCount = cfg.cpuCount
-        config.memorySize = cfg.memorySize
-        config.storageDevices = [
-            VZVirtioBlockDeviceConfiguration(
-                attachment: try VZDiskImageStorageDeviceAttachment(url: Paths.disk(name), readOnly: false)
-            )
-        ]
+        // Attach a graphics device (virtual display) and input devices even when headless.
+        // macOS only brings up an Aqua (GUI) login session when a framebuffer exists, and
+        // `xcodebuild test` needs that Aqua session to reach testmanagerd — without a display
+        // device, auto-login never produces a console session and tests fail at launch with
+        // "com.apple.testmanagerd.control ... No such process". `headless` only suppresses the
+        // host-side AppKit window (see run()), not the display device the guest renders to.
+        let config = try VMConfigBuilder.build(
+            hardwareModel: hardwareModel,
+            machineIdentifier: machineIdentifier,
+            auxiliaryStorage: VZMacAuxiliaryStorage(contentsOf: Paths.nvram(name)),
+            cpuCount: cfg.cpuCount,
+            memorySize: cfg.memorySize,
+            diskURL: Paths.disk(name),
+            display: cfg.display
+        )
 
         let network = VZVirtioNetworkDeviceConfiguration()
         // Networking is fail-closed: the egress-filtered (vfkit/file-handle) datapath
@@ -285,24 +285,6 @@ final class RunSession: NSObject, VZVirtualMachineDelegate {
             }
         }
         config.networkDevices = [network]
-
-        // Attach a graphics device (virtual display) and input devices even when headless.
-        // macOS only brings up an Aqua (GUI) login session when a framebuffer exists, and
-        // `xcodebuild test` needs that Aqua session to reach testmanagerd — without a display
-        // device, auto-login never produces a console session and tests fail at launch with
-        // "com.apple.testmanagerd.control ... No such process". `headless` only suppresses the
-        // host-side AppKit window (see run()), not the display device the guest renders to.
-        let graphics = VZMacGraphicsDeviceConfiguration()
-        graphics.displays = [
-            VZMacGraphicsDisplayConfiguration(
-                widthInPixels: cfg.display.width,
-                heightInPixels: cfg.display.height,
-                pixelsPerInch: cfg.display.pixelsPerInch
-            )
-        ]
-        config.graphicsDevices = [graphics]
-        config.keyboards = [VZUSBKeyboardConfiguration()]
-        config.pointingDevices = [VZUSBScreenCoordinatePointingDeviceConfiguration()]
 
         let shares = try parseShares()
         if !shares.isEmpty {

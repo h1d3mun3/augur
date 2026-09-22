@@ -133,35 +133,20 @@ final class InstallSession {
 
         // Minimal install-time configuration: no network or graphics needed to
         // install; `run` (M2/M3) rebuilds a full runtime config from the bundle.
-        let platform = VZMacPlatformConfiguration()
-        platform.hardwareModel = hardwareModel
-        platform.machineIdentifier = machineIdentifier
-        platform.auxiliaryStorage = auxiliaryStorage
-
-        let config = VZVirtualMachineConfiguration()
-        config.platform = platform
-        config.bootLoader = VZMacOSBootLoader()
-        config.cpuCount = cpuCount
-        config.memorySize = memorySize
-        config.storageDevices = [
-            VZVirtioBlockDeviceConfiguration(
-                attachment: try VZDiskImageStorageDeviceAttachment(url: diskURL, readOnly: false)
-            )
-        ]
-
+        //
         // The installer needs the same device set a bootable macOS VM has — a minimal
         // config (platform + boot + disk only) makes VZ trap (SIGTRAP) when the VM is
         // constructed. Mirror Apple's install sample: graphics, NAT network, and USB
         // keyboard + pointing device.
-        let graphics = VZMacGraphicsDeviceConfiguration()
-        graphics.displays = [
-            VZMacGraphicsDisplayConfiguration(
-                widthInPixels: persisted.display.width,
-                heightInPixels: persisted.display.height,
-                pixelsPerInch: persisted.display.pixelsPerInch
-            )
-        ]
-        config.graphicsDevices = [graphics]
+        let config = try VMConfigBuilder.build(
+            hardwareModel: hardwareModel,
+            machineIdentifier: machineIdentifier,
+            auxiliaryStorage: auxiliaryStorage,
+            cpuCount: cpuCount,
+            memorySize: memorySize,
+            diskURL: diskURL,
+            display: persisted.display
+        )
 
         let network = VZVirtioNetworkDeviceConfiguration()
         network.attachment = VZNATNetworkDeviceAttachment()
@@ -169,9 +154,6 @@ final class InstallSession {
             network.macAddress = mac
         }
         config.networkDevices = [network]
-
-        config.keyboards = [VZUSBKeyboardConfiguration()]
-        config.pointingDevices = [VZUSBScreenCoordinatePointingDeviceConfiguration()]
 
         return config
     }
