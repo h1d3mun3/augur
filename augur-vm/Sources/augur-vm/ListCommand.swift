@@ -1,22 +1,12 @@
 import ArgumentParser
 import Foundation
 
-struct Version: ParsableCommand {
-    static let configuration = CommandConfiguration(
-        commandName: "version",
-        abstract: "Print augur-vm version."
-    )
-    func run() {
-        print("augur-vm \(AugurVersion.string)")
-    }
-}
-
 /// VM listing. augur parses this positionally:
 ///   - `macos_vm_exists`  : awk 'NR>1 {print $2}'        → name is column 2
 ///   - `macos_vm_running` : awk 'NR>1 {print $2, $NF}'   → name col 2, state is last column
 /// The `Source Name Disk Size State` columns (Source=local) keep a header on row 1
 /// (skipped by NR>1) so the contract holds.
-struct ListCmd: ParsableCommand {
+struct ListCommand: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "list",
         abstract: "List VMs (columns: Source Name Disk Size State)."

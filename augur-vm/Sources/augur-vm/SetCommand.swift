@@ -3,7 +3,7 @@ import Foundation
 
 /// `augur-vm set <name> [--cpu N] [--memory MB]`
 /// Memory is given in MB, e.g. `--memory 8192`.
-struct SetCmd: ParsableCommand {
+struct SetCommand: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "set",
         abstract: "Set CPU count and/or memory (MB) on an existing VM."

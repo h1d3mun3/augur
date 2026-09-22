@@ -10,7 +10,7 @@ import Darwin
 /// source until written, so it is near-free on disk. `machineIdentifier` and
 /// `macAddress` are regenerated on the destination's config.json so the clone can
 /// run concurrently with the source without colliding (see issue #67).
-struct Clone: ParsableCommand {
+struct CloneCommand: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "clone",
         abstract: "Copy-on-write clone a VM (APFS clonefile)."

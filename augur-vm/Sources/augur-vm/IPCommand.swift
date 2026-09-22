@@ -2,7 +2,7 @@ import ArgumentParser
 import Foundation
 
 /// `augur-vm ip <name>` — print the running VM's IP (from the DHCP lease database).
-struct IP: ParsableCommand {
+struct IPCommand: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "ip",
         abstract: "Print a VM's IP address."
