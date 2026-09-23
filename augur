@@ -786,7 +786,9 @@ proxy_running() {
 # never stops running instances, so after an upgrade the OLD binary kept serving until an
 # explicit `down` — a fixed proxy bug stayed live with nothing saying so. Each launch therefore
 # records the sha256 of the binary it ran in a sidecar next to the pidfile ("<pidfile>.binsha"),
-# and the reuse path compares it with the binary it would launch NOW.
+# and the reuse path compares it with the binary it would launch NOW. That reuse path is start_proxy
+# (`up`) AND refresh_stale_proxy (`claude`/`shell` on an already-running guest, which never reach
+# `up` — without it the common "install, then re-run claude" case never replaced the old proxy).
 #   • CONTENT, not mtime: resolve_proxy_cli may resolve a different path than the one running
 #     (PATH vs ~/.augur vs a local .build), and `cp -p`/touch/clock skew make mtimes lie both ways.
 #   • Not VERSION: dev builds share one VERSION number across many different binaries.
@@ -1449,6 +1451,43 @@ start_egress_proxy() {
         done
     fi
     start_proxy "$listen"
+}
+
+# The --listen address a running augur-proxy was LAUNCHED with, read from its argv. $1 = pid. Fails
+# unless it is a plain IPv4 literal (all augur ever binds), so a garbled/foreign argv falls back.
+running_proxy_listen() {
+    local args re='[[:space:]]--listen[[:space:]]+([0-9]+(\.[0-9]+){3})([[:space:]]|$)'
+    args="$(ps -o args= -p "$1" 2>/dev/null)" || return 1
+    [[ " $args" =~ $re ]] || return 1
+    echo "${BASH_REMATCH[1]}"
+}
+
+# `claude`/`shell` on an ALREADY-RUNNING guest skip `up` entirely, so start_proxy's stale-binary
+# restart never ran there (see the header above file_sha256). Replace a LIVE stale augur-proxy only:
+#   • Cheap no-op otherwise — egress_enabled, proxy_running, then ONE sha256; nothing else runs
+#     unless the binary changed (no network inspect, no ifconfig wait, no allowlist write).
+#   • A DEAD proxy is left alone: reviving one stays `up`'s job (finish_up / the macOS reconcile),
+#     which also re-runs the egress self-test that proves the revival. Without a proxy the guest
+#     fails closed, so doing nothing here never opens egress.
+#   • Relaunched on the address the OLD process was started with (its argv), not a recomputed
+#     one: that is by construction what the live guest dials, and it sidesteps
+#     container_egress_gateway's computed fallback (a --no-egress container has no gateway; see
+#     reconcile_running_container). Only if argv is unreadable do we fall back to what `up` would
+#     compute. start_proxy then does the stop+relaunch with up's allowlist/ports/log/pidfile and
+#     up's error semantics (exit 1 if the new one fails to come up). Its allowlist rewrite is the
+#     same host-side merge `up` does — approved snapshot only, so it cannot widen past approval.
+refresh_stale_proxy() {
+    egress_enabled || return 0
+    proxy_running || return 0
+    local pidfile listen; pidfile="$(proxy_pidfile)"
+    launched_binary_changed "$(resolve_proxy_cli)" "$pidfile" || return 0
+    if listen="$(running_proxy_listen "$(cat "$pidfile" 2>/dev/null)")"; then
+        start_proxy "$listen"
+    elif $MACOS_MODE; then
+        start_proxy "127.0.0.1"
+    else
+        start_egress_proxy
+    fi
 }
 
 # Tear down the egress datapath (safe no-ops if it was never up).
@@ -2138,7 +2177,8 @@ drop_guest_history() {
 # On the already-running path this one line buys three distinct things:
 #   • start_egress_proxy → start_proxy rewrites the merged allowlist AND REVIVES A DEAD PROXY. That
 #     is the only recovery from a proxy killed out from under a live session; nothing else in
-#     `up`/`claude` restarts one.
+#     `up`/`claude` revives one (`claude`/`shell` only REPLACE a live stale-binary proxy —
+#     refresh_stale_proxy — never a dead one).
 #   • verify_egress_locked restores I1's tripwire on that path.
 #   • apply_guest_profile picks up a structural profile change.
 finish_up() {
@@ -2447,7 +2487,9 @@ cmd_claude() {
     # bare `container start`. With a persisted container, `down`(stop) then `claude` is a normal
     # reuse path; a bare start would re-attach the guest with NO proxy re-established and NO
     # self-test — silently bypassing egress. Mirrors macOS `cmd_claude_macos` (running || up).
-    container_running || cmd_up
+    # Already running ⇒ cmd_up is skipped, so swap out a proxy whose binary changed (e.g. `bash
+    # install` since it started) here instead — a no-op hash compare otherwise.
+    if container_running; then refresh_stale_proxy; else cmd_up; fi
     # The line above reaches `cmd_up` only when the container is NOT running, so on the common case
     # — repeated `claude`/`shell` calls without an intervening `down` — cmd_up (and therefore its
     # finish_up, and the apply_guest_profile inside it) never runs. Call it here too, matching macOS
@@ -2480,7 +2522,7 @@ cmd_shell() {
     require_engine
     # Same as cmd_claude: route a stopped/absent container through the full `up` so egress is
     # re-established and self-tested, never a bare `container start`.
-    container_running || cmd_up
+    if container_running; then refresh_stale_proxy; else cmd_up; fi   # see cmd_claude
     # Same reasoning as cmd_claude: an already-running container never reaches `cmd_up` at all, so
     # re-wire the profile here too — otherwise a structural profile change (an entry
     # added/removed/replaced) is invisible until an intervening `down`.
@@ -3884,7 +3926,8 @@ cmd_claude_macos() {
     require_vz
     local project_vm
     project_vm="$(macos_project_vm)"
-    macos_vm_running "$project_vm" || cmd_up_macos
+    # Running ⇒ cmd_up_macos is skipped; replace a stale-binary augur-proxy here (see cmd_claude).
+    if macos_vm_running "$project_vm"; then refresh_stale_proxy; else cmd_up_macos; fi
     # Here for the same reason warn_if_macos_egress_pinned is: on an already-running VM this command
     # skips cmd_up_macos entirely, so anything an `up` does for the guest has to be done here too or
     # it never happens. This is the site where a skewed clock costs the most — the interactive launch
@@ -3910,7 +3953,7 @@ cmd_shell_macos() {
     require_vz
     local project_vm
     project_vm="$(macos_project_vm)"
-    macos_vm_running "$project_vm" || cmd_up_macos
+    if macos_vm_running "$project_vm"; then refresh_stale_proxy; else cmd_up_macos; fi
     # Same rationale as cmd_claude_macos': this path attaches to a running guest without going
     # through `up`. A shell is where the operator runs `git`, `gh` and `curl` by hand, all of which
     # sign, stamp or validate against this clock.

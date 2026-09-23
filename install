@@ -114,10 +114,10 @@ if [[ "$(uname)" == "Darwin" ]] && [[ -f "$SCRIPT_DIR/gvproxy/build.sh" ]]; then
 fi
 
 # Installing never stops a RUNNING proxy (it may be serving a live session). augur notices the
-# changed binary on reuse: augur-proxy is restarted on the next `augur up`; augur-gvproxy — the
-# live VM's NIC — only warns, so it needs a VM cycle.
+# changed binary on reuse: augur-proxy is replaced on the next `augur up` / `claude` / `shell`;
+# augur-gvproxy — the live VM's NIC — only warns, so it needs a VM cycle.
 if compgen -G "$INSTALL_DIR/proxy/*.pid" >/dev/null; then
-    info "Egress proxies are running: augur-proxy restarts on the next ${BOLD}augur up${RESET};"
+    info "Egress proxies are running: augur-proxy is replaced automatically on the next ${BOLD}augur up${RESET} / ${BOLD}claude${RESET} / ${BOLD}shell${RESET};"
     info "  a macOS VM picks up a new augur-gvproxy via ${BOLD}augur down --macos && augur up --macos${RESET}."
 fi
 

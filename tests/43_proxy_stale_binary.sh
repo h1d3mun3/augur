@@ -6,6 +6,8 @@
 # now records the launched binary's sha256 next to the pidfile and the reuse path compares it:
 #   • augur-proxy: same binary → reused; changed / unrecorded → old pid stopped, new one started.
 #   • augur-gvproxy: changed → WARN only (its socket is the live VM's NIC), pid untouched.
+#   • claude/shell (both modes) on an already-running guest: a live stale augur-proxy is replaced
+#     on its original --listen; not stale / not running / egress off → left alone.
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/.." && pwd)"
 source "$HERE/lib.sh"
 AUGUR="$REPO/augur"
@@ -132,5 +134,117 @@ if [[ -n "$pp2" && "$pp2" != "$pp1" ]] && ! kill -0 "$pp1" 2>/dev/null; then ok 
 else fail "provision proxy not restarted" "pp1=$pp1 pp2=$pp2"; fi
 stop_provision_proxy >/dev/null 2>&1
 [[ -e "$pside" ]] && fail "sidecar left behind by stop_provision_proxy" || ok "stop_provision_proxy removes the sidecar"
+
+# ── claude/shell on an ALREADY-RUNNING guest never reach `up`, so they call refresh_stale_proxy ──
+# The REAL cmd_claude/cmd_shell(_macos) run here; only the engine/VM/guest side is stubbed. This
+# stub keeps its argv visible to `ps` (no `exec sleep`), because refresh_stale_proxy relaunches on
+# the --listen the OLD process was started with.
+make_argv_stub() {   # $1 = path, $2 = content marker
+  cat > "$1" <<EOF
+#!/usr/bin/env bash
+# stub augur-proxy, argv-preserving ($2)
+pf=""
+for ((i=1; i<=\$#; i++)); do [[ "\${!i}" == --pidfile ]] && { j=\$((i+1)); pf="\${!j}"; }; done
+[[ -n "\$pf" ]] && echo \$\$ > "\$pf"
+sleep 300 & c=\$!
+trap 'kill \$c 2>/dev/null; exit 0' TERM
+wait \$c
+EOF
+  chmod +x "$1"
+}
+alive() { [[ -n "$1" ]] && kill -0 "$1" 2>/dev/null; }
+require_engine() { :; }; require_vz() { :; }
+apply_guest_profile() { :; }; save_guest_history() { :; }; eng() { :; }; ssh_macos() { :; }
+sync_macos_guest_clock() { :; }; sync_macos_guest_timezone() { :; }; ensure_macos_workspace() { :; }
+ensure_macos_claude_projects() { :; }; ensure_macos_claude_agents() { :; }; ensure_macos_claude_profile() { :; }
+ensure_macos_claude_bin() { :; }; warn_if_macos_egress_pinned() { :; }; macos_project_vm() { echo augur-test-vm; }
+cmd_up() { echo "CMD_UP_CALLED"; }; cmd_up_macos() { echo "CMD_UP_MACOS_CALLED"; }
+GUEST_UP=0
+container_running() { [[ "$GUEST_UP" == 1 ]]; }; macos_vm_running() { [[ "$GUEST_UP" == 1 ]]; }
+MACOS_MODE=false
+pidfile="$(proxy_pidfile)"; side="$(binsha_file "$pidfile")"
+
+section "Tier 1 — claude on a running container: not stale → untouched (hash compare only)"
+make_argv_stub "$AUGUR_PROXY_BIN" c1
+start_proxy 10.9.8.7 >/dev/null 2>&1          # an address no fallback would compute
+c1="$(cat "$pidfile" 2>/dev/null)"
+eq "10.9.8.7" "$(running_proxy_listen "$c1")" "running_proxy_listen reads the launched --listen from argv"
+GUEST_UP=1
+out="$(cmd_claude 2>&1)"
+eq "$c1" "$(cat "$pidfile")" "same pid when the binary is unchanged"
+hasnt "$out" "restarting" "no restart"
+hasnt "$out" "CMD_UP_CALLED" "running container => cmd_up not called (no double work)"
+
+section "Tier 1 — claude on a running container: stale binary → replaced on the SAME address"
+make_argv_stub "$AUGUR_PROXY_BIN" c2
+out="$(cmd_claude 2>&1)"
+c2="$(cat "$pidfile" 2>/dev/null)"
+has "$out" "binary changed" "says why it restarts"
+alive "$c1" && fail "stale proxy still alive after claude" || ok "stale proxy stopped by claude"
+if [[ "$c2" != "$c1" ]] && alive "$c2"; then ok "new proxy running"; else fail "no new proxy" "c1=$c1 c2=$c2"; fi
+eq "10.9.8.7" "$(running_proxy_listen "$c2")" "relaunched on the old proxy's --listen"
+eq "$(file_sha256 "$AUGUR_PROXY_BIN")" "$(cat "$side" 2>/dev/null)" "sidecar updated"
+hasnt "$out" "CMD_UP_CALLED" "still no cmd_up"
+
+section "Tier 1 — shell on a running container: stale binary → replaced too"
+make_argv_stub "$AUGUR_PROXY_BIN" c3
+out="$(cmd_shell 2>&1)"
+c3="$(cat "$pidfile" 2>/dev/null)"
+if [[ "$c3" != "$c2" ]] && alive "$c3" && ! alive "$c2"; then ok "cmd_shell replaced the stale proxy"; else fail "cmd_shell did not replace it" "c2=$c2 c3=$c3"; fi
+eq "10.9.8.7" "$(running_proxy_listen "$c3")" "…on the same address"
+
+section "Tier 1 — stale + unreadable argv → falls back to up's address computation"
+make_argv_stub "$AUGUR_PROXY_BIN" c4
+saved_rpl="$(declare -f running_proxy_listen)"
+running_proxy_listen() { return 1; }
+out="$(AUGUR_PROXY_LISTEN=0.0.0.0 cmd_claude 2>&1)"
+eval "$saved_rpl"
+c4="$(cat "$pidfile" 2>/dev/null)"
+eq "0.0.0.0" "$(running_proxy_listen "$c4")" "fallback goes through start_egress_proxy (AUGUR_PROXY_LISTEN honoured)"
+
+section "Tier 1 — stale but egress disabled → left alone"
+make_argv_stub "$AUGUR_PROXY_BIN" c5
+out="$(AUGUR_EGRESS=0 cmd_claude 2>&1)"
+eq "$c4" "$(cat "$pidfile")" "no restart with AUGUR_EGRESS=0"
+
+section "Tier 1 — stale and the new binary fails to start → claude errors out (start_proxy semantics)"
+printf '#!/usr/bin/env bash\n# broken augur-proxy: exits without writing its pidfile\nexit 3\n' > "$AUGUR_PROXY_BIN"
+out="$(cmd_claude 2>&1)"; rc=$?
+[[ "$rc" != 0 ]] && ok "cmd_claude exits non-zero (rc=$rc)" || fail "cmd_claude continued with no proxy"
+has "$out" "failed to start" "reports the start failure"
+hasnt "$out" "Launching" "never reaches the agent launch"
+
+section "Tier 1 — proxy NOT running → claude does not start one (reviving stays up's job)"
+make_argv_stub "$AUGUR_PROXY_BIN" c6
+stop_proxy >/dev/null 2>&1
+out="$(cmd_claude 2>&1)"
+[[ -e "$pidfile" ]] && fail "claude started a proxy that was not running" || ok "no proxy started"
+GUEST_UP=0
+out="$(cmd_claude 2>&1)"
+has "$out" "CMD_UP_CALLED" "stopped container => cmd_up (which owns proxy bring-up)"
+
+section "Tier 1 — claude/shell --macos on a running VM: stale binary → replaced on 127.0.0.1"
+MACOS_MODE=true; GUEST_UP=1
+pidfile="$(proxy_pidfile)"
+start_proxy 127.0.0.1 >/dev/null 2>&1
+m1="$(cat "$pidfile" 2>/dev/null)"
+out="$(cmd_claude_macos 2>&1)"
+eq "$m1" "$(cat "$pidfile")" "not stale → same pid"
+hasnt "$out" "CMD_UP_MACOS_CALLED" "running VM => cmd_up_macos not called"
+make_argv_stub "$AUGUR_PROXY_BIN" m2
+out="$(cmd_claude_macos 2>&1)"
+m2="$(cat "$pidfile" 2>/dev/null)"
+if [[ "$m2" != "$m1" ]] && alive "$m2" && ! alive "$m1"; then ok "cmd_claude_macos replaced the stale proxy"; else fail "not replaced" "m1=$m1 m2=$m2"; fi
+eq "127.0.0.1" "$(running_proxy_listen "$m2")" "…on 127.0.0.1"
+make_argv_stub "$AUGUR_PROXY_BIN" m3
+out="$(cmd_shell_macos 2>&1)"
+m3="$(cat "$pidfile" 2>/dev/null)"
+if [[ "$m3" != "$m2" ]] && alive "$m3" && ! alive "$m2"; then ok "cmd_shell_macos replaced the stale proxy"; else fail "not replaced" "m2=$m2 m3=$m3"; fi
+stop_proxy >/dev/null 2>&1
+out="$(cmd_shell_macos 2>&1)"
+[[ -e "$pidfile" ]] && fail "shell --macos started a proxy that was not running" || ok "dead proxy not revived by shell --macos"
+GUEST_UP=0
+out="$(cmd_claude_macos 2>&1)"
+has "$out" "CMD_UP_MACOS_CALLED" "stopped VM => cmd_up_macos"
 
 finish
