@@ -2081,18 +2081,9 @@ cmd_up() {
     require_engine
     ensure_image
 
-    # ALREADY RUNNING — reconcile the host side instead of no-opping. This used to `return 0`
-    # before the approval gate and before any datapath work, which did not WIDEN anything (the
-    # previously approved policy stayed in force, which is fail-closed) but silently dropped three
-    # things the rest of this file claims `up` always does:
-    #   • A REVOCATION never landed. write_merged_allowlist has exactly one caller — start_proxy,
-    #     reached only from start_egress_proxy (container) and cmd_up_macos (macOS), both BELOW this
-    #     point — and augur-proxy hot-reloads policy from that file's mtime. So editing the allowlist
-    #     and running `augur up` printed one yellow line, exited 0, and left the live proxy enforcing
-    #     the old policy.
-    #   • I1's tripwire did not run. verify_egress_locked lives in finish_up, also below this point.
-    #   • A flipped egress mode / rotated credential was not surfaced: the container_fingerprint
-    #     reconcile that exists to catch exactly that is below this point too.
+    # Already running: the container itself can't change, but the host side is rebuilt on
+    # every `up` — rewrite the allowlist (augur-proxy hot-reloads it, so a revocation takes
+    # effect), check the config fingerprint, and re-run the boot self-test (INVARIANTS I1).
     if container_running; then
         warn "Container '${CONTAINER_NAME}' is already running — reconciling host-side state only."
         if egress_enabled; then
@@ -3564,13 +3555,10 @@ cmd_up_macos() {
         exit 1
     }
 
-    # ALREADY RUNNING — reconcile what the host owns, and be explicit about what it cannot. Same
-    # defect as cmd_up's peer branch (a bare `return 0` skipped the approval gate and the allowlist
-    # rewrite, so a REVOCATION never reached the live proxy), but the remedy is deliberately weaker:
-    # `return 0`, never `exit 1`. macOS mode has no container_fingerprint, so there is no reliable
-    # drift signal to refuse on. It DOES now have a boot self-test to re-run (see the bottom of this
-    # branch), which is the one thing that can still end this path non-zero — on a detected leak,
-    # never on drift.
+    # Already running: like cmd_up, rebuild what the host owns — rewrite the allowlist (so a
+    # revocation takes effect) and re-run the boot self-test. Unlike cmd_up, never refuse on config
+    # drift: macOS mode has no container_fingerprint, so there is no reliable drift signal. The only
+    # way this path ends non-zero is the self-test detecting a leak.
     if macos_vm_running "$project_vm"; then
         warn "VM '${project_vm}' is already running — reconciling host-side state only."
         if egress_enabled; then
