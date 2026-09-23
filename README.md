@@ -6,23 +6,77 @@
   <img src="resources/auger.png" alt="augur" width="320">
 </p>
 
-Run Claude Code in an isolated environment.
-Works in any directory — only the current directory is exposed to the container or VM.
-It must be a directory that does not contain augur itself: `augur up`/`claude`/`shell` refuse to run
-in `$HOME`, in `~/.augur`, or in any parent of either, because the workspace is shared **read-write**
-and those hold the binaries your host runs (see
-[ADR-0014](docs/decisions/0014-workspace-must-not-contain-augur.md)). Use a subdirectory instead.
+<p align="center">
+  <b>Sandboxed macOS VMs with full Xcode for AI coding agents</b> — plus a lightweight Linux container mode.
+</p>
 
-Two modes are available:
+augur runs Claude Code inside an isolated guest where it can build, run, and **test** Apple-platform
+code, while your host stays out of reach. Only the current directory is exposed; network egress is
+limited to an allowlist enforced on the host.
+
+## Why augur
+
+- **Xcode inside the sandbox — not just Linux.** macOS VM mode boots a real macOS guest on Apple's
+  Virtualization.framework, with Xcode, `xcodebuild`, and the iOS Simulator preinstalled. Most agent
+  sandboxes stop at Linux containers; augur gives the agent the full Apple toolchain without giving
+  it your Mac.
+- **`xcodebuild test` works headless, over SSH.** Tests that need `testmanagerd` normally require a
+  GUI login session. The base VM is built with auto-login and a virtual display, so the agent can run
+  every test type unattended. See [Running `xcodebuild test`](#running-xcodebuild-test).
+- **One command, no GUI on macOS 27.** On a macOS 27+ host and guest, `augur build --macos`
+  provisions the VM's account through macOS 27's `VZMacGuestProvisioningOptions`. There is no Setup
+  Assistant to click through, and the admin password is randomized per build. Older pairs fall back to
+  a short manual step. See [ADR-0018](docs/decisions/0018-macos27-unattended-provisioning.md).
+- **Built only from Apple-signed assets.** The base VM comes from an Apple IPSW plus an Xcode XIP,
+  with no third-party VM images or automation scripts. The VM backend (`augur-vm`) is a small Swift
+  CLI that ships in this repo.
+- **Egress allowlist, on by default, no `sudo`.** A host-side proxy lets the guest reach only the
+  domains you allow, DNS included. Project-supplied domains need your approval on first sight. See
+  [Egress allowlist](#egress-allowlist-augurallowlistconf).
+- **Per-project isolation.** Each project gets its own thin clone of the base VM or its own
+  container. It sees its workspace and only its own Claude history, not the rest of your home
+  directory. Claude auth is injected through the environment, and the host's credential store is
+  never mounted.
+- **Honest about its limits.** Design decisions and accepted risks, such as the `.git/hooks` host
+  execution risk and the exfiltration ceiling, are written down in [`docs/decisions/`](docs/decisions)
+  and [`docs/security-reviews/`](docs/security-reviews). Releases are gated on a full macOS-VM E2E run.
+
+### Quick start (macOS VM + Xcode)
+
+```bash
+git clone -b release https://github.com/h1d3mun3/augur.git && cd augur
+brew install go                          # needed for macOS VM egress filtering (augur-gvproxy)
+bash install && source ~/.zshrc          # installs augur + builds augur-vm / augur-proxy
+
+# one-time base VM build from Apple-signed assets (~75 min, unattended on macOS 27+)
+augur build --macos --ipsw ~/Downloads/macOS.ipsw --xcode-xip ~/Downloads/Xcode.xip
+
+cd ~/projects/my-ios-app
+augur claude --macos                     # Claude Code in an isolated, egress-filtered macOS VM
+```
+
+Don't need Xcode? `augur build && augur claude` gives you the lightweight
+[Container mode](#container-mode-default) instead.
+
+## Two modes
 
 | | Container mode | macOS VM mode |
 |---|---|---|
-| **Isolation** | Linux container | macOS VM (Apple Virtualization Framework) |
-| **Xcode / xcodebuild** | ✗ | ✓ |
-| **iOS Simulator** | ✗ | ✓ |
-| **Setup time** | ~5 min (image build) | ~75 min (VM build) |
+| **Best for** | Web, backend, scripting, anything Linux | iOS / macOS / Apple-platform apps |
+| **Isolation** | Linux container (Apple Container) | Full macOS VM (Apple Virtualization.framework) |
+| **Xcode / `xcodebuild` / `xcodebuild test`** | ✗ | ✓ |
+| **iOS Simulator** | ✗ | ✓ (other platforms via `--platforms`) |
+| **Egress allowlist** | ✓ | ✓ |
+| **One-time setup** | ~5 min (image build) | ~75 min (base VM build; unattended on macOS 27+) |
+| **Per-project start** | fast (container kept on `down`) | thin clone of the base VM, kept on `down` |
 | **Disk usage** | ~2 GB | ~70 GB+ |
 | **Requires** | Apple Container (macOS 26+) | augur-vm (bundled), IPSW, Xcode XIP |
+
+> **Workspace rule.** augur works in any directory except one that contains augur itself.
+> `augur up`/`claude`/`shell` refuse to run in `$HOME`, in `~/.augur`, or in any parent of either,
+> because the workspace is shared **read-write** and those directories hold the binaries your host
+> runs (see [ADR-0014](docs/decisions/0014-workspace-must-not-contain-augur.md)). Use a subdirectory
+> instead.
 
 ---
 
