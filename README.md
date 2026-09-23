@@ -345,6 +345,14 @@ augur update --macos    # update Claude Code in the base VM
 augur version --macos   # show augur version (macOS mode)
 ```
 
+> **At most two macOS VMs can run at once.** Apple's macOS license permits up to two virtualized
+> macOS instances per Mac, and Virtualization.framework enforces that limit: starting a third
+> running macOS guest fails. That covers every macOS guest on the host, not just augur's. Each
+> project clone counts while it is running, and so does the build VM during `augur build --macos` /
+> `augur update --macos`. Stopped clones don't count, so you can keep as many as your disk allows.
+> Run `augur down --macos` in a project you're not using (or check `augur list --macos`) to free a
+> slot. Container mode runs Linux guests and isn't affected.
+
 ### Authentication
 
 On macOS, Claude Code stores its OAuth login in the Keychain, which is unreadable over SSH and
@@ -437,6 +445,7 @@ clone is gone for good. Both are accepted, documented trade-offs, not oversights
 ### Requirements
 
 - macOS (Apple Silicon)
+- At most two macOS VMs running at once per Mac (Apple's limit, see [Usage](#usage-1))
 - Xcode / Swift toolchain (to build the bundled `augur-vm` backend via `bash install`)
 - macOS IPSW (Apple-signed)
 - Xcode XIP (Apple-signed, from developer.apple.com)
