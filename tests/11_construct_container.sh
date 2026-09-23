@@ -377,11 +377,12 @@ has "$shell_body"  'save_guest_history' "carry-over: cmd_shell snapshots on the 
 # Both must preserve the interactive exit status rather than returning the snapshot's.
 has "$claude_body" 'return "$_rc"'      "carry-over: cmd_claude still returns the agent's own exit status"
 has "$shell_body"  'return "$_rc"'      "carry-over: cmd_shell still returns the shell's own exit status"
-up_body="$(awk '/^cmd_up\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
+fn_body() { awk -v n="$1" '$0 ~ "^"n"\\(\\) \\{"{f=1} f{print} f&&/^}/{exit}' "$AUGUR"; }
+recreate_body="$(fn_body recreate_container)"
 down_body="$(awk '/^cmd_down\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
 destroy_body="$(awk '/^cmd_destroy\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
 inval_body="$(awk '/^invalidate_persisted_container\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
-has   "$up_body"      'restore_guest_history' "carry-over: cmd_up restores on the create path"
+has   "$recreate_body" 'restore_guest_history' "carry-over: the create path (recreate_container) restores"
 has   "$down_body"    'save_guest_history'    "carry-over: cmd_down snapshots before stopping"
 has   "$destroy_body" 'drop_guest_history'    "carry-over: cmd_destroy drops the snapshot"
 hasnt "$destroy_body" 'save_guest_history'    "carry-over: cmd_destroy never snapshots (destroy is the clean-guest button)"
