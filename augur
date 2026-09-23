@@ -2211,31 +2211,18 @@ cmd_up() {
         fi
     done < <(agent_auth_specs)
 
-    # Persist ONLY this project's Claude history, not the whole ~/.claude. Claude
-    # keys history by cwd (the container runs in /workspace-<slug>, which Claude
-    # encodes as projects/-workspace-<slug>); we bind the whole ~/.claude/projects
-    # parent (not just that one leaf) so any leaf Claude creates for THIS project —
-    # the main checkout, or a `claude --worktree` session run ad hoc via `augur
-    # shell` (no augur support for that flag itself; see
-    # docs/decisions/0004-no-special-worktree-support.md §3 Option A / §7-§9) — persists across
-    # `down`/`up`. The guest can therefore neither read other projects' transcripts
-    # nor tamper with host auth/settings, but CAN read/tamper with a sibling leaf's
-    # transcript within this one project — an accepted trade-off, not a new one
-    # (see the doc). The container-side parent (~/.claude/projects) and a minimal
-    # ~/.claude.json are baked dev-owned into the image (see Dockerfile) only as a
-    # fallback for any path that skips this mount; normally this bind mount fully
-    # shadows that pre-baked parent.
-    # A3: persist this project's history OUTSIDE the host's own ~/.claude/projects tree
-    # (under ~/.augur/claude-projects, mirroring macOS mode). A hostile guest can write
-    # arbitrary *.jsonl into this RW mount; keeping it out of ~/.claude/projects means the
-    # host's own Claude Code never enumerates or resumes guest-forged transcripts (which
-    # could otherwise inject instructions into a higher-privilege host-side agent). The
-    # container still sees it at the path Claude derives from its cwd (/workspace-<slug>).
-    # AUGUR_AGENT_SEAM | history mount — core OWNS the keying/scope (host source keyed on the
-    # FULL path = slug + path hash, so two same-basename projects never share history, kept
-    # OUTSIDE the host's own agent tree); the agent only DECLARES its guest paths. See docs §4 C7.
-    # "current-project-only" (C7) means no OTHER project's data is reachable — it does not
-    # mean single-leaf; every leaf under this one project's host_hist_dir is in scope.
+    # AUGUR_AGENT_SEAM | history mount — core decides where history lives and who can see it;
+    # the agent only declares its guest paths (ADR-0003 C7).
+    # Persist this project's agent history across down/up:
+    # - Host side: ~/.augur/claude-projects/<slug>-<path hash>, OUTSIDE the host's own
+    #   ~/.claude/projects, so the host's Claude never resumes a transcript a hostile guest forged
+    #   (security review 2026-06-28, finding A3). The path hash keeps two same-named projects
+    #   apart: no other project's history is reachable.
+    # - Guest side: the whole projects/ parent is mounted, not one leaf, so every leaf Claude
+    #   creates for this project (the main checkout, ad-hoc `claude --worktree` sessions) persists.
+    #   Accepted trade-off: those leaves can read each other (ADR-0004 §3 Option A).
+    # - The image pre-bakes projects/ and a minimal ~/.claude.json (Dockerfile) only as a
+    #   fallback; this mount normally shadows them.
     local agent_proj_leaf host_hist_dir
     agent_proj_leaf="$(agent_state_guest_leaf "$(workspace_slug)")"
     host_hist_dir="$AUGUR_DIR/$(agent_state_host_subdir)/$(workspace_slug)-$(workspace_path_hash)"
