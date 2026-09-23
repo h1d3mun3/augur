@@ -291,7 +291,8 @@ has "$mout" "VM SSH did not become available" "valid credentials: the VM is boot
 
 section "Tier 1 — source guards: the reconcile is wired where behaviour cannot see it"
 
-up_body="$(awk '/^cmd_up\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
+fn_body() { awk -v n="$1" '$0 ~ "^"n"\\(\\) \\{"{f=1} f{print} f&&/^}/{exit}' "$AUGUR"; }
+reconcile_body="$(fn_body reconcile_running_container)"
 up_macos_body="$(awk '/^cmd_up_macos\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
 claude_macos_body="$(awk '/^cmd_claude_macos\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
 shell_macos_body="$(awk '/^cmd_shell_macos\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
@@ -310,7 +311,7 @@ hasnt "$pinned_fn" 'ssh_macos'   "the pinned-state check never reads the guest"
 hasnt "$pinned_fn" '$VM_CLI'     "the pinned-state check never asks the VM backend"
 has   "$pinned_fn" 'gvproxy_pidfile' "the pinned-state check keys off the gvproxy pidfile (no new state file)"
 # The container half refuses; the macOS half must NOT (no fingerprint ⇒ no reliable drift signal).
-has   "$up_body"       'exit 1'  "cmd_up can refuse on drift (it has container_fingerprint)"
+has   "$reconcile_body" 'exit 1' "container up's running path (reconcile_running_container) can refuse on drift (it has container_fingerprint)"
 if printf '%s\n' "$up_macos_body" | sed -n '/already running/,/^    fi$/p' | grep -q 'exit 1'
 then fail "cmd_up_macos refuses on the already-running path" "macOS has no drift signal to refuse on"
 else ok "cmd_up_macos returns 0 on the already-running path (no fingerprint ⇒ no drift refusal)"; fi

@@ -2077,61 +2077,36 @@ finish_up() {
     echo -e "  ${BOLD}augur destroy${RESET} → Remove the container entirely"
 }
 
-cmd_up() {
-    require_engine
-    ensure_image
-
-    # Already running: the container itself can't change, but the host side is rebuilt on
-    # every `up` — rewrite the allowlist (augur-proxy hot-reloads it, so a revocation takes
-    # effect), check the config fingerprint, and re-run the boot self-test (INVARIANTS I1).
-    if container_running; then
-        warn "Container '${CONTAINER_NAME}' is already running — reconciling host-side state only."
-        if egress_enabled; then
-            check_project_conf_approved      # the gate runs wherever policy is written
-            # DELIBERATELY REDUNDANT with the write inside start_proxy on the match path below.
-            # It is here so a REVOCATION still lands on the MISMATCH path, which exits before
-            # finish_up is ever reached. Do not "simplify" it away.
-            write_merged_allowlist >/dev/null
-        fi
-        # A running container cannot be re-provisioned: --network / --cap-drop / HTTP_PROXY /
-        # --no-dns / -e credentials are baked once at `container run`. Refuse rather than warn and
-        # continue: the fingerprint is an opaque digest (it hashes RESOLVED SECRET VALUES, so naming
-        # the drifted field would mean storing them in plaintext), and continuing into
-        # start_egress_proxy with a container created under --no-egress fails opaquely anyway —
-        # container_egress_gateway falls back to a COMPUTED IP when `network inspect` reports none,
-        # start_egress_proxy then burns its 5s ifconfig wait on an address no interface holds, and
-        # start_proxy dies on the bind. A missing fingerprint (a container started by an augur that
-        # predates it) lands here too, and the same remedy heals it.
-        if ! container_fingerprint_matches; then
-            error "Container '${CONTAINER_NAME}' was created with a different config (egress mode, memory, credentials or mounts"
-            error "changed since). A running container cannot pick those up: ${BOLD}augur down && augur up${RESET}"
-            exit 1
-        fi
-        finish_up                            # restores I1's boot self-test on this path
-        return 0
+# The container is already running: rebuild the host side only, or refuse (exit 1) on config drift.
+reconcile_running_container() {
+    warn "Container '${CONTAINER_NAME}' is already running — reconciling host-side state only."
+    if egress_enabled; then
+        check_project_conf_approved      # the gate runs wherever policy is written
+        # DELIBERATELY REDUNDANT with the write inside start_proxy on the match path below.
+        # It is here so a REVOCATION still lands on the MISMATCH path, which exits before
+        # finish_up is ever reached. Do not "simplify" it away.
+        write_merged_allowlist >/dev/null
     fi
-
-    # Gate the untrusted project ./.augur/allowlist.conf before tearing anything down or
-    # starting the proxy (only relevant when egress filtering is on).
-    if egress_enabled; then check_project_conf_approved; fi
-
-    # Reconcile: `down` now STOPS (keeps) the container, so if a persisted one exists AND the
-    # config it was created with is unchanged (see container_fingerprint), reuse it — start it,
-    # bring egress up, and return. A reused container re-applies its ORIGINAL egress wiring,
-    # credentials, memory and mounts (baked once at `run`), so ANY drift must instead force a
-    # clean recreate below; the boot self-test in finish_up still gates the reuse.
-    if container_exists && container_fingerprint_matches; then
-        info "Reusing stopped container '${CONTAINER_NAME}' (config unchanged; fast restart)..."
-        # The internal egress network is kept across `down`; ensure it still exists (idempotent)
-        # so the container can re-attach.
-        if egress_enabled; then start_egress; fi
-        if eng start "$CONTAINER_NAME" &>/dev/null; then
-            finish_up
-            return 0
-        fi
-        warn "Could not start the existing container; recreating it clean..."
+    # A running container cannot be re-provisioned: --network / --cap-drop / HTTP_PROXY /
+    # --no-dns / -e credentials are baked once at `container run`. Refuse rather than warn and
+    # continue: the fingerprint is an opaque digest (it hashes RESOLVED SECRET VALUES, so naming
+    # the drifted field would mean storing them in plaintext), and continuing into
+    # start_egress_proxy with a container created under --no-egress fails opaquely anyway —
+    # container_egress_gateway falls back to a COMPUTED IP when `network inspect` reports none,
+    # start_egress_proxy then burns its 5s ifconfig wait on an address no interface holds, and
+    # start_proxy dies on the bind. A missing fingerprint (a container started by an augur that
+    # predates it) lands here too, and the same remedy heals it.
+    if ! container_fingerprint_matches; then
+        error "Container '${CONTAINER_NAME}' was created with a different config (egress mode, memory, credentials or mounts"
+        error "changed since). A running container cannot pick those up: ${BOLD}augur down && augur up${RESET}"
+        exit 1
     fi
+    finish_up                            # restores I1's boot self-test on this path
+}
 
+# Build a fresh container from the image: drop any old one, assemble the `container run` argv,
+# run it, record its fingerprint, then bring egress up via finish_up.
+recreate_container() {
     # Recreate: drop any existing container (its config drifted, or it wouldn't start), then
     # build a fresh one from the image below.
     if container_exists; then
@@ -2167,6 +2142,45 @@ cmd_up() {
     # mismatch that `exec` already fixes for free.
     run_args+=(-e "TZ=$(host_timezone)")
 
+    _add_egress_run_args
+    _add_auth_run_args
+    _add_state_mount_run_args
+    _add_host_config_run_args
+
+    # Keep-alive PID 1 so the container stays up (detached) for repeated `exec` (augur
+    # claude/shell). A bare `bash` exits immediately on Apple Container (no stdin) and stops the
+    # container; the backgrounded-and-`wait`ed `sleep infinity` keeps it up with no TTY (see -d
+    # above). The `trap … TERM` is what makes `augur down` fast: the kernel only delivers PID 1 a
+    # signal it has a HANDLER for, so a bare `sleep infinity` ignores `container stop`'s SIGTERM
+    # and stop must wait its full grace period, then SIGKILL (~5s observed). With the handler,
+    # SIGTERM exits PID 1 cleanly (0) at once; the writable layer persists either way. The
+    # agent/shell still run via `<engine> exec -it`, not PID 1. (Verified: dash and bash both keep
+    # running and exit 0 within ms of SIGTERM.)
+    run_args+=("$IMAGE_NAME" sh -c 'trap "exit 0" TERM; sleep infinity & wait')
+
+    if ! eng "${run_args[@]}" &>/dev/null; then
+        error "Failed to start the container."
+        # Don't leave a started proxy / internal network orphaned.
+        if egress_enabled; then stop_egress; fi
+        exit 1
+    fi
+    # Record the config this fresh container was created with, so the next `up` can tell whether
+    # the persisted container is still reusable or must be recreated (see the reconcile in cmd_up).
+    write_container_fingerprint
+
+    # Carry this project's prompt history into the fresh container (create path only; the reuse path
+    # in cmd_up kept it in its writable layer). `destroy` drops the snapshot, so a deliberate clean
+    # slate stays clean. Best-effort.
+    restore_guest_history
+
+    # The agent container has now ATTACHED to the network — the host's host-only gateway
+    # interface comes up at that point, so finish_up starts the host proxy and runs the boot
+    # self-test. Shared with the reuse path in cmd_up (the datapath is rebuilt on EVERY up).
+    finish_up
+}
+
+# The _add_*_run_args functions below append to the caller's `local run_args` (bash dynamic scoping).
+_add_egress_run_args() {
     # Egress allowlist: put the agent on an --internal network with NET_ADMIN dropped so
     # the root agent can't re-route, and point all egress at the HOST augur-proxy reached
     # over the host-only gateway. No host sudo required. The proxy enforces the allowlist
@@ -2192,7 +2206,9 @@ cmd_up() {
         run_args+=(--no-dns)
         info "Egress restricted to allowlisted domains (proxy: ${BOLD}${proxy_url}${RESET})."
     fi
+}
 
+_add_auth_run_args() {
     # Claude auth via env only — the host's credential store is never mounted into
     # the guest. ANTHROPIC_API_KEY wins if both are set (official precedence);
     # otherwise the subscription token (run `claude setup-token` once on the host,
@@ -2210,7 +2226,9 @@ cmd_up() {
             run_args+=(-e "${_genv}=${_aval}")
         fi
     done < <(agent_auth_specs)
+}
 
+_add_state_mount_run_args() {
     # AUGUR_AGENT_SEAM | history mount — core decides where history lives and who can see it;
     # the agent only declares its guest paths (ADR-0003 C7).
     # Persist this project's agent history across down/up:
@@ -2234,15 +2252,7 @@ cmd_up() {
     # guest leaf path). Now that the whole parent is mounted below, those files
     # need to live one level deeper — under host_hist_dir/$agent_proj_leaf/ — to
     # keep surfacing at the same guest path Claude already expects.
-    if [[ ! -d "$host_hist_dir/$agent_proj_leaf" ]]; then
-        shopt -s dotglob nullglob
-        local _pre_option_a_entries=("$host_hist_dir"/*)
-        shopt -u dotglob nullglob
-        mkdir -p "$host_hist_dir/$agent_proj_leaf"
-        if [[ ${#_pre_option_a_entries[@]} -gt 0 ]]; then
-            mv "${_pre_option_a_entries[@]}" "$host_hist_dir/$agent_proj_leaf/"
-        fi
-    fi
+    migrate_pre_option_a_history "$host_hist_dir" "$agent_proj_leaf"
     run_args+=(-v "${host_hist_dir}:$(agent_state_guest_projects_dir)")
 
     # AUGUR_AGENT_SEAM | user-level subagent defs (~/.claude/agents) — SAME keying/scope as the
@@ -2266,7 +2276,9 @@ cmd_up() {
     host_profile_dir="$AUGUR_DIR/$(agent_profile_host_subdir)"
     mkdir -p "$host_profile_dir"
     run_args+=(-v "${host_profile_dir}:$(agent_profile_guest_mount):ro")
+}
 
+_add_host_config_run_args() {
     [[ -f "$HOME/.gitconfig" ]] && run_args+=(-v "${HOME}/.gitconfig:/home/dev/.gitconfig:ro")
 
     # gh config is mounted READ-ONLY: the guest may read it but cannot rewrite the
@@ -2291,37 +2303,56 @@ cmd_up() {
             -e 'GIT_CONFIG_VALUE_0=!f() { test "$1" = get && echo username=x-access-token && echo "password=$GH_TOKEN"; }; f'
         )
     fi
+}
 
-    # Keep-alive PID 1 so the container stays up (detached) for repeated `exec` (augur
-    # claude/shell). A bare `bash` exits immediately on Apple Container (no stdin) and stops the
-    # container; the backgrounded-and-`wait`ed `sleep infinity` keeps it up with no TTY (see -d
-    # above). The `trap … TERM` is what makes `augur down` fast: the kernel only delivers PID 1 a
-    # signal it has a HANDLER for, so a bare `sleep infinity` ignores `container stop`'s SIGTERM
-    # and stop must wait its full grace period, then SIGKILL (~5s observed). With the handler,
-    # SIGTERM exits PID 1 cleanly (0) at once; the writable layer persists either way. The
-    # agent/shell still run via `<engine> exec -it`, not PID 1. (Verified: dash and bash both keep
-    # running and exit 0 within ms of SIGTERM.)
-    run_args+=("$IMAGE_NAME" sh -c 'trap "exit 0" TERM; sleep infinity & wait')
-
-    if ! eng "${run_args[@]}" &>/dev/null; then
-        error "Failed to start the container."
-        # Don't leave a started proxy / internal network orphaned.
-        if egress_enabled; then stop_egress; fi
-        exit 1
+# Usage: migrate_pre_option_a_history <host_hist_dir> <leaf>
+migrate_pre_option_a_history() {
+    local host_hist_dir="$1" agent_proj_leaf="$2"
+    if [[ ! -d "$host_hist_dir/$agent_proj_leaf" ]]; then
+        shopt -s dotglob nullglob
+        local _pre_option_a_entries=("$host_hist_dir"/*)
+        shopt -u dotglob nullglob
+        mkdir -p "$host_hist_dir/$agent_proj_leaf"
+        if [[ ${#_pre_option_a_entries[@]} -gt 0 ]]; then
+            mv "${_pre_option_a_entries[@]}" "$host_hist_dir/$agent_proj_leaf/"
+        fi
     fi
-    # Record the config this fresh container was created with, so the next `up` can tell whether
-    # the persisted container is still reusable or must be recreated (see the reconcile above).
-    write_container_fingerprint
+}
 
-    # Carry this project's prompt history into the fresh container (create path only; the reuse path
-    # above kept it in its writable layer). `destroy` drops the snapshot, so a deliberate clean
-    # slate stays clean. Best-effort.
-    restore_guest_history
+cmd_up() {
+    require_engine
+    ensure_image
 
-    # The agent container has now ATTACHED to the network — the host's host-only gateway
-    # interface comes up at that point, so finish_up starts the host proxy and runs the boot
-    # self-test. Shared with the reuse path above (the datapath is rebuilt on EVERY up).
-    finish_up
+    # Already running: the container itself can't change, but the host side is rebuilt on
+    # every `up` — rewrite the allowlist (augur-proxy hot-reloads it, so a revocation takes
+    # effect), check the config fingerprint, and re-run the boot self-test (INVARIANTS I1).
+    if container_running; then
+        reconcile_running_container
+        return 0
+    fi
+
+    # Gate the untrusted project ./.augur/allowlist.conf before tearing anything down or
+    # starting the proxy (only relevant when egress filtering is on).
+    if egress_enabled; then check_project_conf_approved; fi
+
+    # Reconcile: `down` now STOPS (keeps) the container, so if a persisted one exists AND the
+    # config it was created with is unchanged (see container_fingerprint), reuse it — start it,
+    # bring egress up, and return. A reused container re-applies its ORIGINAL egress wiring,
+    # credentials, memory and mounts (baked once at `run`), so ANY drift must instead force a
+    # clean recreate below; the boot self-test in finish_up still gates the reuse.
+    if container_exists && container_fingerprint_matches; then
+        info "Reusing stopped container '${CONTAINER_NAME}' (config unchanged; fast restart)..."
+        # The internal egress network is kept across `down`; ensure it still exists (idempotent)
+        # so the container can re-attach.
+        if egress_enabled; then start_egress; fi
+        if eng start "$CONTAINER_NAME" &>/dev/null; then
+            finish_up
+            return 0
+        fi
+        warn "Could not start the existing container; recreating it clean..."
+    fi
+
+    recreate_container
 }
 
 cmd_claude() {

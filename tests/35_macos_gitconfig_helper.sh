@@ -191,6 +191,16 @@ section "Tier 1 — source guards: ordering, and container mode's immunity"
 
 up_macos_body="$(awk '/^cmd_up_macos\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
 up_body="$(awk       '/^cmd_up\(\)/{f=1}       f{print} f&&/^}/{exit}' "$AUGUR")"
+fn_body() { awk -v n="$1" '$0 ~ "^"n"\\(\\) \\{"{f=1} f{print} f&&/^}/{exit}' "$AUGUR"; }
+host_config_body="$(fn_body _add_host_config_run_args)"
+# The whole container-up path: cmd_up plus every function it was split into.
+up_path_body="$up_body"
+for _f in reconcile_running_container recreate_container _add_egress_run_args _add_auth_run_args \
+          _add_state_mount_run_args _add_host_config_run_args migrate_pre_option_a_history; do
+  _fb="$(fn_body "$_f")"
+  [[ -n "$_fb" ]] || fail "source guard: could not extract $_f() from augur" "the up-path guard below would pass vacuously"
+  up_path_body+=$'\n'"$_fb"
+done
 
 # The scp REPLACES the file the helper is written into, so their order is load-bearing in a way no
 # behavioural test of the function alone can see: swap them and the helper is silently discarded on
@@ -206,9 +216,9 @@ fi
 
 # Container mode's immunity is the reason only one mode ever had this bug, and it is a property worth
 # pinning: the mounted ~/.gitconfig is read-only there, so the helper MUST arrive via env vars.
-hasnt "$up_body" 'git config --global' "container up never mutates the mounted ~/.gitconfig"
-has   "$up_body" 'GIT_CONFIG_KEY_0=credential.https://github.com.helper' \
+hasnt "$up_path_body" 'git config --global' "container up (cmd_up and every helper it calls) never mutates the mounted ~/.gitconfig"
+has   "$host_config_body" 'GIT_CONFIG_KEY_0=credential.https://github.com.helper' \
                                        "container up injects the same helper through GIT_CONFIG_* env vars instead"
-has   "$up_body" '.gitconfig:/home/dev/.gitconfig:ro' "container up mounts ~/.gitconfig READ-ONLY"
+has   "$host_config_body" '.gitconfig:/home/dev/.gitconfig:ro' "container up mounts ~/.gitconfig READ-ONLY"
 
 finish
