@@ -2215,12 +2215,14 @@ cmd_up() {
     # the agent only declares its guest paths (ADR-0003 C7).
     # Persist this project's agent history across down/up:
     # - Host side: ~/.augur/claude-projects/<slug>-<path hash>, OUTSIDE the host's own
-    #   ~/.claude/projects, so the host's Claude never resumes a transcript a hostile guest forged
+    #   ~/.claude/projects. The guest can write anything into this mount, and a forged transcript
+    #   resumed by the host's Claude could inject instructions into that higher-privilege agent
     #   (security review 2026-06-28, finding A3). The path hash keeps two same-named projects
-    #   apart: no other project's history is reachable.
-    # - Guest side: the whole projects/ parent is mounted, not one leaf, so every leaf Claude
-    #   creates for this project (the main checkout, ad-hoc `claude --worktree` sessions) persists.
-    #   Accepted trade-off: those leaves can read each other (ADR-0004 §3 Option A).
+    #   apart: no other project's history, and nothing else of the host's ~/.claude, is reachable.
+    # - Guest side: Claude keeps one leaf dir per cwd (projects/-workspace-<slug>). The whole
+    #   projects/ parent is mounted, not one leaf, so every leaf this project creates (the main
+    #   checkout, ad-hoc `claude --worktree` sessions) persists.
+    #   Accepted trade-off: those leaves can read and modify each other (ADR-0004 §3 Option A).
     # - The image pre-bakes projects/ and a minimal ~/.claude.json (Dockerfile) only as a
     #   fallback; this mount normally shadows them.
     local agent_proj_leaf host_hist_dir
