@@ -113,6 +113,14 @@ if [[ "$(uname)" == "Darwin" ]] && [[ -f "$SCRIPT_DIR/gvproxy/build.sh" ]]; then
     fi
 fi
 
+# Installing never stops a RUNNING proxy (it may be serving a live session). augur notices the
+# changed binary on reuse: augur-proxy is restarted on the next `augur up`; augur-gvproxy — the
+# live VM's NIC — only warns, so it needs a VM cycle.
+if compgen -G "$INSTALL_DIR/proxy/*.pid" >/dev/null; then
+    info "Egress proxies are running: augur-proxy restarts on the next ${BOLD}augur up${RESET};"
+    info "  a macOS VM picks up a new augur-gvproxy via ${BOLD}augur down --macos && augur up --macos${RESET}."
+fi
+
 # Build the macOS VM backend (augur-vm) when on macOS with a Swift toolchain.
 # Container mode does not need this, so a failure here is only a warning.
 if [[ "$(uname)" == "Darwin" ]]; then

@@ -780,6 +780,87 @@ proxy_running() {
     [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
 }
 
+# ── Stale-binary detection for the long-lived egress helpers ──────────────────
+# augur-proxy and augur-gvproxy outlive the augur invocation that launched them, and every
+# start_* reuses a live one on "pid alive" alone. `bash install` overwrites the binaries but
+# never stops running instances, so after an upgrade the OLD binary kept serving until an
+# explicit `down` — a fixed proxy bug stayed live with nothing saying so. Each launch therefore
+# records the sha256 of the binary it ran in a sidecar next to the pidfile ("<pidfile>.binsha"),
+# and the reuse path compares it with the binary it would launch NOW.
+#   • CONTENT, not mtime: resolve_proxy_cli may resolve a different path than the one running
+#     (PATH vs ~/.augur vs a local .build), and `cp -p`/touch/clock skew make mtimes lie both ways.
+#   • Not VERSION: dev builds share one VERSION number across many different binaries.
+#   • No sidecar (started by an augur predating this) counts as changed — one restart, by design.
+#   • Can't hash (no shasum/sha256sum, unreadable file) counts as UNCHANGED: fall back to plain
+#     reuse, never a restart loop or an abort. This only ever decides reuse-vs-relaunch of a proxy
+#     that enforces the same allowlist either way, so no egress invariant rests on it.
+file_sha256() {
+    local f="$1" out=""
+    [[ -n "$f" && -f "$f" && -r "$f" ]] || return 1
+    if command -v shasum &>/dev/null; then out="$(shasum -a 256 "$f" 2>/dev/null)" || return 1
+    elif command -v sha256sum &>/dev/null; then out="$(sha256sum "$f" 2>/dev/null)" || return 1
+    else return 1; fi
+    out="${out%% *}"
+    [[ ${#out} -eq 64 ]] || return 1
+    echo "$out"
+}
+binsha_file() { echo "$1.binsha"; }   # $1 = the helper's pidfile
+# Record what is about to be launched. $1 = binary (bare name or path), $2 = pidfile. A failed hash
+# REMOVES the sidecar rather than leaving a previous binary's digest to be compared against.
+record_launched_binsha() {
+    local sha side; side="$(binsha_file "$2")"
+    if sha="$(file_sha256 "$(command -v "$1" 2>/dev/null)")"; then
+        echo "$sha" > "$side" 2>/dev/null || true
+    else
+        rm -f "$side" 2>/dev/null || true
+    fi
+}
+# Succeeds iff the running helper provably came from a DIFFERENT binary than $1 (or recorded none).
+# $1 = binary we would launch now, $2 = pidfile. Unhashable ⇒ "unchanged" (see header).
+launched_binary_changed() {
+    local cur rec=""
+    cur="$(file_sha256 "$(command -v "$1" 2>/dev/null)")" || return 1
+    rec="$(cat "$(binsha_file "$2")" 2>/dev/null)" || true
+    [[ "$rec" != "$cur" ]]
+}
+# SIGTERM a pid and wait for it to exit (its listen ports must be free before the same address and
+# ports are rebound); SIGKILL after ~3s. If it still survives, the relaunch fails to bind and the
+# caller's start check reports it — failing closed, never serving through a half-dead pair.
+terminate_and_wait() {
+    local pid="$1" t=30
+    [[ -n "$pid" ]] || return 0
+    kill "$pid" 2>/dev/null || return 0
+    while ((t-- > 0)); do kill -0 "$pid" 2>/dev/null || return 0; sleep 0.1; done
+    kill -9 "$pid" 2>/dev/null || true
+    t=10
+    while ((t-- > 0)); do kill -0 "$pid" 2>/dev/null || return 0; sleep 0.1; done
+    return 0
+}
+# Relaunch-or-reuse for an augur-proxy instance. $1 = binary, $2 = pidfile, $3 = label. Returns 0
+# (and has stopped the old one) iff it is stale, so the caller falls through to its normal launch.
+# Safe under a live guest in BOTH modes: container mode's HTTP_PROXY and gvproxy's --socks-upstream
+# are dialed per connection, so only in-flight connections drop and the next one reaches the new
+# proxy on the same address:port.
+restart_proxy_if_binary_changed() {
+    launched_binary_changed "$1" "$2" || return 1
+    info "The augur-proxy binary changed since this ${3} started (pid $(cat "$2" 2>/dev/null)); restarting it..."
+    terminate_and_wait "$(cat "$2" 2>/dev/null)"
+    rm -f "$2" 2>/dev/null || true
+    return 0
+}
+# gvproxy's peer of the above — WARN only. Its unixgram socket IS the VM's NIC (see start_gvproxy),
+# so killing it under a live VM cuts the guest off; the operator has to cycle the VM.
+# $1 = pidfile, $2 = what to run to pick the new binary up.
+warn_if_gvproxy_binary_changed() {
+    local pidfile="$1" gvp; gvp="$(resolve_gvproxy)"
+    [[ -n "$gvp" && -f "$pidfile" ]] || return 0
+    launched_binary_changed "$gvp" "$pidfile" || return 0
+    warn "The running augur-gvproxy (pid $(cat "$pidfile" 2>/dev/null)) was started from a different"
+    warn "(or unrecorded) binary than ${gvp} — e.g. an upgrade since it started. It cannot be"
+    warn "restarted under a live VM (its socket is the VM's NIC). To pick up the new one: ${BOLD}${2}${RESET}"
+    return 0
+}
+
 # Merge the managed baseline + user global + project conf into a host-side runtime
 # allowlist the proxy reads. Deliberately written under ~/.augur (NOT the project tree)
 # so the guest — which can write the mounted ./.augur/allowlist.conf — cannot widen its own
@@ -1230,12 +1311,13 @@ start_proxy() {
     pidfile="$(proxy_pidfile)"
     logfile="$(proxy_logfile)"
 
-    if proxy_running; then
+    if proxy_running && ! restart_proxy_if_binary_changed "$bin" "$pidfile" "egress proxy"; then
         info "Egress proxy already running (pid $(cat "$pidfile"))."
         return 0
     fi
     mkdir -p "$AUGUR_PROXY_DIR"
     info "Starting egress proxy (allowlist: ${BOLD}${allowlist}${RESET})..."
+    record_launched_binsha "$bin" "$pidfile"
     "$bin" --allowlist "$allowlist" \
            --listen "$listen" \
            --http-port "$AUGUR_PROXY_HTTP_PORT" \
@@ -1259,7 +1341,7 @@ stop_proxy() {
         info "Stopping egress proxy..."
         kill "$(cat "$pidfile")" 2>/dev/null || true
     fi
-    rm -f "$pidfile" 2>/dev/null || true
+    rm -f "$pidfile" "$(binsha_file "$pidfile")" 2>/dev/null || true
     # Migration: reap a proxy left running under an OLDER pidfile name, in the two generations
     # this file has had. Both are invisible to the current proxy_running above, so without this
     # they survive every `down` and the next same-address `up` collides with them:
@@ -1525,7 +1607,10 @@ start_gvproxy() {
         exit 1
     fi
     sock="$(gvproxy_socket)"; pidfile="$(gvproxy_pidfile)"
-    gvproxy_running && return 0
+    if gvproxy_running; then
+        warn_if_gvproxy_binary_changed "$pidfile" "augur down --macos && augur up --macos"
+        return 0
+    fi
     # Checked on the path that actually BINDS the socket (same placement rule as the unlink
     # below): a reused gvproxy already proved its path fits, and the failure this catches is
     # `--listen-vfkit`'s, which happens here and nowhere else.
@@ -1547,6 +1632,7 @@ start_gvproxy() {
     # silent guest (no frames) apart from a wrong-IP guest (DHCP served, not .2).
     local gvp_debug=()
     [[ "${AUGUR_DEBUG:-}" == "1" ]] && gvp_debug=(--debug)
+    record_launched_binsha "$gvp" "$pidfile"
     "$gvp" --listen-vfkit "unixgram://${sock}" \
            --socks-upstream "127.0.0.1:${AUGUR_PROXY_SOCKS_PORT}" \
            --dns-allowlist "$(proxy_allowlist)" \
@@ -1564,7 +1650,7 @@ start_gvproxy() {
 stop_gvproxy() {
     local pidfile; pidfile="$(gvproxy_pidfile)"
     gvproxy_running && kill "$(cat "$pidfile")" 2>/dev/null || true
-    rm -f "$pidfile" "$(gvproxy_socket)" 2>/dev/null || true
+    rm -f "$pidfile" "$(binsha_file "$pidfile")" "$(gvproxy_socket)" 2>/dev/null || true
     # Migration: mirror of stop_proxy's reap, for the pre-path-hash gvproxy names
     # ("<slug>.gvproxy.pid" + "<slug>.vfkit.sock"). gvproxy_running only ever consults the
     # CURRENT pidfile, so a gvproxy started by an older augur is invisible to `down --macos`
@@ -3269,6 +3355,9 @@ ensure_macos_claude_profile() {
 warn_if_macos_egress_pinned() {
     local vm="$1" allowlist gvp_pid
     allowlist="$(proxy_allowlist)"; gvp_pid="$(gvproxy_pidfile)"
+    # A fourth thing pinned at boot: the gvproxy BINARY itself (an upgrade since this VM booted).
+    # This is the live-VM reuse path's only gvproxy touchpoint — start_gvproxy runs on a boot.
+    warn_if_gvproxy_binary_changed "$gvp_pid" "augur down --macos && augur up --macos"
     # No pidfile: nothing snapshotted a DNS allowlist for this VM (egress off, or a gvproxy started
     # by an augur that predates this name). Say nothing rather than guess: a false alarm here would
     # train people to ignore the warning that matters.
@@ -4582,12 +4671,14 @@ start_provision_proxy() {
     pidfile="$(provision_proxy_pidfile)"
     logfile="$(provision_proxy_logfile)"
 
-    if provision_proxy_running; then
+    if provision_proxy_running \
+       && ! restart_proxy_if_binary_changed "$bin" "$pidfile" "build-provisioning egress proxy"; then
         info "Build-provisioning egress proxy already running (pid $(cat "$pidfile"))."
         return 0
     fi
     mkdir -p "$AUGUR_PROXY_DIR"
     info "Starting build-provisioning egress proxy (allowlist: ${BOLD}${allowlist}${RESET})..."
+    record_launched_binsha "$bin" "$pidfile"
     "$bin" --allowlist "$allowlist" \
            --listen "127.0.0.1" \
            --http-port "$AUGUR_PROXY_HTTP_PORT_PROVISION" \
@@ -4610,7 +4701,7 @@ stop_provision_proxy() {
         info "Stopping build-provisioning egress proxy..."
         kill "$(cat "$pidfile")" 2>/dev/null || true
     fi
-    rm -f "$pidfile" 2>/dev/null || true
+    rm -f "$pidfile" "$(binsha_file "$pidfile")" 2>/dev/null || true
 }
 
 # Mirrors start_gvproxy, but the standalone build-provisioning identity.
@@ -4624,7 +4715,12 @@ start_provision_gvproxy() {
         exit 1
     fi
     sock="$(provision_gvproxy_socket)"; pidfile="$(provision_gvproxy_pidfile)"
-    provision_gvproxy_running && return 0
+    # Warn-only, like start_gvproxy: the provisioning identity is fixed (not per-project), so a
+    # live one may be another build/update's VM NIC. run_base_provisioning stops it on the way out.
+    if provision_gvproxy_running; then
+        warn_if_gvproxy_binary_changed "$pidfile" "stop the other build/update, or kill $(cat "$pidfile" 2>/dev/null), then retry"
+        return 0
+    fi
     # Same ordering rule as start_gvproxy, for the same reason: the unlink clears a socket left
     # behind by a crashed gvproxy (or the -S wait below succeeds instantly against a dead file),
     # so it must stay BELOW the early return — above it, reusing a running gvproxy unlinked the
@@ -4633,6 +4729,7 @@ start_provision_gvproxy() {
     info "Starting build-provisioning gvproxy..."
     local gvp_debug=()
     [[ "${AUGUR_DEBUG:-}" == "1" ]] && gvp_debug=(--debug)
+    record_launched_binsha "$gvp" "$pidfile"
     "$gvp" --listen-vfkit "unixgram://${sock}" \
            --socks-upstream "127.0.0.1:${AUGUR_PROXY_SOCKS_PORT_PROVISION}" \
            --dns-allowlist "$(provision_allowlist_path)" \
@@ -4650,7 +4747,7 @@ start_provision_gvproxy() {
 stop_provision_gvproxy() {
     local pidfile; pidfile="$(provision_gvproxy_pidfile)"
     provision_gvproxy_running && kill "$(cat "$pidfile")" 2>/dev/null || true
-    rm -f "$pidfile" "$(provision_gvproxy_socket)" 2>/dev/null || true
+    rm -f "$pidfile" "$(binsha_file "$pidfile")" "$(provision_gvproxy_socket)" 2>/dev/null || true
 }
 
 # ssh_macos routes through gvproxy only for the per-project VM (macos_via_gvproxy checks
