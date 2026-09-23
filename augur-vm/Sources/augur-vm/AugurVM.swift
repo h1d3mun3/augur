@@ -14,18 +14,21 @@ struct AugurVM: ParsableCommand {
         commandName: "augur-vm",
         abstract: "Minimal Virtualization.framework VM tool — the macOS VM backend for augur.",
         version: AugurVersion.string,
+        // Every subcommand below is named `<Noun>Command` — see ADR-0020
+        // (docs/decisions/0020-augur-vm-subcommand-naming.md) for why, and follow the
+        // same shape for any new one rather than reopening that choice.
         subcommands: [
-            Version.self,
-            ListCmd.self,
-            Smoke.self,
-            Create.self,
-            SetCmd.self,
-            Run.self,
-            IP.self,
+            VersionCommand.self,
+            ListCommand.self,
+            SmokeCommand.self,
+            CreateCommand.self,
+            SetCommand.self,
+            RunCommand.self,
+            IPCommand.self,
             GuestOSVersionCommand.self,
-            Stop.self,
-            DeleteCmd.self,
-            Clone.self,
+            StopCommand.self,
+            DeleteCommand.self,
+            CloneCommand.self,
         ]
     )
 }

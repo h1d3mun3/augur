@@ -2,7 +2,7 @@ import ArgumentParser
 import Foundation
 
 /// `augur-vm create <name> --from-ipsw <path> [--disk-size <GB>]`
-struct Create: ParsableCommand {
+struct CreateCommand: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "create",
         abstract: "Create a VM by installing macOS from an IPSW restore image."

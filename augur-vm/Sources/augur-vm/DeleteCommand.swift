@@ -2,7 +2,7 @@ import ArgumentParser
 import Foundation
 
 /// `augur-vm delete <name>` — remove a VM bundle.
-struct DeleteCmd: ParsableCommand {
+struct DeleteCommand: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "delete",
         abstract: "Delete a VM bundle."

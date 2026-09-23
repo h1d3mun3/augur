@@ -6,7 +6,7 @@ import Darwin
 
 /// `augur-vm stop <name>` — signal the resident `run` process to shut down the
 /// guest gracefully, blocking until it stops (the `stop` command).
-struct Stop: ParsableCommand {
+struct StopCommand: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "stop",
         abstract: "Stop a running VM."
