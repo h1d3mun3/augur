@@ -3348,79 +3348,16 @@ ensure_macos_git_credential_helper() {
     return 0
 }
 
-# Tolerance, in seconds, for BOTH the "is it worth correcting" test and the read-back below. One
-# constant on purpose: two numbers would drift apart, and the pair only makes sense if the value we
-# refuse to correct is the same value we accept afterwards. 5s is chosen against what actually
-# consumes the clock — JWT `nbf`/`exp` windows (minutes), X.509 validity (days), TLS handshakes —
-# none of which can tell 5s from 0. It is also comfortably above the noise floor: the drift below is
-# measured across an SSH round-trip through gvproxy's forward and both clocks are read at whole-second
-# granularity, so |drift| of 0–1 is normal on a correct guest and must not trigger a `sudo` write.
+# Tolerance, in seconds, for both the "is it worth correcting" test and the read-back after
+# correcting. One constant so the two can't drift apart. 5s: nothing that consumes the clock (JWT
+# nbf/exp windows, X.509 validity) can tell 5s from 0, and it sits above the normal 0–1s noise of
+# reading both clocks at whole-second granularity across an SSH round-trip.
 _MACOS_CLOCK_TOLERANCE_S=5
 
-# Set the guest's wall clock from the HOST's, over SSH, on every path that hands a guest to the agent.
-#
-# THE DEFECT. A cloned macOS guest boots with a CLOCK_REALTIME that is a fixed offset behind the
-# host's — measured on this host at -5733s (95.6 min), with `kern.monotoniclock_offset_usecs`
-# byte-identical across two different boots and unchanged across 7h36m of uptime, and
-# `kern.sleeptime`/`kern.waketime` both zero. So it is not accumulated suspend time: it is a constant
-# baked into the base VM's persisted state and inherited by every clone, and nothing in augur ever
-# corrected it. The guest's `kern.monotonicclock` meanwhile tracks the host's wall clock exactly,
-# which is why the skew is invisible to anything that measures a DURATION and lethal to anything that
-# compares an ABSOLUTE instant.
-#
-# WHY IT MATTERS, worst first. A JWT issued by the host's `gh`/`claude setup-token` at time T is
-# handed to a guest that believes it is T-95min, so `nbf`/`iat` can put a freshly minted token in the
-# FUTURE and the agent refuses its own credential; `exp` on a short-lived token is the mirror case.
-# Then git commit timestamps land 95 min in the past, `gh` API request signing sees a skewed clock,
-# and TLS certificate validity windows are evaluated 95 min early — the last is normally harmless
-# (windows are days wide) but a certificate rotated within the last 95 minutes is not yet valid to
-# this guest, which in verify_macos_egress_locked's positive half reads as "allowlisted egress does
-# not work" and tears down a perfectly good VM.
-#
-# WHY NOT NTP. The obvious fix — let the guest sync time itself — cannot work here and must not be
-# made to. NTP is UDP/123; augur.conf is a SOCKS5/TCP name allowlist, so adding a time server to it
-# forwards nothing. And per gvproxy/augur-egress.patch, `--deny-direct` does not register the UDP or
-# ICMP forwarders at all, so UDP has no path out of the datapath regardless of the allowlist. Opening
-# one would be a straight security regression against INVARIANTS.md I9 ("the gvproxy patch drops
-# UDP/ICMP"), which verify_macos_egress_locked now actively self-tests. See
-# docs/decisions/0015-guest-clock-from-host.md.
-#
-# WHY THE HOST'S CLOCK AND NOT THE GUEST'S OWN `kern.monotonicclock`. The guest does hold a correct
-# wall clock in that sysctl, and reading it would need no host round-trip — but `monotonicclock` is
-# only specified as a clock `settimeofday` cannot perturb, not as "the host's wall clock". That it
-# matches the host here is an artifact of this hypervisor seeding the guest timebase from the host's;
-# nothing guarantees it on another host, another Virtualization.framework version, or a base VM whose
-# monotonic base was itself seeded from the same stale persisted state — and a guest reading its own
-# bad clock has no way to notice. The host is a real NTP-synced Mac and is already the authority for
-# everything else augur pushes in (credentials, ~/.gitconfig, the managed policy, the allowlist), so
-# it is the authority for time too. The cost is transfer accuracy: the value is stale by one SSH
-# round-trip (tens of ms locally, and the read-back below bounds the total at
-# _MACOS_CLOCK_TOLERANCE_S), which is three orders of magnitude below the 5733s being fixed.
-#
-# The push shape is install_macos_managed_settings': `echo <password> | sudo -S -p ''`. A project
-# clone has NO passwordless sudo — cmd_build_macos revokes /etc/sudoers.d/augur before saving the
-# base VM — so `sudo -S` fed the admin password (macos_admin_password: the fixed ADR-0007 one, or the
-# generated one from ADR-0018's automated build) is the established, and only, way augur
-# runs a privileged command in a project guest. This takes no privilege augur's build does not
-# already take, and ADR-0001's sudo-free rule is about the HOST (its examples are host `pf` rules and
-# the bridged-networking entitlement), which is untouched. `/bin/date` is absolute for the same
-# reason verify_macos_egress_locked pins PATH: ~/.augur-env puts $HOME/.local/bin first in every
-# guest shell and the clone survives `down --macos`, so a bare `date` is shadowable by a prior guest
-# session. That is hygiene, not a security control — the clock is not a boundary, and a guest that
-# can lie about it can also lie on the read-back.
-#
-# BEST-EFFORT, never fatal. A guest with a wrong clock is degraded, not uncontained: it is the
-# opposite of verify_macos_egress_locked, whose hard `exit 1` exists because I1 makes an unverifiable
-# datapath a security failure. Aborting here would also abort with the VM already cloned, sized,
-# booted and SSH-reachable — the stranded-guest shape the pre-clone credential check was written to
-# remove — in exchange for a condition every augur before this one shipped with. So: warn, name the
-# consequence, continue, exactly as the profile wiring and the git credential helper do.
-#
-# The guest's CLOCK_REALTIME in epoch seconds, or nothing at all. One reader for both the drift
-# measurement and the read-back, so there is no second validator to drift from the first. The shape
-# is checked rather than scrubbed: `ssh <host> <cmd>` runs the command under the guest's zsh, which
-# sources ~/.zshenv (and therefore augur's own ~/.augur-env), so anything that ever printed on that
-# path would otherwise be spliced into the number and silently move the clock.
+# The guest's CLOCK_REALTIME in epoch seconds, or nothing at all. The output shape is checked
+# rather than scrubbed: `ssh` runs the command under the guest's zsh, which sources ~/.zshenv (and
+# so augur's ~/.augur-env), and anything else printed on that path would otherwise be spliced into
+# the number and silently move the clock.
 _macos_guest_epoch() {
     local raw
     raw="$(ssh_macos "$1" '/bin/date +%s' 2>/dev/null || true)"
@@ -3429,6 +3366,19 @@ _macos_guest_epoch() {
     return 0
 }
 
+# Set the guest's wall clock from the host's, over SSH, on every path that hands a guest to the
+# agent. A cloned macOS guest boots a fixed ~95 min behind the host (the offset is inherited from
+# the base VM), so a freshly issued token looks not-yet-valid and git/TLS timestamps are skewed.
+# - Not NTP: UDP has no path out of the egress datapath, by design (INVARIANTS I9).
+# - The host's clock, not the guest's own kern.monotonicclock: nothing guarantees the latter
+#   tracks real time on another host or Virtualization.framework version.
+# - Written with `sudo -S` fed the admin password, as for every privileged command in a project
+#   guest (clones have no passwordless sudo). This is guest-side; ADR-0001's sudo-free rule is
+#   about the host. `/bin/date` is absolute because ~/.augur-env puts ~/.local/bin first, where a
+#   previous guest session could shadow `date` (hygiene, not a security control).
+# - Best-effort: warns and continues, never fails `up`. A wrong clock degrades the guest but does
+#   not uncontain it — unlike verify_macos_egress_locked, which must exit on failure.
+# Measurements and full reasoning: docs/decisions/0015-guest-clock-from-host.md
 sync_macos_guest_clock() {
     local vm="$1" tol="$_MACOS_CLOCK_TOLERANCE_S" host_epoch guest_epoch drift adrift stamp setout
     # Read first. This is what makes the correction idempotent across the four call sites (a second
