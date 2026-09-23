@@ -14,6 +14,11 @@ augur runs Claude Code inside an isolated guest where it can build, run, and **t
 code, while your host stays out of reach. Only the current directory is exposed; network egress is
 limited to an allowlist enforced on the host.
 
+<p align="center">
+  <img src="resources/demo.gif" alt="augur up --macos boots an egress-filtered macOS VM, then Claude Code inside it runs xcodebuild test and the suite passes" width="800">
+  <br><sub><code>augur up --macos</code> → <code>augur claude --macos</code> → the agent runs <code>xcodebuild test</code> inside the VM (5× speed)</sub>
+</p>
+
 ## Why augur
 
 - **Xcode inside the sandbox — not just Linux.** macOS VM mode boots a real macOS guest on Apple's
