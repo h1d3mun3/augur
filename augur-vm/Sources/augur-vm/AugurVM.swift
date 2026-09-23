@@ -14,6 +14,9 @@ struct AugurVM: ParsableCommand {
         commandName: "augur-vm",
         abstract: "Minimal Virtualization.framework VM tool — the macOS VM backend for augur.",
         version: AugurVersion.string,
+        // Every subcommand below is named `<Noun>Command` — see ADR-0020
+        // (docs/decisions/0020-augur-vm-subcommand-naming.md) for why, and follow the
+        // same shape for any new one rather than reopening that choice.
         subcommands: [
             VersionCommand.self,
             ListCommand.self,
