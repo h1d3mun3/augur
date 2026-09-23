@@ -132,13 +132,13 @@ section "Tier 2 — augur-vm clone identity regeneration (source guard, run anyw
 # the destination, running the source and the clone concurrently collides on the shared
 # NAT MAC (augur-vm ip resolves by MAC) and on VZMacMachineIdentifier, which
 # Virtualization.framework does not support running twice live.
-clone_src="$REPO/augur-vm/Sources/augur-vm/Clone.swift"
+clone_src="$REPO/augur-vm/Sources/augur-vm/CloneCommand.swift"
 if [[ -f "$clone_src" ]]; then
   clone_txt="$(cat "$clone_src")"
   has "$clone_txt" 'VZMacMachineIdentifier()' "clone regenerates machineIdentifier on the copy (issue #67)"
   has "$clone_txt" 'VZMACAddress.randomLocallyAdministered()' "clone regenerates macAddress on the copy (issue #67)"
 else
-  fail "augur-vm/Sources/augur-vm/Clone.swift present" "not found at $clone_src"
+  fail "augur-vm/Sources/augur-vm/CloneCommand.swift present" "not found at $clone_src"
 fi
 
 section "Tier 2 — macOS build SSH bootstrap: no human-typed password (source guard, run anywhere)"

@@ -7,7 +7,7 @@ import Security
 /// (2) the running binary actually carries the com.apple.security.virtualization
 /// entitlement. Reading our own code signature avoids having to boot a real VM just
 /// to validate the signing pipeline — that comes at M1.
-struct Smoke: ParsableCommand {
+struct SmokeCommand: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "smoke",
         abstract: "Verify VZ links and the virtualization entitlement is embedded."

@@ -6,7 +6,7 @@ import Darwin
 
 /// `augur-vm run <name> [--no-graphics] [--dir=name:path ...]`
 /// Headless (`--no-graphics`) parks on dispatchMain; without it a GUI window opens.
-struct Run: ParsableCommand {
+struct RunCommand: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "run",
         abstract: "Boot a VM and keep it running (--no-graphics headless, or a GUI window)."
