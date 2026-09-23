@@ -131,47 +131,27 @@ final class InstallSession {
         )
         try persisted.save(name)
 
-        // Minimal install-time configuration: no network or graphics needed to
-        // install; `run` (M2/M3) rebuilds a full runtime config from the bundle.
-        let platform = VZMacPlatformConfiguration()
-        platform.hardwareModel = hardwareModel
-        platform.machineIdentifier = machineIdentifier
-        platform.auxiliaryStorage = auxiliaryStorage
+        let config = try VMConfigBuilder.build(
+            hardwareModel: hardwareModel,
+            machineIdentifier: machineIdentifier,
+            auxiliaryStorage: auxiliaryStorage,
+            cpuCount: cpuCount,
+            memorySize: memorySize,
+            diskURL: diskURL,
+            display: persisted.display
+        )
 
-        let config = VZVirtualMachineConfiguration()
-        config.platform = platform
-        config.bootLoader = VZMacOSBootLoader()
-        config.cpuCount = cpuCount
-        config.memorySize = memorySize
-        config.storageDevices = [
-            VZVirtioBlockDeviceConfiguration(
-                attachment: try VZDiskImageStorageDeviceAttachment(url: diskURL, readOnly: false)
-            )
-        ]
-
-        // The installer needs the same device set a bootable macOS VM has — a minimal
-        // config (platform + boot + disk only) makes VZ trap (SIGTRAP) when the VM is
-        // constructed. Mirror Apple's install sample: graphics, NAT network, and USB
-        // keyboard + pointing device.
-        let graphics = VZMacGraphicsDeviceConfiguration()
-        graphics.displays = [
-            VZMacGraphicsDisplayConfiguration(
-                widthInPixels: persisted.display.width,
-                heightInPixels: persisted.display.height,
-                pixelsPerInch: persisted.display.pixelsPerInch
-            )
-        ]
-        config.graphicsDevices = [graphics]
-
+        // Fixed, unfiltered NAT: install time has no untrusted guest workload yet,
+        // and — like the graphics/keyboard/pointing devices VMConfigBuilder already
+        // attached above — VZ just needs a full device set to avoid trapping on VM
+        // construction. `run` (M2/M3) rebuilds a full runtime config, including the
+        // real network choice, from the persisted bundle.
         let network = VZVirtioNetworkDeviceConfiguration()
         network.attachment = VZNATNetworkDeviceAttachment()
         if let mac = VZMACAddress(string: macAddress) {
             network.macAddress = mac
         }
         config.networkDevices = [network]
-
-        config.keyboards = [VZUSBKeyboardConfiguration()]
-        config.pointingDevices = [VZUSBScreenCoordinatePointingDeviceConfiguration()]
 
         return config
     }
