@@ -831,6 +831,171 @@ proxy_running() {
     [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
 }
 
+# ── Stale-binary detection for the long-lived egress helpers ──────────────────
+# augur-proxy and augur-gvproxy outlive the augur invocation that launched them, and `bash install`
+# overwrites their binaries without stopping running instances. Each launch therefore records the
+# sha256 of the binary it ran in a sidecar next to the pidfile ("<pidfile>.binsha"). A live helper
+# is FRESH iff that sidecar exists, the binary augur would launch now can be hashed, and the two
+# digests are equal. Anything else is NOT fresh, for one of these reasons (egress_helper_staleness):
+#   changed       the binary on disk differs from the one the helper was launched from.
+#   no-record     no sidecar: started by an older augur that wrote none. Not fresh by design — it
+#                 cannot be shown to run the installed binary; one restart records it.
+#   unreadable    the binary to compare against is missing or unreadable.
+#   no-hash-tool  neither shasum nor sha256sum is on PATH.
+# The last two mean freshness cannot be PROVEN, so they persist across restarts until the cause is
+# fixed. What a not-fresh helper leads to depends on whether a guest can be using it:
+#   • Guest running ⇒ up/claude/shell/setup-token refuse to attach (require_fresh_egress_helpers).
+#   • Guest not running ⇒ nobody is attached, so start_proxy / start_gvproxy replace it silently.
+#   • Build provisioning: start_provision_proxy replaces it, start_provision_gvproxy only warns.
+# Compared by CONTENT, not mtime: resolve_proxy_cli may resolve a different path than the one
+# running (PATH vs ~/.augur vs a local .build), and `cp -p`/touch/clock skew make mtimes lie both
+# ways. Not by VERSION either: dev builds share one VERSION number across many different binaries.
+sha256_tool_available() { command -v shasum &>/dev/null || command -v sha256sum &>/dev/null; }
+file_sha256() {
+    local f="$1" out=""
+    [[ -n "$f" && -f "$f" && -r "$f" ]] || return 1
+    if command -v shasum &>/dev/null; then out="$(shasum -a 256 "$f" 2>/dev/null)" || return 1
+    elif command -v sha256sum &>/dev/null; then out="$(sha256sum "$f" 2>/dev/null)" || return 1
+    else return 1; fi
+    out="${out%% *}"
+    [[ ${#out} -eq 64 ]] || return 1
+    echo "$out"
+}
+binsha_file() { echo "$1.binsha"; }   # $1 = the helper's pidfile
+# Record what is about to be launched. $1 = binary (bare name or path), $2 = pidfile. A failed hash
+# REMOVES the sidecar rather than leaving a previous binary's digest to be compared against.
+record_launched_binsha() {
+    local sha side; side="$(binsha_file "$2")"
+    if sha="$(file_sha256 "$(command -v "$1" 2>/dev/null)")"; then
+        echo "$sha" > "$side" 2>/dev/null || true
+    else
+        rm -f "$side" 2>/dev/null || true
+    fi
+}
+# Succeeds silently iff the helper launched under pidfile $2 is fresh against binary $1 (bare name,
+# path, or empty when not found); otherwise prints one reason code from the list above and fails.
+# Hashability is checked first, so the reason reported is the one a restart alone cannot fix.
+egress_helper_staleness() {
+    local path cur rec
+    path="$(command -v "$1" 2>/dev/null)" || path=""
+    sha256_tool_available || { echo no-hash-tool; return 1; }
+    cur="$(file_sha256 "$path")" || { echo unreadable; return 1; }
+    rec="$(cat "$(binsha_file "$2")" 2>/dev/null)" || { echo no-record; return 1; }
+    [[ "$rec" == "$cur" ]] || { echo changed; return 1; }
+}
+# One-line explanation of a reason code, for error/info messages. $1 = code, $2 = the binary as
+# resolved (path or name) — named so the operator knows which file to fix or compare.
+egress_helper_staleness_text() {
+    case "$1" in
+        changed)      echo "its binary changed since it started (${2} is not the binary it was launched from)" ;;
+        no-record)    echo "no record of the binary it was started from (it was started by an older augur)" ;;
+        unreadable)   echo "cannot hash its binary: ${2} is missing or unreadable" ;;
+        no-hash-tool) echo "cannot hash its binary: neither shasum nor sha256sum is on PATH" ;;
+        *)            echo "not verified as the installed binary" ;;
+    esac
+}
+# `status` text for a live helper: "running", plus "(stale: <why>)" when it is not fresh.
+# $1 = binary, $2 = pidfile.
+egress_helper_status() {
+    local why
+    if why="$(egress_helper_staleness "$1" "$2")"; then echo "${GREEN}running${RESET}"; return 0; fi
+    case "$why" in
+        changed)   why="binary changed" ;;
+        no-record) why="no record" ;;
+        *)         why="cannot hash" ;;
+    esac
+    echo "${GREEN}running${RESET} ${YELLOW}(stale: ${why})${RESET}"
+}
+# SIGTERM a pid and wait for it to exit (its listen ports / socket must be free before the same
+# ones are rebound); SIGKILL after ~3s, then wait ~1s more.
+terminate_and_wait() {
+    local pid="$1" t=30
+    [[ -n "$pid" ]] || return 0
+    kill "$pid" 2>/dev/null || return 0
+    while ((t-- > 0)); do kill -0 "$pid" 2>/dev/null || return 0; sleep 0.1; done
+    kill -9 "$pid" 2>/dev/null || true
+    t=10
+    while ((t-- > 0)); do kill -0 "$pid" 2>/dev/null || return 0; sleep 0.1; done
+    return 0
+}
+# Stop a live helper that is not fresh so the caller falls through to its normal launch. Only for a
+# helper no running guest is attached to (see the header above). $1 = pidfile, $2 = label for
+# messages, $3 = reason code, $4 = binary as resolved. Fails closed (exit 1) if the old process
+# survives SIGKILL: it may still hold the address, ports or socket, and a second instance must never
+# be launched next to it.
+replace_stale_helper() {
+    local pidfile="$1" label="$2" pid; pid="$(cat "$pidfile" 2>/dev/null)" || pid=""
+    info "Replacing the ${label} (pid ${pid}): $(egress_helper_staleness_text "$3" "$4")."
+    terminate_and_wait "$pid"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        error "The ${label} (pid ${pid}) did not exit even after SIGKILL; refusing to start a second one next to it."
+        error "Wait for it to exit (check with ${BOLD}ps -p ${pid}${RESET}), then retry. If it never exits, a reboot clears it."
+        exit 1
+    fi
+    rm -f "$pidfile" "$(binsha_file "$pidfile")" 2>/dev/null || true
+}
+# Refuse (exit 1) to attach to a RUNNING guest while one of its live egress helpers is not fresh
+# (see the header above file_sha256). ONE gate for both modes: container mode checks the project's
+# augur-proxy; macOS VM mode checks the project's augur-proxy and augur-gvproxy.
+#   • Refuse, not replace: swapping a helper under a live guest is never transparent — gvproxy's
+#     socket IS the VM's NIC, and a replaced augur-proxy drops the guest's in-flight connections —
+#     so it takes an explicit `down && up`, which relaunches the helpers from the installed binaries
+#     and re-runs the boot self-test. Both modes behave the same way.
+#   • Not conditioned on egress_enabled: a live helper for this project is what the guest uses,
+#     whatever this invocation's --no-egress says.
+#   • A guest that is NOT running has nobody attached, so this lets the command through and
+#     start_proxy / start_gvproxy replace the stale helper on the way up.
+#   • Placement: first thing in cmd_up/cmd_claude/cmd_shell/cmd_setup_token and their _macos peers,
+#     right after require_engine (+ require_engine_version) / require_vz (the guest-running check
+#     needs the engine / VM CLI) — before the running-vs-up branch (ensure_session_container in
+#     container mode's claude/shell), because claude/shell/setup-token on a running guest never
+#     reach `up`, and before `up`'s running-guest reconcile. The dispatch tail next to
+#     require_safe_workspace would be too early: it runs before require_vz. When claude/shell/
+#     setup-token fall through to `up`, the second call only re-hashes.
+#   • Cheap when fresh: a liveness check and one sha256 per live helper; the guest is queried only
+#     once a helper turns out not fresh.
+# Deliberately NOT called from down/destroy/status/list: they are the way out of this refusal.
+# Deliberately no override: egress enforcement is augur's core promise, so there is no flag or env
+# var to attach through a helper that cannot be shown to run the installed binary.
+require_fresh_egress_helpers() {
+    local lines="" why bin pf cannot_hash=false guest remedy kept l
+    if proxy_running; then
+        bin="$(resolve_proxy_cli)"; pf="$(proxy_pidfile)"
+        if ! why="$(egress_helper_staleness "$bin" "$pf")"; then
+            lines+="augur-proxy (pid $(cat "$pf" 2>/dev/null)): $(egress_helper_staleness_text "$why" "$(command -v "$bin" 2>/dev/null || echo "$bin")")"$'\n'
+            [[ "$why" == unreadable || "$why" == no-hash-tool ]] && cannot_hash=true
+        fi
+    fi
+    if $MACOS_MODE && gvproxy_running; then
+        bin="$(resolve_gvproxy)"; pf="$(gvproxy_pidfile)"
+        if ! why="$(egress_helper_staleness "$bin" "$pf")"; then
+            lines+="augur-gvproxy (pid $(cat "$pf" 2>/dev/null)): $(egress_helper_staleness_text "$why" "${bin:-augur-gvproxy}")"$'\n'
+            [[ "$why" == unreadable || "$why" == no-hash-tool ]] && cannot_hash=true
+        fi
+    fi
+    [[ -n "$lines" ]] || return 0
+    if $MACOS_MODE; then
+        guest="VM '$(macos_project_vm)'"
+        macos_vm_running "$(macos_project_vm)" || return 0
+        remedy="augur down --macos && augur up --macos"; kept="the VM clone"
+    else
+        guest="container '${CONTAINER_NAME}'"
+        container_running || return 0
+        remedy="augur down && augur up"; kept="the container's writable layer"
+    fi
+    error "Refusing to attach to the running ${guest}: an egress helper serving it is not verified"
+    error "to run the installed binary."
+    while IFS= read -r l; do [[ -n "$l" ]] && error "  • ${l}"; done <<< "$lines"
+    if $cannot_hash; then
+        error "Fix that first: until augur can hash the installed binary it cannot verify any running"
+        error "helper, and this refusal repeats after every restart."
+    fi
+    error "Restart the guest and its egress helpers from the installed binaries: ${BOLD}${remedy}${RESET}"
+    error "  \`down\` ends every running claude/shell session of this project; the workspace and"
+    error "  ${kept} are kept."
+    exit 1
+}
+
 # Merge the managed baseline + user global + project conf into a host-side runtime
 # allowlist the proxy reads. Deliberately written under ~/.augur (NOT the project tree)
 # so the guest — which can write the mounted ./.augur/allowlist.conf — cannot widen its own
@@ -1273,12 +1438,20 @@ start_proxy() {
     pidfile="$(proxy_pidfile)"
     logfile="$(proxy_logfile)"
 
+    # Reuse a live proxy only if it is fresh (see the header above file_sha256); otherwise stop it
+    # and launch below. A running guest never gets here with a stale one — require_fresh_egress_helpers
+    # refused before `up` — so the proxy replaced here is one nobody is attached to.
     if proxy_running; then
-        info "Egress proxy already running (pid $(cat "$pidfile"))."
-        return 0
+        local why
+        if why="$(egress_helper_staleness "$bin" "$pidfile")"; then
+            info "Egress proxy already running (pid $(cat "$pidfile"))."
+            return 0
+        fi
+        replace_stale_helper "$pidfile" "egress proxy" "$why" "$(command -v "$bin" 2>/dev/null || echo "$bin")"
     fi
     mkdir -p "$AUGUR_PROXY_DIR"
     info "Starting egress proxy (allowlist: ${BOLD}${allowlist}${RESET})..."
+    record_launched_binsha "$bin" "$pidfile"
     "$bin" --allowlist "$allowlist" \
            --listen "$listen" \
            --http-port "$AUGUR_PROXY_HTTP_PORT" \
@@ -1302,7 +1475,7 @@ stop_proxy() {
         info "Stopping egress proxy..."
         kill "$(cat "$pidfile")" 2>/dev/null || true
     fi
-    rm -f "$pidfile" 2>/dev/null || true
+    rm -f "$pidfile" "$(binsha_file "$pidfile")" 2>/dev/null || true
     # Migration: reap a proxy left running under an OLDER pidfile name, in the two generations
     # this file has had. Both are invisible to the current proxy_running above, so without this
     # they survive every `down` and the next same-address `up` collides with them:
@@ -1573,7 +1746,14 @@ start_gvproxy() {
         exit 1
     fi
     sock="$(gvproxy_socket)"; pidfile="$(gvproxy_pidfile)"
-    gvproxy_running && return 0
+    # Reuse a live gvproxy only if it is fresh (see the header above file_sha256); otherwise stop it
+    # and launch below. This runs only on the VM boot path, so no VM is attached to the one replaced
+    # here; a running VM with a stale gvproxy is refused earlier by require_fresh_egress_helpers.
+    if gvproxy_running; then
+        local why
+        why="$(egress_helper_staleness "$gvp" "$pidfile")" && return 0
+        replace_stale_helper "$pidfile" "gvproxy" "$why" "$gvp"
+    fi
     # Checked on the path that actually BINDS the socket (same placement rule as the unlink
     # below): a reused gvproxy already proved its path fits, and the failure this catches is
     # `--listen-vfkit`'s, which happens here and nowhere else.
@@ -1595,6 +1775,7 @@ start_gvproxy() {
     # silent guest (no frames) apart from a wrong-IP guest (DHCP served, not .2).
     local gvp_debug=()
     [[ "${AUGUR_DEBUG:-}" == "1" ]] && gvp_debug=(--debug)
+    record_launched_binsha "$gvp" "$pidfile"
     "$gvp" --listen-vfkit "unixgram://${sock}" \
            --socks-upstream "127.0.0.1:${AUGUR_PROXY_SOCKS_PORT}" \
            --dns-allowlist "$(proxy_allowlist)" \
@@ -1612,7 +1793,7 @@ start_gvproxy() {
 stop_gvproxy() {
     local pidfile; pidfile="$(gvproxy_pidfile)"
     gvproxy_running && kill "$(cat "$pidfile")" 2>/dev/null || true
-    rm -f "$pidfile" "$(gvproxy_socket)" 2>/dev/null || true
+    rm -f "$pidfile" "$(binsha_file "$pidfile")" "$(gvproxy_socket)" 2>/dev/null || true
     # Migration: mirror of stop_proxy's reap, for the pre-path-hash gvproxy names
     # ("<slug>.gvproxy.pid" + "<slug>.vfkit.sock"). gvproxy_running only ever consults the
     # CURRENT pidfile, so a gvproxy started by an older augur is invisible to `down --macos`
@@ -2094,7 +2275,8 @@ drop_guest_history() {
 # On the already-running path this one line buys three distinct things:
 #   • start_egress_proxy → start_proxy rewrites the merged allowlist AND REVIVES A DEAD PROXY. That
 #     is the only recovery from a proxy killed out from under a live session; nothing else in
-#     `up`/`claude` restarts one.
+#     `up`/`claude` revives or replaces one — `claude`/`shell` on a running guest never touch the
+#     proxy, and one whose binary is not verified is refused by require_fresh_egress_helpers.
 #   • verify_egress_locked restores the boot self-test on that path.
 #   • apply_guest_profile picks up a structural profile change.
 finish_up() {
@@ -2399,6 +2581,7 @@ migrate_pre_option_a_history() {
 cmd_up() {
     require_engine
     require_engine_version
+    require_fresh_egress_helpers
     ensure_image
 
     # Already running: the container itself can't change, but the host side is rebuilt on
@@ -2436,6 +2619,7 @@ cmd_up() {
 cmd_claude() {
     require_engine
     require_engine_version
+    require_fresh_egress_helpers
     # Checked before anything starts; see session_credential_env for why here and not in the
     # process substitution.
     validate_resolved_credentials || exit 1
@@ -2467,6 +2651,7 @@ cmd_claude() {
 cmd_shell() {
     require_engine
     require_engine_version
+    require_fresh_egress_helpers
     validate_resolved_credentials || exit 1      # same as cmd_claude
     ensure_session_container
     # Same reasoning as cmd_claude: an already-running container never reaches `cmd_up` at all, so
@@ -2491,6 +2676,7 @@ cmd_shell() {
 cmd_setup_token() {
     require_engine
     require_engine_version
+    require_fresh_egress_helpers
     # Auto-start a container if none is running, and stop it again afterward (kept, like any
     # `down`), so the token flow doesn't leave a RUNNING container/proxy behind. The token is
     # saved to the host for future sessions regardless; an already-running container is left
@@ -2730,7 +2916,7 @@ cmd_status() {
     echo -e "${BOLD}Memory:${RESET}     $(resolve_container_memory)"
     if egress_enabled; then
         local estate="${RED}stopped${RESET}" ekind="host proxy"
-        egress_proxy_running && estate="${GREEN}running${RESET}"
+        egress_proxy_running && estate="$(egress_helper_status "$(resolve_proxy_cli)" "$(proxy_pidfile)")"
         echo -e "${BOLD}Egress:${RESET}     ${GREEN}on${RESET} (allowlist; ${ekind} ${estate})"
         echo -e "${BOLD}Allowlist:${RESET}  baseline$( [[ -f "$AUGUR_GLOBAL_CONF" ]] && echo " + augur.conf" )$( [[ -f "$AUGUR_PROJECT_CONF" ]] && echo " + .augur/allowlist.conf" )"
         if [[ -f "$AUGUR_PROJECT_CONF" ]]; then
@@ -3594,6 +3780,7 @@ sync_macos_guest_timezone() {
 
 cmd_up_macos() {
     require_vz
+    require_fresh_egress_helpers
     local project_vm
     project_vm="$(macos_project_vm)"
 
@@ -3872,6 +4059,7 @@ cmd_up_macos() {
 
 cmd_claude_macos() {
     require_vz
+    require_fresh_egress_helpers
     local project_vm
     project_vm="$(macos_project_vm)"
     macos_vm_running "$project_vm" || cmd_up_macos
@@ -3898,6 +4086,7 @@ cmd_claude_macos() {
 
 cmd_shell_macos() {
     require_vz
+    require_fresh_egress_helpers
     local project_vm
     project_vm="$(macos_project_vm)"
     macos_vm_running "$project_vm" || cmd_up_macos
@@ -3919,6 +4108,7 @@ cmd_shell_macos() {
 # the resulting token on the host. Same copy-the-code flow (no host claude needed).
 cmd_setup_token_macos() {
     require_vz
+    require_fresh_egress_helpers
     local project_vm
     project_vm="$(macos_project_vm)"
     # Auto-start the VM if it isn't running, and stop it again afterward, so this
@@ -4053,8 +4243,10 @@ cmd_status_macos() {
         echo -e "${BOLD}Status:${RESET}        ${RED}not created${RESET}"
     fi
     if egress_enabled; then
-        local estate="${RED}stopped${RESET}"; proxy_running && estate="${GREEN}running${RESET}"
-        local gstate="${RED}stopped${RESET}"; gvproxy_running && gstate="${GREEN}running${RESET}"
+        local estate="${RED}stopped${RESET}"
+        proxy_running && estate="$(egress_helper_status "$(resolve_proxy_cli)" "$(proxy_pidfile)")"
+        local gstate="${RED}stopped${RESET}"
+        gvproxy_running && gstate="$(egress_helper_status "$(resolve_gvproxy)" "$(gvproxy_pidfile)")"
         echo -e "${BOLD}Egress:${RESET}        ${GREEN}on${RESET} (proxy ${estate}, gvproxy ${gstate})"
         echo -e "${BOLD}Allowlist:${RESET}     baseline$( [[ -f "$AUGUR_GLOBAL_CONF" ]] && echo " + augur.conf" )$( [[ -f "$AUGUR_PROJECT_CONF" ]] && echo " + .augur/allowlist.conf" )"
         if [[ -f "$AUGUR_PROJECT_CONF" ]]; then
@@ -4664,12 +4856,19 @@ start_provision_proxy() {
     pidfile="$(provision_proxy_pidfile)"
     logfile="$(provision_proxy_logfile)"
 
+    # Same fresh-or-replace rule as start_proxy. No guest attaches to this proxy across
+    # invocations — run_base_provisioning stops it on the way out — so replacing it cuts nobody off.
     if provision_proxy_running; then
-        info "Build-provisioning egress proxy already running (pid $(cat "$pidfile"))."
-        return 0
+        local why
+        if why="$(egress_helper_staleness "$bin" "$pidfile")"; then
+            info "Build-provisioning egress proxy already running (pid $(cat "$pidfile"))."
+            return 0
+        fi
+        replace_stale_helper "$pidfile" "build-provisioning egress proxy" "$why" "$(command -v "$bin" 2>/dev/null || echo "$bin")"
     fi
     mkdir -p "$AUGUR_PROXY_DIR"
     info "Starting build-provisioning egress proxy (allowlist: ${BOLD}${allowlist}${RESET})..."
+    record_launched_binsha "$bin" "$pidfile"
     "$bin" --allowlist "$allowlist" \
            --listen "127.0.0.1" \
            --http-port "$AUGUR_PROXY_HTTP_PORT_PROVISION" \
@@ -4692,7 +4891,7 @@ stop_provision_proxy() {
         info "Stopping build-provisioning egress proxy..."
         kill "$(cat "$pidfile")" 2>/dev/null || true
     fi
-    rm -f "$pidfile" 2>/dev/null || true
+    rm -f "$pidfile" "$(binsha_file "$pidfile")" 2>/dev/null || true
 }
 
 # Mirrors start_gvproxy, but the standalone build-provisioning identity.
@@ -4706,7 +4905,18 @@ start_provision_gvproxy() {
         exit 1
     fi
     sock="$(provision_gvproxy_socket)"; pidfile="$(provision_gvproxy_pidfile)"
-    provision_gvproxy_running && return 0
+    # Deliberately warn-only on a live gvproxy that is not fresh: the provisioning identity is fixed
+    # (not per-project), so a live one may be another build/update's VM NIC, and killing it would
+    # cut that VM off. run_base_provisioning stops it on the way out.
+    if provision_gvproxy_running; then
+        local why pid; pid="$(cat "$pidfile" 2>/dev/null)" || pid=""
+        if ! why="$(egress_helper_staleness "$gvp" "$pidfile")"; then
+            warn "The running build-provisioning gvproxy (pid ${pid}) is reused although it is not verified"
+            warn "as the installed binary: $(egress_helper_staleness_text "$why" "$gvp")."
+            warn "To use the installed one: stop the other build/update, or ${BOLD}kill ${pid}${RESET}, then retry."
+        fi
+        return 0
+    fi
     # Same ordering rule as start_gvproxy, for the same reason: the unlink clears a socket left
     # behind by a crashed gvproxy (or the -S wait below succeeds instantly against a dead file),
     # so it must stay BELOW the early return — above it, reusing a running gvproxy unlinked the
@@ -4715,6 +4925,7 @@ start_provision_gvproxy() {
     info "Starting build-provisioning gvproxy..."
     local gvp_debug=()
     [[ "${AUGUR_DEBUG:-}" == "1" ]] && gvp_debug=(--debug)
+    record_launched_binsha "$gvp" "$pidfile"
     "$gvp" --listen-vfkit "unixgram://${sock}" \
            --socks-upstream "127.0.0.1:${AUGUR_PROXY_SOCKS_PORT_PROVISION}" \
            --dns-allowlist "$(provision_allowlist_path)" \
@@ -4732,7 +4943,7 @@ start_provision_gvproxy() {
 stop_provision_gvproxy() {
     local pidfile; pidfile="$(provision_gvproxy_pidfile)"
     provision_gvproxy_running && kill "$(cat "$pidfile")" 2>/dev/null || true
-    rm -f "$pidfile" "$(provision_gvproxy_socket)" 2>/dev/null || true
+    rm -f "$pidfile" "$(binsha_file "$pidfile")" "$(provision_gvproxy_socket)" 2>/dev/null || true
 }
 
 # ssh_macos routes through gvproxy only for the per-project VM (macos_via_gvproxy checks

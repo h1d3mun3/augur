@@ -60,6 +60,9 @@ check_unlink_order() {
   : > "$LAUNCHED"
   : > "$sock"                              # stand-in for the live gvproxy's bound socket path
   echo 4242 > "$pidfile"                   # ...and its pidfile
+  # ...launched from the installed binary: start_gvproxy reuses only a fresh gvproxy (one whose
+  # launch record matches the binary) and replaces any other — see tests/43 for that path.
+  file_sha256 "$TMPD/augur-gvproxy" > "$(binsha_file "$pidfile")"
   ALIVE=true
   ( "$start_fn" ) >/dev/null 2>&1; rc=$?
 
