@@ -140,20 +140,28 @@ in time," this **prescribes** "what must never break." It changes rarely.
   only in the absence of `--deny-direct`. The **live NIC count** still needs a real VM host and
   stays ⚠ review-only; nothing asserts `config.networkDevices = [network]`.
 
-### I10. Do not expose credentials on argv  ⚠ review-only
-- **Rule:** On macOS the token is written to `~/.augur-env` (chmod 600) via SSH stdin,
-  never placed on a command line.
-- **Why:** Prevent a co-resident process from reading credentials via `ps` / `/proc`.
-- **Note:** The `container run -e` argv exposure on the container path is a **known residual
-  risk** (M1, accepted under the single-user-host premise). It resurfaces if moved to a shared host.
-- **Enforced by:** review only (M1) for now.
+### I10. Do not expose credentials on argv  🟡 partial
+- **Rule:** No credential value is ever placed on a command line. On macOS the token is written to
+  `~/.augur-env` (chmod 600) via SSH stdin. In Container mode credentials are never passed to
+  `container run` at all; they reach only the `container exec` that starts `augur claude` /
+  `augur shell`, through `--env-file <(…)` written by the bash builtin `printf`
+  (`session_credential_env`). `augur setup-token` and augur's own execs get none.
+- **Why:** Prevent a co-resident process from reading credentials via `ps` / `/proc`. In Container
+  mode, keeping them off `container run` also keeps them out of the container's persisted config
+  (plaintext in the container bundle, printed by `container inspect`).
+- **Enforced by:** Container mode ✅ `tests/11_construct_container.sh` via the `container` shim:
+  the `run` argv carries no credential name or value, no `GH_TOKEN` and no `GIT_CONFIG_*`; the
+  `claude` / `shell` exec carries `--env-file` whose captured content holds the credentials while
+  no engine argv holds a value; `setup-token` and the profile/history execs carry no `--env-file`.
+  `tests/21_container_live.sh` (live, `AUGUR_TEST_LIVE=1`) additionally checks `container inspect`
+  shows no credential. macOS mode ⚠ review-only.
 
 ---
 
-> Of the 10, I1–I8 are enforced by tests/self-tests; I9 is partial (entitlement only);
-> I10 is review-only. The remaining review-only surface is I10 (credentials not on argv:
-> macOS goes through a file, but the container-run argv is an accepted residual, M1) and the
-> hardware-dependent part of I9 (the live NIC count — the gvproxy UDP/ICMP drop is now probed
+> Of the 10, I1–I8 are enforced by tests/self-tests; I9 is partial (entitlement only); I10 is
+> partial (Container mode test-enforced). The remaining review-only surface is the macOS half of
+> I10 (credentials not on argv: macOS goes through a file written over SSH stdin, which no test
+> asserts) and the hardware-dependent part of I9 (the live NIC count — the gvproxy UDP/ICMP drop is now probed
 > live on every `up --macos`). Note that "enforced by tests" does not extend to augur's own
 > argv for I5 and I8: see their notes. For background on each item, see the newest
 > [review snapshot](./README.md).
