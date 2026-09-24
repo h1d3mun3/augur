@@ -3,9 +3,8 @@ import Foundation
 /// augur-vm's version. There is no augur-vm release independent from augur's own — the
 /// repo-root `VERSION` file is augur's single source of truth (see the `augur` script's own
 /// `augur_version()`) — so augur-vm reads it at runtime instead of carrying a hand-maintained
-/// string. (The "0.0.1 (M0)" constant this replaces was set once at augur-vm's initial commit
-/// and never bumped again; reading VERSION at runtime makes that drift structurally
-/// impossible instead of relying on someone remembering to edit a second copy on release.)
+/// string. (Reading VERSION at runtime makes version drift structurally impossible instead of
+/// relying on someone remembering to edit a second copy on release.)
 enum AugurVersion {
     static let string: String = read() ?? "unknown"
 

@@ -2,32 +2,32 @@
 # Tier 1 — `up` against an ALREADY-RUNNING guest reconciles host-side state (runs anywhere; no
 # container/VM host needed, and nothing is ever cloned or booted).
 #
-# Both cmd_up and cmd_up_macos used to `return 0` on "already running" BEFORE the approval gate and
-# before any datapath work. Nothing widened (the previously approved policy stayed in force, which
-# is fail-closed), but three properties the rest of augur claims silently stopped holding:
+# If cmd_up or cmd_up_macos returned 0 on "already running" BEFORE the approval gate and before
+# any datapath work, nothing would widen (the previously approved policy stays in force, which is
+# fail-closed), but three properties the rest of augur claims would silently stop holding:
 #
-#   1. A REVOCATION never landed. write_merged_allowlist has exactly ONE caller — start_proxy,
-#      reached only from start_egress_proxy (container) and cmd_up_macos (macOS), both BELOW the
+#   1. A REVOCATION would never land. write_merged_allowlist has exactly ONE caller — start_proxy,
+#      reached only from start_egress_proxy (container) and cmd_up_macos (macOS), both BELOW such a
 #      short-circuit — and augur-proxy hot-reloads policy from that file's mtime. So editing the
-#      allowlist and running `augur up` printed one yellow line, exited 0, and left the live proxy
-#      enforcing the old policy.
-#   2. I1's tripwire did not run: verify_egress_locked lives in finish_up, also below it.
-#   3. A flipped egress mode / rotated credential was not surfaced: the container_fingerprint
+#      allowlist and running `augur up` would print one yellow line, exit 0, and leave the live
+#      proxy enforcing the old policy.
+#   2. I1's tripwire would not run: verify_egress_locked lives in finish_up, also below it.
+#   3. A flipped egress mode / rotated credential would not be surfaced: the container_fingerprint
 #      reconcile that exists to catch exactly that sits below it too.
 #
 # The two modes are deliberately ASYMMETRIC. Container mode can refuse (`exit 1`) because it HAS a
 # drift signal; macOS mode has no fingerprint, so its half applies what the host owns and WARNS about
 # what a live VM cannot pick up (gvproxy's DNS allowlist is read once at startup, VM sizing needs the
-# VM stopped, ~/.augur-env is not re-pushed). It does now re-run a boot self-test on this path —
+# VM stopped, ~/.augur-env is not re-pushed). It does re-run a boot self-test on this path —
 # verify_macos_egress_locked, whose behaviour tests/36_macos_egress_selftest.sh owns — and that is
 # the one thing that can still end the path non-zero, but on a DETECTED leak, never on drift.
 #
-# The last section covers the OTHER half of that story: WHY an operator ended up on the
-# already-running path with a credential-less guest in the first place. macOS mode validated the
-# credentials it injects only at the ~/.augur-env writer — after clone, sizing, boot and the SSH
-# wait — so a value that could not be injected aborted `up` with a VM already running and nothing
-# torn down; the retry then hit the branch above, which cannot re-push ~/.augur-env. The check now
-# runs before the clone, like container mode's has always run before `container run`.
+# The last section covers the OTHER half of that story: HOW an operator could end up on the
+# already-running path with a credential-less guest in the first place. Validated only at the
+# ~/.augur-env writer — after clone, sizing, boot and the SSH wait — a value that could not be
+# injected would abort `up` with a VM already running and nothing torn down; the retry would then
+# hit the branch above, which cannot re-push ~/.augur-env. So the check runs before the clone,
+# like container mode's runs before `container run`.
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/.." && pwd)"
 source "$HERE/lib.sh"
 AUGUR="$REPO/augur"
@@ -212,12 +212,12 @@ has "$pin_out" "newly APPROVED domain stays unresolvable"   "…is honest that o
 section "Tier 1 — macOS: a credential that cannot be injected fails BEFORE anything is created"
 
 # Same asymmetry, other half. Container mode resolves and validates every credential before
-# `container run`; macOS mode used to do it only at the ~/.augur-env writer — after `augur-vm
-# clone`, `augur-vm set`, `augur-vm run` and the SSH wait — and that `exit 1` tore NOTHING down
-# (unlike the SSH-timeout path right above it, which stops the VM, gvproxy and the proxy). So the
-# operator fixed the value, re-ran `up --macos`, and landed on the already-running branch tested
-# above, which by design cannot re-push ~/.augur-env: a live guest with no credentials at all,
-# remedy `down --macos && up --macos`.
+# `container run`, and macOS mode must too. Checked only at the ~/.augur-env writer — after
+# `augur-vm clone`, `augur-vm set`, `augur-vm run` and the SSH wait — that `exit 1` would tear
+# NOTHING down (unlike the SSH-timeout path right above it, which stops the VM, gvproxy and the
+# proxy). The operator would fix the value, re-run `up --macos`, and land on the already-running
+# branch tested above, which by design cannot re-push ~/.augur-env: a live guest with no
+# credentials at all, remedy `down --macos && up --macos`.
 #
 # The load-bearing assertion is therefore NOT the exit code — it is that the augur-vm CLI was never
 # invoked. Nothing was cloned, nothing was resized, nothing was booted.

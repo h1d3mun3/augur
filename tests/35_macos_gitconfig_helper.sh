@@ -3,7 +3,7 @@
 # defines credential.https://github.com.helper MORE THAN ONCE (runs anywhere; nothing is ever
 # cloned, booted or SSH'd — the guest shell is a local `bash -c` against a sandboxed $HOME).
 #
-# The defect. cmd_up_macos scp's the HOST's ~/.gitconfig into the guest and then MUTATES that copy
+# The hazard. cmd_up_macos scp's the HOST's ~/.gitconfig into the guest and then MUTATES that copy
 # with `git config --global 'credential.https://github.com.helper' <helper>`, so HTTPS `git push`
 # works off GH_TOKEN alone. But `credential.<url>.helper` is a multi-valued key by git's design, and
 # `gh auth setup-git` writes TWO entries for github.com — an empty one to reset the helper chain,
@@ -13,12 +13,12 @@
 #     error: cannot overwrite multiple values with a single value
 #     $? = 5
 #
-# Under augur's `set -e` that aborted `up` after the clone, the sizing, the boot and the SSH wait,
-# tearing none of it down — the stranded-guest shape the pre-clone credential check (34) exists to
-# prevent. Container mode is immune: it bind-mounts ~/.gitconfig read-only and injects the same
-# helper through GIT_CONFIG_KEY_0/VALUE_0, never touching the file. The fix is --replace-all, which
-# collapses the duplicates to the single value augur intends, plus `|| warn` for the residue
-# --replace-all cannot fix (a ~/.gitconfig git cannot parse at all fails with 128).
+# Under augur's `set -e` that would abort `up` after the clone, the sizing, the boot and the SSH
+# wait, tearing none of it down — the stranded-guest shape the pre-clone credential check (34)
+# exists to prevent. Container mode is immune: it bind-mounts ~/.gitconfig read-only and injects
+# the same helper through GIT_CONFIG_KEY_0/VALUE_0, never touching the file. The remedy is
+# --replace-all, which collapses the duplicates to the single value augur intends, plus `|| warn`
+# for the residue --replace-all cannot fix (a ~/.gitconfig git cannot parse at all fails with 128).
 #
 # Two INDEPENDENT properties, one assertion each, because `|| warn` alone would hide the first:
 #   1. the guest's config ends up holding EXACTLY augur's helper (without --replace-all git writes
@@ -133,8 +133,8 @@ fi
 
 section "Tier 1 — single-value and absent-key controls (the fix must not regress the working path)"
 
-# A host that set ONE helper is the path that worked before this change: the plain form overwrote it.
-# --replace-all must land on the same result, or the fix would be a behaviour change for everyone.
+# A host that sets ONE helper is the common path, where the plain form simply overwrites it.
+# --replace-all must land on the same result, or it would be a behaviour change for everyone.
 mk_guest single <<'EOF'
 [credential "https://github.com"]
 	helper = osxkeychain
@@ -214,7 +214,7 @@ else
        "scp@${scp_at:-none} helper@${wire_at:-none}"
 fi
 
-# Container mode's immunity is the reason only one mode ever had this bug, and it is a property worth
+# Container mode's immunity is the reason only one mode is exposed to this, and it is a property worth
 # pinning: the mounted ~/.gitconfig is read-only there, so the helper MUST arrive via env vars.
 hasnt "$up_path_body" 'git config --global' "container up (cmd_up and every helper it calls) never mutates the mounted ~/.gitconfig"
 has   "$host_config_body" 'GIT_CONFIG_KEY_0=credential.https://github.com.helper' \

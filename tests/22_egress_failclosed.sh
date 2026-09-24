@@ -66,7 +66,7 @@ slug="$(basename "$proj" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]' '-' |
 # inside the `cd "$proj"` subshell, so hash the project dir the same way workspace_path_hash does.
 phash="$(printf '%s' "$proj" | { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; } | cut -c1-12)"
 cont="augur-${slug}-${phash}-swift-$(printf '%s' "${SWIFT_VERSION:-latest}" | tr '.' '-')"
-# destroy (not down): down now only STOPS the container, so the throwaway must be fully removed
+# destroy (not down): down only STOPS the container, so the throwaway must be fully removed
 # (container + egress network) on exit.
 cleanup() { ( cd "$proj" && bash "$AUGUR" destroy ) >/dev/null 2>&1; rm -rf "$proj"; }
 trap cleanup EXIT
@@ -159,9 +159,9 @@ if ! container exec "$cont" true >/dev/null 2>&1; then
 fi
 ok "container '$cont' is running"
 
-# NOTE: earlier revisions asserted "secrets-zero" here (no ANTHROPIC_API_KEY /
-# CLAUDE_CODE_OAUTH_TOKEN in the guest), a fork-PR-safety premise for when this tier ran
-# agentless in CI. It no longer runs in CI — Apple Container needs macOS 26+, so this is a
+# NOTE: no "secrets-zero" assertion here (no ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN in
+# the guest) — that is a fork-PR-safety premise that only fits an agentless CI run. This tier
+# does not run in CI — Apple Container needs macOS 26+, so this is a
 # LOCAL gate on the trusted single-user host, where the developer IS authenticated and augur
 # correctly forwards their token. Asserting its ABSENCE would fail every real local run. The
 # egress fail-closed guarantee below does not depend on secrets-zero — it holds whether or

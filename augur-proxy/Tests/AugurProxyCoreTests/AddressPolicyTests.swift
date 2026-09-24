@@ -78,7 +78,7 @@ final class AddressPolicyTests: XCTestCase {
         XCTAssertFalse(AddressPolicy.isPrivateV6(v6([0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0,
                                                      0, 0, 0, 0, 0, 0, 0x88, 0x88]))) // 2001:4860:4860::8888
         XCTAssertFalse(AddressPolicy.isPrivateV6(mapped(8, 8, 8, 8))) // mapped PUBLIC stays public
-        // 6to4 wrapping a PUBLIC v4 must stay public — the fix classifies by embedded v4, it does
+        // 6to4 wrapping a PUBLIC v4 must stay public — the policy classifies by embedded v4, it does
         // NOT blanket-deny 2002::/16 (so legitimate 6to4-to-public is never over-blocked).
         XCTAssertFalse(AddressPolicy.isPrivateV6(v6([0x20, 0x02, 8, 8, 8, 8]))) // 2002:0808:0808:: (6to4 → 8.8.8.8)
         // The Teredo check is the EXACT 2001:0::/32, not the broad 2001::/16 — real global unicast
