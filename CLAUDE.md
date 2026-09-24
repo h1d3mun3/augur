@@ -7,16 +7,23 @@ Guidance for agents working in this repository.
 A comment explains what the code does *now*, and why when that isn't obvious. Keep it readable
 by someone who has never opened `docs/`.
 
-### No references to ADRs or other docs
+### No references to ADRs, INVARIANTS.md, or other docs
 
-Code is read by humans for *what* it does; the deeper *why* is looked up with AI, which finds
-the ADR (`docs/decisions/`) from the code because every ADR names the functions and files it
-governs. So comments do not cite ADRs, security reviews, or their section/clause labels
-(`ADR-0007`, `§3 Option A`, `C7`, `docs/decisions/…`) — such pointers are unreadable without
-opening the doc and go stale when a decision is superseded.
+Code comments must not reference any document under `docs/`. That explicitly includes:
 
-- Name the concept in plain words instead of a number ("macOS 27's automated provisioning",
-  not "ADR-0018's automated provisioning").
+- **ADRs** (`docs/decisions/`): `ADR-0007`, `(see ADR-0018: …)`, `§3 Option A`, `C7`, paths.
+- **The egress contract** (`docs/security-reviews/INVARIANTS.md`): the file path and the
+  invariant labels `I1`–`I10` ("I1's tripwire", "(invariant I7)").
+- **Security-review snapshots** (`docs/security-reviews/*.md`): dates, findings, addenda.
+
+Any such pointer only means something once you open the doc, and it goes stale when the doc
+changes. Code is read by humans for *what* it does; the *why* is looked up with AI, which finds
+the ADR or invariant from the code because those docs name the functions, files, and tests
+they govern.
+
+- Name the concept in plain words instead of a label ("macOS 27's automated provisioning",
+  not "ADR-0018's automated provisioning"; "the fail-closed boot self-test", not "I1's
+  tripwire").
 - Where the code looks wrong or surprising and someone might "fix" it, say that it is
   deliberate, in plain words, with a one-line reason: `Deliberately NOT gated: …`,
   `Accepted trade-off: …`. That marker is what sends a reader (or an AI) to look for the why.
