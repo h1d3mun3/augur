@@ -343,7 +343,7 @@ augur down --macos      # stop the VM (keeps the clone — next up is fast)
 augur destroy --macos   # stop and remove the project VM clone
 augur status --macos    # show VM status, toolchain, and auth info
 augur list --macos      # list all VMs and their state
-augur update --macos    # update Claude Code in the base VM
+augur update --macos    # update CLI tools in the base VM
 augur version --macos   # show augur version (macOS mode)
 ```
 
