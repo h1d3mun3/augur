@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "augur-vm",
-    // macOS 13 (Ventura): VZMultipleDirectoryShare + macOSGuestAutomountTag (M5),
+    // macOS 13 (Ventura): VZMultipleDirectoryShare + macOSGuestAutomountTag,
     // VZMacOSInstaller / NAT / restore-image are macOS 12+ but we standardize on 13.
     // (RunSession.swift additionally uses VZMacGuestProvisioningOptions, macOS 27+ only. The
     // deployment target is NOT what makes that safe: `@available` gates runtime availability,
