@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # Tier 1 — a running egress helper whose binary changed since it started (runs anywhere; stub
 # binaries, no container/VM host). `bash install` overwrites ~/.augur/augur-proxy and
-# augur-gvproxy but never stops running instances, and start_proxy/start_gvproxy used to reuse any
-# live pid — so after an upgrade the OLD binary kept serving until an explicit `down`. Each launch
-# now records the launched binary's sha256 next to the pidfile and the reuse path compares it:
+# augur-gvproxy but never stops running instances. Each launch records the launched binary's
+# sha256 next to the pidfile, and the reuse path compares it with the binary it would launch now:
 #   • augur-proxy: same binary → reused; changed / unrecorded → old pid stopped, new one started.
 #   • augur-gvproxy: changed → WARN only (its socket is the live VM's NIC), pid untouched.
 #   • claude/shell (both modes) on an already-running guest: a live stale augur-proxy is replaced

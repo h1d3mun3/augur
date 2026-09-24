@@ -783,16 +783,17 @@ proxy_running() {
 # ── Stale-binary detection for the long-lived egress helpers ──────────────────
 # augur-proxy and augur-gvproxy outlive the augur invocation that launched them, and every
 # start_* reuses a live one on "pid alive" alone. `bash install` overwrites the binaries but
-# never stops running instances, so after an upgrade the OLD binary kept serving until an
-# explicit `down` — a fixed proxy bug stayed live with nothing saying so. Each launch therefore
-# records the sha256 of the binary it ran in a sidecar next to the pidfile ("<pidfile>.binsha"),
-# and the reuse path compares it with the binary it would launch NOW. That reuse path is start_proxy
-# (`up`) AND refresh_stale_proxy (`claude`/`shell` on an already-running guest, which never reach
-# `up` — without it the common "install, then re-run claude" case never replaced the old proxy).
+# never stops running instances, so reuse on "pid alive" alone would keep an OLD binary serving
+# until an explicit `down`, with nothing saying so. Each launch therefore records the sha256 of
+# the binary it ran in a sidecar next to the pidfile ("<pidfile>.binsha"), and the reuse path
+# compares it with the binary it would launch NOW. That reuse path is start_proxy (`up`) AND
+# refresh_stale_proxy (`claude`/`shell` on an already-running guest, which never reach `up` — so
+# the common "install, then re-run claude" case needs its own check).
 #   • CONTENT, not mtime: resolve_proxy_cli may resolve a different path than the one running
 #     (PATH vs ~/.augur vs a local .build), and `cp -p`/touch/clock skew make mtimes lie both ways.
 #   • Not VERSION: dev builds share one VERSION number across many different binaries.
-#   • No sidecar (started by an augur predating this) counts as changed — one restart, by design.
+#   • No sidecar (started by an older augur that did not write one) counts as changed — one
+#     restart, by design.
 #   • Can't hash (no shasum/sha256sum, unreadable file) counts as UNCHANGED: fall back to plain
 #     reuse, never a restart loop or an abort. This only ever decides reuse-vs-relaunch of a proxy
 #     that enforces the same allowlist either way, so no egress invariant rests on it.
@@ -1463,7 +1464,7 @@ running_proxy_listen() {
 }
 
 # `claude`/`shell` on an ALREADY-RUNNING guest skip `up` entirely, so start_proxy's stale-binary
-# restart never ran there (see the header above file_sha256). Replace a LIVE stale augur-proxy only:
+# restart never runs there (see the header above file_sha256). Replace a LIVE stale augur-proxy only:
 #   • Cheap no-op otherwise — egress_enabled, proxy_running, then ONE sha256; nothing else runs
 #     unless the binary changed (no network inspect, no ifconfig wait, no allowlist write).
 #   • A DEAD proxy is left alone: reviving one stays `up`'s job (finish_up / the macOS reconcile),
