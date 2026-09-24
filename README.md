@@ -209,7 +209,7 @@ What you get instead is a directory you populate on purpose:
 
   This is a platform defect, and augur accepts it rather than working around it — see
   [ADR-0017](./docs/decisions/0017-accept-virtiofs-staleness.md) for the measurements, the
-  mitigation that was tried and withdrawn, and what would bring it back.
+  mitigation augur decided against, and what would bring it back.
   Issues [#124](https://github.com/h1d3mun3/augur/issues/124) and
   [#135](https://github.com/h1d3mun3/augur/issues/135).
 
@@ -230,15 +230,13 @@ It carries **prompt text only**: no credentials, no tool permissions, no trust s
 **`augur destroy` deletes it**, so the clean-guest button stays a clean-guest button. Container mode
 only — the macOS clone already survives `down`.
 
-> Auth is env-based in both modes now. If you only ever logged in via the browser, run `augur setup-token` (or set `ANTHROPIC_API_KEY`); see [API keys and authentication](#api-keys-and-authentication). Upgrading from an older augur requires a one-time `augur build` (the image now pre-creates the scoped history dir). To activate `~/.claude/agents` persistence on a container/VM that already exists, recreate it once — `augur destroy && augur up` (or `augur down --macos && augur up --macos`); new containers/VMs get it automatically.
-
 > **The read/write workspace mount includes `.git` — treat it as attacker-controlled.** A prompt-injected agent running inside the container can write `.git/hooks/pre-commit` (or `post-checkout`, `post-merge`, …) into the mounted repo. Git runs repo-local hooks with no trust prompt, so the next `git` command *you* run on the **host** in that repo executes guest-authored code at your full host-user privilege — a complete escape of both the container boundary and the egress allowlist. This isn't a bug augur can close in software: it's inherent to mounting a repo read-write so an agent can edit it. Review diffs before trusting them, and treat `.git/hooks` (and anything else the host later runs unreviewed, e.g. a `Makefile` or `.envrc`) in an augur-touched repo as attacker-controlled until inspected. See `docs/security-reviews/2026-07-10-egress.md` §6 item 12.
 
 > Claude Code's `--worktree` isn't specially supported (`augur claude --worktree ...` won't forward the flag). If you want it anyway: run `augur shell`, then type `claude --worktree <name>` yourself at the prompt — the worktree's files/git state persist fine, and its conversation history survives `augur down && up` too — `cmd_up` mounts the whole `~/.claude/projects` parent to a per-project host dir, so every cwd-keyed leaf under this project (the main checkout **and** any worktree) is stored host-side and persists (only `augur destroy` plus deleting the host history dir removes it). See `docs/decisions/0004-no-special-worktree-support.md` for the full trade-offs.
 
 ### Disk cleanup
 
-`augur down` now **stops** the container and keeps it (like `augur down --macos` keeps its VM
+`augur down` **stops** the container and keeps it (like `augur down --macos` keeps its VM
 clone) so the next `augur up` restarts it fast, preserving the writable layer's caches and tool
 state that live outside the mounted workspace. **`augur destroy`** removes *this project's*
 container and its egress network when you're done with it (or to force a clean, from-scratch
@@ -372,7 +370,7 @@ every `up` (the same way it does for the GitHub token):
 ### Guest clock
 
 A cloned macOS guest boots with its wall clock a fixed amount **behind** the host's (measured at ~95
-minutes on the machine this was found on — a constant inherited from the base VM's saved state, not
+minutes on one host — a constant inherited from the base VM's saved state, not
 drift), and it cannot fix itself: NTP is UDP/123 and macOS VM egress drops UDP by design. So augur
 **sets the guest's clock from the host's** over SSH — on `up --macos` (both a fresh boot and a
 reconcile of an already-running VM) and on `claude`/`shell --macos`, which attach without going
@@ -387,8 +385,8 @@ warning, not a failed `up`. See
 |------|-------------|
 | Current directory | exposed at `~/workspace-<project>` in the VM (read/write, virtiofs auto-mount) |
 | `~/.gitconfig` | **copied** on VM start (unlike container mode, which mounts it read-only). augur then rewrites `credential.https://github.com.helper` in **the guest's copy** so HTTPS `git push` works off `GH_TOKEN`; any helper the host set for `github.com` is replaced, including the pair `gh auth setup-git` writes, because those need a host path or the host Keychain the guest does not have. Your host file is never modified. |
-| `~/.config/gh/` | **not shared** in macOS VM mode. It was, but nothing ever wired it to `~/.config/gh` inside the VM, so the config was never read — exposure without a feature. `gh` works there off the injected `GH_TOKEN`, which is the real auth path on a macOS host anyway (the token lives in the Keychain, not in `hosts.yml`). Container mode still mounts it read-only at the guest's real path, where it does work. |
-| Claude history | **only this project's** history is shared, in a per-VM isolated dir (`~/.augur/claude-projects/<vm>`), so other projects' transcripts stay invisible. Cross-mode (container↔macOS) resume is no longer shared. |
+| `~/.config/gh/` | **not shared** in macOS VM mode. A share would land under `/Volumes/My Shared Files/` and nothing wires it to `~/.config/gh` inside the VM, so the config would never be read — exposure without a feature. `gh` works there off the injected `GH_TOKEN`, which is the real auth path on a macOS host anyway (the token lives in the Keychain, not in `hosts.yml`). Container mode mounts it read-only at the guest's real path, where it does work. |
+| Claude history | **only this project's** history is shared, in a per-VM isolated dir (`~/.augur/claude-projects/<vm>`), so other projects' transcripts stay invisible. History is not shared across modes, so a container session can't be resumed in the macOS VM or vice versa. |
 | Claude auth | **not** shared — injected via env (the macOS Keychain is unreadable over SSH; see above) |
 | Everything else | **not visible to the VM** |
 
@@ -401,7 +399,7 @@ warning, not a failed `up`. See
 > repo. See the note in [Container mode's File access](#file-access) section.
 
 > Same caveat as container mode for Claude Code's `--worktree`: not specially supported, but `augur shell --macos` +
-> manually running `claude --worktree <name>` works today. Unlike container mode, its conversation history *does*
+> manually running `claude --worktree <name>` works. Unlike container mode, its conversation history *does*
 > survive `augur down --macos`/`up --macos` (the VM's disk is stopped, not destroyed, until `augur destroy --macos`).
 > See `docs/decisions/0004-no-special-worktree-support.md`.
 
@@ -431,8 +429,8 @@ If builds are flaky from the shared mount (virtiofs is not tuned for heavy I/O �
 
 `augur destroy --macos` removes the *current* project's VM clone — but augur names a clone
 from its project directory, so if that directory is later renamed or moved, the old clone
-becomes unreachable by `destroy` (it's still on disk, just under a name `destroy` no longer
-computes). `augur list --macos` still shows it; remove it directly:
+becomes unreachable by `destroy` (it's still on disk, just under a name `destroy` doesn't
+compute). `augur list --macos` still shows it; remove it directly:
 
 ```bash
 augur list --macos       # every VM the store knows about, by name — not just this project's
@@ -706,7 +704,7 @@ Branch protection only lets a commit onto `release` if a green `e2e/macos-vm` st
 for it, so **you can't ship something the E2E never ran against.** One subtlety: GitHub carries
 that satisfaction **through merge commits** — a merge commit whose merged-in parent has the status
 is accepted even though the merge commit itself has none. So if you gate the *pre-merge* bump
-commit (as `v0.10.1` was), the tagged merge commit is a *different* SHA — content-identical for a
+commit, the tagged merge commit is a *different* SHA — content-identical for a
 clean merge, but not literally the tested one. So **`release.yml` re-checks the `e2e/macos-vm`
 status on the tag-target commit itself and refuses to tag otherwise** — you must gate the
 **post-merge `main` tip** (step 2), or the release fails loudly. (`required_linear_history` is
