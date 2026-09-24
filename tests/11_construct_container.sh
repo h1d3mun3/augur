@@ -2,10 +2,10 @@
 # Tier 1 (offline) — Apple `container` command CONSTRUCTION via a `container` shim. No
 # runtime needed. Drives the REAL augur code paths (cmd_up / cmd_claude) with egress off and
 # a shimmed `container` on PATH, then asserts the constructed `container run` / `container
-# exec` argv carries exactly what the agent seam declares: auth env (named-only), the
-# cwd-keyed history mount, the fixed env, and the launch argv. This is the "verify the
-# constructed argv is byte-identical" check the agent-seam design calls for, without a live
-# container.
+# exec` argv carries exactly what the agent seam declares: the cwd-keyed history mount, the fixed
+# env, the launch argv — and credentials (named-only) ONLY on the session exec's --env-file, never
+# on any argv and never on `container run`. This is the "verify the constructed argv is
+# byte-identical" check the agent-seam design calls for, without a live container.
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/.." && pwd)"
 source "$HERE/lib.sh"
 section "Tier 1 — Apple container run/exec construction (shimmed container, no runtime)"
@@ -17,6 +17,9 @@ export AUGUR_TEST_SHIMLOG="$work/shim"
 export PATH="$HERE/shims:$PATH"
 export ANTHROPIC_API_KEY="sk-ant-test123"
 unset CLAUDE_CODE_OAUTH_TOKEN || true
+# The gh shim prints this for `gh auth token`, so the GH_TOKEN / git-credential-helper path runs.
+export AUGUR_TEST_GH_TOKEN="gho_testGhToken456"
+envf="$AUGUR_TEST_SHIMLOG.envfile"
 AUGUR="$REPO/augur"
 slug="myproj"
 
@@ -37,8 +40,20 @@ if [[ -f "$run" ]]; then
   has "$cname" "augur-${slug}-"                                 "up: container name derived from slug"
   if grep -Eq "^augur-${slug}-[0-9a-f]{12}-swift-" <<<"$cname"; then ok "up: container name keyed on full-path hash (cross-project isolation)"
   else fail "up: container name not keyed on path hash" "got: $cname"; fi
-  has "$body" "ANTHROPIC_API_KEY=sk-ant-test123"               "up: injects ANTHROPIC_API_KEY (auth seam)"
-  hasnt "$body" "CLAUDE_CODE_OAUTH_TOKEN"                       "up: omits the unset oauth token (named-only auth)"
+  # Secrets-zero on `container run`: Apple Container persists the run config (env included) in
+  # the container bundle and `container inspect` prints it, so nothing credential-shaped or
+  # per-session may be baked here — neither names nor values.
+  hasnt "$body" "ANTHROPIC_API_KEY"                             "up: run argv carries no ANTHROPIC_API_KEY"
+  hasnt "$body" "sk-ant-test123"                                "up: run argv carries no API key value"
+  hasnt "$body" "CLAUDE_CODE_OAUTH_TOKEN"                       "up: run argv carries no CLAUDE_CODE_OAUTH_TOKEN"
+  hasnt "$body" "GH_TOKEN"                                      "up: run argv carries no GH_TOKEN (gh shim has a token)"
+  hasnt "$body" "gho_testGhToken456"                            "up: run argv carries no gh token value"
+  hasnt "$body" "GIT_CONFIG_"                                   "up: run argv carries no GIT_CONFIG_* helper"
+  if grep -q '^TZ=' "$run"; then fail "up: run argv bakes TZ" "TZ is per session only"
+  else ok "up: run argv bakes no TZ (per session only)"; fi
+  hasnt "$body" "--env-file"                                    "up: run argv carries no --env-file"
+  [[ ! -s "$envf" ]] && ok "up: no env-file content was handed to the engine" \
+                     || fail "up: an env-file reached the engine during up" "$(cat "$envf")"
   has "$body" "claude-projects/${slug}-"                        "up: host history under claude-projects/<slug>-… (state seam)"
   if grep -Eq ":/home/dev/\.claude/projects$" "$run"; then ok "up: mounts the whole projects parent, not one leaf (Option A)"
   else fail "up: does not mount the projects parent exactly" "expected a line ending exactly in :/home/dev/.claude/projects"; fi
@@ -117,13 +132,30 @@ rm -f "$AUGUR_TEST_SHIMLOG.trace"
 trace="$(cat "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null)"
 has "$trace" "delete --force"       "up: removes the stale container when baked config changed (memory)"
 has "$trace" "container run"        "up: recreates the container from the image on config drift"
+
+# Back to the default memory (another recreate), so the stored fingerprint matches the plain config.
+( cd "$proj" && bash "$AUGUR" up --no-egress ) >/dev/null 2>&1 || true
+
+# ── Credential rotation never recreates: nothing credential-shaped is baked or fingerprinted ──
+rm -f "$AUGUR_TEST_SHIMLOG.trace"
+( cd "$proj" && ANTHROPIC_API_KEY="sk-ant-rotated999" AUGUR_TEST_GH_TOKEN="gho_rotated789" \
+    bash "$AUGUR" up --no-egress ) >/dev/null 2>&1 || true
+trace="$(cat "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null)"
+has   "$trace" "container start"    "up: a rotated API key / gh token reuses (starts) the stopped container"
+hasnt "$trace" "container run"      "up: a rotated credential does NOT recreate the container"
+hasnt "$trace" "delete --force"     "up: a rotated credential does NOT remove the container"
+rm -f "$AUGUR_TEST_SHIMLOG.trace"
+( cd "$proj" && env -u ANTHROPIC_API_KEY AUGUR_TEST_GH_TOKEN= bash "$AUGUR" up --no-egress ) >/dev/null 2>&1 || true
+trace="$(cat "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null)"
+has   "$trace" "container start"    "up: removing every credential also reuses the stopped container"
+hasnt "$trace" "container run"      "up: removing every credential does NOT recreate the container"
 unset AUGUR_TEST_CONTAINER_STOPPED
 
 # ── augur claude: capture the constructed `container exec ... claude` ────────
 export AUGUR_TEST_CONTAINER_RUNNING=1
 export AUGUR_TEST_CONTAINER_NAME="$cname"
-rm -f "$AUGUR_TEST_SHIMLOG.trace"
-( cd "$proj" && bash "$AUGUR" claude ) >/dev/null 2>&1 || true
+rm -f "$AUGUR_TEST_SHIMLOG.trace" "$envf"
+( cd "$proj" && bash "$AUGUR" claude --no-egress ) >/dev/null 2>&1 || true
 ex="$AUGUR_TEST_SHIMLOG.exec"
 # `cmd_claude` issues MORE than one exec: apply_guest_profile (re-wiring, since an
 # ALREADY-RUNNING container never reaches cmd_up at all — `container_running || cmd_up` — so
@@ -153,6 +185,26 @@ if [[ -f "$ex" && -n "$launch_line" ]]; then
   if [[ -n "$history_at" && "$history_at" -gt "$launch_at" ]]
   then ok "claude: the interactive launch runs before the history snapshot (launch@$launch_at < history@$history_at)"
   else fail "claude: launch is not before the history snapshot" "launch@$launch_at history@$history_at"; fi
+  # Per-session credentials: on the launch exec's --env-file (a process-substitution pipe the shim
+  # read), never on any argv; the non-secret per-session env as plain -e.
+  has   "$body" "--env-file /dev/fd/"          "claude: the launch exec carries --env-file <(…) (a pipe, not a file on disk)"
+  hasnt "$full_trace" "sk-ant-test123"          "claude: the API key value is on NO engine argv"
+  hasnt "$full_trace" "gho_testGhToken456"      "claude: the gh token value is on NO engine argv"
+  hasnt "$full_trace" "ANTHROPIC_API_KEY"       "claude: no credential NAME on any argv either"
+  envc="$(cat "$envf" 2>/dev/null)"
+  eq "1" "$(grep -c '^== exec ' "$envf" 2>/dev/null)" "claude: exactly ONE exec received an env-file (the launch)"
+  has   "$envc" $'\nANTHROPIC_API_KEY=sk-ant-test123\n' "claude: the env-file injects ANTHROPIC_API_KEY"
+  has   "$envc" $'\nGH_TOKEN=gho_testGhToken456'      "claude: the env-file injects GH_TOKEN"
+  hasnt "$envc" "CLAUDE_CODE_OAUTH_TOKEN"              "claude: the unset oauth token is omitted (named-only, non-empty only)"
+  hasnt "$envc" "unreadable"                           "claude: the env-file pipe was readable by the engine process"
+  has   "$body" "TZ="                                  "claude: TZ is set per session"
+  has   "$body" "GIT_CONFIG_COUNT=1"                   "claude: git credential helper count set (gh token present)"
+  has   "$body" "GIT_CONFIG_KEY_0=credential.https://github.com.helper" "claude: git credential helper key set"
+  has   "$body" 'password=$GH_TOKEN'                   "claude: the helper carries only the \$GH_TOKEN reference"
+  # augur's own non-interactive execs (profile wiring, history snapshot) get no credentials.
+  if printf '%s\n' "$full_trace" | grep '^container exec ' | grep -v '^container exec -it ' | grep -q -- '--env-file'
+  then fail "claude: a non-interactive exec carries --env-file" "only the session launch may"
+  else ok "claude: profile-wiring / history execs carry no --env-file"; fi
 else
   fail "claude: no container exec captured" "trace: $(cat "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null)"
 fi
@@ -351,13 +403,23 @@ has "$besteffort" "REACHED_NEXT_STATEMENT" "carry-over: a failing snapshot never
 section "Tier 1 — profile re-wiring when the container is already running (the live-testing bug)"
 export AUGUR_TEST_CONTAINER_RUNNING=1
 rm -f "$AUGUR_TEST_SHIMLOG.trace"
-( cd "$proj" && bash "$AUGUR" claude ) >/dev/null 2>&1 || true
+( cd "$proj" && bash "$AUGUR" claude --no-egress ) >/dev/null 2>&1 || true
 has "$(cat "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null)" "AUGUR_PROFILE_SRC=" \
     "claude: re-wires the profile even when the container was ALREADY running (no cmd_up call)"
 
-rm -f "$AUGUR_TEST_SHIMLOG.trace"
-( cd "$proj" && bash "$AUGUR" shell ) >/dev/null 2>&1 || true
+rm -f "$AUGUR_TEST_SHIMLOG.trace" "$envf"
+( cd "$proj" && bash "$AUGUR" shell --no-egress ) >/dev/null 2>&1 || true
 shell_trace="$(cat "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null)"
+shell_launch="$(printf '%s\n' "$shell_trace" | grep -E '^container exec -it ' | tail -n1)"
+has   "$shell_launch" "--env-file /dev/fd/"     "shell: the bash exec carries --env-file <(…)"
+eq    "bash" "${shell_launch##* }"               "shell: launches bash"
+has   "$shell_launch" "TZ="                      "shell: TZ is set per session"
+has   "$shell_launch" "GIT_CONFIG_KEY_0="        "shell: git credential helper set (gh token present)"
+hasnt "$shell_trace" "sk-ant-test123"            "shell: the API key value is on NO engine argv"
+hasnt "$shell_trace" "gho_testGhToken456"        "shell: the gh token value is on NO engine argv"
+shell_envc="$(cat "$envf" 2>/dev/null)"
+has   "$shell_envc" "ANTHROPIC_API_KEY=sk-ant-test123" "shell: the env-file injects ANTHROPIC_API_KEY"
+has   "$shell_envc" "GH_TOKEN=gho_testGhToken456"      "shell: the env-file injects GH_TOKEN"
 has "$shell_trace" "AUGUR_PROFILE_SRC=" \
     "shell: re-wires the profile even when the container was ALREADY running (no cmd_up call)"
 # Same ordering requirement as claude: wiring before the interactive bash, not after.
@@ -366,6 +428,98 @@ shell_profile_at="$(printf '%s\n' "$shell_trace" | grep -n 'AUGUR_PROFILE_SRC=' 
 if [[ -n "$shell_profile_at" && -n "$shell_launch_at" && "$shell_profile_at" -lt "$shell_launch_at" ]]
 then ok "shell: re-wires the operator profile BEFORE the interactive bash starts"
 else fail "shell: profile wiring is not before the launch" "profile@$shell_profile_at launch@$shell_launch_at"; fi
+
+# No gh token on the host → no GH_TOKEN and no git credential helper at all.
+rm -f "$AUGUR_TEST_SHIMLOG.trace" "$envf"
+( cd "$proj" && AUGUR_TEST_GH_TOKEN='' bash "$AUGUR" shell --no-egress ) >/dev/null 2>&1 || true
+nogh_launch="$(grep -E '^container exec -it ' "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null | tail -n1)"
+has   "$nogh_launch" "--env-file /dev/fd/"       "shell (no gh token): still carries --env-file"
+hasnt "$nogh_launch" "GIT_CONFIG_"               "shell (no gh token): no git credential helper"
+hasnt "$(cat "$envf" 2>/dev/null)" "GH_TOKEN"    "shell (no gh token): no GH_TOKEN in the env-file"
+has   "$(cat "$envf" 2>/dev/null)" "ANTHROPIC_API_KEY=sk-ant-test123" "shell (no gh token): the API key is still injected"
+
+# ── setup-token: no credentials at all ────────────────────────────────────────
+# It exists to mint a token; the current one is not handed to a guest binary for that. The shim
+# makes the integrity gate's two sha256 probes agree so the flow reaches its interactive exec.
+section "Tier 1 — setup-token and augur's own execs get no credentials"
+rm -f "$AUGUR_TEST_SHIMLOG.trace" "$envf"
+( cd "$proj" && AUGUR_TEST_CLAUDE_SHA256=abc123 bash "$AUGUR" setup-token --no-egress ) </dev/null >/dev/null 2>&1 || true
+st_trace="$(cat "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null)"
+st_launch="$(printf '%s\n' "$st_trace" | grep -E '^container exec -it ' | tail -n1)"
+if [[ -n "$st_launch" ]]; then
+  eq    "setup-token" "${st_launch##* }"         "setup-token: reached its interactive 'claude setup-token' exec"
+  hasnt "$st_launch" "--env-file"                 "setup-token: the exec carries no --env-file"
+  hasnt "$st_launch" "GIT_CONFIG_"                "setup-token: the exec carries no git credential helper"
+  hasnt "$st_trace"  "sk-ant-test123"             "setup-token: no API key value on any argv"
+  [[ ! -s "$envf" ]] && ok "setup-token: no env-file content reached the engine at all" \
+                     || fail "setup-token: an env-file reached the engine" "$(cat "$envf")"
+else
+  fail "setup-token: never reached its interactive exec" "trace: $st_trace"
+fi
+
+# ── A RUNNING container with a stale fingerprint: claude/shell refuse before any exec -it ──
+# Includes a container an older augur created with credentials/TZ baked into `container run`: exec
+# env is appended to the baked env without de-duplication, so its baked values would shadow the
+# per-session ones for anything using libc getenv.
+section "Tier 1 — claude/shell refuse a RUNNING container whose fingerprint is stale"
+fp_file="$(find "$HOME/.augur/container-state" -name '*.fingerprint' 2>/dev/null | head -1)"
+if [[ -n "$fp_file" ]]; then
+  fp_saved="$(cat "$fp_file")"
+  echo "created-by-an-older-augur" > "$fp_file"
+  for c in claude shell setup-token; do
+    rm -f "$AUGUR_TEST_SHIMLOG.trace" "$envf"
+    out="$( cd "$proj" && bash "$AUGUR" "$c" --no-egress 2>&1 )"; rc=$?
+    out="$(printf '%s\n' "$out" | sed $'s/\033\\[[0-9;]*m//g')"
+    [[ $rc -ne 0 ]] && ok "$c: exits non-zero on a stale running container" || fail "$c: exited 0 on a stale running container"
+    has   "$out" "augur down && augur up"  "$c: names the remedy"
+    hasnt "$(cat "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null)" "exec -it" "$c: refuses BEFORE any interactive exec"
+    [[ ! -s "$envf" ]] && ok "$c: no credential reached the stale container" || fail "$c: credentials reached the stale container"
+  done
+  printf '%s\n' "$fp_saved" > "$fp_file"
+else
+  fail "stale fingerprint: could not locate the fingerprint file" "looked under $HOME/.augur/container-state"
+fi
+
+# ── Credential validation runs at session start; `up` itself injects nothing and does not check ──
+section "Tier 1 — credential validation at session start"
+rm -f "$AUGUR_TEST_SHIMLOG.trace" "$envf"
+out="$( cd "$proj" && ANTHROPIC_API_KEY=$'sk-ant-bad\nEVIL=1' bash "$AUGUR" claude --no-egress 2>&1 )"; rc=$?
+[[ $rc -ne 0 ]] && ok "claude: refuses a credential with a control character" || fail "claude: accepted a newline-bearing credential"
+has   "$out" "ANTHROPIC_API_KEY" "claude: the refusal names the offending variable"
+hasnt "$(cat "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null)" "exec -it" "claude: the bad credential is refused before any interactive exec"
+[[ ! -s "$envf" ]] && ok "claude: nothing was written to an env-file" || fail "claude: a bad credential reached the env-file" "$(cat "$envf")"
+# `up` must still work with a bad stored token, so `augur setup-token` can replace it.
+export AUGUR_TEST_CONTAINER_RUNNING=0
+rm -f "$AUGUR_TEST_SHIMLOG.trace"
+( cd "$proj" && ANTHROPIC_API_KEY="sk-ant-it's-bad" bash "$AUGUR" up --no-egress ) >/dev/null 2>&1; rc=$?
+eq "0" "$rc" "up: proceeds with an uninjectable stored credential (setup-token must stay reachable)"
+
+# ── Apple Container CLI floor (1.0.0) ─────────────────────────────────────────
+section "Tier 1 — Apple Container version floor"
+for c in up claude shell setup-token; do
+  rm -f "$AUGUR_TEST_SHIMLOG.trace" "$AUGUR_TEST_SHIMLOG.run"
+  out="$( cd "$proj" && AUGUR_TEST_CONTAINER_VERSION=0.12.3 bash "$AUGUR" "$c" --no-egress 2>&1 )"; rc=$?
+  [[ $rc -ne 0 ]] && ok "$c: refuses Apple Container 0.12.3" || fail "$c: accepted Apple Container 0.12.3"
+  has   "$out" "1.0.0 or newer"  "$c: the refusal names the minimum version"
+  st="$(cat "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null)"
+  hasnt "$st" "container run"    "$c: nothing is created on a too-old CLI"
+  hasnt "$st" "exec -it"         "$c: no session starts on a too-old CLI"
+done
+rm -f "$AUGUR_TEST_SHIMLOG.trace"
+( cd "$proj" && AUGUR_TEST_CONTAINER_VERSION=1.0.0 bash "$AUGUR" up --no-egress ) >/dev/null 2>&1; rc=$?
+eq "0" "$rc" "up: accepts exactly Apple Container 1.0.0"
+# Deliberately NOT gated: teardown must work on an old CLI so the operator can clean up.
+for c in down destroy list; do
+  out="$( cd "$proj" && AUGUR_TEST_CONTAINER_VERSION=0.12.3 bash "$AUGUR" "$c" --no-egress 2>&1 )"; rc=$?
+  eq "0" "$rc" "$c: still runs on Apple Container 0.12.3"
+  hasnt "$out" "too old" "$c: no version refusal"
+done
+# Unparseable --version output fails OPEN with a warning (the floor is a usability guard).
+rm -f "$AUGUR_TEST_SHIMLOG.trace"
+out="$( cd "$proj" && AUGUR_TEST_CONTAINER_VERSION=garbage bash "$AUGUR" up --no-egress 2>&1 )"; rc=$?
+eq "0" "$rc" "up: an unparseable 'container --version' does not block"
+has "$out" "Could not read the Apple Container version" "up: an unparseable version is warned about"
+export AUGUR_TEST_CONTAINER_RUNNING=1
 
 # Source guards for the lifecycle wiring — behaviour above cannot see WHERE these are called.
 claude_body="$(awk '/^cmd_claude\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"

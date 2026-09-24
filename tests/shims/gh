@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Test shim for `gh`: report no token so cmd_up's GH_TOKEN injection block is skipped,
-# keeping the constructed `container run` deterministic. (Real `gh auth token` would make
-# the argv depend on the host's GitHub login.)
+# Test shim for `gh`. By default reports no token, so augur's GH_TOKEN / git-credential-helper
+# path is skipped and the constructed `container` argv stays deterministic (real `gh auth token`
+# would make it depend on the host's GitHub login). Set AUGUR_TEST_GH_TOKEN to have
+# `gh auth token` print that value instead, exercising that path.
+if [[ "${1:-} ${2:-}" == "auth token" && -n "${AUGUR_TEST_GH_TOKEN:-}" ]]; then
+  printf '%s\n' "$AUGUR_TEST_GH_TOKEN"
+fi
 exit 0
