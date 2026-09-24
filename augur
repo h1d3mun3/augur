@@ -27,13 +27,8 @@ MACOS_BASE_VM="augur-macos-base"
 MACOS_BUILD_VM="augur-macos-build"
 MACOS_SSH_USER="admin"
 MACOS_SSH_KEY="$HOME/.augur/vm_key"
-# The base VM's admin account password. Deliberately a fixed "admin"/"admin" (rotating it after
-# Setup Assistant would desync the auto-login keychain) UNLESS the base VM was built via macOS 27's
-# automated guest provisioning, in which case cmd_build_macos generates a random one and
-# persists it here (0600) — every project VM is an APFS clone of the base VM and inherits
-# whichever password the base VM has, so this file (or its absence) governs sudo/SSH auth for
-# every clone, not just the build. See macos_admin_password(). Must never contain a single
-# quote — see that function.
+# The generated admin password of a base VM built via macOS 27's automated provisioning; absent
+# for the fixed-password case. See macos_admin_password().
 MACOS_ADMIN_PASSWORD_FILE="$HOME/.augur/macos-admin-password"
 
 # macOS VM backend binary (augur-vm, built from ./augur-vm). Override with AUGUR_VM_BIN.
@@ -519,9 +514,8 @@ vm_cli_supports_provisioning() {
     "$VM_CLI" run --help 2>&1 | grep -q -- '--provision-password-stdin'
 }
 
-# Keyed on basename + workspace_path_hash (mirrors the container-mode
-# host_hist_dir key), not basename alone: two distinct directories that happen to
-# share a basename (e.g. ~/work/myapp and ~/archive/myapp) must never collide onto
+# Keyed on basename + workspace_path_hash, not basename alone (see workspace_path_hash; mirrors
+# the container-mode host_hist_dir key): ~/work/myapp and ~/archive/myapp must never collide onto
 # the same VM/history-dir/egress-config. Changing this key means any
 # project VM cloned under the old (basename-only) name is orphaned — a one-time
 # fresh clone on next `up`, not data loss (the old VM/clone is left in place;
@@ -611,9 +605,18 @@ vm_known_hosts_file() {
     echo "$AUGUR_DIR/known_hosts/${1}"
 }
 
-# The base VM's admin account password — see MACOS_ADMIN_PASSWORD_FILE's comment. Defaults
-# to the fixed admin/admin credential when no override file exists (the common case: a base VM
-# built via the legacy manual Setup Assistant flow, or before this feature existed at all).
+# The base VM's admin account password, used by every macOS-mode sudo/SSH call that needs one.
+# - No MACOS_ADMIN_PASSWORD_FILE: the fixed "admin"/"admin" (MACOS_SSH_USER doubles as the
+#   password) — a base VM built via the manual Setup Assistant flow, or by an older augur.
+#   Deliberately fixed: rotating it after Setup Assistant would desync the auto-login keychain.
+# - A base VM built via macOS 27's automated guest provisioning has a random password instead:
+#   cmd_build_macos generates it and persists it in MACOS_ADMIN_PASSWORD_FILE (0600) once the
+#   guest has come up with it; a manual-setup build deletes the file.
+# Every project VM is an APFS clone of the base VM and inherits whichever password the base VM
+# had, so this file (or its absence) governs sudo/SSH auth for every clone, not just the build
+# (for a clone older than the latest base rebuild, see warn_if_stale_admin_password).
+# Must never contain a single quote: callers embed it unescaped in single-quoted
+# "echo '<password>' | sudo -S" strings, which is why cmd_build_macos generates it with base64.
 macos_admin_password() {
     if [[ -f "$MACOS_ADMIN_PASSWORD_FILE" ]]; then
         cat "$MACOS_ADMIN_PASSWORD_FILE"
@@ -708,9 +711,8 @@ ssh_macos_bootstrap() {
     askpass="$(mktemp "${TMPDIR:-/tmp}/augur-askpass.XXXXXX")" \
         || { error "Failed to create SSH askpass helper."; exit 1; }
     chmod 700 "$askpass"
-    # Embed the password via %q (safe regardless of its content); reply to password prompts
-    # only, else exit 1. Fixed "admin" unless this base VM was built with macOS 27's automated
-    # provisioning, in which case it's the generated random one.
+    # Embed the password (see macos_admin_password()) via %q, safe regardless of its content;
+    # reply to password prompts only, else exit 1.
     printf '#!/bin/bash\ncase "$1" in *[Pp]assword:*) printf "%%s\\n" %q ;; *) exit 1 ;; esac\n' \
         "$(macos_admin_password)" > "$askpass"
     # Explicit cleanup (not `trap … RETURN`): a RETURN trap is not function-local — it would
@@ -1020,11 +1022,6 @@ resolve_macos_vm_memory_mb() {
 # the port/subnet offset all carry it. A guest-visible name lives in a PER-GUEST namespace where
 # a collision is harmless and unobservable, so make_workspace_mount (/workspace-<slug>) and
 # MACOS_SHARE (~/workspace-<slug>) deliberately stay slug-based and readable.
-#
-# The egress ports and the network name are on the path-hash side too (see _augur_port_offset),
-# by this very rule: the ports' own purpose is anti-collision in the host's single port
-# namespace, and a basename input would GUARANTEE a collision for exactly the pair the hash
-# exists to separate.
 workspace_path_hash() {
     local h
     if command -v sha256sum &>/dev/null; then
@@ -3290,11 +3287,11 @@ warn_if_macos_egress_pinned() {
 # self-heals on the next routine update instead of needing a full rebuild — the same reason the
 # ~/.claude.json scrub runs in both.
 #
-# HONEST SCOPE: the base VM's account is the published admin/admin, so this is a policy
-# DEFAULT, not a tamper-proof control — anyone with that password can rewrite it. It still does the
-# job it is here for: stopping a repository's own settings from re-enabling the auto-updater and
-# swapping out the binary the integrity gate verifies. In Container mode the same file IS
-# root-owned against an unprivileged agent.
+# HONEST SCOPE: the base VM's admin password is by default the published fixed one (see
+# macos_admin_password()), so this is a policy DEFAULT, not a tamper-proof control — anyone with
+# that password can rewrite it. It still does the job it is here for: stopping a repository's own
+# settings from re-enabling the auto-updater and swapping out the binary the integrity gate
+# verifies. In Container mode the same file IS root-owned against an unprivileged agent.
 macos_managed_settings_path() { echo "/Library/Application Support/ClaudeCode/managed-settings.json"; }
 install_macos_managed_settings() {
     local vm="$1" dst parent staged
@@ -3309,9 +3306,9 @@ install_macos_managed_settings() {
         return 0
     }
     # `sudo -S` works whether or not the build-time NOPASSWD grant is still present, which is what
-    # lets `update --macos` reach a base VM that no longer has it. The password is whatever this
-    # base VM's admin account actually has — the documented fixed one unless it was built via
-    # automated provisioning — no privilege here augur's build doesn't already take.
+    # lets `update --macos` reach a base VM that no longer has it. The password is this base VM's
+    # own admin password (see macos_admin_password()) — no privilege here augur's build doesn't
+    # already take.
     ssh_macos "$vm" "echo '$(macos_admin_password)' | sudo -S -p '' sh -c '
         mkdir -p \"${parent}\" &&
         mv \"${staged}\" \"${dst}\" &&
@@ -4833,8 +4830,7 @@ run_base_provisioning() {
     # mid-build VM already has this grant from its own Step 4; a standalone base-VM
     # 'augur update --macos' does not, since the original build already revoked it — this
     # establishes it fresh in that case). Same admin credential the rest of the build already
-    # depends on (see cmd_build_macos and macos_admin_password) — fixed admin/admin
-    # unless this base VM was built via automated provisioning.
+    # depends on — see macos_admin_password().
     ssh_macos_provision "$vm" \
         "echo '$(macos_admin_password)' | sudo -S -p '' bash -c \
             'echo \"${MACOS_SSH_USER} ALL=(ALL) NOPASSWD:ALL\" > /etc/sudoers.d/augur \

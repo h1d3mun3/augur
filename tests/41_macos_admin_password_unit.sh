@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # Tier 0 — macOS 27 automated guest provisioning, pure-function slice.
-# macos_admin_password() decides which credential every macOS-mode sudo/SSH call uses
-# (fixed admin/admin, unless the base VM was built via automated provisioning,
-# in which case a generated password is on disk); host_macos_major_version() is the host
-# half of the eligibility check for that automated path. Both are pure enough to unit-test
-# without a VM — the actual `augur-vm run --provision-*` / `guest-os-version` wiring is
-# exercised live only (no free-runner CI can boot a VZ guest; see tests/README.md).
+# macos_admin_password() decides which credential every macOS-mode sudo/SSH call uses (see its
+# comment in augur); host_macos_major_version() is the host half of the eligibility check for
+# the automated path. Both are pure enough to unit-test without a VM — the actual
+# `augur-vm run --provision-*` / `guest-os-version` wiring is exercised live only (no
+# free-runner CI can boot a VZ guest; see tests/README.md).
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/.." && pwd)"
 source "$HERE/lib.sh"
 AUGUR="$REPO/augur"
