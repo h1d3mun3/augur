@@ -165,8 +165,9 @@ agent_fixed_env() { echo "DISABLE_AUTOUPDATER=1"; }
 agent_version_cmd() { echo "claude --version"; }
 
 # Credential specs, one per line: GUEST_ENV|HOST_ENV|HOST_FILE|VALIDATOR. DATA.
-# The core (cmd_up / cmd_up_macos) resolves each via resolve_api_key and injects ONLY
-# these NAMED vars — never the wholesale host env, never a mounted credential store.
+# The core resolves each via resolve_api_key and injects ONLY these NAMED vars — never the
+# wholesale host env, never a mounted credential store. Container mode injects them per session
+# (session_credential_env); macOS VM mode writes them to ~/.augur-env in cmd_up_macos.
 # CONTRACT (credentials): VALIDATOR is the per-value check a FUTURE multi-agent build must run on
 #   every resolved value before it is interpolated into a shell / sourced file. It is
 #   'none' here to preserve current behavior byte-for-byte (today only the setup-token
@@ -287,6 +288,51 @@ engine_ready() {
     fi
 }
 
+# Oldest Apple Container CLI augur starts sessions with: the per-session credential exec relies on
+# it reading `--env-file` from a process-substitution pipe and on its explicit-empty `K=` handling
+# (see session_credential_env).
+AUGUR_MIN_CONTAINER_VERSION="1.0.0"
+
+# Print the X.Y.Z release out of `container --version`, whose single line reads
+# `container CLI version 1.4.1 (build: release, commit: 1a2b3c4)` (a dev build carries a suffix,
+# `0.10.0-27-g9fd15f0`, which is cut off). Prints nothing when no X.Y.Z follows "version ".
+engine_cli_version() {
+    container --version 2>/dev/null \
+        | sed -n 's/.*version \([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' \
+        | head -n1 || true
+}
+
+# True iff dotted version $1 >= $2 (both X.Y.Z, compared field by field as integers).
+version_at_least() {
+    local a1 a2 a3 b1 b2 b3
+    IFS=. read -r a1 a2 a3 <<< "$1"
+    IFS=. read -r b1 b2 b3 <<< "$2"
+    # 10# so a zero-padded field is read as decimal, not octal.
+    (( 10#$a1 != 10#$b1 )) && { (( 10#$a1 > 10#$b1 )); return; }
+    (( 10#$a2 != 10#$b2 )) && { (( 10#$a2 > 10#$b2 )); return; }
+    (( 10#$a3 >= 10#$b3 ))
+}
+
+# Refuse an Apple Container CLI older than AUGUR_MIN_CONTAINER_VERSION. Called by the commands that
+# create a container or start a session in it (up / claude / shell / setup-token).
+# Deliberately NOT gated: down/destroy/list/status/build/update/install-cert, so an operator on an
+# older CLI can still stop and clean up what exists before upgrading.
+# Deliberately fail-OPEN when the version cannot be parsed: the floor is a usability guard, not a
+# security boundary. A CLI that cannot read the credential pipe fails the session's `exec` loudly
+# and injects nothing, while refusing an unparseable string would lock every operator out the day
+# Apple reformats `--version`.
+require_engine_version() {
+    local v; v="$(engine_cli_version)"
+    if [[ -z "$v" ]]; then
+        warn "Could not read the Apple Container version from 'container --version'; continuing."
+        return 0
+    fi
+    version_at_least "$v" "$AUGUR_MIN_CONTAINER_VERSION" && return 0
+    error "Apple Container ${v} is too old: augur needs ${AUGUR_MIN_CONTAINER_VERSION} or newer."
+    error "Upgrade it from https://github.com/apple/container/releases, then re-run this command."
+    exit 1
+}
+
 # Apple spells container removal "delete" (with "rm" as an alias); --force drops a
 # still-running container.
 engine_rm_force() { container delete --force "$@"; }
@@ -357,9 +403,10 @@ resolve_api_key() {
 # in the macOS ~/.augur-env writer, or smuggle control bytes into the guest environment. This is
 # the per-value credential validator the auth seam flagged as future work: a single quote is the only
 # character that can escape a single-quoted shell string, and control bytes (newline/CR/tab/…)
-# have no place in a credential token. Container mode is not shell-exposed (values go to argv),
-# but validating in one place keeps both datapaths safe. Fails closed — a malformed secret must
-# abort `up`, never be injected.
+# have no place in a credential token. Container mode is not shell-exposed, but it writes one
+# NAME=value per line into an --env-file (session_credential_env), where a newline would smuggle in
+# a second variable — so the same check guards both datapaths. Fails closed — a malformed secret
+# must abort the command that would inject it, never be injected.
 validate_secret_value() {
     local name="$1" value="$2"
     if [[ "$value" == *\'* ]]; then
@@ -373,18 +420,21 @@ validate_secret_value() {
     return 0
 }
 
-# Resolve every credential an `up` would inject and validate each value, injecting NOTHING.
+# Resolve every credential augur would inject and validate each value, injecting NOTHING.
 # This is the CHECK half of the auth seam, split from the PUSH half so it can run before anything
 # irreversible happens: resolution reads only host env vars, host files and `gh auth token`, while
-# the push needs a booted guest (macOS mode writes ~/.augur-env over SSH).
+# the push needs a booted guest (macOS mode writes ~/.augur-env over SSH; Container mode passes an
+# --env-file on the session's `exec`).
 #
 # WHY IT EXISTS: checked only at push time — AFTER `augur-vm clone`, `augur-vm set` and
 # `augur-vm run` plus the SSH wait — a value that cannot be safely injected would abort `up` with
 # a VM already cloned, sized and BOOTED, and (unlike the SSH-timeout path just above it) nothing torn
 # down. Once the operator fixed the value and re-ran `up --macos`, it would hit the already-running
 # branch, which by design cannot re-push ~/.augur-env — so the guest would keep running with no
-# credentials at all until `down --macos && up --macos`. Container mode checks before
-# `container run`; cmd_up_macos likewise calls this before the clone.
+# credentials at all until `down --macos && up --macos`. cmd_up_macos therefore calls this before
+# the clone. Container mode injects at session start instead, so cmd_claude / cmd_shell call it
+# before bringing the container up; cmd_up itself injects nothing there and does not check, which
+# keeps `augur setup-token` usable to replace a stored token that fails the check.
 #
 # Deliberately NOT an error: an ABSENT credential. A guest with no token is a supported state in both
 # modes (`augur setup-token` runs `claude setup-token` inside it), so this refuses only a value that
@@ -406,8 +456,8 @@ validate_resolved_credentials() {
     return 0
 }
 
-# Persist a captured Claude subscription token to the host token file augur reads on
-# every `up` (resolve_api_key picks it up as CLAUDE_CODE_OAUTH_TOKEN). Validates the
+# Persist a captured Claude subscription token to the host token file augur reads whenever it
+# injects credentials (resolve_api_key picks it up as CLAUDE_CODE_OAUTH_TOKEN). Validates the
 # shape and writes it 0600. The host never needs claude installed for this.
 # AUGUR_AGENT_SEAM | token persistence — Claude-specific shape (sk-ant-*) + dest file.
 # CONTRACT (credentials): this charset/length check is the only credential validator today;
@@ -429,7 +479,7 @@ save_oauth_token() {
     ( umask 077; printf '%s\n' "$token" > "$dest" )
     chmod 600 "$dest"
     success "Saved subscription token to ${BOLD}${dest}${RESET} (chmod 600)."
-    info "augur injects it as CLAUDE_CODE_OAUTH_TOKEN on every 'up' — no host claude needed."
+    info "augur injects it as CLAUDE_CODE_OAUTH_TOKEN from the next session (macOS VM mode: the next 'up') — no host claude needed."
 }
 
 # Security notice shown before the operator pastes a setup-token. The token is produced by
@@ -1781,7 +1831,8 @@ invalidate_persisted_container() {
 # container's tzdata lookup nor the macOS VM guest's `systemsetup -settimezone` accepts. Falls
 # back to UTC (a safe no-op, not a guess) if the symlink is ever missing or doesn't point into a
 # zoneinfo tree; on a real Mac this has never been observed to happen. Shared by both guest kinds
-# augur can run: the container's `-e TZ=` injection in cmd_up, and sync_macos_guest_timezone.
+# augur can run: the container's per-session `-e TZ=` (_add_session_exec_env), and
+# sync_macos_guest_timezone.
 host_timezone() {
     local link="" tz=""
     link="$(readlink /etc/localtime 2>/dev/null)"
@@ -1795,27 +1846,27 @@ host_timezone() {
 
 # ── Persisted-container reconcile (Apple Container mode keeps the container across `down`) ──
 # `down` STOPS the container instead of deleting it, so the next `up` can restart it for a fast,
-# cache-preserving resume. But a container's egress wiring, credentials, memory and mounts are
-# baked once at `container run` and are NOT re-evaluated by `container start` — so reusing a
-# container whose inputs have since changed would silently run stale/wrong config (a rotated
-# token, a flipped egress mode, a resized memory limit). The fingerprint records exactly those
-# baked inputs; `up` reuses the container only on an exact match and otherwise recreates it clean.
+# cache-preserving resume. But a container's egress wiring, memory and mounts are baked once at
+# `container run` and are NOT re-evaluated by `container start` — so reusing a container whose
+# inputs have since changed would silently run stale/wrong config (a flipped egress mode, a resized
+# memory limit). The fingerprint records exactly those baked inputs; `up` reuses the container only
+# on an exact match and otherwise recreates it clean. Credentials and TZ are not baked at all (see
+# session_credential_env), so a rotated token or a moved host never recreates it.
 container_fingerprint_file() {
     mkdir -p "$AUGUR_DIR/container-state"
     # Key on the FULL container name (which already includes the Swift tag) so a project persisted
     # across multiple --swift versions keeps ONE fingerprint PER container. A tag-agnostic key could
-    # match one tag's container while describing another tag's baked config → stale-credential reuse.
+    # match one tag's container while describing another tag's baked config → stale-config reuse.
     echo "$AUGUR_DIR/container-state/${CONTAINER_NAME}.fingerprint"
 }
 
 # Hash of everything cmd_up bakes into the container at `run` time and cannot change without
 # recreating it. NOTE: image CONTENT is handled separately — build/update/install-cert remove
 # this project's container so a rebuilt image always takes effect (a persisted container keeps
-# the old image's filesystem). Reads the resolved secret VALUES so a rotated token forces a
-# recreate; the digest is written host-side 0600, never in the project tree.
+# the old image's filesystem). Holds no credential: those are injected per session, never baked.
+# The digest is written host-side 0600, never in the project tree.
 container_fingerprint() {
-    local gh_token egress_state egress_wiring _genv _henv _hfile _hvalidator _aval
-    gh_token="$(gh auth token 2>/dev/null || true)"
+    local egress_state egress_wiring
     if egress_enabled; then
         egress_state="on"
         # Fingerprint the STABLE inputs that DETERMINE the baked HTTP_PROXY (subnet → gateway, an
@@ -1841,14 +1892,6 @@ container_fingerprint() {
         # existed has no such mount, and hashing the path recreates it once so the feature is
         # actually present rather than silently missing until the operator happens to `destroy`.
         echo "profile_mount=$(agent_profile_guest_mount)"
-        # AUGUR_AGENT_SEAM | fingerprint the resolved auth values (named-only, same source as the
-        # -e injection) so a rotated/added/removed credential recreates the container on next up.
-        while IFS='|' read -r _genv _henv _hfile _hvalidator; do
-            [[ -z "$_genv" ]] && continue
-            _aval="$(resolve_api_key "${!_henv:-}" "$_hfile")"
-            echo "auth:${_genv}=${_aval}"
-        done < <(agent_auth_specs)
-        echo "gh_token=${gh_token}"
         # else-less `if`, NOT `[[ -f ]] && echo`: the &&-form returns 1 when no ~/.gitconfig, and
         # under `set -o pipefail` that 1 becomes the pipeline's (hence the function's) exit status,
         # which would abort the STANDALONE write_container_fingerprint call under `set -e` — skipping
@@ -1940,9 +1983,9 @@ apply_guest_profile() {
 }
 
 # ── Prompt-history carry-over (Container mode) ───────────────────────────────────────────────
-# augur recreates the container for its OWN reasons — a rotated credential, an egress toggle, a
-# memory change, `build`/`update`/`install-cert`, or any other fingerprint drift. Each of those
-# discards the writable layer, and ~/.claude/history.jsonl (up-arrow prompt recall) lives directly
+# augur recreates the container for its OWN reasons — an egress toggle, a memory change,
+# `build`/`update`/`install-cert`, or any other fingerprint drift. Each of those discards the
+# writable layer, and ~/.claude/history.jsonl (up-arrow prompt recall) lives directly
 # in ~/.claude rather than under one of the mounts, so it goes with it.
 #
 # Scope is deliberately JUST the prompt history. augur does not snapshot ~/.claude.json: augur
@@ -2055,7 +2098,7 @@ finish_up() {
     fi
     # Every `up` path lands here, so a host-side profile edit is picked up without a recreate. That
     # is still NOT sufficient on its own: cmd_claude/cmd_shell reach cmd_up only when the container
-    # is NOT running (`container_running || cmd_up`), so on the common case — repeated
+    # is NOT running (ensure_session_container), so on the common case — repeated
     # `claude`/`shell` with no intervening `down` — nothing in this function runs at all. They
     # therefore call apply_guest_profile directly too; see those call sites (without that, a
     # profile entry added/removed while the container stays running would be invisible until an
@@ -2080,21 +2123,28 @@ reconcile_running_container() {
         # finish_up is ever reached. Do not "simplify" it away.
         write_merged_allowlist >/dev/null
     fi
-    # A running container cannot be re-provisioned: --network / --cap-drop / HTTP_PROXY /
-    # --no-dns / -e credentials are baked once at `container run`. Refuse rather than warn and
-    # continue: the fingerprint is an opaque digest (it hashes RESOLVED SECRET VALUES, so naming
-    # the drifted field would mean storing them in plaintext), and continuing into
-    # start_egress_proxy with a container created under --no-egress fails opaquely anyway —
-    # container_egress_gateway falls back to a COMPUTED IP when `network inspect` reports none,
-    # start_egress_proxy then burns its 5s ifconfig wait on an address no interface holds, and
-    # start_proxy dies on the bind. A missing fingerprint (a container started by an augur that
-    # predates it) lands here too, and the same remedy heals it.
-    if ! container_fingerprint_matches; then
-        error "Container '${CONTAINER_NAME}' was created with a different config (egress mode, memory, credentials or mounts"
-        error "changed since). A running container cannot pick those up: ${BOLD}augur down && augur up${RESET}"
-        exit 1
-    fi
+    # Refuse rather than warn and continue: continuing into start_egress_proxy with a container
+    # created under --no-egress fails opaquely anyway — container_egress_gateway falls back to a
+    # COMPUTED IP when `network inspect` reports none, start_egress_proxy then burns its 5s ifconfig
+    # wait on an address no interface holds, and start_proxy dies on the bind.
+    require_running_container_current
     finish_up                            # restores the boot self-test on this path
+}
+
+# Exit 1 unless the RUNNING container's fingerprint matches the current config. A running container
+# cannot be re-provisioned: --network / --cap-drop / HTTP_PROXY / --no-dns / --memory / mounts are
+# baked once at `container run`, and the remedy is a stop plus the recreate `up` does on mismatch.
+# The fingerprint is an opaque digest, so the message cannot name the drifted field.
+#
+# A missing or older-format fingerprint lands here too — including a container created by an augur
+# that baked credentials and TZ into `container run`. That case must refuse, not continue: a value
+# baked at `run` shadows the per-session one (see _add_session_exec_env), so the session would run
+# on the baked, possibly stale, credentials.
+require_running_container_current() {
+    container_fingerprint_matches && return 0
+    error "Container '${CONTAINER_NAME}' was created with a different config (egress mode, memory or mounts changed"
+    error "since, or an older augur created it). A running container cannot pick those up: ${BOLD}augur down && augur up${RESET}"
+    exit 1
 }
 
 # Build a fresh container from the image: drop any old one, assemble the `container run` argv,
@@ -2123,20 +2173,9 @@ recreate_container() {
     # See resolve_container_memory for the override precedence.
     run_args+=(--memory "$(resolve_container_memory)")
 
-    # Container mode has no clock-skew defect (the guest shares the host kernel's clock, unlike a
-    # macOS VM guest), but it DOES default to UTC like any bare Linux image: nothing here
-    # otherwise tells the guest what zone the host is in. Baked here so PID 1 and anything that
-    # never goes through `exec` still gets a sane starting value. Deliberately NOT in
-    # container_fingerprint: unlike egress/memory/credentials/mounts, a stale TZ doesn't need a
-    # recreate to fix — cmd_claude/cmd_shell refresh it on every `exec` (a running container's
-    # baked env can't be changed, but `exec -e` overrides it per call), which is enough for
-    # anything an operator or the agent actually reads. Fingerprinting it too would make a
-    # traveling host's NEXT `augur up` against an already-running container hard-fail over a
-    # mismatch that `exec` already fixes for free.
-    run_args+=(-e "TZ=$(host_timezone)")
-
+    # Deliberately NO credentials and NO TZ here: both go on each session's `exec` instead
+    # (see session_credential_env and _add_session_exec_env).
     _add_egress_run_args
-    _add_auth_run_args
     _add_state_mount_run_args
     _add_host_config_run_args
 
@@ -2201,27 +2240,6 @@ _add_egress_run_args() {
     fi
 }
 
-_add_auth_run_args() {
-    # Claude auth via env only — the host's credential store is never mounted into
-    # the guest. ANTHROPIC_API_KEY wins if both are set (official precedence);
-    # otherwise the subscription token (run `claude setup-token` once on the host,
-    # or place it in ~/.claude_code_oauth_token). Mirrors macOS VM mode and keeps
-    # the guest off the host's ~/.claude entirely.
-    # AUGUR_AGENT_SEAM | auth injection — core enforces named-only (never wholesale host env,
-    # never a mounted credential store); the agent only DECLARES the names + host sources
-    # (agent_auth_specs). CONTRACT (credentials): a future multi-agent build validates each value
-    # here.
-    local _genv _henv _hfile _hvalidator _aval
-    while IFS='|' read -r _genv _henv _hfile _hvalidator; do
-        [[ -z "$_genv" ]] && continue
-        _aval="$(resolve_api_key "${!_henv:-}" "$_hfile")"
-        if [[ -n "$_aval" ]]; then
-            validate_secret_value "$_genv" "$_aval" || exit 1
-            run_args+=(-e "${_genv}=${_aval}")
-        fi
-    done < <(agent_auth_specs)
-}
-
 _add_state_mount_run_args() {
     # AUGUR_AGENT_SEAM | history mount — core decides where history lives and who can see it;
     # the agent only declares its guest paths.
@@ -2275,26 +2293,86 @@ _add_host_config_run_args() {
     [[ -f "$HOME/.gitconfig" ]] && run_args+=(-v "${HOME}/.gitconfig:/home/dev/.gitconfig:ro")
 
     # gh config is mounted READ-ONLY: the guest may read it but cannot rewrite the
-    # host's hosts.yml/config (tamper). The token itself is supplied via GH_TOKEN
-    # (gh respects it automatically; on macOS hosts gh keeps the token in Keychain,
-    # not hosts.yml, so the env var is the real auth path either way).
+    # host's hosts.yml/config (tamper). The token itself is supplied per session as GH_TOKEN
+    # (see session_credential_env; gh respects it automatically, and on macOS hosts gh keeps the
+    # token in Keychain, not hosts.yml, so the env var is the real auth path either way).
     mkdir -p "$HOME/.config/gh"
     run_args+=(-v "${HOME}/.config/gh:/home/dev/.config/gh:ro")
-    local gh_token
-    gh_token="$(gh auth token 2>/dev/null || true)"
-    if [[ -n "$gh_token" ]]; then
-        validate_secret_value GH_TOKEN "$gh_token" || exit 1
-        # GH_TOKEN authenticates gh; the GIT_CONFIG_* env vars add a self-contained
-        # git credential helper so HTTPS `git push` works off GH_TOKEN alone — without
-        # writing to the read-only ~/.gitconfig and without depending on the host's
-        # credential helper being executable inside the Linux container (a macOS host's
-        # osxkeychain/gh helper is not). $GH_TOKEN expands in the container at push time.
-        run_args+=(
-            -e "GH_TOKEN=${gh_token}"
+}
+
+# ── Per-session credentials (Container mode) ───────────────────────────────────────────────────
+# Credentials are never baked into `container run`: Apple Container persists the run config — the
+# init process's environment included — as plaintext in the container bundle, `container inspect`
+# prints it, and the container outlives `down`. They go only on the `container exec` that starts an
+# augur session (cmd_claude / cmd_shell), as `--env-file <(session_credential_env)`:
+#   • printf is a bash builtin, so no value ever reaches any process's argv;
+#   • the CLI reads the process-substitution pipe once at startup, so nothing is written to disk;
+#   • exec-time config is not persisted in the container bundle.
+# A rotated token or a new `gh auth login` therefore reaches the next session with no recreate, and
+# the credentials live only in the environment of that session's processes.
+# Deliberately none for `augur setup-token` (it exists to mint a token; the current one is not handed
+# to a guest binary for that) or for augur's own non-interactive execs (profile wiring, history
+# carry-over, the integrity check). Accepted trade-off: a manual `container exec` gets none either.
+#
+# Prints NAME=value lines: the resolved agent_auth_specs values plus the host's gh token as GH_TOKEN,
+# named-only and non-empty only. Callers run validate_resolved_credentials FIRST and outside the
+# process substitution: an `exit` in here ends only the substitution's subshell, never augur.
+# Every value is resolved again here, so each is re-checked too; one that fails (it changed since the
+# up-front check) is dropped with the validator's error rather than written.
+# AUGUR_AGENT_SEAM | auth injection — core enforces named-only (never wholesale host env, never a
+# mounted credential store); the agent only DECLARES the names + host sources (agent_auth_specs).
+# ANTHROPIC_API_KEY wins if both Claude vars are set (official precedence).
+session_credential_env() {
+    local _genv _henv _hfile _hvalidator _aval _gh
+    while IFS='|' read -r _genv _henv _hfile _hvalidator; do
+        [[ -z "$_genv" ]] && continue
+        _aval="$(resolve_api_key "${!_henv:-}" "$_hfile")"
+        [[ -n "$_aval" ]] || continue
+        validate_secret_value "$_genv" "$_aval" || continue
+        printf '%s=%s\n' "$_genv" "$_aval"
+    done < <(agent_auth_specs)
+    _gh="$(gh auth token 2>/dev/null || true)"
+    if [[ -n "$_gh" ]] && validate_secret_value GH_TOKEN "$_gh"; then
+        printf 'GH_TOKEN=%s\n' "$_gh"
+    fi
+    return 0
+}
+
+# Append the NON-secret per-session env for the same `exec` to the caller's `local _env` array (bash
+# dynamic scoping), as plain `-e`:
+#   • TZ — Container mode shares the host kernel's clock but defaults to UTC like any bare Linux
+#     image. Per session, so a host that changed zone is picked up by the next session.
+#   • git's credential helper, only when the host has a gh token: GIT_CONFIG_* adds a self-contained
+#     helper so HTTPS `git push` works off GH_TOKEN alone — without writing to the read-only
+#     ~/.gitconfig and without depending on the host's helper being executable inside the Linux
+#     container (a macOS host's osxkeychain/gh helper is not). It carries only the REFERENCE
+#     `$GH_TOKEN`, expanded in the container at push time, never the value.
+# Deliberately NEVER at `run`, for these and for the credentials alike: Apple Container appends
+# exec env to the container's baked init env without de-duplicating, and libc `getenv` takes the
+# FIRST duplicate (bash takes the last), so a baked value would silently win over the per-session
+# one for `date` and any other program that reads it through libc.
+_add_session_exec_env() {
+    _env+=(-e "TZ=$(host_timezone)")
+    if [[ -n "$(gh auth token 2>/dev/null || true)" ]]; then
+        _env+=(
             -e "GIT_CONFIG_COUNT=1"
             -e "GIT_CONFIG_KEY_0=credential.https://github.com.helper"
             -e 'GIT_CONFIG_VALUE_0=!f() { test "$1" = get && echo username=x-access-token && echo "password=$GH_TOKEN"; }; f'
         )
+    fi
+}
+
+# Bring the container up for an interactive session. Not running → the FULL `up` (reconcile +
+# egress bring-up + boot self-test), never a bare `container start`: with a persisted container,
+# `down`(stop) then `claude` is a normal reuse path, and a bare start would re-attach the guest with
+# NO proxy re-established and NO self-test — silently bypassing egress. Mirrors macOS
+# `cmd_claude_macos` (running || up). Already running → cmd_up is skipped, so check the fingerprint
+# here with the same refusal `augur up` gives (see require_running_container_current).
+ensure_session_container() {
+    if container_running; then
+        require_running_container_current
+    else
+        cmd_up
     fi
 }
 
@@ -2314,6 +2392,7 @@ migrate_pre_option_a_history() {
 
 cmd_up() {
     require_engine
+    require_engine_version
     ensure_image
 
     # Already running: the container itself can't change, but the host side is rebuilt on
@@ -2331,7 +2410,7 @@ cmd_up() {
     # Reconcile: `down` STOPS (keeps) the container, so if a persisted one exists AND the
     # config it was created with is unchanged (see container_fingerprint), reuse it — start it,
     # bring egress up, and return. A reused container re-applies its ORIGINAL egress wiring,
-    # credentials, memory and mounts (baked once at `run`), so ANY drift must instead force a
+    # memory and mounts (baked once at `run`), so ANY drift must instead force a
     # clean recreate below; the boot self-test in finish_up still gates the reuse.
     if container_exists && container_fingerprint_matches; then
         info "Reusing stopped container '${CONTAINER_NAME}' (config unchanged; fast restart)..."
@@ -2350,11 +2429,11 @@ cmd_up() {
 
 cmd_claude() {
     require_engine
-    # Not running? Go through the FULL `up` (reconcile + egress bring-up + boot self-test), not a
-    # bare `container start`. With a persisted container, `down`(stop) then `claude` is a normal
-    # reuse path; a bare start would re-attach the guest with NO proxy re-established and NO
-    # self-test — silently bypassing egress. Mirrors macOS `cmd_claude_macos` (running || up).
-    container_running || cmd_up
+    require_engine_version
+    # Checked before anything starts; see session_credential_env for why here and not in the
+    # process substitution.
+    validate_resolved_credentials || exit 1
+    ensure_session_container
     # The line above reaches `cmd_up` only when the container is NOT running, so on the common case
     # — repeated `claude`/`shell` calls without an intervening `down` — cmd_up (and therefore its
     # finish_up, and the apply_guest_profile inside it) never runs. Call it here too, matching macOS
@@ -2366,17 +2445,13 @@ cmd_claude() {
     info "Launching $(agent_display_name) in '${CONTAINER_NAME}'..."
     # AUGUR_AGENT_SEAM | interactive launch (engine `exec`: argv array — safe by construction)
     local _env=() _argv=() kv
-    # Same gap `apply_guest_profile` above exists to close, applied to the TZ `cmd_up` bakes in at
-    # `run`: that value can't change without recreating the container, and this is the ONLY place
-    # it's kept current — a running container's baked TZ is otherwise whatever the host's zone was
-    # at `run` time, forever. `exec -e` overrides the baked env for just this session; cheap (one
-    # readlink, no engine round-trip) and safe to send unconditionally, running or not.
-    _env+=(-e "TZ=$(host_timezone)")
+    _add_session_exec_env
     for kv in $(agent_fixed_env); do _env+=(-e "$kv"); done
     read -ra _argv <<< "$(agent_launch_argv)"
     # empty-safe expansion (bash 3.2 + set -u) so a future agent_fixed_env="" can't crash this
     local _rc=0
-    eng exec -it ${_env[@]+"${_env[@]}"} "$CONTAINER_NAME" ${_argv[@]+"${_argv[@]}"} || _rc=$?
+    eng exec -it --env-file <(session_credential_env) ${_env[@]+"${_env[@]}"} \
+        "$CONTAINER_NAME" ${_argv[@]+"${_argv[@]}"} || _rc=$?
     # Snapshot on the way out, while the container is still running — the freshest moment for the
     # prompt history a later recreate would otherwise discard. Never changes the agent's own status.
     save_guest_history
@@ -2385,18 +2460,18 @@ cmd_claude() {
 
 cmd_shell() {
     require_engine
-    # Same as cmd_claude: route a stopped/absent container through the full `up` so egress is
-    # re-established and self-tested, never a bare `container start`.
-    container_running || cmd_up
+    require_engine_version
+    validate_resolved_credentials || exit 1      # same as cmd_claude
+    ensure_session_container
     # Same reasoning as cmd_claude: an already-running container never reaches `cmd_up` at all, so
     # re-wire the profile here too — otherwise a structural profile change (an entry
     # added/removed/replaced) is invisible until an intervening `down`.
     apply_guest_profile
     info "Opening bash shell in '${CONTAINER_NAME}'..."
-    # Same reasoning as cmd_claude's _env: the container's baked TZ can't change without a
-    # recreate, so refresh it per-session here instead.
-    local _rc=0
-    eng exec -it -e "TZ=$(host_timezone)" "$CONTAINER_NAME" bash || _rc=$?
+    # Same per-session env as cmd_claude (see session_credential_env), minus the agent's fixed env.
+    local _env=() _rc=0
+    _add_session_exec_env
+    eng exec -it --env-file <(session_credential_env) ${_env[@]+"${_env[@]}"} "$CONTAINER_NAME" bash || _rc=$?
     # Same snapshot-on-exit as cmd_claude: a `claude` run ad hoc from this shell writes the same
     # history file, and the container is still running here.
     save_guest_history
@@ -2409,11 +2484,14 @@ cmd_shell() {
 # headless: it prints a URL to open in any browser; paste the code back here.
 cmd_setup_token() {
     require_engine
+    require_engine_version
     # Auto-start a container if none is running, and stop it again afterward (kept, like any
     # `down`), so the token flow doesn't leave a RUNNING container/proxy behind. The token is
-    # saved to the host for future `up`s regardless; an already-running container is left untouched.
+    # saved to the host for future sessions regardless; an already-running container is left
+    # running, but only if its fingerprint is current — one an older augur created may still carry
+    # credentials baked into its environment, and this flow must run without any.
     local started_here=false
-    if ! container_running; then cmd_up; started_here=true; fi
+    if container_running; then require_running_container_current; else cmd_up; started_here=true; fi
     # Integrity gate: the guest can overwrite its own (uid 1001-owned) claude binary, and setup-token
     # attaches that binary to the operator's TTY. Refuse if it differs from the image's pristine
     # copy — a freshly-CREATED container matches; a reused one tampered with by a prior session
@@ -2429,7 +2507,8 @@ cmd_setup_token() {
     info "Complete the browser sign-in; when it prints the token, copy it."
     # Run attached straight to the terminal (no pipe). `claude setup-token` is a
     # full-screen TUI; capturing its stdout forces a non-TTY and garbles the redraw,
-    # so we don't capture it — the token is pasted back here instead.
+    # so we don't capture it — the token is pasted back here instead. Deliberately no
+    # --env-file: this flow gets no credentials (see session_credential_env).
     # AUGUR_AGENT_SEAM | login launch (engine `exec`: argv array)
     local _lenv=() _largv=() kv
     for kv in $(agent_fixed_env); do _lenv+=(-e "$kv"); done
@@ -3357,7 +3436,8 @@ ensure_macos_claude_bin() {
 # were never copied, so it is already a lossy snapshot. (An include CANNOT be what introduces the
 # duplicate, incidentally: `--includes` defaults OFF for a scope-limited `git config --global`.)
 # Container mode never hits any of this because it never mutates the file — it bind-mounts
-# ~/.gitconfig read-only and injects the identical helper via GIT_CONFIG_KEY_0/VALUE_0 (cmd_up).
+# ~/.gitconfig read-only and injects the identical helper per session via GIT_CONFIG_KEY_0/VALUE_0
+# (_add_session_exec_env).
 #
 # Best-effort like ensure_macos_claude_profile, for the residue --replace-all cannot fix: the copied
 # file is arbitrary operator-authored input, and a shape git cannot parse at all still fails (exit
@@ -5107,7 +5187,8 @@ cmd_help() {
     echo -e "    AUGUR_MACOS_VM_MEMORY_MB macOS VM memory in MB; overrides .augur/resources.conf; default: 8192"
     echo ""
     echo -e "  ${BOLD}NOTES${RESET}"
-    echo -e "    • Container mode runs on ${CYAN}container${RESET} (Apple Container), on macOS 26+."
+    echo -e "    • Container mode runs on ${CYAN}container${RESET} (Apple Container) ${AUGUR_MIN_CONTAINER_VERSION}+, on macOS 26+."
+    echo -e "      Credentials reach only ${BOLD}augur claude${RESET}/${BOLD}augur shell${RESET} sessions, never the container itself."
     echo -e "    • Egress allowlist: on by default (global ${CYAN}~/.augur/augur.conf${RESET}). Add a ${CYAN}.augur/allowlist.conf${RESET}"
     echo -e "      in the project root to extend it with project-specific domains. Use ${CYAN}--no-egress${RESET} to"
     echo -e "      disable for one run. Needs no sudo. macOS VM egress also needs Go (augur-gvproxy)."
@@ -5195,7 +5276,7 @@ MACOS_SHARE="workspace-$(workspace_slug)"
 # than inside cmd_up/cmd_up_macos. Two reasons:
 #   • Structural: a single site makes it impossible to fix one mode and forget the other.
 #   • Correctness: cmd_claude/cmd_shell only call cmd_up when the guest is NOT already
-#     running (`container_running || cmd_up`, `macos_vm_running … || cmd_up_macos`), so a
+#     running (ensure_session_container, `macos_vm_running … || cmd_up_macos`), so a
 #     check inside `up` would be skipped entirely when attaching to a guest a pre-fix augur
 #     had already created from $HOME — exactly the case that needs refusing.
 # It also runs BEFORE require_vz (called from inside the macOS cmd_* functions), so the
