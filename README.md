@@ -452,9 +452,6 @@ project: it aborts any build in flight anywhere else on the Mac. See
 
 - **Apple Container** (`container`) on macOS 26+
 - bash
-- A Swift toolchain (Xcode or the Command Line Tools), so `bash install` can build `augur-proxy`.
-  Egress filtering is on by default, and `augur up` fails closed without the proxy unless you pass
-  `--no-egress`.
 
 ---
 
