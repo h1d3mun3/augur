@@ -113,12 +113,13 @@ if [[ "$(uname)" == "Darwin" ]] && [[ -f "$SCRIPT_DIR/gvproxy/build.sh" ]]; then
     fi
 fi
 
-# Installing never stops a RUNNING proxy (it may be serving a live session). augur notices the
-# changed binary on reuse: augur-proxy is replaced on the next `augur up` / `claude` / `shell`;
-# augur-gvproxy — the live VM's NIC — only warns, so it needs a VM cycle.
+# Installing never stops a RUNNING proxy (it may be serving a live session). augur compares each
+# running helper with the installed binary: a project whose guest is running refuses to attach
+# until its egress is restarted, and a stopped guest picks the new binaries up on its next `up`.
 if compgen -G "$INSTALL_DIR/proxy/*.pid" >/dev/null; then
-    info "Egress proxies are running: augur-proxy is replaced automatically on the next ${BOLD}augur up${RESET} / ${BOLD}claude${RESET} / ${BOLD}shell${RESET};"
-    info "  a macOS VM picks up a new augur-gvproxy via ${BOLD}augur down --macos && augur up --macos${RESET}."
+    info "Egress proxies are running. Installing does not stop them; a project whose guest is running"
+    info "  refuses ${BOLD}up${RESET} / ${BOLD}claude${RESET} / ${BOLD}shell${RESET} / ${BOLD}setup-token${RESET} until ${BOLD}augur down && augur up${RESET} (${BOLD}--macos${RESET} on both for VM mode);"
+    info "  a stopped guest picks up the new binaries on its next ${BOLD}augur up${RESET}."
 fi
 
 # Build the macOS VM backend (augur-vm) when on macOS with a Swift toolchain.
