@@ -183,11 +183,10 @@ agent_auth_specs() {
 # lives in the CORE (cmd_up). CONTRACT (state dir): a future agent whose state dir is flat (no
 # cwd fan-out) or colocated with its credential file must still be hash-keyed and must never
 # mount its credential store.
-# NOTE: this stays pinned to exactly ONE leaf on purpose. A Claude Code `--worktree`
-#   session gets its own, different leaf that this mount does not cover, so its history is
-#   ephemeral (lost on container recreation) — deliberate, not a bug. Mounting the
-#   `~/.claude/projects` parent instead would cover it, but a compromised session in one
-#   leaf would then have filesystem access to every sibling leaf in the same container.
+# NOTE: the whole guest projects dir is persisted, not one leaf, so every leaf this project
+#   creates (the main checkout's and each `claude --worktree` session's) survives recreation.
+#   Accepted trade-off: a compromised session in one leaf can read and modify its sibling
+#   leaves — all of them this same project's history, never another project's.
 agent_state_host_subdir()        { echo "claude-projects"; }              # dir under $AUGUR_DIR (both modes)
 agent_state_guest_projects_dir() { echo "/home/dev/.claude/projects"; }   # guest parent dir
 agent_state_guest_leaf()         { echo "-workspace-$1"; }                # leaf name from slug ($1)
