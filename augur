@@ -877,8 +877,8 @@ replace_stale_helper() {
     info "Replacing the ${label} (pid ${pid}): $(egress_helper_staleness_text "$3" "$4")."
     terminate_and_wait "$pid"
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-        error "The ${label} (pid ${pid}) did not exit; refusing to start a second one next to it."
-        error "Kill it (${BOLD}kill -9 ${pid}${RESET}) and retry."
+        error "The ${label} (pid ${pid}) did not exit even after SIGKILL; refusing to start a second one next to it."
+        error "Wait for it to exit (check with ${BOLD}ps -p ${pid}${RESET}), then retry. If it never exits, a reboot clears it."
         exit 1
     fi
     rm -f "$pidfile" "$(binsha_file "$pidfile")" 2>/dev/null || true
