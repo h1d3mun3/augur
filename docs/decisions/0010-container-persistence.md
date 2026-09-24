@@ -1,7 +1,10 @@
 # ADR-0010 — Apple Container mode keeps the container across `down` (reconcile-on-`up`)
 
 - **Status:** Accepted. Supersedes the Container-mode consequence of
-  [`0006`](./0006-macos-vm-clone-persistence.md).
+  [`0006`](./0006-macos-vm-clone-persistence.md). Amended by
+  [ADR-0021](./0021-container-per-session-credentials.md): credentials move off `run` and out of
+  the fingerprint, injected per session instead; once its implementation lands, the credential
+  parts of Rationale 1 and the "rotated token recreates" Consequence no longer hold.
 - **Date:** 2026-07-23.
 - **Applies to:** Apple Container mode only.
 
