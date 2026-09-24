@@ -289,8 +289,9 @@ engine_ready() {
 }
 
 # Oldest Apple Container CLI augur starts sessions with: the per-session credential exec relies on
-# it reading `--env-file` from a process-substitution pipe and on its explicit-empty `K=` handling
-# (see session_credential_env).
+# it reading `--env-file` from a process-substitution pipe (see session_credential_env), and the
+# boot self-test's direct-egress probes rely on `-e HTTP_PROXY=` meaning an explicit empty value
+# rather than "inherit from the host" (see verify_egress_locked).
 AUGUR_MIN_CONTAINER_VERSION="1.0.0"
 
 # Print the X.Y.Z release out of `container --version`, whose single line reads
@@ -1439,6 +1440,11 @@ verify_egress_locked() {
     # session (uid 1001, no root) could plant ~/.local/bin/curl|getent stubs that fake the isolated
     # answers and pass this self-test on the reuse path. curl/getent/sh all live in /usr/bin//bin, so
     # this can never cause a "not found" false failure — it only stops the tripwire being shadowed.
+    # Deliberately run through `sh -c`, never curl/getent directly: Apple Container appends exec
+    # `-e` after the container's baked env without de-duplicating, so the baked HTTP_PROXY and PATH
+    # stay in the environment too. The shell keeps the LAST duplicate and passes one clean copy on;
+    # curl called directly would read the FIRST (baked) HTTP_PROXY through libc and send every
+    # "direct" probe via the proxy, so the test could no longer see a leak.
     local _probe_path="/usr/bin:/bin:/usr/local/bin"
     local _probe
     for _probe in https://example.com https://1.1.1.1 https://8.8.8.8 http://1.1.1.1 http://8.8.8.8 \

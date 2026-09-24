@@ -141,7 +141,8 @@ in time," this **prescribes** "what must never break." It changes rarely.
   stays ⚠ review-only; nothing asserts `config.networkDevices = [network]`.
 
 ### I10. Do not expose credentials on argv  🟡 partial
-- **Rule:** No credential value is ever placed on a command line. On macOS the token is written to
+- **Rule:** No injected agent or gh credential (`agent_auth_specs` values, `GH_TOKEN`) is ever
+  placed on a command line. On macOS the token is written to
   `~/.augur-env` (chmod 600) via SSH stdin. In Container mode credentials are never passed to
   `container run` at all; they reach only the `container exec` that starts `augur claude` /
   `augur shell`, through `--env-file <(…)` written by the bash builtin `printf`
@@ -155,6 +156,10 @@ in time," this **prescribes** "what must never break." It changes rarely.
   no engine argv holds a value; `setup-token` and the profile/history execs carry no `--env-file`.
   `tests/21_container_live.sh` (live, `AUGUR_TEST_LIVE=1`) additionally checks `container inspect`
   shows no credential. macOS mode ⚠ review-only.
+- **Note:** The rule does not cover the macOS guest's admin password (`macos_admin_password`).
+  The `sudo -S` call sites embed it in the remote command string, so it is on the host's local
+  `ssh` argv for the length of each call. That is an accepted residual (snapshot 2026-09-21, item
+  44), not an I10 guarantee.
 
 ---
 
