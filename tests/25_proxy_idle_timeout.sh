@@ -2,7 +2,7 @@
 # Tier 1 (live, real binary) — augur-proxy idle-timeout on ESTABLISHED tunnels (issue #101).
 #
 # The connection cap (#36, tier 24) bounds how many tunnels exist, but an established-but-idle
-# tunnel could still pin a slot forever. This tier proves the idle timeout added for #101 against
+# tunnel could still pin a slot forever. This tier proves the idle timeout (#101) against
 # the REAL binary:
 #   A+D. an established idle tunnel is torn down within the window AND its connectionCap slot is
 #        released — proven through a cap of 1, so a leaked/stranded slot (the #36 deadlock one
@@ -10,10 +10,10 @@
 #   B.   a low-traffic stream (a byte every second — the SSE / long-poll shape) is PRESERVED past
 #        the window, because activity in EITHER direction resets the shared idle clock, then is
 #        torn down once it goes quiet;
-#   C.   --idle-timeout 0 restores the pre-#101 behavior (an idle tunnel stays open);
-#   E.   a normal client half-close does NOT truncate the in-flight opposite direction (the idle
-#        change made teardown branch: idle-expiry shuts both fds, but a normal EOF stays a single
-#        half-close — else it would truncate a legit response the other way).
+#   C.   --idle-timeout 0 disables it (an idle tunnel stays open);
+#   E.   a normal client half-close does NOT truncate the in-flight opposite direction (teardown
+#        branches: idle-expiry shuts both fds, but a normal EOF stays a single half-close — else
+#        it would truncate a legit response the other way).
 #
 # To exercise an ESTABLISHED tunnel we need a reachable upstream. augur-proxy denies IP-literals
 # (I4) and refuses non-public addresses (I8), so we allowlist the NAME `localhost`, run a tiny
@@ -177,7 +177,7 @@ close_tunnel
 eq "closed" "$state_quiet" "once the stream went quiet, the idle tunnel was reclaimed"
 reap "$proxy_pid"; proxy_pid=""
 
-# ── C. --idle-timeout 0 restores the pre-#101 infinite-idle behavior ──────────────────────────
+# ── C. --idle-timeout 0 disables the timeout (infinite idle) ──────────────────────────────────
 section "C. --idle-timeout 0 disables the timeout (idle tunnel stays open)"
 if ! start_proxy 0 proxyC; then
   fail "proxy (idle 0) did not come up" "last stderr: $(tail -3 "$TMPD/proxyC.err" 2>/dev/null)"; finish; exit $?

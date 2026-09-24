@@ -3,9 +3,8 @@
 # cloned, booted or SSH'd, and NO REAL CLOCK IS EVER SET — the "guest" is a scriptable stand-in for
 # ssh_macos, and the only `date` calls that actually execute are host-side READS).
 #
-# The defect. A macOS guest cloned from augur's base VM boots with a CLOCK_REALTIME a fixed offset
-# BEHIND the host's, and nothing in augur ever corrected it. Measured from inside a live guest on the
-# host this was written on:
+# The hazard. A macOS guest cloned from augur's base VM boots with a CLOCK_REALTIME a fixed offset
+# BEHIND the host's, and nothing inside the guest corrects it. Measured from inside a live guest:
 #
 #   host clock (a file mtime stamped through the virtiofs share) : 1785039613
 #   kern.monotonicclock                                          : 1785039613   delta =     0 s
@@ -25,7 +24,7 @@
 # Why NTP is not the fix: NTP is UDP/123, `augur.conf` is a SOCKS5/TCP NAME allowlist, and
 # `gvproxy/augur-egress.patch` does not register the UDP or ICMP forwarders at all under
 # `--deny-direct` — so UDP has no path out regardless of the allowlist, and opening one would
-# regress INVARIANTS.md I9, which tests/36 now self-tests. The last section pins both of those so
+# regress INVARIANTS.md I9, which tests/36 self-tests. The last section pins both of those so
 # "just allowlist a time server" cannot be quietly attempted later.
 #
 # What this file pins, all through stubs:

@@ -13,8 +13,8 @@
 #
 # Under CI and inside a subagent stdin is /dev/null, so `cat` sees EOF and the bug is invisible.
 # On a developer's terminal stdin is the TTY: `make offline-tests` stops dead, printing a section
-# header and nothing else, with no error and no timeout. Two files shipped in that state and the
-# failure was only found by a maintainer running the suite by hand.
+# header and nothing else, with no error and no timeout — a failure only a maintainer running the
+# suite by hand would ever see.
 #
 # So the guard cannot be a source grep — it has to reproduce the condition CI never has. Each
 # candidate is re-run with stdin held OPEN (a fd that never reaches EOF) and must still finish.
@@ -33,9 +33,9 @@ LIMIT_S=45
 
 # The stdin the candidate inherits must NEVER reach EOF — that is the TTY property being modelled.
 # A FIFO with a writer held open here does that for free and, unlike `< <(sleep $LIMIT_S)`, cannot
-# expire. That distinction is not academic: with a sleep whose duration equalled the timeout, a
-# genuinely hung file was UNBLOCKED by its own holder a moment before the poll gave up, and this
-# guard reported `ok` on a file that had blocked for the full window. Mutation-checked both ways.
+# expire. That distinction is not academic: with a sleep whose duration equals the timeout, a
+# genuinely hung file is UNBLOCKED by its own holder a moment before the poll gives up, and this
+# guard would report `ok` on a file that had blocked for the full window. Mutation-checked both ways.
 FIFO_DIR="$(mktemp -d)"; trap 'exec 9>&-; rm -rf "$FIFO_DIR"' EXIT
 mkfifo "$FIFO_DIR/stdin.fifo"
 exec 9<>"$FIFO_DIR/stdin.fifo"    # parent keeps a writer open; readers block forever, never EOF

@@ -117,20 +117,20 @@ else
 fi
 
 # ── ARM A: reconcile a RUNNING guest (the second `up`) ────────────────────────────────────────
-# Until this arm existed, this gate called `up --macos` exactly ONCE, so the already-running
-# reconcile branch had ZERO live coverage on this engine — and it is not a minor branch: it is where
+# Without this arm, this gate calls `up --macos` exactly ONCE, so the already-running reconcile
+# branch would have ZERO live coverage on this engine — and it is not a minor branch: it is where
 # a revoked allowlist reaches a live proxy, where the guest clock is re-corrected, and where the
 # boot self-test re-runs against a guest that is already up. Container mode has live evidence for
-# its half (`make egress` asserts "boot self-test re-ran on the reused container"); macOS had none.
+# its half (`make egress` asserts "boot self-test re-ran on the reused container"); this arm is
+# macOS's.
 #
-# The branch was in fact only ever entered by ACCIDENT: on 2026-07-26 two consecutive runs of this
-# script hit it because a stale running VM happened to be left over, and that is how the silent-exit
-# defect fixed in #137 was found. An accident is not coverage. This arm enters it deliberately.
+# A stale running VM left over from an earlier run can land in the branch by ACCIDENT, but an
+# accident is not coverage. This arm enters it deliberately.
 #
 # The clock assertion is a NEGATIVE one on purpose. sync_macos_guest_clock is silent when the guest
 # is already within tolerance (`return 0`, no output), so "it printed something" cannot be asserted.
 # What CAN be asserted is that it did not report the failure it reports when SSH is unusable — which
-# is precisely the symptom the observed defect showed on this branch, one line before dying.
+# is precisely the symptom a lost SSH transport shows on this branch, one line before dying.
 section "Reconcile a running guest (second up --macos)"
 reout="$( cd "$PROJECT" && AUGUR_ACCEPT_PROJECT_CONF=1 bash "$AUGUR" up --macos 2>&1 )"; rerc=$?
 if [[ $rerc -eq 0 ]]; then
@@ -180,12 +180,13 @@ fi
 # The EXIT trap runs `down --macos` again — a harmless no-op now the VM is already stopped.
 
 # ── ARM B: the self-test with NO SSH transport (gvproxy killed under a live VM) ────────────────
-# The state #137 fixed, constructed on purpose. It is reachable in the field because
+# The no-transport state (#137), constructed on purpose. It is reachable in the field because
 # cmd_down_macos stops gvproxy and the proxy at the TOP: a stop that fails to kill the VM leaves a
 # running guest whose NIC is gone. macos_ssh_host then falls back to `augur-vm ip`, which a
 # vfkit-networked guest has no DHCP lease to answer, and ssh_macos EXITS the script rather than
-# returning — which used to end `up --macos` at rc=1 with no output and, worse, JUMP OVER the
-# self-test's own fail-closed teardown, leaving a live VM with a live NIC.
+# returning — which, unless the self-test checks for it first, ends `up --macos` at rc=1 with no
+# output and, worse, JUMPS OVER the self-test's own fail-closed teardown, leaving a live VM with a
+# live NIC.
 #
 # tests/40 pins that offline through the real ssh_macos, but only a live host can prove the pieces
 # it has to stub: that a real `stop_gvproxy` really does strand the guest, and that `augur-vm ip`
@@ -210,7 +211,7 @@ if [[ $btrc -eq 0 ]] && macos_vm_running "$vm"; then
 
   # THE two load-bearing assertions, and both are environment-independent: whichever branch the
   # self-test takes, an unverifiable datapath must end `up` non-zero AND must not leave the guest
-  # running. The second is the one the defect broke — rc was already 1 before #137.
+  # running. The second is the one that catches the no-transport defect — rc is 1 either way.
   if [[ $ntrc -ne 0 ]]; then ok "up --macos against the stranded guest exits non-zero"
   else fail "up --macos against the stranded guest exits non-zero" "it exited 0 — an unverifiable datapath was accepted:
 $(printf '%s\n' "$ntout" | tail -n 12)"; fi

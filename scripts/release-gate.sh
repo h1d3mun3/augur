@@ -4,7 +4,7 @@
 # WHAT: runs the LOCAL macOS-VM E2E (`make e2e`) on a real Mac and posts its result as a
 # GitHub commit status (context "e2e/macos-vm") on the current HEAD. Branch protection on
 # the `release` branch REQUIRES that status green, so a release physically cannot ship
-# without this passing — the E2E can no longer be "forgotten". The status is issued ONLY
+# without this passing — the E2E cannot be "forgotten". The status is issued ONLY
 # when `make e2e` exits 0, so there is no way to mark green without actually running it.
 #
 # WHY LOCAL: `make e2e` boots a macOS VM (Virtualization.framework). No GitHub-hosted

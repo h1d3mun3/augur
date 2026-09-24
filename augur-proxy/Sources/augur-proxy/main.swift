@@ -35,7 +35,7 @@ struct Options {
     // direction, so an idle guest can't pin a connection slot forever (#101). 900s is well
     // beyond any real streaming gap (SSE tokens flow sub-second; idle keep-alive connections
     // are closed and transparently reopened) yet bounds the slot-pinning DoS. 0 disables it
-    // (pre-#101 infinite-idle behavior). Precedence: --idle-timeout > AUGUR_PROXY_IDLE_TIMEOUT > default.
+    // (an idle tunnel stays open indefinitely). Precedence: --idle-timeout > AUGUR_PROXY_IDLE_TIMEOUT > default.
     var idleTimeoutSecs = 900
 }
 

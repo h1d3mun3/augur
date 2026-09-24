@@ -80,9 +80,9 @@ RUN mkdir -p /home/dev/.claude/projects \
 # able to back the assertion, and it must not already be enforced by a stronger layer. Almost
 # everything security-relevant here IS already stronger — egress by the proxy/netstack and
 # `--no-dns`, the filesystem by read-only root-owned mounts — so restating it in a config file
-# would be theatre. Pinning a repo's `permissions`/`hooks` was considered and rejected: ADR-0012
-# just decided that Claude Code's own folder-trust dialog is the right gate for those, and
-# overriding it here would re-litigate that decision through the back door.
+# would be theatre. Pinning a repo's `permissions`/`hooks` is deliberately left out: under ADR-0012
+# Claude Code's own folder-trust dialog is the right gate for those, and overriding it here would
+# re-litigate that decision through the back door.
 #
 # What IS left, and what this pins: the ENV above disables the autoupdater *because the integrity
 # gate depends on it* — it keeps the on-disk binary byte-identical to the image. But a settings-file

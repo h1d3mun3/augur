@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Tier 1 — gvproxy socket lifecycle (runs anywhere; no container/VM host needed).
-# Guards the fix for the "guest boots with no NIC" bug: both gvproxy start paths unlinked their
-# vfkit socket BEFORE the already-running check, so the reuse path deleted the socket path of a
-# LIVE gvproxy and returned 0 as if it had adopted it. The `vm run --net-vfkit=<that path>` that
-# follows then had nothing to attach to — and since an unlink does not tear down existing
-# datagram connections, gvproxy stayed up and reported nothing, so the symptom was a NIC-less
-# guest instead of a clean error.
+# Guards against a guest that boots with no NIC: a gvproxy start path that unlinked its vfkit
+# socket BEFORE the already-running check would, on the reuse path, delete the socket path of a
+# LIVE gvproxy and return 0 as if it had adopted it. The `vm run --net-vfkit=<that path>` that
+# follows would then have nothing to attach to — and since an unlink does not tear down existing
+# datagram connections, gvproxy stays up and reports nothing, so the symptom is a NIC-less guest
+# instead of a clean error.
 #
 #   start_gvproxy            reached by `augur up --macos` when the VM is stopped but gvproxy is
 #                            still alive (a `vm stop` issued outside augur, or a boot that died
@@ -17,7 +17,7 @@
 # The `rm -f` itself must STAY on both paths: each function ends in a `[[ -S "$sock" ]]` wait that
 # a stale socket file left by a crashed gvproxy satisfies instantly. It just has to run only on
 # the path that actually starts a new gvproxy. Both directions are asserted for both functions
-# below, so neither reordering an unlink back up nor deleting one outright can pass.
+# below, so neither moving an unlink above the check nor deleting one outright can pass.
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/.." && pwd)"
 source "$HERE/lib.sh"
 AUGUR="$REPO/augur"

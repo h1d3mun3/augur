@@ -61,13 +61,13 @@ public enum SpliceRead: Equatable {
     case data(Int)     // n > 0: forward these bytes, then bump the idle clock
     case eof           // n == 0: clean half-close
     case idleTimeout   // n < 0, receive timeout fired (idle on): consult the shared clock
-    case error         // n < 0 genuine error, OR any n < 0 when idle is off (== today's n<=0 break)
+    case error         // n < 0 genuine error, OR any n < 0 when idle is off (== a plain n<=0 break)
 }
 
 /// Classify a `read()` result. `wouldBlock` = the read failed with EAGAIN/EWOULDBLOCK, i.e. a
 /// `SO_RCVTIMEO` receive-timeout fired (the executable computes this from errno; the two consts
 /// are equal on Linux and Darwin). It is only meaningful when `idleEnabled` — with idle off no
-/// timeout is set, so any `n < 0` is a genuine error, exactly as before this feature.
+/// timeout is set, so any `n < 0` is a genuine error.
 public func classifyRead(n: Int, wouldBlock: Bool, idleEnabled: Bool) -> SpliceRead {
     if n > 0 { return .data(n) }
     if n == 0 { return .eof }
@@ -79,7 +79,7 @@ public func classifyRead(n: Int, wouldBlock: Bool, idleEnabled: Bool) -> SpliceR
 public enum SpliceWrite: Equatable {
     case wrote(Int)    // w > 0: advance the write offset, then bump the idle clock
     case idleTimeout   // w < 0, send timeout fired (idle on): consult the shared clock
-    case error         // w == 0, a genuine write error, OR w < 0 when idle is off (== today's w<=0 break)
+    case error         // w == 0, a genuine write error, OR w < 0 when idle is off (== a plain w<=0 break)
 }
 
 /// Classify a `write()` result. `wouldBlock` mirrors `classifyRead` but for `SO_SNDTIMEO` (a
@@ -93,7 +93,7 @@ public func classifyWrite(w: Int, wouldBlock: Bool, idleEnabled: Bool) -> Splice
 
 /// How often the splice loop should re-check the shared idle clock (the `SO_RCVTIMEO`/
 /// `SO_SNDTIMEO` value in seconds), so detection lag is bounded by ~this even when the idle
-/// window is large. `0` → idle timeout disabled (restore the pre-#101 infinite-idle behavior).
+/// window is large. `0` → idle timeout disabled (an idle tunnel stays open indefinitely).
 public func idlePollSecs(idleTimeoutSecs: Int) -> Int {
     idleTimeoutSecs <= 0 ? 0 : min(idleTimeoutSecs, 30)
 }

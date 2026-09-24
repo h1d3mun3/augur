@@ -23,7 +23,7 @@ slug="myproj"
 # ── augur up: capture the constructed `container run` ────────────────────────
 export AUGUR_TEST_CONTAINER_RUNNING=0
 # HOME here has no ~/.gitconfig — a regression guard for the pipefail/set -e class where
-# write_container_fingerprint returned non-zero and aborted cmd_up before finish_up (skipping the
+# write_container_fingerprint returning non-zero would abort cmd_up before finish_up (skipping the
 # I1 self-test). up MUST exit 0 here.
 ( cd "$proj" && bash "$AUGUR" up --no-egress ) >/dev/null 2>&1; up_rc=$?
 eq "0" "$up_rc" "up: exits 0 on a host without ~/.gitconfig (fingerprint write must not abort cmd_up)"
@@ -68,10 +68,10 @@ else
   fail "up: no container run captured" "trace: $(cat "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null)"
 fi
 
-# ── No folder-trust seed: augur no longer pre-trusts the mounted workspace (ADR-0012, reverses
-#    ADR-0011). The blanket "no exec at all" check this used to make no longer holds — finish_up
-#    now wires the operator profile via one exec on every up — so assert the thing that actually
-#    matters instead: nothing on the create path writes trust, or touches ~/.claude.json at all. ──
+# ── No folder-trust seed: augur does not pre-trust the mounted workspace (ADR-0012). A blanket
+#    "no exec at all" check would not hold — finish_up wires the operator profile via one exec on
+#    every up — so assert the thing that actually matters instead: nothing on the create path
+#    writes trust, or touches ~/.claude.json at all. ──
 create_trace="$(cat "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null)"
 hasnt "$create_trace" "hasTrustDialogAccepted"                "up: does NOT seed folder-trust in the guest on create"
 hasnt "$create_trace" ".claude.json"                          "up: create path never writes the guest ~/.claude.json (ADR-0012)"
@@ -125,7 +125,7 @@ export AUGUR_TEST_CONTAINER_NAME="$cname"
 rm -f "$AUGUR_TEST_SHIMLOG.trace"
 ( cd "$proj" && bash "$AUGUR" claude ) >/dev/null 2>&1 || true
 ex="$AUGUR_TEST_SHIMLOG.exec"
-# `cmd_claude` issues MORE than one exec now: apply_guest_profile (re-wiring, since an
+# `cmd_claude` issues MORE than one exec: apply_guest_profile (re-wiring, since an
 # ALREADY-RUNNING container never reaches cmd_up at all — `container_running || cmd_up` — so
 # finish_up and the apply_guest_profile inside it never run; see the augur comment at the call
 # site), the interactive launch, then the prompt-history snapshot on the way out. The shim's .exec
@@ -339,15 +339,15 @@ besteffort="$(AUGUR_CARRY_TD="$ctd" bash -c '
 ' _ "$AUGUR" 2>/dev/null)"
 has "$besteffort" "REACHED_NEXT_STATEMENT" "carry-over: a failing snapshot never aborts the caller under set -euo pipefail"
 
-# ── Re-wiring while the container is ALREADY running (real bug, found in live testing) ──────
+# ── Re-wiring while the container is ALREADY running ────────────────────────────────────────
 # `claude`/`shell` route through cmd_up only when the container is NOT running
 # (`container_running || cmd_up`), so on the common case — repeated `claude`/`shell` calls with no
-# intervening `down` — finish_up never runs. That skipped apply_guest_profile entirely, so a
-# STRUCTURAL profile change (an entry added/removed/replaced) was invisible until the operator ran
-# `down` first, contradicting the documented "the next `augur claude` picks it up." Assert
-# cmd_claude/cmd_shell wire the profile themselves, not only via cmd_up, by driving them with the
-# container already RUNNING. (cmd_up's own already-running path now reconciles rather than
-# no-opping — see tests/34_up_reconcile.sh — but it is still not on this path.)
+# intervening `down` — finish_up never runs. Left to finish_up alone, apply_guest_profile would be
+# skipped entirely, so a STRUCTURAL profile change (an entry added/removed/replaced) would stay
+# invisible until the operator ran `down` first, contradicting the documented "the next `augur
+# claude` picks it up." Assert cmd_claude/cmd_shell wire the profile themselves, not only via
+# cmd_up, by driving them with the container already RUNNING. (cmd_up's own already-running path
+# reconciles rather than no-opping — see tests/34_up_reconcile.sh — but it is still not on this path.)
 section "Tier 1 — profile re-wiring when the container is already running (the live-testing bug)"
 export AUGUR_TEST_CONTAINER_RUNNING=1
 rm -f "$AUGUR_TEST_SHIMLOG.trace"

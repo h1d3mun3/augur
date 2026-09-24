@@ -2,17 +2,18 @@
 # Tier 1 — macOS mode's BOOT EGRESS SELF-TEST (runs anywhere; nothing is ever cloned, booted or
 # SSH'd — the "guest" is a scriptable stand-in for ssh_macos).
 #
-# The defect. INVARIANT I1 is "egress fails closed on every engine", and its shell half is the boot
-# self-test. But `verify_egress_locked` had exactly ONE call site — `finish_up`, which only container
-# mode reaches — so no macOS production path ever probed the guest's network. `augur status --macos`
-# does not close the gap either: it reports pidfile liveness, never reachability. The only live proof
-# was `tests/e2e_macos_vm.sh`, which is AUGUR_TEST_LIVE-gated and therefore never runs in CI. Each of
-# the three gvproxy flags that IS the enforcement could be deleted from start_gvproxy's argv and
-# `up --macos` would still print "Egress restricted to allowlisted domains" and then "VM is up."
+# The hazard. INVARIANT I1 is "egress fails closed on every engine", and its shell half is the boot
+# self-test. But `verify_egress_locked` has exactly ONE call site — `finish_up`, which only container
+# mode reaches — so unless its macOS peer is wired in, no macOS production path probes the guest's
+# network. `augur status --macos` does not close the gap either: it reports pidfile liveness, never
+# reachability. The only other live proof is `tests/e2e_macos_vm.sh`, which is AUGUR_TEST_LIVE-gated
+# and therefore never runs in CI. Without that wiring, each of the three gvproxy flags that IS the
+# enforcement could be deleted from start_gvproxy's argv and `up --macos` would still print "Egress
+# restricted to allowlisted domains" and then "VM is up."
 #
 # What this file pins. CI boots no guest, so the probes themselves cannot be exercised here — that
-# half stays live-only, exactly as container mode's does. What IS offline-testable, and is what broke
-# in the first place, is the WIRING: that the self-test is invoked on both `up --macos` paths, that a
+# half stays live-only, exactly as container mode's does. What IS offline-testable, and is what can
+# silently go missing, is the WIRING: that the self-test is invoked on both `up --macos` paths, that a
 # NOT-locked verdict ends the bring-up non-zero with the VM, gvproxy and the proxy torn down, and
 # that a locked verdict lets bring-up finish. The scriptable guest below also lets each gvproxy-argv
 # mutation be replayed as a distinct verdict, so the probe SET is asserted rather than assumed:
@@ -31,8 +32,8 @@
 # loss, and `curl https://api.github.com/` returns 200.
 #
 # NOTE: container mode's `verify_egress_locked` has NO offline test of its own — its only gate is the
-# live, locally-run `tests/22_egress_failclosed.sh`. There was nothing to mirror, so this file is the
-# first offline coverage of a boot self-test on either engine.
+# live, locally-run `tests/22_egress_failclosed.sh` — so this file is the only offline coverage of a
+# boot self-test on either engine.
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/.." && pwd)"
 source "$HERE/lib.sh"
 AUGUR="$REPO/augur"

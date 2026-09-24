@@ -37,7 +37,7 @@ enum DHCPLeases {
                 if let currentMAC, currentMAC == target, let currentIP {
                     // Freshest lease wins. A block without a parseable `lease=` counts as 0,
                     // so a real expiry always beats it; among equal/absent values the later
-                    // block in file order wins (>=), preserving the old behavior as a fallback.
+                    // block in file order wins (>=), so file order remains the tie-break.
                     let lease = currentLease ?? 0
                     if bestLease == nil || lease >= bestLease! {
                         bestLease = lease
