@@ -32,8 +32,12 @@ case "${1:-}" in
     done
     # AUGUR_TEST_CLAUDE_SHA256 makes the setup-token integrity gate's two `sha256sum` probes (one
     # `run --rm` of the image, one `exec` in the container) agree, so the flow reaches its launch.
+    # AUGUR_TEST_CLAUDE_SHA256_EXEC overrides the container side (a tampered binary), and
+    # AUGUR_TEST_CLAUDE_PATH the path the image reports for `claude`.
     if [[ -n "${AUGUR_TEST_CLAUDE_SHA256:-}" && "$*" == *sha256sum* ]]; then
-      printf '%s  /usr/local/bin/claude\n' "$AUGUR_TEST_CLAUDE_SHA256"
+      h="$AUGUR_TEST_CLAUDE_SHA256"
+      [[ "$1" == exec && -n "${AUGUR_TEST_CLAUDE_SHA256_EXEC:-}" ]] && h="$AUGUR_TEST_CLAUDE_SHA256_EXEC"
+      printf '%s  %s\n' "$h" "${AUGUR_TEST_CLAUDE_PATH:-/home/dev/.local/bin/claude}"
     fi
     exit 0 ;;
   --version)

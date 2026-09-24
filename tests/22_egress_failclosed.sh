@@ -175,6 +175,24 @@ assert_egress_locked "$cont" "fresh"
 # so we can PROVE the next up reused this exact container rather than rebuilding it.
 marker="/home/dev/augur-reuse-marker-$$"
 container exec "$cont" sh -lc "echo alive > '$marker'" >/dev/null 2>&1 || true
+# Plant a stub `sh` in ~/.local/bin, the guest-writable directory first in the image PATH, as a
+# prior session could. It intercepts anything that looks like a self-test probe (answering "leaked"
+# so a stub that DID run would fail the self-test, and leaving a sentinel), and hands everything else
+# to the real /bin/sh so the container's keep-alive and augur's own convenience execs still work.
+# The reuse `up` below must run the genuine self-test, so the sentinel must never appear.
+stub_sentinel="/home/dev/augur-stub-sh-ran-$$"
+container exec -e "AUGUR_STUB_SENTINEL=$stub_sentinel" "$cont" /bin/sh -c '
+  cat > /home/dev/.local/bin/sh <<EOF
+#!/bin/sh
+case "\$*" in *curl*|*getent*) : > "$AUGUR_STUB_SENTINEL"; echo 200; exit 0 ;; esac
+exec /bin/sh "\$@"
+EOF
+  chmod 755 /home/dev/.local/bin/sh' >/dev/null 2>&1 || true
+if container exec "$cont" /bin/sh -c '[ -x /home/dev/.local/bin/sh ]' >/dev/null 2>&1; then
+  ok "planted a stub ~/.local/bin/sh in the kept container"
+else
+  fail "planted a stub ~/.local/bin/sh in the kept container" "could not write /home/dev/.local/bin/sh"
+fi
 
 ( cd "$proj" && bash "$AUGUR" down ) >/dev/null 2>&1
 if container inspect "$cont" >/dev/null 2>&1; then
@@ -195,6 +213,14 @@ fi
 ok "augur up (reuse, egress on) succeeded"
 has "$upout2" "Reusing stopped container"   "up took the REUSE path (container start), not a rebuild"
 has "$upout2" "Egress self-test passed"      "boot self-test re-ran on the reused container (I1 gates reuse)"
+
+if container exec "$cont" /bin/sh -c "[ -e '$stub_sentinel' ]" >/dev/null 2>&1; then
+  fail "the self-test ignored the planted ~/.local/bin/sh" "the stub intercepted a probe (sentinel present)"
+else
+  ok "the self-test ignored the planted ~/.local/bin/sh (probes ran the absolute /bin/sh)"
+fi
+# Remove the stub: the assertion set below uses a bare `sh`, as an operator typing commands would.
+container exec "$cont" /bin/rm -f /home/dev/.local/bin/sh >/dev/null 2>&1 || true
 
 # Marker survived → the container was genuinely reused (a rebuild starts from the image and loses it).
 survived="$(container exec "$cont" sh -lc "cat '$marker' 2>/dev/null" 2>/dev/null | tr -d '\r' || true)"
