@@ -24,7 +24,7 @@ slug="myproj"
 export AUGUR_TEST_CONTAINER_RUNNING=0
 # HOME here has no ~/.gitconfig — a regression guard for the pipefail/set -e class where
 # write_container_fingerprint returning non-zero would abort cmd_up before finish_up (skipping the
-# I1 self-test). up MUST exit 0 here.
+# boot self-test). up MUST exit 0 here.
 ( cd "$proj" && bash "$AUGUR" up --no-egress ) >/dev/null 2>&1; up_rc=$?
 eq "0" "$up_rc" "up: exits 0 on a host without ~/.gitconfig (fingerprint write must not abort cmd_up)"
 run="$AUGUR_TEST_SHIMLOG.run"
