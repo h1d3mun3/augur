@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # Tier 0 — egress allowlist hardening (pure functions, runs anywhere).
-# Invariant I7 (docs/security-reviews/INVARIANTS.md): a guest-writable ./.augur/allowlist.conf
-# cannot widen the egress policy — every project line is validated (conf_line_valid),
-# only sanitized LDH patterns reach the MERGED allowlist, that allowlist is written
-# HOST-SIDE (under ~/.augur), never inside the project tree, AND the merge honors only the
-# domains SNAPSHOTTED at approval time (never a fresh read of the live mounted conf), so a
-# post-approval mutation cannot be honored (TOCTOU).
+# A guest-writable ./.augur/allowlist.conf cannot widen the egress policy — every project line
+# is validated (conf_line_valid), only sanitized LDH patterns reach the MERGED allowlist, that
+# allowlist is written HOST-SIDE (under ~/.augur), never inside the project tree, AND the merge
+# honors only the domains SNAPSHOTTED at approval time (never a fresh read of the live mounted
+# conf), so a post-approval mutation cannot be honored (TOCTOU).
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/.." && pwd)"
 source "$HERE/lib.sh"
 AUGUR="$REPO/augur"
@@ -52,7 +51,7 @@ done
 for bad in "evil .com" "bad;rm" "*" "*.*.com" "*evil.com" "under_score.com" ""; do
   if conf_line_valid "$bad"; then fail "rejects [$bad]" "accepted an invalid pattern"; else ok "rejects [$bad]"; fi
 done
-esc=$'evil\e[31m.com'   # A1: terminal-escape bytes must never survive into the policy / UI
+esc=$'evil\e[31m.com'   # terminal-escape bytes must never survive into the policy / UI
 if conf_line_valid "$esc"; then fail "rejects ESC-byte line" "accepted"; else ok "rejects ESC-byte line"; fi
 
 section "Tier 0 — project_conf_domains sanitizes a guest-writable conf"
@@ -115,10 +114,10 @@ else
 fi
 
 section "Tier 0 — a conf ending in an invalid line does not abort approval (set -e regression)"
-# Regression: project_conf_domains used to inherit its trailing while-loop's status, so a conf
-# whose LAST line is invalid made it return 1. The three `project_conf_domains > snap` call sites
-# then aborted augur under `set -euo pipefail` (augur:7) — a guest-triggerable startup DoS plus an
-# upgrade regression for repos whose conf legitimately ends in a dropped line. This harness runs
+# project_conf_domains must not inherit its trailing while-loop's status: a conf whose LAST line is
+# invalid would make it return 1, and the three `project_conf_domains > snap` call sites would then
+# abort augur under `set -euo pipefail` (augur:7) — a guest-triggerable startup DoS, and a broken
+# upgrade for repos whose conf legitimately ends in a dropped line. This harness runs
 # WITHOUT `set -e`, so assert BOTH the function's status AND a real `set -e` approval run.
 printf 'good.example.com\n*\n' > "$AUGUR_PROJECT_CONF"   # ends with a bare '*' (invalid but tolerated)
 project_conf_domains "$AUGUR_PROJECT_CONF" >/dev/null; rc=$?
@@ -164,8 +163,9 @@ has   "$b_out" "$AUGUR_PROXY_DIR" "B's allowlist stays under the host-side proxy
 
 # Degenerate variant: a same-basename sibling with NO ./.augur/allowlist.conf at all.
 # check_project_conf_approved returns 0 immediately and write_merged_allowlist omits the project
-# block entirely, so a bare `augur up` in ANY same-basename directory used to strip a live
-# session's project domains with zero interaction — no prompt, no output, nothing to notice.
+# block entirely, so with a basename-keyed merged allowlist a bare `augur up` in ANY same-basename
+# directory would strip a live session's project domains with zero interaction — no prompt, no
+# output, nothing to notice.
 rm -f "$AUGUR_PROJECT_CONF"
 TEST_PATH_HASH="hash-of-tmp-myapp"
 c_out="$(write_merged_allowlist)"
@@ -174,12 +174,12 @@ has   "$(cat "$a_out")" "a-only.example.com" "a bare up in a conf-less same-base
 
 section "Tier 0 — write_merged_allowlist is CONTENT-idempotent (its mtime is a signal, not metadata)"
 
-# The file used to carry a "generated at <date>" header rewritten on EVERY call, so its mtime bumped
+# Anything rewritten on EVERY call (e.g. a "generated at <date>" header) would bump the file's mtime
 # unconditionally. Two consumers read that mtime as a POLICY-CHANGED signal:
-#   • augur-proxy hot-reloads on mtime change (main.swift polls every ~2s) — so every `up` forced a
-#     pointless reload of a byte-identical policy;
+#   • augur-proxy hot-reloads on mtime change (main.swift polls every ~2s) — so every `up` would
+#     force a pointless reload of a byte-identical policy;
 #   • warn_if_macos_egress_pinned compares this file against the gvproxy pidfile to detect a DNS
-#     allowlist gvproxy snapshotted BEFORE the policy changed — which would have cried wolf forever.
+#     allowlist gvproxy snapshotted BEFORE the policy changed — which would cry wolf forever.
 # Asserted with `-nt` against a reference file rather than by parsing timestamps: no `stat` portability
 # (BSD `-f %m` vs GNU `-c %Y`) and no clock arithmetic. Same technique as warn_if_macos_profile_stale.
 TEST_PATH_HASH="hash-idempotence"

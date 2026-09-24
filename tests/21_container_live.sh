@@ -37,7 +37,7 @@ slug="$(basename "$proj" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]' '-' |
 # WORKSPACE_DIR="$(pwd)" inside the `cd "$proj"` subshells, so this matches augur's workspace_path_hash.
 phash="$(printf '%s' "$proj" | { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; } | cut -c1-12)"
 augur_dir="${AUGUR_DIR:-$HOME/.augur}"
-# destroy (not down): down now only STOPS the container (persistence), so the test must fully
+# destroy (not down): down only STOPS the container (persistence), so the test must fully
 # remove it on exit. Also remove the per-project HOST state dirs this test created under ~/.augur
 # (history + agents) — destroy deliberately does NOT touch them, so clean them up here.
 cleanup() {
@@ -69,10 +69,10 @@ if ( cd "$proj" && bash "$REPO/augur" up --no-egress ) >/dev/null 2>&1; then
   if [[ "$survived" == "alive" ]]; then ok "up reused the container — writable-layer state survived down/up"; else fail "up did not reuse the container (marker lost)"; fi
 
   # ── Agent-config persistence: user-level /agents survive DESTROY+up (host-mounted, #113) ──
-  # Write a user-level subagent def into ~/.claude/agents (the newly bind-mounted host dir), then
+  # Write a user-level subagent def into ~/.claude/agents (the bind-mounted host dir), then
   # DESTROY (removes the container + its writable layer) and up (a fresh container). Unlike the
   # writable-layer marker above, this MUST survive: ~/.claude/agents is a host mount that `destroy`
-  # never touches — exactly the reported gap (augur up → /agents → destroy → up used to lose it).
+  # never touches, so augur up → /agents → destroy → up must not lose it.
   agentdef="/home/dev/.claude/agents/augur-test-agent.md"
   container exec "$cont" sh -lc "mkdir -p ~/.claude/agents && printf '%s\n' '---' 'name: augur-test-agent' '---' 'probe' > '$agentdef'" >/dev/null 2>&1 || true
   ( cd "$proj" && bash "$REPO/augur" destroy --no-egress ) >/dev/null 2>&1
@@ -83,9 +83,9 @@ if ( cd "$proj" && bash "$REPO/augur" up --no-egress ) >/dev/null 2>&1; then
     fail "subagent def lost across destroy+up" "~/.claude/agents did not persist (expected host mount)"
   fi
 
-  # ── No folder-trust seed: the FRESH (post-destroy) container is NOT pre-trusted (ADR-0012,
-  #    reverses ADR-0011). augur no longer marks the workspace cwd trusted in the guest's
-  #    ~/.claude.json — Claude Code's own trust dialog runs once, same as on any other machine. ──
+  # ── No folder-trust seed: the FRESH (post-destroy) container is NOT pre-trusted.
+  #    augur does not mark the workspace cwd trusted in the guest's ~/.claude.json — Claude
+  #    Code's own trust dialog runs once, same as on any other machine. ──
   if container exec "$cont" sh -lc "jq -e '.projects[\"/workspace-${slug}\"].hasTrustDialogAccepted == true' ~/.claude.json" >/dev/null 2>&1; then
     fail "workspace was pre-trusted after destroy+up" "expected no hasTrustDialogAccepted for /workspace-${slug} in ~/.claude.json"
   else

@@ -2,13 +2,13 @@
 # Tier 1 — `down --macos` must VERIFY the VM actually stopped (runs anywhere; nothing is ever
 # cloned, booted or SSH'd — the augur-vm CLI is a recorder function).
 #
-# The defect. Container mode's `cmd_down` runs `eng stop … || true` and then re-checks
+# The hazard. Container mode's `cmd_down` runs `eng stop … || true` and then re-checks
 # `container_running`, warning when the container is still up rather than claiming success. macOS
-# mode ran `"$VM_CLI" stop … 2>/dev/null || true` and then printed an UNCONDITIONAL
-# `success "VM … stopped"`. `augur-vm stop` swallows its diagnostics into 2>/dev/null and exits 0
-# even on its force-kill path, so "the signal never landed" (a `run` process this host user cannot
-# signal, or a stop that errored before signalling) was completely invisible: `down --macos`
-# reported a clean stop over a VM that was still executing.
+# mode runs `"$VM_CLI" stop … 2>/dev/null || true`, and `augur-vm stop` swallows its diagnostics
+# into 2>/dev/null and exits 0 even on its force-kill path. Followed by an UNCONDITIONAL
+# `success "VM … stopped"`, "the signal never landed" (a `run` process this host user cannot
+# signal, or a stop that errored before signalling) would be completely invisible: `down --macos`
+# would report a clean stop over a VM that was still executing.
 #
 # Why it is worse here than in container mode: gvproxy and the proxy are stopped at the TOP of
 # cmd_down_macos, so the surviving guest keeps running with this workspace shared into it while no
@@ -27,7 +27,7 @@
 # cmd_destroy_macos deliberately has NO such re-check: its `"$VM_CLI" delete` carries no `|| true`,
 # `augur-vm delete` refuses a running VM, and `set -e` therefore aborts it before its success line.
 # The last section pins that difference, so "make destroy tolerant of a failed delete" cannot quietly
-# reintroduce the very defect this commit removes from `down`.
+# bring into `destroy` the false success `down`'s re-check exists to prevent.
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/.." && pwd)"
 source "$HERE/lib.sh"
 AUGUR="$REPO/augur"
@@ -128,8 +128,8 @@ has "$out" "remove the clone entirely"      "down --macos: prints the destroy hi
 hasnt "$out" "did NOT stop"  "down --macos: no failure warning on a clean stop"
 hasnt "$out" "run.pid"       "down --macos: no kill-it-by-hand remedy on a clean stop"
 eq "0" "$rc" "down --macos: exits 0 after a clean stop"
-# Nothing is deleted by `down` (ADR-0006 keeps the clone) — the re-check must not have turned into
-# an escalation that removes the VM.
+# Nothing is deleted by `down` (it deliberately keeps the clone) — the re-check must not have
+# turned into an escalation that removes the VM.
 if grep -q '^delete ' "$VMLOG"; then fail "down --macos: deleted the VM" "$(cat "$VMLOG")"
 else ok "down --macos: never invokes 'delete' (the clone is kept)"; fi
 

@@ -196,8 +196,8 @@ enum Sock {
     /// shut down BOTH fds (not just a half-close) so the peer splice thread's blocked call
     /// returns promptly instead of stranding and pinning a connectionCap slot (#101).
     ///
-    /// With `idle == nil` this is byte-for-byte the pre-#101 behavior: no timeout is set, `n < 0`
-    /// is always a genuine error (→ break), and teardown is the original single half-close.
+    /// With `idle == nil` no timeout is set, `n < 0` is always a genuine error (→ break), and
+    /// teardown is a single half-close.
     ///
     /// LOAD-BEARING INVARIANT: both fds must be BLOCKING (they are — client fds come from a plain
     /// `accept()`, upstream fds are restored to blocking after the non-blocking connect). The only
@@ -244,7 +244,7 @@ enum Sock {
             shutdown(src, shutReadWrite)
             shutdown(dst, shutReadWrite)
         } else {
-            shutdown(dst, shutWrite)   // normal EOF/error: original half-close, unchanged
+            shutdown(dst, shutWrite)   // normal EOF/error: half-close only
         }
     }
 

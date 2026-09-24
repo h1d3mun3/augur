@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Tier 1 — per-mode host proxy identity (runs anywhere; no container/VM host needed).
-# Guards the fix for the shared-proxy bug: with BOTH Apple Container mode and macOS VM mode
-# up for the same project, they used to share ONE host augur-proxy (keyed only on the project
-# slug). The second `up` reused the first's proxy — bound to the wrong address, so its egress
-# silently failed closed — and a `down` in either mode killed the shared proxy out from under
-# the other. The proxy is now keyed on (project PATH, role), so each mode of each project owns a
-# separate instance: the second half of that key was added later, when the same class of sharing
-# turned out to span PROJECTS too (~/work/app vs ~/archive/app share a basename, so they shared
-# every basename-derived host-state name — see the per-path section below).
+# Guards against a shared proxy: with BOTH Apple Container mode and macOS VM mode up for the
+# same project, ONE host augur-proxy keyed only on the project slug would make the second `up`
+# reuse the first's proxy — bound to the wrong address, so its egress silently fails closed —
+# and a `down` in either mode would kill the shared proxy out from under the other. The proxy is
+# keyed on (project PATH, role), so each mode of each project owns a separate instance: the PATH
+# half covers the same class of sharing across PROJECTS (~/work/app vs ~/archive/app share a
+# basename, so they would share every basename-derived host-state name — see the per-path
+# section below).
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/.." && pwd)"
 source "$HERE/lib.sh"
 AUGUR="$REPO/augur"
@@ -69,12 +69,12 @@ fi
 
 section "Tier 1 — host state is per (project PATH, role): two same-basename projects share nothing"
 
-# ~/work/myapp and ~/archive/myapp sanitize to the SAME workspace_slug, so a slug-only key made
-# them share every egress host-state name: the merged allowlist augur-proxy enforces (project B's
-# `up` overwrote project A's live policy), the proxy/gvproxy pidfiles (B's `up` "found" A's proxy
-# already running and reused it), the vfkit socket, and the logs. workspace_path_hash is what
-# separates them now — and the slug assertion below is what proves the hash is doing that work
-# rather than an incidental difference in the directory names.
+# ~/work/myapp and ~/archive/myapp sanitize to the SAME workspace_slug, so a slug-only key would
+# make them share every egress host-state name: the merged allowlist augur-proxy enforces (project
+# B's `up` would overwrite project A's live policy), the proxy/gvproxy pidfiles (B's `up` would
+# "find" A's proxy already running and reuse it), the vfkit socket, and the logs.
+# workspace_path_hash is what separates them — and the slug assertion below is what proves the
+# hash is doing that work rather than an incidental difference in the directory names.
 ORIG_WS="$WORKSPACE_DIR"
 mkdir -p "$TMPD/work/myapp" "$TMPD/archive/myapp"
 # Every per-project path this file owns, captured for one project at a time. Ports are NOT here:
@@ -111,7 +111,7 @@ for f in allowlist proxy_pid_macos proxy_pid_container proxy_log_macos proxy_log
   if [[ -n "$av" && "$av" != "$bv" ]]; then ok "$f differs between the two projects"
   else fail "$f must differ between the two projects" "both = [$av]"; fi
 done
-# Nothing escaped the host-side proxy dir while gaining the hash (I7: outside the project tree).
+# Nothing escaped the host-side proxy dir while gaining the hash (still outside the project tree).
 for f in allowlist proxy_pid_macos proxy_pid_container proxy_log_macos proxy_log_container \
          gvproxy_pid gvproxy_log vm_log socket; do
   has "$(field "$f" "$a_paths")" "$AUGUR_PROXY_DIR/" "$f stays under AUGUR_PROXY_DIR"
@@ -124,8 +124,8 @@ section "Tier 1 — the egress PORTS and subnet are per project path too"
 # this shell would just re-read the offset computed for the test's own cwd. Each project needs its
 # own `bash -c` (a fresh process: none of these vars is exported, so nothing leaks in from here).
 #
-# They must move WITH the pidfile keying, not after it: hash-keyed pidfiles plus shared ports means
-# project B's start_proxy no longer sees A's proxy, launches its own, and augur-proxy dies on the
+# They must be keyed WITH the pidfiles, not separately: hash-keyed pidfiles plus shared ports means
+# project B's start_proxy does not see A's proxy, launches its own, and augur-proxy dies on the
 # listen error for A's already-bound gateway:port — turning silent sharing into a hard failure.
 port_env() {   # $1 = workspace dir → "http socks ssh subnet"
   bash -c 'cd "$1" && AUGUR_SOURCE_ONLY=1 source "$2" >/dev/null 2>&1

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Tier 0 — the two waits cmd_build_macos's automated path depends on (ADR-0018's amendment).
-# Both are bounded polls, and both shipped broken in the original ADR-0018: the build treated a
-# DHCP lease as "SSH is ready" (there was no macos_wait_for_ssh at all, so it SSH'd into a guest
-# whose sshd had not started) and gave up on a fixed iteration count that could not be widened
-# for a cold first boot. What must not regress is the pair of properties asserted here — a wait
+# Tier 0 — the two waits cmd_build_macos's automated path depends on.
+# Both are bounded polls. A DHCP lease does not mean sshd is up, so the build must wait for TCP
+# reachability (macos_wait_for_ssh), not just an IP, before it SSHes in; and a cold first boot
+# needs more time than a fixed iteration count can give, so each wait takes a budget the caller
+# can widen. What must not regress is the pair of properties asserted here — a wait
 # that actually ends, and a budget the caller can raise — because giving up early makes the
 # caller tear down (SIGKILL) a VM that was still coming up, and never waiting reports a healthy
 # guest as unreachable. The live paths are exercised only by a real build (see tests/README.md).
@@ -100,7 +100,7 @@ else
 fi
 
 # The default has to stay generous enough for a cold boot: a caller that passes nothing must not
-# inherit a budget shorter than the ~90s the original fixed 30×3s loop allowed.
+# inherit a budget shorter than ~90s.
 default_budget="$(awk '/^macos_vm_ip\(\)/{f=1} f&&/max_secs=/{print; exit}' "$AUGUR")"
 has "$default_budget" '${2:-90}' "keeps the historical ~90s default when no budget is passed"
 

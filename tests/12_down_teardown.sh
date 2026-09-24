@@ -2,7 +2,7 @@
 # Tier 1 (offline) — `augur down` / `augur destroy` TEARDOWN via a `container` shim. No runtime
 # needed. Drives the REAL cmd_down / cmd_destroy paths with a shimmed `container` on PATH and
 # toggles whether this directory's container "exists" (AUGUR_TEST_CONTAINER_RUNNING → shim's
-# `inspect` exit). Apple Container mode now PERSISTS the container across down/up, so:
+# `inspect` exit). Apple Container mode PERSISTS the container across down/up, so:
 #   • `down`    STOPS the container (keeps it) and does NOT delete it or its egress network.
 #   • `destroy` force-removes the container ('container delete --force') AND its network.
 # Both print the "no container" notice when absent and exit 0 either way (stop_egress/stop_proxy
@@ -47,11 +47,11 @@ has "$trace" "delete --force"       "destroy: force-removes the container when i
 has "$trace" "network delete"       "destroy: tears down the egress network too"
 eq  "0" "$rc"                       "destroy: exits 0 after removing the container"
 
-# The egress network name gained the workspace path hash (two same-basename projects used to share
-# ONE network, so project B's `up` silently attached to project A's). `destroy` must delete BOTH
-# names: the current one, and the pre-hash `augur-<slug>-net` an older augur may have created for
-# this same directory. Nothing looks the legacy name up any more, so if teardown misses it the
-# network — and its subnet — is stranded for good.
+# The egress network name carries the workspace path hash (without it, two same-basename
+# projects would share ONE network, so project B's `up` would silently attach to A's).
+# `destroy` must delete BOTH names: the current one, and the pre-hash `augur-<slug>-net` an older
+# augur may have created for this same directory. Nothing looks the legacy name up any more, so if
+# teardown misses it the network — and its subnet — is stranded for good.
 # Both names are recomputed here INDEPENDENTLY of augur (same recipe as workspace_slug /
 # workspace_path_hash, sha256sum-first like the real helper) on purpose: asking augur for them
 # would make the two assertions collapse into one if a future change reverted the keying — both
@@ -75,11 +75,11 @@ has   "$out"   "No container found" "destroy: reports no container for this dire
 eq    "0" "$rc"                     "destroy: exits 0 even when nothing to remove"
 
 # ── Scenario 5: the CLEANUP path stays ungated in $HOME ────────────────────────
-# `up`/`claude`/`shell`/`setup-token` refuse a workspace containing augur's own control plane
-# (docs/decisions/0014-workspace-must-not-contain-augur.md), but `down`/`destroy` must NOT —
-# a pre-fix augur could already have created a container from $HOME, and gating the teardown
-# would strand it with no supported way to remove it. This is the assertion that stops a
-# future refactor from "consistently" applying the guard across the whole dispatch.
+# `up`/`claude`/`shell`/`setup-token` refuse a workspace containing augur's own control plane,
+# but `down`/`destroy` must NOT — a pre-fix augur could already have created a container from
+# $HOME, and gating the teardown would strand it with no supported way to remove it. This is
+# the assertion that stops a future refactor from "consistently" applying the guard across the
+# whole dispatch.
 rm -f "$AUGUR_TEST_SHIMLOG.trace"
 export AUGUR_TEST_CONTAINER_RUNNING=1
 ( cd "$HOME" && bash "$AUGUR" destroy ) >/dev/null 2>&1; rc=$?

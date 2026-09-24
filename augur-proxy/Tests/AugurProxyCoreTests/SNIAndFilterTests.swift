@@ -80,7 +80,7 @@ final class SNIAndFilterTests: XCTestCase {
         XCTAssertFalse(f.decide(Destination(host: "github.com", port: 443, isIPLiteral: false), client: "c").allowed)
     }
 
-    // Invariant I6 (fail closed on an unreadable file): the loader must yield nil so the
+    // Fail closed on an unreadable file: the loader must yield nil so the
     // caller keeps the previous policy — it must never fall open to an allow-all policy.
     private func tempConf(_ text: String) -> String {
         let path = NSTemporaryDirectory() + "augur-i6-\(ProcessInfo.processInfo.globallyUniqueString).conf"

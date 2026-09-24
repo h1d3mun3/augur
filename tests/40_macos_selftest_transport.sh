@@ -2,27 +2,26 @@
 # Tier 1 — the boot self-test's SSH TRANSPORT precondition (runs anywhere; nothing is cloned,
 # booted or really SSH'd).
 #
-# The defect, found by `make e2e` on 2026-07-26 and predicted in tests/37's header before that.
-# `ssh_macos` does not RETURN when it cannot name a host for the VM — it exits the script:
+# The hazard. `ssh_macos` does not RETURN when it cannot name a host for the VM — it exits the script:
 #
 #     host="$(macos_ssh_host "$vm")"; [[ -n "$host" ]] || { error "Cannot resolve SSH host…"; exit 1; }
 #
-# verify_macos_egress_locked's first probe called it as `if ! ssh_macos … &>/dev/null`, a SIMPLE
-# COMMAND, so that exit terminated `augur up --macos` outright: rc=1, the `error` swallowed by the
+# A probe in verify_macos_egress_locked that calls it as `if ! ssh_macos … &>/dev/null`, a SIMPLE
+# COMMAND, lets that exit terminate `augur up --macos` outright: rc=1, the `error` swallowed by the
 # redirection, and — the part that matters — the fail-closed teardown at the bottom of the function
 # JUMPED OVER. A self-test whose stated contract is "a detected leak must not leave a live VM with a
-# live NIC behind" left exactly that. The `cannot run a command in the guest over SSH` branch existed
-# for this situation and was unreachable in it.
+# live NIC behind" would leave exactly that, and its `cannot run a command in the guest over SSH`
+# branch, which exists for this situation, would be unreachable in it.
 #
 # Reachable state, not a hypothetical: VM RUNNING + gvproxy DOWN. `cmd_down_macos` stops gvproxy and
 # the proxy at the top, so a stop that fails to kill the VM leaves it; macos_ssh_host then falls back
 # to `augur-vm ip`, which a vfkit-networked guest has no DHCP lease to answer. The next `up --macos`
-# takes the already-running reconcile branch and dies there. Observed three times in a row on a real
-# host, byte-identical, with five lines of output and no error at all.
+# takes the already-running reconcile branch and would die there. Observed three times in a row
+# on a real host, byte-identical, with five lines of output and no error at all.
 #
-# Why tests/36 could not see it. That fixture replaces ssh_macos wholesale with a stub whose
+# Why tests/36 cannot see it. That fixture replaces ssh_macos wholesale with a stub whose
 # unreachable case is `return 255`. The stub RETURNS where the real function EXITS, so the entire
-# class of "a helper terminates the script inside a suppressed context" was invisible to it. This
+# class of "a helper terminates the script inside a suppressed context" is invisible to it. This
 # file therefore drives the REAL ssh_macos and shadows the `ssh` BINARY with a function instead —
 # the seam has to sit below the code under test, not above it.
 #
@@ -31,7 +30,7 @@
 #   • the underlying mechanism (ssh_macos exits rather than returns) — so the precheck stays
 #     load-bearing, and so a future "just make it return 1" is a deliberate, tested change
 #   • a resolvable transport still runs the probes: the precheck must not break the happy path
-#   • the narrow race (host resolves, SSH then fails) still lands on the older, less specific branch
+#   • the narrow race (host resolves, SSH then fails) still lands on the general, less specific branch
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/.." && pwd)"
 source "$HERE/lib.sh"
 AUGUR="$REPO/augur"
@@ -115,7 +114,7 @@ else fail "gvproxy down + no lease → macos_ssh_host resolves to NOTHING" "got 
 section "The mechanism the precheck compensates for: ssh_macos EXITS, it does not return"
 
 # If ssh_macos merely returned non-zero, `echo REACHED-NEXT-LINE` would run. It does not — and this
-# is why the fix lives in verify_macos_egress_locked rather than in ssh_macos, whose exit semantics
+# is why the precheck lives in verify_macos_egress_locked rather than in ssh_macos, whose exit semantics
 # 47 call sites depend on. Should someone convert it to `return 1`, this assertion fails loudly and
 # the precheck can then be revisited on purpose.
 G_GVPROXY=0 G_VMIP=""
@@ -135,8 +134,8 @@ selftest
 if [[ $rc -ne 0 ]]; then ok "unresolvable transport ends the self-test non-zero"
 else fail "unresolvable transport ends the self-test non-zero" "rc=$rc"; fi
 
-# THE load-bearing assertion. Before the fix this was the whole defect: rc was already 1 (ssh_macos's
-# own exit), so an exit-status assertion alone stays green with the fix reverted. Only the recorded
+# THE load-bearing assertion. Without the precheck rc is 1 anyway (ssh_macos's own exit), so an
+# exit-status assertion alone stays green with the precheck removed. Only the recorded
 # teardown distinguishes them.
 if teardown_ran testvm; then ok "the VM, gvproxy and the proxy are all torn down (no live NIC left behind)"
 else fail "the VM, gvproxy and the proxy are all torn down" "recorded: $(tr '\n' ' ' < "$LOG")"; fi

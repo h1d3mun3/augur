@@ -1,9 +1,9 @@
 import XCTest
 @testable import AugurProxyCore
 
-/// Regressions for the bypasses found by the adversarial egress review.
+/// Regression tests for known egress-filter bypass techniques.
 final class SecurityTests: XCTestCase {
-    // MF1 — NUL/illegal-byte hostnames must be rejected so the allowlist decision
+    // NUL/illegal-byte hostnames must be rejected so the allowlist decision
     // and the getaddrinfo dial can never disagree.
     func testHostnameValidation() {
         XCTAssertTrue(isValidHostname("api.github.com"))

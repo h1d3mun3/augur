@@ -30,7 +30,7 @@ RUN if [ -n "$EXTRA_APT_PACKAGES" ]; then \
 # Create non-root user (no sudo — the agent runs as dev with no elevated privileges)
 RUN useradd -m -u 1001 -s /bin/bash dev
 
-# AUGUR_AGENT_SEAM | agent install (Docker image). Swap installer + pin per agent. See docs §4 C2.
+# AUGUR_AGENT_SEAM | agent install (Docker image). Swap installer + pin per agent.
 # Install Claude Code via the official native installer so installMethod matches
 # the host's (the shared ~/.claude.json reports "native"). The AMFI code-signing
 # issue that forces native on macOS does not apply to Linux; native is used here
@@ -66,7 +66,7 @@ ENV DISABLE_AUTOUPDATER=1
 # The seed is intentionally GENERIC and PERMANENT (no workspace-trust entry, and nothing later
 # adds one): augur does not pre-trust the mounted workspace. Claude Code's own folder-trust
 # dialog runs once inside the guest like it would anywhere else — the guest is not special-cased
-# to skip it. See docs/decisions/0012-drop-workspace-trust-seed.md (which supersedes 0011).
+# to skip it.
 # AUGUR_AGENT_SEAM | agent state seed — pre-create the per-project history parent + minimal config.
 RUN mkdir -p /home/dev/.claude/projects \
     && printf '{"hasCompletedOnboarding":true,"installMethod":"native"}\n' > /home/dev/.claude.json
@@ -80,8 +80,8 @@ RUN mkdir -p /home/dev/.claude/projects \
 # able to back the assertion, and it must not already be enforced by a stronger layer. Almost
 # everything security-relevant here IS already stronger — egress by the proxy/netstack and
 # `--no-dns`, the filesystem by read-only root-owned mounts — so restating it in a config file
-# would be theatre. Pinning a repo's `permissions`/`hooks` was considered and rejected: ADR-0012
-# just decided that Claude Code's own folder-trust dialog is the right gate for those, and
+# would be theatre. Pinning a repo's `permissions`/`hooks` is deliberately left out: augur does not
+# pre-trust the workspace, so Claude Code's own folder-trust dialog is the right gate for those, and
 # overriding it here would re-litigate that decision through the back door.
 #
 # What IS left, and what this pins: the ENV above disables the autoupdater *because the integrity

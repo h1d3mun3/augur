@@ -16,8 +16,7 @@ import Darwin
 // must exist (fail-closed: we refuse to run with no policy). Both datapaths share
 // one Filter so the container (HTTP CONNECT) and macOS VM (SOCKS) paths behave identically.
 //
-// Security contract for this filter: docs/security-reviews/INVARIANTS.md — a change
-// that breaks an invariant there is a contract change (see that file's header).
+// This is a security-critical filter: every undecidable case must fail closed.
 
 struct Options {
     var allowlist = ""
@@ -35,7 +34,7 @@ struct Options {
     // direction, so an idle guest can't pin a connection slot forever (#101). 900s is well
     // beyond any real streaming gap (SSE tokens flow sub-second; idle keep-alive connections
     // are closed and transparently reopened) yet bounds the slot-pinning DoS. 0 disables it
-    // (pre-#101 infinite-idle behavior). Precedence: --idle-timeout > AUGUR_PROXY_IDLE_TIMEOUT > default.
+    // (an idle tunnel stays open indefinitely). Precedence: --idle-timeout > AUGUR_PROXY_IDLE_TIMEOUT > default.
     var idleTimeoutSecs = 900
 }
 
@@ -105,7 +104,7 @@ func parseNonNegative(_ s: String, _ flag: String) -> Int {
 
 /// Read + parse the allowlist file. Returns nil if the file can't be read (the
 /// caller fails closed by refusing to start / keeping the old policy on reload).
-/// Delegates to the testable core (see AllowlistTests / invariant I6).
+/// Delegates to the testable core (see AllowlistTests).
 func loadAllowlist(_ path: String) -> Allowlist? { Allowlist.fromFile(path) }
 
 // ── Boot ──────────────────────────────────────────────────────────────────────

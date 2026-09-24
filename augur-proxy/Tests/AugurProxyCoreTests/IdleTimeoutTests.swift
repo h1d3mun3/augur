@@ -75,7 +75,7 @@ final class IdleTimeoutTests: XCTestCase {
         XCTAssertEqual(classifyRead(n: -1, wouldBlock: false, idleEnabled: false), .error)
     }
 
-    // Legacy parity: with idle OFF, every n<=0 maps to a teardown, exactly like the old `n<=0 break`.
+    // With idle OFF, every n<=0 maps to a teardown, exactly like a plain `n<=0 break`.
     func testClassifyReadLegacyParityWhenIdleOff() {
         XCTAssertEqual(classifyRead(n: 0,  wouldBlock: false, idleEnabled: false), .eof)
         XCTAssertEqual(classifyRead(n: -1, wouldBlock: true,  idleEnabled: false), .error)
@@ -94,7 +94,7 @@ final class IdleTimeoutTests: XCTestCase {
     func testClassifyWriteZeroAndErrorAreTeardown() {
         XCTAssertEqual(classifyWrite(w: 0,  wouldBlock: false, idleEnabled: true),  .error)  // 0 bytes written
         XCTAssertEqual(classifyWrite(w: -1, wouldBlock: false, idleEnabled: true),  .error)  // genuine error
-        XCTAssertEqual(classifyWrite(w: -1, wouldBlock: true,  idleEnabled: false), .error)  // idle off → legacy break
+        XCTAssertEqual(classifyWrite(w: -1, wouldBlock: true,  idleEnabled: false), .error)  // idle off → plain break
     }
 
     // MARK: idlePollSecs

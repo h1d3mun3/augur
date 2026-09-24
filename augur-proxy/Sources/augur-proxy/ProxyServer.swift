@@ -29,7 +29,7 @@ final class ProxyServer {
     private let gauge: InFlightGauge
     /// Tear down an established tunnel after this many seconds with no bytes moving in EITHER
     /// direction, so an idle guest can't pin a `connectionCap` slot forever (#101). `0` disables
-    /// it (pre-#101 infinite-idle behavior). Tunable via --idle-timeout / AUGUR_PROXY_IDLE_TIMEOUT.
+    /// it (an idle tunnel stays open indefinitely). Tunable via --idle-timeout / AUGUR_PROXY_IDLE_TIMEOUT.
     private let idleTimeoutSecs: Int
 
     init(filter: Filter, log: DecisionLog, publicOnly: Bool, maxConnections: Int = 128,
