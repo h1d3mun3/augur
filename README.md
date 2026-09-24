@@ -256,6 +256,8 @@ augur update --macos    # update CLI tools in the base VM
 augur version --macos   # show augur version (macOS mode)
 ```
 
+### Concurrent VM limit
+
 > **At most two macOS VMs can run at once.** Apple's macOS license permits up to two virtualized
 > macOS instances per Mac, and Virtualization.framework enforces that limit: starting a third
 > running macOS guest fails. That covers every macOS guest on the host, not just augur's. Each
@@ -347,7 +349,7 @@ clone is gone for good. Both are accepted, documented trade-offs, not oversights
 ### Requirements
 
 - macOS (Apple Silicon)
-- At most two macOS VMs running at once per Mac (Apple's limit, see [Usage](#usage))
+- At most two macOS VMs running at once per Mac (Apple's limit, see [Concurrent VM limit](#concurrent-vm-limit))
 - Xcode / Swift toolchain (to build the bundled `augur-vm` backend via `bash install`)
 - Go (`brew install go`), so `bash install` can build `augur-gvproxy`. Egress filtering is on by
   default, and `augur up --macos` fails closed without it unless you pass `--no-egress`.
