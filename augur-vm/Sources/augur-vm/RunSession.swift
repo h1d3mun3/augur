@@ -2,10 +2,10 @@ import Foundation
 import Virtualization
 
 /// Boots a VM and keeps the process resident for its lifetime (the `run` command).
-/// Headless mode (M2) parks on `dispatchMain()`; GUI mode (M3, see GUIRun.swift)
+/// Headless mode parks on `dispatchMain()`; GUI mode (see GUIRun.swift)
 /// runs an AppKit window for manual Setup Assistant. Networking is NAT with the
 /// VM's persisted MAC so `ip` can find the lease. A pidfile (run.pid) records the
-/// host PID so `list` can report running state and `stop` (M4) can signal it.
+/// host PID so `list` can report running state and `stop` can signal it.
 final class RunSession: NSObject, VZVirtualMachineDelegate {
     static var shared: RunSession?
 

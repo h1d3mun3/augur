@@ -144,7 +144,7 @@ final class InstallSession {
         // Fixed, unfiltered NAT: install time has no untrusted guest workload yet,
         // and — like the graphics/keyboard/pointing devices VMConfigBuilder already
         // attached above — VZ just needs a full device set to avoid trapping on VM
-        // construction. `run` (M2/M3) rebuilds a full runtime config, including the
+        // construction. `run` rebuilds a full runtime config, including the
         // real network choice, from the persisted bundle.
         let network = VZVirtioNetworkDeviceConfiguration()
         network.attachment = VZNATNetworkDeviceAttachment()

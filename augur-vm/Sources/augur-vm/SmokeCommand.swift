@@ -3,10 +3,10 @@ import Foundation
 import Virtualization
 import Security
 
-/// M0 acceptance test: proves (1) Virtualization.framework links and loads, and
+/// Acceptance test: proves (1) Virtualization.framework links and loads, and
 /// (2) the running binary actually carries the com.apple.security.virtualization
 /// entitlement. Reading our own code signature avoids having to boot a real VM just
-/// to validate the signing pipeline — that comes at M1.
+/// to validate the signing pipeline.
 struct SmokeCommand: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "smoke",

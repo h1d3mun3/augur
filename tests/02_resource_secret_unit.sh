@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Tier 0 — resource-bound + secret-value hardening (pure functions, runs anywhere).
 #
-# F2: validate_secret_value rejects a single-quote / control-byte secret (the per-value contract)
-#     BEFORE it is interpolated into the macOS ~/.augur-env writer as export VAR='<value>'.
-# F4: a guest-writable ./.augur/resources.conf CPU/MEMORY value is clamped to a sane range so a
-#     hostile value (e.g. MEMORY=9999g) cannot over-commit / DoS the host on the next `augur up`.
-#     An explicit AUGUR_* env override is operator intent and is deliberately NOT clamped.
+# - validate_secret_value rejects a single-quote / control-byte secret (the per-value contract)
+#   BEFORE it is interpolated into the macOS ~/.augur-env writer as export VAR='<value>'.
+# - A guest-writable ./.augur/resources.conf CPU/MEMORY value is clamped to a sane range so a
+#   hostile value (e.g. MEMORY=9999g) cannot over-commit / DoS the host on the next `augur up`.
+#   An explicit AUGUR_* env override is operator intent and is deliberately NOT clamped.
 #
 # Same slice-by-name technique as 01_egress_allowlist_unit.sh: augur's entry-point never runs.
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/.." && pwd)"
@@ -25,7 +25,7 @@ error() { :; }
 warn()  { :; }
 source "$helpers"
 
-# ── F2 — validate_secret_value ────────────────────────────────────────────────
+# ── validate_secret_value ─────────────────────────────────────────────────────
 section "F2 — validate_secret_value rejects quote/control-byte secrets (C3)"
 validate_secret_value K 'sk-ant-abc123_.-'      && ok "accepts a normal token"                  || fail "accepts a normal token"
 validate_secret_value K 'ghp_ABCdef0123456789'  && ok "accepts an alnum/underscore token"       || fail "accepts an alnum/underscore token"
@@ -34,7 +34,7 @@ validate_secret_value K $'abc\ndef'             && fail "rejects an embedded new
 validate_secret_value K $'abc\tdef'             && fail "rejects an embedded tab"                || ok "rejects an embedded tab"
 validate_secret_value K $'abc\x01def'           && fail "rejects a control byte"                 || ok "rejects a control byte"
 
-# ── F4 — resources.conf clamping ──────────────────────────────────────────────
+# ── resources.conf clamping ───────────────────────────────────────────────────
 section "F4 — guest-writable resources.conf values are clamped"
 conf="$WORK/resources.conf"
 export AUGUR_PROJECT_RESOURCES_CONF="$conf"

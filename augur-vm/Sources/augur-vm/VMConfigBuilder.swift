@@ -16,8 +16,8 @@ import Virtualization
 ///     set to avoid trapping on VM construction.
 ///   - RunSession.swift attaches the security-sensitive NAT-vs-vfkit choice (the
 ///     security-reviewed egress-filtering datapath), plus an
-///     optional virtiofs directory-sharing device. That logic stays untouched at
-///     its original call site — see RunSession.buildConfiguration().
+///     optional virtiofs directory-sharing device. That logic stays at its call
+///     site — see RunSession.buildConfiguration().
 enum VMConfigBuilder {
     static func build(
         hardwareModel: VZMacHardwareModel,
