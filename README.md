@@ -153,8 +153,11 @@ What you get instead is a directory you populate on purpose:
   read-only into the VM and wired the same way), but through a **virtiofs share** rather than a bind
   mount, on every macOS version.
 - **macOS VM mode caveat on macOS 26.x — host-side edits need a VM restart.** When the host or the
-  guest runs macOS 26.x, the guest's virtiofs client keeps serving **stale file data** after a
-  host-side edit. So if you change the profile while a VM is running, run
+  guest runs macOS 26.x, a file the guest has **already read** keeps returning the content from that
+  read after the host edits it: the guest's virtiofs client holds on to the cached copy and never
+  re-fetches it. The stale copy comes from the guest's own earlier read, not from anything cached
+  up front at boot — but profile files are read as soon as the guest is wired and Claude Code
+  starts, so in practice a profile edit made while the VM is running is not seen. Run
   `augur down --macos && augur up --macos` to pick it up. Container mode is unaffected.
 
   **On macOS 27.0+ (host and guest) the defect no longer reproduces**, and host-side edits show up
