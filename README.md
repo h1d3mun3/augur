@@ -582,8 +582,10 @@ brew install gh
 gh auth login
 ```
 
-`gh` credentials are shared automatically in both modes (token injected via `GH_TOKEN`;
-the host's `~/.config/gh` is mounted read-only so the guest can't rewrite it).
+`gh` credentials are shared automatically in both modes: the host's `gh auth token` is injected
+as `GH_TOKEN`, and a guest-only git credential helper makes HTTPS `git push` work off it. In
+Container mode the host's `~/.config/gh` is also mounted read-only (so the guest can't rewrite it);
+macOS VM mode does not share `~/.config/gh` at all.
 
 ---
 
