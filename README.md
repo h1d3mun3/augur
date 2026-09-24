@@ -85,68 +85,28 @@ Don't need Xcode? `augur build && augur claude` gives you the lightweight
 
 ---
 
-## Container mode (default)
+## Install
 
-Lightweight Linux container. Suitable for most projects that don't need Xcode.
-
-The container is hosted by **Apple Container** (`container`, github.com/apple/container) on **macOS 26+** — native to macOS, no Docker Desktop, no licensing; each container runs in its own lightweight Linux VM. `augur status` shows the active engine.
-
-### Setup
+Both modes share one install. The `release` branch is the gated stable channel:
 
 ```bash
-# 1. Get augur — the `release` branch is the gated stable channel
 git clone -b release https://github.com/h1d3mun3/augur.git
 cd augur
-
-# 2. Run the install script
+brew install go     # macOS VM mode only: needed for egress filtering (augur-gvproxy)
 bash install
-
-# 3. Reload shell config
-source ~/.zshrc  # or source ~/.bashrc
-
-# 4. Build the image
-augur build
+source ~/.zshrc     # or source ~/.bashrc
 ```
 
-The install script copies `Dockerfile` and `augur` to `~/.augur/` and configures `PATH`. Safe to re-run.
+The install script copies `augur` and `Dockerfile` to `~/.augur/`, refreshes the managed egress
+baseline (`~/.augur/augur.conf.default`), builds the host egress proxy `augur-proxy` (needs Swift)
+and, on macOS, the VM backend `augur-vm` (needs Swift) and `augur-gvproxy` (needs Go), and
+configures `PATH`. Safe to re-run.
 
 > **Stable vs. bleeding-edge.** Cloning `-b release` installs the latest release that passed the full macOS-VM E2E gate — `augur version` then reports a bare `X.Y.Z`. To follow development instead, clone `main` (the default branch); `augur version` reports `X.Y.Z-dev+<sha>` so you can always tell the two apart. Pin an exact version with `git clone --branch vX.Y.Z`. See [Cutting a release](#cutting-a-release-structural-gate).
 
-> **Apple Container only:** `augur build`/`augur update` implicitly starts a BuildKit "builder" VM (~2 CPU/2GiB) that keeps running after the build finishes, to speed up the next one. It's a single instance shared by every `container build` on the machine — not scoped to a project — so augur deliberately never stops it for you (doing so from one project's `down`/`build` could kill another project's in-flight build). If you want to free the RAM/CPU, run `container builder stop` yourself once you're sure nothing else is building.
+---
 
-### Usage
-
-```bash
-cd ~/projects/my-app
-
-augur up [--swift VERSION]      # start the container
-augur claude                    # launch Claude Code
-augur shell                     # open a bash shell (for debugging)
-augur setup-token               # get a Claude subscription token (runs in the guest, saves on the host)
-augur down                      # stop the container (kept for a fast, cache-preserving restart)
-augur destroy                   # stop and remove the container entirely (+ its egress network)
-augur status                    # show status, toolchain, and auth info
-augur list                      # list all augur containers across projects, with state + address
-augur build [--swift VERSION]   # build the container image
-augur update [--swift VERSION]  # rebuild image with latest tool versions
-augur init-conf                 # scaffold ./.augur/{allowlist,resources}.conf
-augur version                   # show augur version
-```
-
-### File access
-
-| Path | Description |
-|------|-------------|
-| Current directory | mounted at `/workspace-<project>` (read/write), named after the directory |
-| `~/.claude/projects/-workspace-<project>` | **only this project's** Claude history is shared (read/write) — not the rest of `~/.claude`, so other projects' transcripts and host auth/settings stay invisible |
-| `~/.claude/agents/` | **this project's** user-level custom subagent definitions (`/agents`) are persisted (read/write), keyed per-project under `~/.augur/claude-agents/<project>` — so they survive `augur down`/`up` **and** `destroy`/recreate. Isolated per project (not the host's global `~/.claude/agents`), so a guest can't plant a subagent read by another project. Project-level `.claude/agents/` in the repo work too, via the workspace mount. |
-| `~/.augur/claude-profile/` | **opt-in** operator profile, mounted **read-only** — your personal `commands/`, `skills/`, `rules/`, `output-styles/`, `workflows/`, `themes/`, `CLAUDE.md`, `settings.json` and `keybindings.json` are wired into the guest's `~/.claude/`. Absent or empty (the default) wires nothing. See [Operator profile](#operator-profile). |
-| `~/.config/gh/` | mounted **read-only** (the container can read but not rewrite it; the token is injected via `GH_TOKEN`) |
-| `~/.gitconfig` | mounted read-only |
-| Claude auth | injected via env (`CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY`) — the host's credential store is never mounted |
-| Everything else | **not visible to the container** — including the rest of `~/.claude` and the host's `~/.claude.json`, which augur never reads, copies, or mounts ([ADR-0013](docs/decisions/0013-claude-config-inheritance.md)) |
-
-#### Operator profile
+## Operator profile
 
 augur **never mirrors your host `~/.claude`** — that tree is executable config (hooks, skills,
 commands), it is full of host-absolute paths that break in a Linux guest, and its permission set was
@@ -189,13 +149,25 @@ What you get instead is a directory you populate on purpose:
 - **Your own files are never deleted.** If the guest already had a real `~/.claude/commands` or
   `~/.claude/skills` when you first populate the profile, augur moves it aside to
   `<name>.pre-profile` rather than replacing it (an empty one is simply dropped).
-- **macOS VM mode caveat — host-side edits need a VM restart.** The profile works there (it is
-  shared read-only into the VM and wired the same way), but macOS mode reaches it over a **virtiofs
-  share** rather than a bind mount, and the macOS guest's virtiofs client keeps serving **stale file
-  data** after a host-side edit. So if you change the profile while a VM is running, run
+- **macOS VM mode reaches the profile over a virtiofs share.** The profile works there (it is shared
+  read-only into the VM and wired the same way), but through a **virtiofs share** rather than a bind
+  mount, on every macOS version.
+- **macOS VM mode caveat on macOS 26.x — host-side edits need a VM restart.** When the host or the
+  guest runs macOS 26.x, a file the guest has **already read** keeps returning the content from that
+  read after the host edits it: the guest's virtiofs client holds on to the cached copy and never
+  re-fetches it. The stale copy comes from the guest's own earlier read, not from anything cached
+  up front at boot — but profile files are read as soon as the guest is wired and Claude Code
+  starts, so in practice a profile edit made while the VM is running is not seen. Run
   `augur down --macos && augur up --macos` to pick it up. Container mode is unaffected.
 
-  Three things are worth knowing, because each is the opposite of what seems reasonable:
+  **On macOS 27.0+ (host and guest) the defect no longer reproduces**, and host-side edits show up
+  in a running guest within about a second. That was confirmed on one machine (M1 Max, build
+  26A428), not across hardware or 27.x point releases. See
+  [ADR-0019](./docs/decisions/0019-macos27-virtiofs-staleness-resolved.md) for what was tested and
+  what it does not establish.
+
+  On macOS 26.x, three things are worth knowing, because each is the opposite of what seems
+  reasonable:
 
   - **It is not specific to read-only shares.** The read-write workspace share behaves identically,
     so this is not only about the profile — edit a source file on the host and a running guest may
@@ -207,68 +179,23 @@ What you get instead is a directory you populate on purpose:
     `vm run` rebuilds the share device — Virtualization.framework cannot rebuild a share device on a
     live VM in any case.
 
-  This is a platform defect, and augur accepts it rather than working around it — see
-  [ADR-0017](./docs/decisions/0017-accept-virtiofs-staleness.md) for the measurements, the
-  mitigation that was tried and withdrawn, and what would bring it back.
+  On macOS 26.x this is a platform defect, and augur accepts it rather than working around it — see
+  [ADR-0017](./docs/decisions/0017-accept-virtiofs-staleness.md) for the measurements, why the
+  mitigation was removed, and what would bring it back.
   Issues [#124](https://github.com/h1d3mun3/augur/issues/124) and
-  [#135](https://github.com/h1d3mun3/augur/issues/135).
+  [#135](https://github.com/h1d3mun3/augur/issues/135) (closed by ADR-0019).
 
 Your **repository's** own `.claude/settings.json`, `CLAUDE.md`, `.claude/commands/`,
 `.claude/skills/` and `.mcp.json` already work with no setup — they arrive inside the workspace
 mount. The profile is for what a repo cannot supply because it is yours, not the project's.
 
-#### Prompt history across a recreate
+## Security notes
 
-augur recreates the container for its own reasons — a rotated credential, an egress toggle, a memory
-change, `augur build`/`update`/`install-cert`. That discards the writable layer, and your up-arrow
-prompt history (`~/.claude/history.jsonl`) lives there rather than on a mount. So augur keeps a
-small, capped snapshot of just that file under `~/.augur/claude-carryover/<project>` (mode `0600`) —
-taken when you exit `augur claude`/`shell`, on `augur down`, and before `build`/`update` throw the
-layer away — and restores it into the fresh container.
+These apply to both modes.
 
-It carries **prompt text only**: no credentials, no tool permissions, no trust state. And
-**`augur destroy` deletes it**, so the clean-guest button stays a clean-guest button. Container mode
-only — the macOS clone already survives `down`.
+> **The read/write workspace mount includes `.git` — treat it as attacker-controlled.** A prompt-injected agent running inside the container or VM can write `.git/hooks/pre-commit` (or `post-checkout`, `post-merge`, …) into the mounted repo. Git runs repo-local hooks with no trust prompt, so the next `git` command *you* run on the **host** in that repo executes guest-authored code at your full host-user privilege — a complete escape of both the container/VM boundary and the egress allowlist. This isn't a bug augur can close in software: it's inherent to mounting a repo read-write so an agent can edit it. Review diffs before trusting them, and treat `.git/hooks` (and anything else the host later runs unreviewed, e.g. a `Makefile` or `.envrc`) in an augur-touched repo as attacker-controlled until inspected. See `docs/security-reviews/2026-07-10-egress.md` §6 item 12.
 
-> Auth is env-based in both modes now. If you only ever logged in via the browser, run `augur setup-token` (or set `ANTHROPIC_API_KEY`); see [API keys and authentication](#api-keys-and-authentication). Upgrading from an older augur requires a one-time `augur build` (the image now pre-creates the scoped history dir). To activate `~/.claude/agents` persistence on a container/VM that already exists, recreate it once — `augur destroy && augur up` (or `augur down --macos && augur up --macos`); new containers/VMs get it automatically.
-
-> **The read/write workspace mount includes `.git` — treat it as attacker-controlled.** A prompt-injected agent running inside the container can write `.git/hooks/pre-commit` (or `post-checkout`, `post-merge`, …) into the mounted repo. Git runs repo-local hooks with no trust prompt, so the next `git` command *you* run on the **host** in that repo executes guest-authored code at your full host-user privilege — a complete escape of both the container boundary and the egress allowlist. This isn't a bug augur can close in software: it's inherent to mounting a repo read-write so an agent can edit it. Review diffs before trusting them, and treat `.git/hooks` (and anything else the host later runs unreviewed, e.g. a `Makefile` or `.envrc`) in an augur-touched repo as attacker-controlled until inspected. See `docs/security-reviews/2026-07-10-egress.md` §6 item 12.
-
-> Claude Code's `--worktree` isn't specially supported (`augur claude --worktree ...` won't forward the flag). If you want it anyway: run `augur shell`, then type `claude --worktree <name>` yourself at the prompt — the worktree's files/git state persist fine, and its conversation history survives `augur down && up` too — `cmd_up` mounts the whole `~/.claude/projects` parent to a per-project host dir, so every cwd-keyed leaf under this project (the main checkout **and** any worktree) is stored host-side and persists (only `augur destroy` plus deleting the host history dir removes it). See `docs/decisions/0004-no-special-worktree-support.md` for the full trade-offs.
-
-### Disk cleanup
-
-`augur down` now **stops** the container and keeps it (like `augur down --macos` keeps its VM
-clone) so the next `augur up` restarts it fast, preserving the writable layer's caches and tool
-state that live outside the mounted workspace. **`augur destroy`** removes *this project's*
-container and its egress network when you're done with it (or to force a clean, from-scratch
-container). `augur update`/`augur install-cert` rebuild the image, self-prune the previous
-generation (`container image prune`), and remove this project's container so the new image takes
-effect on the next `up` — other projects on the same image tag need their own `augur destroy &&
-augur up`. For anything beyond that — stopped containers from projects you're finished with, or
-reclaiming the shared builder's own resources — use `augur destroy` per project, or Apple
-Container's own commands directly. `augur list` shows every augur container across projects
-(filtered to the `augur-` prefix, unlike raw `container list`), so you can spot finished ones by
-their project slug first:
-
-```bash
-container prune              # remove stopped containers
-container image prune --all  # remove dangling AND unused tagged base images
-container builder stop       # stop the shared BuildKit builder (see note above), or:
-container builder delete     # delete it outright — also clears its own build cache
-                              # (~/Library/Application Support/com.apple.container/build)
-```
-
-`augur` deliberately doesn't wrap these in a command of its own — they're already one-liners
-in Apple's CLI, and disk cleanup beyond the automatic self-prune is rare enough not to carry
-as a maintained wrapper. `container builder delete` is machine-wide, not scoped to this
-project: it aborts any build in flight anywhere else on the Mac. See
-`docs/decisions/0005-no-prune-command.md`.
-
-### Requirements
-
-- **Apple Container** (`container`) on macOS 26+
-- bash
+> Claude Code's `--worktree` isn't specially supported (`augur claude --worktree ...` won't forward the flag). If you want it anyway: run `augur shell` (or `augur shell --macos`), then type `claude --worktree <name>` yourself at the prompt — the worktree's files/git state persist fine, and its conversation history survives `augur down && up` (or `augur down --macos && augur up --macos`) too. Both modes mount the guest's whole `~/.claude/projects` parent to a per-project host dir — `~/.augur/claude-projects/<project>-<path hash>` in Container mode, `~/.augur/claude-projects/<vm>` in macOS VM mode — so every cwd-keyed leaf under this project (the main checkout **and** any worktree) is stored host-side and persists (only `augur destroy`/`augur destroy --macos` plus deleting the host history dir removes it). See `docs/decisions/0004-no-special-worktree-support.md` for the full trade-offs.
 
 ---
 
@@ -282,17 +209,13 @@ The VM is isolated per project — each directory gets its own thin clone of the
 #### 1. Build the VM backend
 
 augur ships its own VM backend (`augur-vm`), a small Swift CLI built directly on
-Apple's Virtualization.framework — no third-party tools required.
-
-```bash
-# on the macOS host (needs the Xcode / Swift toolchain)
-git clone -b release https://github.com/h1d3mun3/augur.git && cd augur   # `-b release` = stable; drop -b for dev (main)
-bash install        # builds & installs augur-vm into ~/.augur
-```
+Apple's Virtualization.framework — no third-party tools required. [Install](#install) builds it
+and installs it into `~/.augur` (on the macOS host; needs the Xcode / Swift toolchain, plus Go for
+`augur-gvproxy`, the macOS VM egress datapath).
 
 #### 2. Download Apple-signed assets
 
-- **IPSW** — macOS restore image: System Preferences > Software Update
+- **IPSW** — macOS restore image: https://developer.apple.com/download/
 - **Xcode XIP** — Xcode installer: https://developer.apple.com/download/all/
 
 #### 3. Build the base VM (one-time, ~75 min)
@@ -341,9 +264,11 @@ augur down --macos      # stop the VM (keeps the clone — next up is fast)
 augur destroy --macos   # stop and remove the project VM clone
 augur status --macos    # show VM status, toolchain, and auth info
 augur list --macos      # list all VMs and their state
-augur update --macos    # update Claude Code in the base VM
+augur update --macos    # update CLI tools in the base VM
 augur version --macos   # show augur version (macOS mode)
 ```
+
+### Concurrent VM limit
 
 > **At most two macOS VMs can run at once.** Apple's macOS license permits up to two virtualized
 > macOS instances per Mac, and Virtualization.framework enforces that limit: starting a third
@@ -360,7 +285,7 @@ absent from a freshly cloned VM. So macOS mode injects a credential through the 
 every `up` (the same way it does for the GitHub token):
 
 - `CLAUDE_CODE_OAUTH_TOKEN` — subscription token; either set the env var / save it to
-  `~/.claude_code_oauth_token`, or run **`augur setup-token`**: it runs `claude setup-token`
+  `~/.claude_code_oauth_token`, or run **`augur setup-token --macos`**: it runs `claude setup-token`
   inside the guest (so you don't install Claude Code on the host), then you paste the token
   back once and augur saves it to `~/.claude_code_oauth_token`.
 - `ANTHROPIC_API_KEY` — Console API key (env or `~/.anthropic_api_key`). Takes priority if both are set.
@@ -368,7 +293,7 @@ every `up` (the same way it does for the GitHub token):
 ### Guest clock
 
 A cloned macOS guest boots with its wall clock a fixed amount **behind** the host's (measured at ~95
-minutes on the machine this was found on — a constant inherited from the base VM's saved state, not
+minutes on one host — a constant inherited from the base VM's saved state, not
 drift), and it cannot fix itself: NTP is UDP/123 and macOS VM egress drops UDP by design. So augur
 **sets the guest's clock from the host's** over SSH — on `up --macos` (both a fresh boot and a
 reconcile of an already-running VM) and on `claude`/`shell --macos`, which attach without going
@@ -383,23 +308,14 @@ warning, not a failed `up`. See
 |------|-------------|
 | Current directory | exposed at `~/workspace-<project>` in the VM (read/write, virtiofs auto-mount) |
 | `~/.gitconfig` | **copied** on VM start (unlike container mode, which mounts it read-only). augur then rewrites `credential.https://github.com.helper` in **the guest's copy** so HTTPS `git push` works off `GH_TOKEN`; any helper the host set for `github.com` is replaced, including the pair `gh auth setup-git` writes, because those need a host path or the host Keychain the guest does not have. Your host file is never modified. |
-| `~/.config/gh/` | **not shared** in macOS VM mode. It was, but nothing ever wired it to `~/.config/gh` inside the VM, so the config was never read — exposure without a feature. `gh` works there off the injected `GH_TOKEN`, which is the real auth path on a macOS host anyway (the token lives in the Keychain, not in `hosts.yml`). Container mode still mounts it read-only at the guest's real path, where it does work. |
-| Claude history | **only this project's** history is shared, in a per-VM isolated dir (`~/.augur/claude-projects/<vm>`), so other projects' transcripts stay invisible. Cross-mode (container↔macOS) resume is no longer shared. |
+| `~/.config/gh/` | **not shared** in macOS VM mode. A share would land under `/Volumes/My Shared Files/` and nothing wires it to `~/.config/gh` inside the VM, so the config would never be read — exposure without a feature. `gh` works there off the injected `GH_TOKEN`, which is the real auth path on a macOS host anyway (the token lives in the Keychain, not in `hosts.yml`). Container mode mounts it read-only at the guest's real path, where it does work. |
+| Claude history | **only this project's** history is shared, in a per-VM isolated dir (`~/.augur/claude-projects/<vm>`), so other projects' transcripts stay invisible. History is not shared across modes, so a container session can't be resumed in the macOS VM or vice versa. |
 | Claude auth | **not** shared — injected via env (the macOS Keychain is unreadable over SSH; see above) |
 | Everything else | **not visible to the VM** |
 
 > The macOS guest auto-mounts the shared directory under `/Volumes/My Shared Files/workspace-<project>`; augur
 > symlinks it to `~/workspace-<project>`. The sealed system volume can't host a symlink at `/workspace`, so the
 > per-project `~/workspace-<project>` path is used in the VM (container mode uses `/workspace-<project>`).
-
-> Same `.git/hooks` host-code-execution risk as container mode: the workspace mount here is read/write too, so a
-> prompt-injected agent can plant a hook that runs on the host at your privilege the next time you `git` in this
-> repo. See the note in [Container mode's File access](#file-access) section.
-
-> Same caveat as container mode for Claude Code's `--worktree`: not specially supported, but `augur shell --macos` +
-> manually running `claude --worktree <name>` works today. Unlike container mode, its conversation history *does*
-> survive `augur down --macos`/`up --macos` (the VM's disk is stopped, not destroyed, until `augur destroy --macos`).
-> See `docs/decisions/0004-no-special-worktree-support.md`.
 
 ### Running `xcodebuild test`
 
@@ -427,8 +343,8 @@ If builds are flaky from the shared mount (virtiofs is not tuned for heavy I/O �
 
 `augur destroy --macos` removes the *current* project's VM clone — but augur names a clone
 from its project directory, so if that directory is later renamed or moved, the old clone
-becomes unreachable by `destroy` (it's still on disk, just under a name `destroy` no longer
-computes). `augur list --macos` still shows it; remove it directly:
+becomes unreachable by `destroy` (it's still on disk, just under a name `destroy` doesn't
+compute). `augur list --macos` still shows it; remove it directly:
 
 ```bash
 augur list --macos       # every VM the store knows about, by name — not just this project's
@@ -445,10 +361,109 @@ clone is gone for good. Both are accepted, documented trade-offs, not oversights
 ### Requirements
 
 - macOS (Apple Silicon)
-- At most two macOS VMs running at once per Mac (Apple's limit, see [Usage](#usage-1))
+- At most two macOS VMs running at once per Mac (Apple's limit, see [Concurrent VM limit](#concurrent-vm-limit))
 - Xcode / Swift toolchain (to build the bundled `augur-vm` backend via `bash install`)
+- Go (`brew install go`), so `bash install` can build `augur-gvproxy`. Egress filtering is on by
+  default, and `augur up --macos` fails closed without it unless you pass `--no-egress`.
 - macOS IPSW (Apple-signed)
 - Xcode XIP (Apple-signed, from developer.apple.com)
+
+---
+
+## Container mode (default)
+
+Lightweight Linux container. Suitable for most projects that don't need Xcode.
+
+The container is hosted by **Apple Container** (`container`, github.com/apple/container) on **macOS 26+** — native to macOS, no Docker Desktop, no licensing; each container runs in its own lightweight Linux VM. `augur status` shows the active engine.
+
+### Setup
+
+After [Install](#install), build the image:
+
+```bash
+augur build
+```
+
+> **Apple Container only:** `augur build`/`augur update` implicitly starts a BuildKit "builder" VM (~2 CPU/2GiB) that keeps running after the build finishes, to speed up the next one. It's a single instance shared by every `container build` on the machine — not scoped to a project — so augur deliberately never stops it for you (doing so from one project's `down`/`build` could kill another project's in-flight build). If you want to free the RAM/CPU, run `container builder stop` yourself once you're sure nothing else is building.
+
+### Usage
+
+```bash
+cd ~/projects/my-app
+
+augur up [--swift VERSION]      # start the container
+augur claude                    # launch Claude Code
+augur shell                     # open a bash shell (for debugging)
+augur setup-token               # get a Claude subscription token (runs in the guest, saves on the host)
+augur down                      # stop the container (kept for a fast, cache-preserving restart)
+augur destroy                   # stop and remove the container entirely (+ its egress network)
+augur status                    # show status, toolchain, and auth info
+augur list                      # list all augur containers across projects, with state + address
+augur build [--swift VERSION]   # build the container image
+augur update [--swift VERSION]  # rebuild image with latest tool versions
+augur init-conf                 # scaffold ./.augur/{allowlist,resources}.conf
+augur version                   # show augur version
+```
+
+### File access
+
+| Path | Description |
+|------|-------------|
+| Current directory | mounted at `/workspace-<project>` (read/write), named after the directory |
+| `~/.claude/projects/-workspace-<project>` | **only this project's** Claude history is shared (read/write) — not the rest of `~/.claude`, so other projects' transcripts and host auth/settings stay invisible |
+| `~/.claude/agents/` | **this project's** user-level custom subagent definitions (`/agents`) are persisted (read/write), keyed per-project under `~/.augur/claude-agents/<project>` — so they survive `augur down`/`up` **and** `destroy`/recreate. Isolated per project (not the host's global `~/.claude/agents`), so a guest can't plant a subagent read by another project. Project-level `.claude/agents/` in the repo work too, via the workspace mount. |
+| `~/.augur/claude-profile/` | **opt-in** operator profile, mounted **read-only** — your personal `commands/`, `skills/`, `rules/`, `output-styles/`, `workflows/`, `themes/`, `CLAUDE.md`, `settings.json` and `keybindings.json` are wired into the guest's `~/.claude/`. Absent or empty (the default) wires nothing. See [Operator profile](#operator-profile). |
+| `~/.config/gh/` | mounted **read-only** (the container can read but not rewrite it; the token is injected via `GH_TOKEN`) |
+| `~/.gitconfig` | mounted read-only |
+| Claude auth | injected via env (`CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY`) — the host's credential store is never mounted |
+| Everything else | **not visible to the container** — including the rest of `~/.claude` and the host's `~/.claude.json`, which augur never reads, copies, or mounts ([ADR-0013](docs/decisions/0013-claude-config-inheritance.md)) |
+
+#### Prompt history across a recreate
+
+augur recreates the container for its own reasons — a rotated credential, an egress toggle, a memory
+change, `augur build`/`update`/`install-cert`. That discards the writable layer, and your up-arrow
+prompt history (`~/.claude/history.jsonl`) lives there rather than on a mount. So augur keeps a
+small, capped snapshot of just that file under `~/.augur/claude-carryover/<project>` (mode `0600`) —
+taken when you exit `augur claude`/`shell`, on `augur down`, and before `build`/`update` throw the
+layer away — and restores it into the fresh container.
+
+It carries **prompt text only**: no credentials, no tool permissions, no trust state. And
+**`augur destroy` deletes it**, so the clean-guest button stays a clean-guest button. Container mode
+only — the macOS clone already survives `down`.
+
+### Disk cleanup
+
+`augur down` **stops** the container and keeps it (like `augur down --macos` keeps its VM
+clone) so the next `augur up` restarts it fast, preserving the writable layer's caches and tool
+state that live outside the mounted workspace. **`augur destroy`** removes *this project's*
+container and its egress network when you're done with it (or to force a clean, from-scratch
+container). `augur update`/`augur install-cert` rebuild the image, self-prune the previous
+generation (`container image prune`), and remove this project's container so the new image takes
+effect on the next `up` — other projects on the same image tag need their own `augur destroy &&
+augur up`. For anything beyond that — stopped containers from projects you're finished with, or
+reclaiming the shared builder's own resources — use `augur destroy` per project, or Apple
+Container's own commands directly. `augur list` shows every augur container across projects
+(filtered to the `augur-` prefix, unlike raw `container list`), so you can spot finished ones by
+their project slug first:
+
+```bash
+container prune              # remove stopped containers
+container image prune --all  # remove dangling AND unused tagged base images
+container builder stop       # stop the shared BuildKit builder (see note above), or:
+container builder delete     # delete it outright — also clears its own build cache
+                              # (~/Library/Application Support/com.apple.container/build)
+```
+
+`augur` deliberately doesn't wrap these in a command of its own — they're already one-liners
+in Apple's CLI, and disk cleanup beyond the automatic self-prune is rare enough not to carry
+as a maintained wrapper. `container builder delete` is machine-wide, not scoped to this
+project: it aborts any build in flight anywhere else on the Mac. See
+`docs/decisions/0005-no-prune-command.md`.
+
+### Requirements
+
+- **Apple Container** (`container`) on macOS 26+
+- bash
 
 ---
 
@@ -508,7 +523,7 @@ In every mode the proxy decides by domain (the CONNECT host, or the TLS SNI / HT
 
 ### Requirements
 
-`install` builds the proxy (`augur-proxy`, Swift) automatically — both container and macOS VM modes run the native host `augur-proxy`. **macOS VM egress also needs Go** (for `augur-gvproxy`) — `brew install go`, then re-run `bash install`. Without it, macOS VM egress is unavailable but everything else works.
+`install` builds the proxy (`augur-proxy`, Swift) automatically — both container and macOS VM modes run the native host `augur-proxy`. **macOS VM egress also needs Go** (for `augur-gvproxy`) — `brew install go`, then re-run `bash install`. Without it, `augur up --macos` fails closed while egress filtering is on (the default); pass `--no-egress` to run the VM unfiltered. Container mode does not need Go.
 
 The host ports the proxy uses are derived per-project so two egress-enabled projects can run at once; override with `AUGUR_PROXY_HTTP_PORT` / `AUGUR_PROXY_SOCKS_PORT` / `AUGUR_SSH_FWD_PORT` if needed.
 
@@ -582,8 +597,10 @@ brew install gh
 gh auth login
 ```
 
-`gh` credentials are shared automatically in both modes (token injected via `GH_TOKEN`;
-the host's `~/.config/gh` is mounted read-only so the guest can't rewrite it).
+`gh` credentials are shared automatically in both modes: the host's `gh auth token` is injected
+as `GH_TOKEN`, and a guest-only git credential helper makes HTTPS `git push` work off it. In
+Container mode the host's `~/.config/gh` is also mounted read-only (so the guest can't rewrite it);
+macOS VM mode does not share `~/.config/gh` at all.
 
 ---
 
@@ -698,7 +715,7 @@ Branch protection only lets a commit onto `release` if a green `e2e/macos-vm` st
 for it, so **you can't ship something the E2E never ran against.** One subtlety: GitHub carries
 that satisfaction **through merge commits** — a merge commit whose merged-in parent has the status
 is accepted even though the merge commit itself has none. So if you gate the *pre-merge* bump
-commit (as `v0.10.1` was), the tagged merge commit is a *different* SHA — content-identical for a
+commit, the tagged merge commit is a *different* SHA — content-identical for a
 clean merge, but not literally the tested one. So **`release.yml` re-checks the `e2e/macos-vm`
 status on the tag-target commit itself and refuses to tag otherwise** — you must gate the
 **post-merge `main` tip** (step 2), or the release fails loudly. (`required_linear_history` is
