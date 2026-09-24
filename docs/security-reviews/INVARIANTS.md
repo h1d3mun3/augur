@@ -102,13 +102,20 @@ in time," this **prescribes** "what must never break." It changes rarely.
   `project_conf_domains` sanitization, that `write_merged_allowlist` drops guest-supplied junk and
   writes **outside the project tree**, and that two same-basename projects write **different**
   merged allowlists neither of which contains the other's approved domains) plus
-  `tests/32_proxy_per_mode.sh` (every per-project host-state path differs between two
-  same-basename projects while the slug is identical) plus `tests/11_construct_container.sh` and
-  `tests/30_macos_vm.sh` (the workspace-containment guard `require_safe_workspace`, `augur:4951` —
-  a workspace that CONTAINS `~/.augur` would put the merged allowlist itself inside the read-write
-  share, which is the same widening this invariant forbids; refused on both engines from the shared
-  dispatch tail, see `docs/decisions/0014-workspace-must-not-contain-augur.md`). The TOFU approval
-  itself (`check_project_conf_approved`) is ⚠ review-only.
+  `tests/32_proxy_per_mode.sh` (every per-project egress host-state path except the approval record
+  differs between two same-basename projects while the slug is identical) plus `tests/11_construct_container.sh` and
+  `tests/30_macos_vm.sh` (the workspace-containment guard `require_safe_workspace` — a workspace
+  that CONTAINS `~/.augur` would put the merged allowlist itself inside the read-write share, which
+  is the same widening this invariant forbids; refused on both engines from the shared dispatch
+  tail's `up|claude|shell|setup-token` case, see
+  `docs/decisions/0014-workspace-must-not-contain-augur.md`). The TOFU approval itself
+  (`check_project_conf_approved`) is 🟡 partly tested: `tests/01_egress_allowlist_unit.sh` drives the
+  `AUGUR_ACCEPT_PROJECT_CONF=1` accept, the non-interactive fail-closed refusal of a conf changed
+  after approval, and an accept under `set -e`; the interactive `[y/N]` branch and the
+  no-sha256-tool fail-closed branch are ⚠ review-only. ⚠ The full-path keying of the approval
+  record itself (`project_conf_hash_file`, under `~/.augur/project-hashes/`) is asserted by no
+  test: `tests/32`'s per-project path list omits it, and `tests/01`'s cross-project case cannot
+  observe a shared approval record.
 
 ### I8. Keep the private-IP dial guard always armed  ✅ test
 - **Rule:** Never pass `--allow-private` to `augur-proxy` on a production path. Before
@@ -166,7 +173,8 @@ in time," this **prescribes** "what must never break." It changes rarely.
 > Of the 10, I1–I8 are enforced by tests/self-tests; I9 is partial (entitlement only); I10 is
 > partial (Container mode test-enforced). The remaining review-only surface is the macOS half of
 > I10 (credentials not on argv: macOS goes through a file written over SSH stdin, which no test
-> asserts) and the hardware-dependent part of I9 (the live NIC count — the gvproxy UDP/ICMP drop is now probed
-> live on every `up --macos`). Note that "enforced by tests" does not extend to augur's own
+> asserts), the hardware-dependent part of I9 (the live NIC count — the gvproxy UDP/ICMP drop is now probed
+> live on every `up --macos`), and two gaps inside I7 (the TOFU gate's interactive and no-sha256
+> branches, and the approval record's full-path keying). Note that "enforced by tests" does not extend to augur's own
 > argv for I5 and I8: see their notes. For background on each item, see the newest
 > [review snapshot](./README.md).
