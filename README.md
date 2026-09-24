@@ -269,6 +269,9 @@ project: it aborts any build in flight anywhere else on the Mac. See
 
 - **Apple Container** (`container`) on macOS 26+
 - bash
+- A Swift toolchain (Xcode or the Command Line Tools), so `bash install` can build `augur-proxy`.
+  Egress filtering is on by default, and `augur up` fails closed without the proxy unless you pass
+  `--no-egress`.
 
 ---
 
@@ -287,6 +290,7 @@ Apple's Virtualization.framework — no third-party tools required.
 ```bash
 # on the macOS host (needs the Xcode / Swift toolchain)
 git clone -b release https://github.com/h1d3mun3/augur.git && cd augur   # `-b release` = stable; drop -b for dev (main)
+brew install go     # needed for macOS VM egress filtering (augur-gvproxy)
 bash install        # builds & installs augur-vm into ~/.augur
 ```
 
@@ -447,6 +451,8 @@ clone is gone for good. Both are accepted, documented trade-offs, not oversights
 - macOS (Apple Silicon)
 - At most two macOS VMs running at once per Mac (Apple's limit, see [Usage](#usage-1))
 - Xcode / Swift toolchain (to build the bundled `augur-vm` backend via `bash install`)
+- Go (`brew install go`), so `bash install` can build `augur-gvproxy`. Egress filtering is on by
+  default, and `augur up --macos` fails closed without it unless you pass `--no-egress`.
 - macOS IPSW (Apple-signed)
 - Xcode XIP (Apple-signed, from developer.apple.com)
 
@@ -508,7 +514,7 @@ In every mode the proxy decides by domain (the CONNECT host, or the TLS SNI / HT
 
 ### Requirements
 
-`install` builds the proxy (`augur-proxy`, Swift) automatically — both container and macOS VM modes run the native host `augur-proxy`. **macOS VM egress also needs Go** (for `augur-gvproxy`) — `brew install go`, then re-run `bash install`. Without it, macOS VM egress is unavailable but everything else works.
+`install` builds the proxy (`augur-proxy`, Swift) automatically — both container and macOS VM modes run the native host `augur-proxy`. **macOS VM egress also needs Go** (for `augur-gvproxy`) — `brew install go`, then re-run `bash install`. Without it, `augur up --macos` fails closed while egress filtering is on (the default); pass `--no-egress` to run the VM unfiltered. Container mode does not need Go.
 
 The host ports the proxy uses are derived per-project so two egress-enabled projects can run at once; override with `AUGUR_PROXY_HTTP_PORT` / `AUGUR_PROXY_SOCKS_PORT` / `AUGUR_SSH_FWD_PORT` if needed.
 
