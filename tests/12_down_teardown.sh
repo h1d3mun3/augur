@@ -75,11 +75,11 @@ has   "$out"   "No container found" "destroy: reports no container for this dire
 eq    "0" "$rc"                     "destroy: exits 0 even when nothing to remove"
 
 # ── Scenario 5: the CLEANUP path stays ungated in $HOME ────────────────────────
-# `up`/`claude`/`shell`/`setup-token` refuse a workspace containing augur's own control plane
-# (docs/decisions/0014-workspace-must-not-contain-augur.md), but `down`/`destroy` must NOT —
-# a pre-fix augur could already have created a container from $HOME, and gating the teardown
-# would strand it with no supported way to remove it. This is the assertion that stops a
-# future refactor from "consistently" applying the guard across the whole dispatch.
+# `up`/`claude`/`shell`/`setup-token` refuse a workspace containing augur's own control plane,
+# but `down`/`destroy` must NOT — a pre-fix augur could already have created a container from
+# $HOME, and gating the teardown would strand it with no supported way to remove it. This is
+# the assertion that stops a future refactor from "consistently" applying the guard across the
+# whole dispatch.
 rm -f "$AUGUR_TEST_SHIMLOG.trace"
 export AUGUR_TEST_CONTAINER_RUNNING=1
 ( cd "$HOME" && bash "$AUGUR" destroy ) >/dev/null 2>&1; rc=$?

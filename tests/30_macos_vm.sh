@@ -2,7 +2,7 @@
 # Tier 2 — macOS VM mode. Two parts:
 #   (a) source guards (run anywhere): the macOS launch/state paths must consume the
 #       agent seam, never re-hardcode "claude" / "claude-projects". This catches the
-#       C4 regression the design doc warns about (interpolating into the SSH string).
+#       regression of interpolating unvalidated argv into the SSH command string.
 #   (b) live smoke (gated): only on a macOS host with augur-vm built; opt-in via
 #       AUGUR_TEST_LIVE=1. Boots nothing heavy — just exercises `augur --macos status`.
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/.." && pwd)"
@@ -15,19 +15,19 @@ claude_macos="$(awk '/^cmd_claude_macos\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGU
 has "$claude_macos" 'agent_launch_argv'  "macOS launch reads agent_launch_argv (not a hardcoded 'claude')"
 has "$claude_macos" 'agent_fixed_env'    "macOS launch reads agent_fixed_env"
 has "$claude_macos" '${_rargv}'          "macOS launch interpolates the seam launch argv into the SSH command (C4)"
-# The per-VM history share name must equal agent_state_host_subdir (A3/C7 contract).
+# The per-VM history share name must equal agent_state_host_subdir.
 up_macos="$(awk '/^cmd_up_macos\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
 has "$up_macos" 'agent_state_host_subdir' "macOS history share dir name comes from agent_state_host_subdir (A3/C7)"
 # The per-VM user-level subagent-defs share (#113) mirrors history: share name from the seam, and
 # the guest ~/.claude/agents symlink wired via ensure_macos_claude_agents.
 has "$up_macos" 'agent_state_agents_host_subdir' "macOS agents share dir name comes from agent_state_agents_host_subdir (A3/C7)"
 has "$up_macos" 'ensure_macos_claude_agents'     "macOS up wires ~/.claude/agents (ensure_macos_claude_agents)"
-# No folder-trust seed (ADR-0012): augur does not pre-trust the mounted workspace on macOS
-# either — a regression guard against re-introducing the per-workspace key.
+# No folder-trust seed: augur does not pre-trust the mounted workspace on macOS either — a
+# regression guard against re-introducing the per-workspace key.
 hasnt "$up_macos" 'hasTrustDialogAccepted'       "macOS up does NOT pre-trust the workspace in the .claude.json stub"
 has "$up_macos" 'hasCompletedOnboarding'         "macOS up still seeds the onboarding-only stub"
-# Write-once, gated on "did we just clone this VM" — NOT the file's absence (ADR-0012).
-# `down --macos` keeps the clone (ADR-0006/ADR-0010), so an unconditional scp on every `up`
+# Write-once, gated on "did we just clone this VM" — NOT the file's absence.
+# `down --macos` keeps the clone, so an unconditional scp on every `up`
 # would destroy accumulated guest state on every restart of a REUSED VM. Keying off "just
 # cloned" instead of "file missing" means a fresh project VM gets the stub even if the base VM's
 # own disk has accumulated a stale `.claude.json` between builds — an existence check alone would
@@ -74,7 +74,7 @@ if [[ -n "$m_at" && -n "$r_at" && "$m_at" -lt "$r_at" ]]; then ok "macOS managed
 else fail "macOS managed policy installed after the sudo revoke" "install@$m_at revoke@$r_at"; fi
 has "$up_macos" 'if $_fresh_clone; then'         "macOS .claude.json seed overwrites unconditionally on a fresh clone"
 
-# Base-VM account-state scrub (ADR-0012): the base VM is long-lived and mutable, so a human can
+# Base-VM account-state scrub: the base VM is long-lived and mutable, so a human can
 # log into `claude` by hand at any point in its life (Setup Assistant testing, manual debugging)
 # and leak a real account (userID/machineID) into every future project clone via `up`'s clone
 # step. Both the code paths that legitimately touch
@@ -90,7 +90,7 @@ section "Tier 2 — per-project VM naming is path-hash keyed, not basename-only 
 # macos_project_vm() must not key purely on basename(WORKSPACE_DIR): two distinct
 # directories sharing a basename (e.g. ~/work/myapp and ~/archive/myapp) would collide onto
 # the same VM name — and therefore the same history dir, egress config, and everything else
-# keyed by that name. See docs/decisions/0004-no-special-worktree-support.md §6/§9.
+# keyed by that name.
 project_vm_fns="$(mktemp)"
 work="$(mktemp -d)"
 trap 'rm -f "$project_vm_fns"; rm -rf "$work"' EXIT
@@ -203,8 +203,8 @@ hasnt "$out_f" "SHOULD_NOT_PRINT" "bootstrap: set -e aborts the caller when the 
 eq "0" "$left_f" "bootstrap: temp askpass helper removed on the failure path too"
 
 section "Tier 1 — the containment guard covers macOS mode too (one call site, run anywhere)"
-# The workspace-containment refusal lives in the SHARED dispatch tail, not in cmd_up/cmd_up_macos
-# (docs/decisions/0014-workspace-must-not-contain-augur.md). This is the cross-mode proof of that:
+# The workspace-containment refusal lives in the SHARED dispatch tail, not in cmd_up/cmd_up_macos.
+# This is the cross-mode proof of that:
 # `up --macos` from $HOME must refuse with the WORKSPACE message, not require_vz's "requires macOS".
 # Because the guard runs before dispatch reaches any cmd_*_macos — and therefore before require_vz —
 # this asserts real behaviour on the ubuntu CI runner, where require_vz would otherwise fire first.

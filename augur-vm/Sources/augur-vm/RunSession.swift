@@ -109,8 +109,7 @@ final class RunSession: NSObject, VZVirtualMachineDelegate {
                 // ignores these options on every later boot, and on a guest whose installed
                 // OS predates macOS 27 (Run.swift's --no-graphics requirement plus this host
                 // check are the only gates here; augur's `cmd_build_macos` is what also checks
-                // the GUEST's OS version via `guest-os-version` before ever passing these flags —
-                // see ADR-0018).
+                // the GUEST's OS version via `guest-os-version` before ever passing these flags).
                 guard #available(macOS 27, *) else {
                     fail("--provision-username/--provision-password-stdin need a macOS 27+ host (Virtualization's automated guest provisioning is unavailable on this host)")
                     return

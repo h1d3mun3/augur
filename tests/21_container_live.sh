@@ -83,7 +83,7 @@ if ( cd "$proj" && bash "$REPO/augur" up --no-egress ) >/dev/null 2>&1; then
     fail "subagent def lost across destroy+up" "~/.claude/agents did not persist (expected host mount)"
   fi
 
-  # ── No folder-trust seed: the FRESH (post-destroy) container is NOT pre-trusted (ADR-0012).
+  # ── No folder-trust seed: the FRESH (post-destroy) container is NOT pre-trusted.
   #    augur does not mark the workspace cwd trusted in the guest's ~/.claude.json — Claude
   #    Code's own trust dialog runs once, same as on any other machine. ──
   if container exec "$cont" sh -lc "jq -e '.projects[\"/workspace-${slug}\"].hasTrustDialogAccepted == true' ~/.claude.json" >/dev/null 2>&1; then

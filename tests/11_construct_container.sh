@@ -3,9 +3,9 @@
 # runtime needed. Drives the REAL augur code paths (cmd_up / cmd_claude) with egress off and
 # a shimmed `container` on PATH, then asserts the constructed `container run` / `container
 # exec` argv carries exactly what the agent seam declares: auth env (named-only), the
-# cwd-keyed history mount, the fixed env, and the launch argv. This is the doc's
-# "byte-identical argv" check (docs/decisions/0003-swappable-agent-abstraction.md §5 DoD) without a
-# live container.
+# cwd-keyed history mount, the fixed env, and the launch argv. This is the "verify the
+# constructed argv is byte-identical" check the agent-seam design calls for, without a live
+# container.
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/.." && pwd)"
 source "$HERE/lib.sh"
 section "Tier 1 — Apple container run/exec construction (shimmed container, no runtime)"
@@ -68,7 +68,7 @@ else
   fail "up: no container run captured" "trace: $(cat "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null)"
 fi
 
-# ── No folder-trust seed: augur does not pre-trust the mounted workspace (ADR-0012). A blanket
+# ── No folder-trust seed: augur does not pre-trust the mounted workspace. A blanket
 #    "no exec at all" check would not hold — finish_up wires the operator profile via one exec on
 #    every up — so assert the thing that actually matters instead: nothing on the create path
 #    writes trust, or touches ~/.claude.json at all. ──
@@ -394,7 +394,6 @@ has   "$inval_body"   'save_guest_history'    "carry-over: build/update/install-
 # puts first on the host's PATH (augur, augur-proxy, augur-gvproxy, augur-vm) plus the merged
 # allowlist augur-proxy hot-reloads. Sharing $HOME (or ~/.augur, or an ancestor of either) is
 # therefore guest→host code execution, not just "the guest can attack the repo you gave it".
-# See docs/decisions/0014-workspace-must-not-contain-augur.md.
 #
 # Asserted BEHAVIOURALLY through the real dispatch, three ways per case: a non-zero exit, NO
 # shim run-log at all (proof nothing was ever mounted — a message plus a mount would be worse

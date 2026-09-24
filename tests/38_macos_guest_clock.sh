@@ -267,7 +267,7 @@ hasnt "$out" "after being set" "set landed 2s out: no spurious 'still off' warni
 
 section "Tier 1 — every failure is BEST-EFFORT: warn, name the cost, never claim success, rc 0"
 
-# (a) the privileged set is refused (a base VM whose fixed ADR-0007 password was changed by hand).
+# (a) the privileged set is refused (a base VM whose fixed admin/admin password was changed by hand).
 reset_guest; g_offset -5733; G_SET_RC=1
 sync
 eq "0" "$rc" "set refused: returns 0 (\`up\` must not die with the VM already booted)"

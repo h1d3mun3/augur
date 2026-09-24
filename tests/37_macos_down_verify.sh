@@ -128,8 +128,8 @@ has "$out" "remove the clone entirely"      "down --macos: prints the destroy hi
 hasnt "$out" "did NOT stop"  "down --macos: no failure warning on a clean stop"
 hasnt "$out" "run.pid"       "down --macos: no kill-it-by-hand remedy on a clean stop"
 eq "0" "$rc" "down --macos: exits 0 after a clean stop"
-# Nothing is deleted by `down` (ADR-0006 keeps the clone) — the re-check must not have turned into
-# an escalation that removes the VM.
+# Nothing is deleted by `down` (it deliberately keeps the clone) — the re-check must not have
+# turned into an escalation that removes the VM.
 if grep -q '^delete ' "$VMLOG"; then fail "down --macos: deleted the VM" "$(cat "$VMLOG")"
 else ok "down --macos: never invokes 'delete' (the clone is kept)"; fi
 

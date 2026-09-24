@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Tier 0 — resource-bound + secret-value hardening (pure functions, runs anywhere).
 #
-# F2: validate_secret_value rejects a single-quote / control-byte secret (the "C3" contract)
+# F2: validate_secret_value rejects a single-quote / control-byte secret (the per-value contract)
 #     BEFORE it is interpolated into the macOS ~/.augur-env writer as export VAR='<value>'.
 # F4: a guest-writable ./.augur/resources.conf CPU/MEMORY value is clamped to a sane range so a
 #     hostile value (e.g. MEMORY=9999g) cannot over-commit / DoS the host on the next `augur up`.

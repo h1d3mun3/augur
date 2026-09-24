@@ -53,7 +53,7 @@ struct RunCommand: ParsableCommand {
     // automated path (see vm_cli_supports_provisioning).
     #if compiler(>=6.4)
     // Only meaningful on the guest's FIRST boot after `create` — the framework ignores these
-    // once a guest has already been provisioned. See RunSession.swift and ADR-0018.
+    // once a guest has already been provisioned. See RunSession.swift.
     @Option(name: .customLong("provision-username"),
             help: "Create this account automatically on first boot instead of waiting for a manually-run Setup Assistant. Requires --provision-password-stdin, --no-graphics, and a macOS 27+ host; has no effect on a guest whose OS predates macOS 27 (see `augur-vm guest-os-version`).")
     var provisionUsername: String?

@@ -6,7 +6,7 @@ name: Release
 # macOS-VM E2E is enforced two ways: branch protection on `release` blocks a no-status push, AND
 # this job re-checks the e2e/macos-vm status on the tag-target commit itself before tagging (branch
 # protection carries the check over a merge commit from a parent — this closes that gap). The
-# status is posted locally by scripts/release-gate.sh. See README "Cutting a release" / ADR-0009.
+# status is posted locally by scripts/release-gate.sh. See README "Cutting a release".
 on:
   push:
     branches: [release]
@@ -53,7 +53,7 @@ jobs:
           # Gate: the pre-release macOS-VM E2E must have passed on THIS exact commit. Branch
           # protection blocks a no-status push but carries the check over a merge commit from a
           # parent — so require the status on the tag-target commit itself. This forces
-          # release-gate.sh to run on the post-merge tip, not a pre-merge bump commit. See ADR-0009.
+          # release-gate.sh to run on the post-merge tip, not a pre-merge bump commit.
           state="$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/status" \
             --jq '[.statuses[] | select(.context=="e2e/macos-vm")][0].state // "missing"')"
           if [ "$state" != "success" ]; then

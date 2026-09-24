@@ -52,7 +52,7 @@ done
 for bad in "evil .com" "bad;rm" "*" "*.*.com" "*evil.com" "under_score.com" ""; do
   if conf_line_valid "$bad"; then fail "rejects [$bad]" "accepted an invalid pattern"; else ok "rejects [$bad]"; fi
 done
-esc=$'evil\e[31m.com'   # A1: terminal-escape bytes must never survive into the policy / UI
+esc=$'evil\e[31m.com'   # terminal-escape bytes must never survive into the policy / UI
 if conf_line_valid "$esc"; then fail "rejects ESC-byte line" "accepted"; else ok "rejects ESC-byte line"; fi
 
 section "Tier 0 — project_conf_domains sanitizes a guest-writable conf"
