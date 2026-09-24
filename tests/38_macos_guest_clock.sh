@@ -24,7 +24,7 @@
 # Why NTP is not the fix: NTP is UDP/123, `augur.conf` is a SOCKS5/TCP NAME allowlist, and
 # `gvproxy/augur-egress.patch` does not register the UDP or ICMP forwarders at all under
 # `--deny-direct` — so UDP has no path out regardless of the allowlist, and opening one would
-# regress INVARIANTS.md I9, which tests/36 self-tests. The last section pins both of those so
+# break guest network isolation, which tests/36 self-tests. The last section pins both of those so
 # "just allowlist a time server" cannot be quietly attempted later.
 #
 # What this file pins, all through stubs:

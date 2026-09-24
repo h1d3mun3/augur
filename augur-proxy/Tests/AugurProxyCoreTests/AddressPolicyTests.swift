@@ -1,9 +1,9 @@
 import XCTest
 @testable import AugurProxyCore
 
-/// Invariant I8 (docs/security-reviews/INVARIANTS.md): the proxy must refuse to dial
-/// any non-public address, so an allowlisted name resolving to a host-local / LAN /
-/// internal IP cannot be used for SSRF. These assert the classification directly.
+/// The proxy must refuse to dial any non-public address, so an allowlisted name resolving
+/// to a host-local / LAN / internal IP cannot be used for SSRF. These assert the
+/// classification directly.
 final class AddressPolicyTests: XCTestCase {
 
     func testV4PrivateAndSpecialRangesAreNonPublic() {

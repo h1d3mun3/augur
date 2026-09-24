@@ -39,8 +39,7 @@ AUGUR_VM_BIN="${AUGUR_VM_BIN:-}"
 # transparent proxy that only permits the domains in the merged allowlist
 # (managed baseline augur.conf.default + global ~/.augur/augur.conf + project
 # ./.augur/allowlist.conf). Everything else is blocked. No host sudo is ever required. See
-# augur-proxy/. Security contract for this datapath: docs/security-reviews/INVARIANTS.md
-# (a change that breaks an invariant there is a contract change — see its header).
+# augur-proxy/. This is a security-critical datapath: it must always fail closed.
 AUGUR_DIR="$HOME/.augur"
 # Three-layer egress allowlist, all merged (union-only: a layer can widen but never
 # narrow the ones below it):
@@ -796,7 +795,7 @@ proxy_running() {
 #     on every `up` made both fire unconditionally — a pointless reload, and a warning that cried
 #     wolf forever.
 #   • `mv` is atomic (rename(2), same directory). The old truncate-in-place let a poller read a
-#     PREFIX of the file. That never fell open — a prefix is only ever NARROWER, so I6 held — but
+#     PREFIX of the file. That never fell open — a prefix is only ever NARROWER — but
 #     the rename removes the window entirely.
 # The temp file's 0600 mode also tightens this file from the previous umask-dependent mode. Only
 # augur-proxy and gvproxy read it, both as this same user, so nothing loses access.
@@ -816,7 +815,7 @@ write_merged_allowlist() {
         # SNAPSHOTTED (host-side, guest-inaccessible) at approval time — NOT a fresh read of the live
         # mounted file. Re-reading the live file here would reopen a TOCTOU: a guest could mutate
         # ./.augur/allowlist.conf between approval and this merge (e.g. during another engine mode's
-        # slow VM clone/boot on the same repo) and get UNAPPROVED domains honored (invariant I7).
+        # slow VM clone/boot on the same repo) and get UNAPPROVED domains honored.
         # The snapshot is written on every approval path; if it is missing, fail closed by omitting
         # the project block (a more restrictive allowlist) rather than trusting the live file.
         if [[ -f "$AUGUR_PROJECT_CONF" ]]; then
@@ -1042,7 +1041,7 @@ workspace_path_hash() {
 # augur-proxy, augur-gvproxy, augur-vm — which resolve_proxy_cli/resolve_gvproxy then run as
 # the host user on every `up`. A guest that can write there owns the host account, and it can
 # also edit the merged allowlist `augur-proxy` hot-reloads on mtime change every ~2s, which
-# is a direct I7 violation ("written host-side … outside the project tree").
+# lets the guest widen its own allowlist, the very thing writing it host-side prevents.
 #
 # Reads $WORKSPACE_DIR / $HOME / $AUGUR_DIR as globals at call time so a test can set them.
 # Compares PHYSICAL paths: $WORKSPACE_DIR is `$(pwd)` — the LOGICAL path — so `cd ~/link`
@@ -1125,7 +1124,7 @@ check_project_conf_approved() {
     hash_file="$(project_conf_hash_file)"
     snap_file="${hash_file}.domains"
 
-    # TOCTOU fix (I7): copy the GUEST-WRITABLE conf to a host-side file ONCE, then derive the
+    # TOCTOU fix: copy the GUEST-WRITABLE conf to a host-side file ONCE, then derive the
     # fingerprint, the approval display, AND the stored domain snapshot ALL from that copy. The
     # honored policy is later rebuilt by write_merged_allowlist from $snap_file — NOT a fresh read
     # of the live mounted file — so a guest that races ./.augur/allowlist.conf between this approval
@@ -1573,8 +1572,9 @@ stop_gvproxy() {
     rm -f "$AUGUR_PROXY_DIR/$(workspace_slug).vfkit.sock" 2>/dev/null || true
 }
 
-# Boot self-test, macOS-VM peer of verify_egress_locked — I1's tripwire on this engine. Read that
-# function first: this one deliberately keeps its shape, including the property that matters most.
+# Boot self-test, macOS-VM peer of verify_egress_locked — the fail-closed tripwire on this engine.
+# Read that function first: this one deliberately keeps its shape, including the property that
+# matters most.
 #
 # A probe that only checks "direct egress fails" reports SUCCESS when the guest has NO network at
 # all. Both halves are therefore load-bearing, exactly as in the container version:
@@ -1656,7 +1656,7 @@ verify_macos_egress_locked() {
         # IPv6 literal, so one blackholed/rerouted address (or a v6-only leak the v4 probes would
         # miss) cannot make a routable network look isolated. Only :443 — unlike container's
         # routeless --internal network, the deny here comes from the proxy refusing an IP-literal
-        # destination unconditionally (I4), which is port-agnostic, so container's second :80 pass
+        # destination unconditionally, which is port-agnostic, so container's second :80 pass
         # would buy no coverage and cost another full timeout. --max-time is 4 rather than
         # container's 6 for the same reason it matters at all: gvproxy's netstack ACCEPTS the
         # connection and the SOCKS deny closes it afterwards, so a severed IP-literal probe burns
@@ -1853,7 +1853,8 @@ container_fingerprint() {
         # else-less `if`, NOT `[[ -f ]] && echo`: the &&-form returns 1 when no ~/.gitconfig, and
         # under `set -o pipefail` that 1 becomes the pipeline's (hence the function's) exit status,
         # which would abort the STANDALONE write_container_fingerprint call under `set -e` — skipping
-        # finish_up and its I1 boot self-test on a fresh up. An else-less if with a false test returns 0.
+        # finish_up and its boot self-test on a fresh up. An else-less if with a false test
+        # returns 0.
         if [[ -f "$HOME/.gitconfig" ]]; then echo "gitconfig=present"; fi
     } | { if command -v sha256sum &>/dev/null; then sha256sum; else shasum -a 256; fi; } | awk '{print $1}'
 }
@@ -2039,14 +2040,14 @@ drop_guest_history() {
 
 # Shared tail of `up` — ALL THREE paths (fresh create, stopped→running reuse, and the
 # already-running reconcile): bring the host egress proxy up now that the container has attached,
-# run the boot self-test (I1's tripwire — runs on EVERY up, never cached from a prior boot), and
+# run the fail-closed boot self-test (runs on EVERY up, never cached from a prior boot), and
 # print the ready banner.
 #
 # On the already-running path this one line buys three distinct things:
 #   • start_egress_proxy → start_proxy rewrites the merged allowlist AND REVIVES A DEAD PROXY. That
 #     is the only recovery from a proxy killed out from under a live session; nothing else in
 #     `up`/`claude` restarts one.
-#   • verify_egress_locked restores I1's tripwire on that path.
+#   • verify_egress_locked restores the boot self-test on that path.
 #   • apply_guest_profile picks up a structural profile change.
 finish_up() {
     if egress_enabled; then
@@ -2094,7 +2095,7 @@ reconcile_running_container() {
         error "changed since). A running container cannot pick those up: ${BOLD}augur down && augur up${RESET}"
         exit 1
     fi
-    finish_up                            # restores I1's boot self-test on this path
+    finish_up                            # restores the boot self-test on this path
 }
 
 # Build a fresh container from the image: drop any old one, assemble the `container run` argv,
@@ -2319,7 +2320,7 @@ cmd_up() {
 
     # Already running: the container itself can't change, but the host side is rebuilt on
     # every `up` — rewrite the allowlist (augur-proxy hot-reloads it, so a revocation takes
-    # effect), check the config fingerprint, and re-run the boot self-test (INVARIANTS I1).
+    # effect), check the config fingerprint, and re-run the boot self-test.
     if container_running; then
         reconcile_running_container
         return 0
@@ -3394,7 +3395,7 @@ _macos_guest_epoch() {
 # Set the guest's wall clock from the host's, over SSH, on every path that hands a guest to the
 # agent. A cloned macOS guest boots a fixed ~95 min behind the host (the offset is inherited from
 # the base VM), so a freshly issued token looks not-yet-valid and git/TLS timestamps are skewed.
-# - Not NTP: UDP has no path out of the egress datapath, by design (INVARIANTS I9).
+# - Not NTP: UDP has no path out of the egress datapath, by design.
 # - The host's clock, not the guest's own kern.monotonicclock: nothing guarantees the latter
 #   tracks real time on another host or Virtualization.framework version.
 # - Written with `sudo -S` fed the admin password, as for every privileged command in a project
@@ -3542,10 +3543,10 @@ cmd_up_macos() {
         # correction can reach. Idempotent: it re-reads first and only writes when it must.
         sync_macos_guest_clock "$project_vm"
         sync_macos_guest_timezone "$project_vm"
-        # I1's tripwire on THIS path too, mirroring container mode: finish_up (and therefore
+        # The boot self-test on THIS path too, mirroring container mode: finish_up (and therefore
         # verify_egress_locked) runs on cmd_up's already-running branch. Accepted trade-off:
         # `augur up` against a running guest can end an operator's session, but only on a
-        # DETECTED leak, which is precisely when I1 says it should. A live check on a running VM
+        # DETECTED leak, which is precisely when it should. A live check on a running VM
         # is if anything MORE valuable than one on a fresh
         # boot: this branch is the only place a proxy killed out from under a live session is
         # revived, and the self-test is what proves that revival actually restored enforcement. It
@@ -3683,14 +3684,14 @@ cmd_up_macos() {
     # below this line does: the self-test's TLS handshakes evaluate certificate validity windows, the
     # ~/.augur-env push hands over a JWT whose `nbf`/`exp` the agent will check against this clock,
     # and the git credential helper's token is the same object. It is deliberately the one step that
-    # precedes I1's tripwire, and that is safe for a reason the tripwire's own comment names: what
+    # precedes the self-test, and that is safe for a reason the tripwire's own comment names: what
     # must not reach an uncontained guest is a CREDENTIAL, and the host's wall-clock time is not one
     # — the guest can already read it off the mtimes of the virtiofs share it is mounting. Going
     # second instead would leave the self-test's own positive half judging a certificate window 95
     # minutes early, i.e. able to tear down a healthy VM over a certificate rotated minutes ago.
     sync_macos_guest_clock "$project_vm"
 
-    # I1's boot tripwire, as early as it can possibly run: the moment a command can be run in the
+    # The boot self-test, as early as it can possibly run: the moment a command can be run in the
     # guest, and BEFORE any of the wiring below — in particular before ~/.augur-env pushes an
     # Anthropic token and a gh token into it. A guest whose egress is not contained is exactly the
     # guest that must not receive credentials, so this deliberately precedes the injection rather

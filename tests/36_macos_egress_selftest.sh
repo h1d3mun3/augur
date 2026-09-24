@@ -2,7 +2,7 @@
 # Tier 1 — macOS mode's BOOT EGRESS SELF-TEST (runs anywhere; nothing is ever cloned, booted or
 # SSH'd — the "guest" is a scriptable stand-in for ssh_macos).
 #
-# The hazard. INVARIANT I1 is "egress fails closed on every engine", and its shell half is the boot
+# The hazard. Egress must fail closed on every engine, and the shell half of that is the boot
 # self-test. But `verify_egress_locked` has exactly ONE call site — `finish_up`, which only container
 # mode reaches — so unless its macOS peer is wired in, no macOS production path probes the guest's
 # network. `augur status --macos` does not close the gap either: it reports pidfile liveness, never

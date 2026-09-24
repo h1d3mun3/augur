@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # Tier 0 — egress allowlist hardening (pure functions, runs anywhere).
-# Invariant I7 (docs/security-reviews/INVARIANTS.md): a guest-writable ./.augur/allowlist.conf
-# cannot widen the egress policy — every project line is validated (conf_line_valid),
-# only sanitized LDH patterns reach the MERGED allowlist, that allowlist is written
-# HOST-SIDE (under ~/.augur), never inside the project tree, AND the merge honors only the
-# domains SNAPSHOTTED at approval time (never a fresh read of the live mounted conf), so a
-# post-approval mutation cannot be honored (TOCTOU).
+# A guest-writable ./.augur/allowlist.conf cannot widen the egress policy — every project line
+# is validated (conf_line_valid), only sanitized LDH patterns reach the MERGED allowlist, that
+# allowlist is written HOST-SIDE (under ~/.augur), never inside the project tree, AND the merge
+# honors only the domains SNAPSHOTTED at approval time (never a fresh read of the live mounted
+# conf), so a post-approval mutation cannot be honored (TOCTOU).
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/.." && pwd)"
 source "$HERE/lib.sh"
 AUGUR="$REPO/augur"

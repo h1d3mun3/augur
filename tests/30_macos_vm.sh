@@ -111,10 +111,10 @@ WORKSPACE_DIR="$work/work/myapp"; name_a2="$(macos_project_vm)"
 eq "$name_a" "$name_a2" "macos_project_vm: same directory is stable across calls"
 
 section "Tier 2 — macOS network isolation (entitlements, run anywhere)"
-# Invariant I9 (docs/security-reviews/INVARIANTS.md): the guest gets one host-owned NIC
-# and no bridged networking. The machine-checkable part is the entitlement set — bridged
-# networking would require com.apple.vm.networking, which augur must NOT ship. (NIC count
-# and the gvproxy UDP/ICMP drop stay review-only: they need a real VM host.)
+# The guest gets one host-owned NIC and no bridged networking. The machine-checkable part is
+# the entitlement set — bridged networking would require com.apple.vm.networking, which augur
+# must NOT ship. (NIC count and the gvproxy UDP/ICMP drop stay review-only: they need a real VM
+# host.)
 ent="$REPO/augur-vm/augur-vm.entitlements"
 if [[ -f "$ent" ]]; then
   # Match the granted <key>…</key> ELEMENTS, not any substring — the file mentions
