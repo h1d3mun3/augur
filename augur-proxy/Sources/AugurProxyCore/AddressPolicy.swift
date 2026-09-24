@@ -1,8 +1,7 @@
 import Foundation
 
-/// Non-public address classification for the proxy's SSRF guard (invariant I8 in
-/// docs/security-reviews/INVARIANTS.md). An allowlisted *name* must never let the
-/// guest reach a host-local / LAN / internal address: `Sock` refuses to dial any
+/// Non-public address classification for the proxy's SSRF guard. An allowlisted *name*
+/// must never let the guest reach a host-local / LAN / internal address: `Sock` refuses to dial any
 /// address classified non-public here when `publicOnly` is set — and augur never
 /// passes `--allow-private` on a production path, so this guard is always armed.
 ///

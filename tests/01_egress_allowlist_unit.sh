@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # Tier 0 — egress allowlist hardening (pure functions, runs anywhere).
-# Invariant I7 (docs/security-reviews/INVARIANTS.md): a guest-writable ./.augur/allowlist.conf
-# cannot widen the egress policy — every project line is validated (conf_line_valid),
-# only sanitized LDH patterns reach the MERGED allowlist, that allowlist is written
-# HOST-SIDE (under ~/.augur), never inside the project tree, AND the merge honors only the
-# domains SNAPSHOTTED at approval time (never a fresh read of the live mounted conf), so a
-# post-approval mutation cannot be honored (TOCTOU).
+# A guest-writable ./.augur/allowlist.conf cannot widen the egress policy — every project line
+# is validated (conf_line_valid), only sanitized LDH patterns reach the MERGED allowlist, that
+# allowlist is written HOST-SIDE (under ~/.augur), never inside the project tree, AND the merge
+# honors only the domains SNAPSHOTTED at approval time (never a fresh read of the live mounted
+# conf), so a post-approval mutation cannot be honored (TOCTOU).
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/.." && pwd)"
 source "$HERE/lib.sh"
 AUGUR="$REPO/augur"
@@ -52,7 +51,7 @@ done
 for bad in "evil .com" "bad;rm" "*" "*.*.com" "*evil.com" "under_score.com" ""; do
   if conf_line_valid "$bad"; then fail "rejects [$bad]" "accepted an invalid pattern"; else ok "rejects [$bad]"; fi
 done
-esc=$'evil\e[31m.com'   # A1: terminal-escape bytes must never survive into the policy / UI
+esc=$'evil\e[31m.com'   # terminal-escape bytes must never survive into the policy / UI
 if conf_line_valid "$esc"; then fail "rejects ESC-byte line" "accepted"; else ok "rejects ESC-byte line"; fi
 
 section "Tier 0 — project_conf_domains sanitizes a guest-writable conf"

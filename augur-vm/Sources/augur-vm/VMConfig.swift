@@ -16,7 +16,7 @@ struct VMConfig: Codable {
     /// created before this field existed still decode (Codable defaults a missing key to
     /// nil for an Optional property). Used to decide whether the guest supports automated
     /// `VZMacGuestProvisioningOptions` setup on its first boot (needs guest macOS 27+, in
-    /// addition to a macOS 27+ host) — see `guest-os-version` and ADR-0018.
+    /// addition to a macOS 27+ host) — see `guest-os-version`.
     var guestOSMajorVersion: Int? = nil
 
     struct Display: Codable {

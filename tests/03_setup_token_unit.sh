@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Tier 0 — setup-token persistence hardening (pure function, runs anywhere).
 #
-# C3: save_oauth_token is the sole credential validator today. Before it writes the
+# save_oauth_token is the sole credential validator today. Before it writes the
 #     captured `claude setup-token` value to the host token file augur replays into
 #     every guest, it enforces a conservative shape: the sk-ant- prefix, a 20–500
 #     length window, and only token-safe chars [A-Za-z0-9._-] (no spaces / control
 #     bytes / quotes). A rejected token must leave NOTHING on disk; an accepted one
-#     lands 0600. See docs §4 C3 / addendum A2.
+#     lands 0600.
 #
 # Same slice-by-name technique as 02_resource_secret_unit.sh: augur's entry-point never runs.
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/.." && pwd)"

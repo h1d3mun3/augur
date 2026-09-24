@@ -11,7 +11,7 @@
 #      short-circuit — and augur-proxy hot-reloads policy from that file's mtime. So editing the
 #      allowlist and running `augur up` would print one yellow line, exit 0, and leave the live
 #      proxy enforcing the old policy.
-#   2. I1's tripwire would not run: verify_egress_locked lives in finish_up, also below it.
+#   2. The boot self-test would not run: verify_egress_locked lives in finish_up, also below it.
 #   3. A flipped egress mode / rotated credential would not be surfaced: the container_fingerprint
 #      reconcile that exists to catch exactly that sits below it too.
 #
@@ -129,7 +129,7 @@ stop_gvproxy()      { :; }
 stop_proxy()        { :; }
 wait_for_macos_ssh() { return 1; }   # would fail loudly if the branch ever fell through
 ssh_macos()         { echo "ssh_macos" >> "$LOG"; return 0; }
-# I1's macOS boot tripwire, recorded rather than run: it probes the guest over ssh_macos, and the
+# The macOS boot self-test, recorded rather than run: it probes the guest over ssh_macos, and the
 # blanket stub above answers every probe with success — i.e. a screaming leak — which would tear the
 # VM down mid-reconcile. tests/36_macos_egress_selftest.sh owns its behaviour; here we only assert
 # that this path reaches it, exactly as the container half asserts it reaches finish_up.

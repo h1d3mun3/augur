@@ -16,9 +16,9 @@
 #        it would truncate a legit response the other way).
 #
 # To exercise an ESTABLISHED tunnel we need a reachable upstream. augur-proxy denies IP-literals
-# (I4) and refuses non-public addresses (I8), so we allowlist the NAME `localhost`, run a tiny
+# and refuses non-public addresses, so we allowlist the NAME `localhost`, run a tiny
 # loopback sink, and start the proxy with --allow-private (TEST-ONLY: it lets the proxy dial the
-# 127.0.0.1 sink; production never passes it — that guard stays covered by AddressPolicy/I8).
+# 127.0.0.1 sink; production never passes it — that guard stays covered by AddressPolicy).
 #
 # Needs the augur-proxy binary (built by `make unit` / `bash install`) and `perl` for the sink;
 # self-skips cleanly when either is absent or the binary can't exec here (same contract as tier 24),
@@ -44,7 +44,7 @@ fi
 
 ADDR=127.0.0.1
 TMPD="$(mktemp -d)"
-echo "localhost" > "$TMPD/allow.conf"     # the CONNECT target must be a NAME (I4 denies IP-literals)
+echo "localhost" > "$TMPD/allow.conf"     # the CONNECT target must be a NAME, not an IP
 
 proxy_pid=""; sink_pid=""; resp_pid=""
 # kill AND reap, so bash doesn't later print an async "Killed" job-control line to stderr.

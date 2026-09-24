@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tier 0 — the two waits cmd_build_macos's automated path depends on (ADR-0018).
+# Tier 0 — the two waits cmd_build_macos's automated path depends on.
 # Both are bounded polls. A DHCP lease does not mean sshd is up, so the build must wait for TCP
 # reachability (macos_wait_for_ssh), not just an IP, before it SSHes in; and a cold first boot
 # needs more time than a fixed iteration count can give, so each wait takes a budget the caller

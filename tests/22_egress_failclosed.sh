@@ -17,7 +17,7 @@
 # and once again after `augur down` (stop, keep) + `augur up` (REUSE via `container start`).
 # The reuse pass is the security-critical coverage the offline suite cannot reach: it proves
 # the persisted-container reconcile path re-establishes the egress datapath and re-runs the
-# boot self-test (INVARIANT I1) on a container that was NOT freshly built from the image.
+# fail-closed boot self-test on a container that was NOT freshly built from the image.
 #
 # Run modes:
 #   tests/22_egress_failclosed.sh                       # read-only: skips (this tier spins a container)

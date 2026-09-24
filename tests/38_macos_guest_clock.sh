@@ -24,7 +24,7 @@
 # Why NTP is not the fix: NTP is UDP/123, `augur.conf` is a SOCKS5/TCP NAME allowlist, and
 # `gvproxy/augur-egress.patch` does not register the UDP or ICMP forwarders at all under
 # `--deny-direct` — so UDP has no path out regardless of the allowlist, and opening one would
-# regress INVARIANTS.md I9, which tests/36 self-tests. The last section pins both of those so
+# break guest network isolation, which tests/36 self-tests. The last section pins both of those so
 # "just allowlist a time server" cannot be quietly attempted later.
 #
 # What this file pins, all through stubs:
@@ -267,7 +267,7 @@ hasnt "$out" "after being set" "set landed 2s out: no spurious 'still off' warni
 
 section "Tier 1 — every failure is BEST-EFFORT: warn, name the cost, never claim success, rc 0"
 
-# (a) the privileged set is refused (a base VM whose fixed ADR-0007 password was changed by hand).
+# (a) the privileged set is refused (a base VM whose fixed admin/admin password was changed by hand).
 reset_guest; g_offset -5733; G_SET_RC=1
 sync
 eq "0" "$rc" "set refused: returns 0 (\`up\` must not die with the VM already booted)"

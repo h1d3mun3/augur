@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Tier 0 — macOS 27 automated guest provisioning (ADR-0018), pure-function slice.
+# Tier 0 — macOS 27 automated guest provisioning, pure-function slice.
 # macos_admin_password() decides which credential every macOS-mode sudo/SSH call uses
-# (fixed admin/admin, ADR-0007, unless the base VM was built via automated provisioning,
+# (fixed admin/admin, unless the base VM was built via automated provisioning,
 # in which case a generated password is on disk); host_macos_major_version() is the host
 # half of the eligibility check for that automated path. Both are pure enough to unit-test
 # without a VM — the actual `augur-vm run --provision-*` / `guest-os-version` wiring is

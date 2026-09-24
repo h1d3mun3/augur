@@ -111,7 +111,7 @@ for f in allowlist proxy_pid_macos proxy_pid_container proxy_log_macos proxy_log
   if [[ -n "$av" && "$av" != "$bv" ]]; then ok "$f differs between the two projects"
   else fail "$f must differ between the two projects" "both = [$av]"; fi
 done
-# Nothing escaped the host-side proxy dir while gaining the hash (I7: outside the project tree).
+# Nothing escaped the host-side proxy dir while gaining the hash (still outside the project tree).
 for f in allowlist proxy_pid_macos proxy_pid_container proxy_log_macos proxy_log_container \
          gvproxy_pid gvproxy_log vm_log socket; do
   has "$(field "$f" "$a_paths")" "$AUGUR_PROXY_DIR/" "$f stays under AUGUR_PROXY_DIR"

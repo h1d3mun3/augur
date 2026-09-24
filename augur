@@ -27,12 +27,13 @@ MACOS_BASE_VM="augur-macos-base"
 MACOS_BUILD_VM="augur-macos-build"
 MACOS_SSH_USER="admin"
 MACOS_SSH_KEY="$HOME/.augur/vm_key"
-# The base VM's admin account password. Fixed "admin"/"admin" (ADR-0007) UNLESS the base VM
-# was built via macOS 27's automated guest provisioning (ADR-0018), in which case
-# cmd_build_macos generates a random one and persists it here (0600) — every project VM is
-# an APFS clone of the base VM and inherits whichever password the base VM has, so this file
-# (or its absence) governs sudo/SSH auth for every clone, not just the build. See
-# macos_admin_password(). Must never contain a single quote — see that function.
+# The base VM's admin account password. Deliberately a fixed "admin"/"admin" (rotating it after
+# Setup Assistant would desync the auto-login keychain) UNLESS the base VM was built via macOS 27's
+# automated guest provisioning, in which case cmd_build_macos generates a random one and
+# persists it here (0600) — every project VM is an APFS clone of the base VM and inherits
+# whichever password the base VM has, so this file (or its absence) governs sudo/SSH auth for
+# every clone, not just the build. See macos_admin_password(). Must never contain a single
+# quote — see that function.
 MACOS_ADMIN_PASSWORD_FILE="$HOME/.augur/macos-admin-password"
 
 # macOS VM backend binary (augur-vm, built from ./augur-vm). Override with AUGUR_VM_BIN.
@@ -43,8 +44,7 @@ AUGUR_VM_BIN="${AUGUR_VM_BIN:-}"
 # transparent proxy that only permits the domains in the merged allowlist
 # (managed baseline augur.conf.default + global ~/.augur/augur.conf + project
 # ./.augur/allowlist.conf). Everything else is blocked. No host sudo is ever required. See
-# augur-proxy/. Security contract for this datapath: docs/security-reviews/INVARIANTS.md
-# (a change that breaks an invariant there is a contract change — see its header).
+# augur-proxy/. This is a security-critical datapath: it must always fail closed.
 AUGUR_DIR="$HOME/.augur"
 # Three-layer egress allowlist, all merged (union-only: a layer can widen but never
 # narrow the ones below it):
@@ -141,7 +141,7 @@ error()   { echo -e "${RED}[augur]${RESET} $*" >&2; }
 # DESIGN RULE — do not break: the agent side only DECLARES DATA; the sandbox core
 # (cmd_up, the egress/proxy stack, the mount keying, resolve_api_key injection) OWNS
 # and ENFORCES every security mechanism. Adding a second agent must NOT move a control
-# out of the core. See docs/decisions/0003-swappable-agent-abstraction.md (§5).
+# out of the core.
 # ────────────────────────────────────────────────────────────────────────────────
 
 # Human-facing product name (info/help text only). DATA.
@@ -151,12 +151,13 @@ agent_display_name() { echo "Claude Code"; }
 agent_cli_name() { echo "claude"; }
 
 # Interactive launch argv (space-separated tokens). DATA.
-# CONTRACT (C4): on macOS this is interpolated into an SSH remote-command string. It is
+# CONTRACT (launch string): on macOS this is interpolated into an SSH remote-command string. It is
 #   a single constant token today (safe). BEFORE it becomes variable per agent, add a
-#   metachar/control-byte reject guard and pass argv via printf %q (docs §4 C4). The
-#   container engines pass it as an argv array to `<engine> exec` — safe by construction.
+#   metachar/control-byte reject guard and pass argv via printf %q. The container engines
+#   pass it as an argv array to `<engine> exec` — safe by construction.
 # NOTE: no argv forwarding is added here for Claude Code's `--worktree` flag — this is a
-#   deliberate non-fix, not an oversight. See docs/decisions/0004-no-special-worktree-support.md.
+#   deliberate non-fix, not an oversight: the supported path is `augur shell` plus a manual
+#   `claude --worktree` launch.
 agent_launch_argv() { echo "claude"; }
 
 # Credential-capture / login subcommand argv. DATA.
@@ -171,10 +172,10 @@ agent_version_cmd() { echo "claude --version"; }
 # Credential specs, one per line: GUEST_ENV|HOST_ENV|HOST_FILE|VALIDATOR. DATA.
 # The core (cmd_up / cmd_up_macos) resolves each via resolve_api_key and injects ONLY
 # these NAMED vars — never the wholesale host env, never a mounted credential store.
-# CONTRACT (C3): VALIDATOR is the per-value check a FUTURE multi-agent build must run on
+# CONTRACT (credentials): VALIDATOR is the per-value check a FUTURE multi-agent build must run on
 #   every resolved value before it is interpolated into a shell / sourced file. It is
 #   'none' here to preserve current behavior byte-for-byte (today only the setup-token
-#   capture path validates, via save_oauth_token). See docs §4 C3.
+#   capture path validates, via save_oauth_token).
 # CONTRACT (precedence): both are injected; the agent applies the official
 #   ANTHROPIC_API_KEY > CLAUDE_CODE_OAUTH_TOKEN precedence when both are set.
 agent_auth_specs() {
@@ -184,21 +185,20 @@ agent_auth_specs() {
 
 # Per-project history/state layout. DATA only — the KEYING discipline (host source keyed
 # on slug+path-hash, kept OUTSIDE the host's own agent tree, scoped to the current project)
-# lives in the CORE (cmd_up). CONTRACT (A3/C7): a future agent whose state dir is flat (no
+# lives in the CORE (cmd_up). CONTRACT (state dir): a future agent whose state dir is flat (no
 # cwd fan-out) or colocated with its credential file must still be hash-keyed and must never
-# mount its credential store. See docs §4 C7.
+# mount its credential store.
 # NOTE: this stays pinned to exactly ONE leaf on purpose. A Claude Code `--worktree`
 #   session gets its own, different leaf that this mount does not cover, so its history is
 #   ephemeral (lost on container recreation) — deliberate, not a bug. Mounting the
 #   `~/.claude/projects` parent instead would cover it, but a compromised session in one
 #   leaf would then have filesystem access to every sibling leaf in the same container.
-#   See docs/decisions/0004-no-special-worktree-support.md before "fixing" this.
 agent_state_host_subdir()        { echo "claude-projects"; }              # dir under $AUGUR_DIR (both modes)
 agent_state_guest_projects_dir() { echo "/home/dev/.claude/projects"; }   # guest parent dir
 agent_state_guest_leaf()         { echo "-workspace-$1"; }                # leaf name from slug ($1)
 # User-level custom subagent definitions (`~/.claude/agents/*.md`, the `/agents` UI). DATA only;
 # the CORE keys the host source on slug+path-hash and keeps it OUTSIDE the host's own ~/.claude,
-# exactly like history above (A3/C7) — a compromised guest can therefore plant an agent def only
+# exactly like history above — a compromised guest can therefore plant an agent def only
 # into ITS OWN project's dir, never the host's real ~/.claude/agents nor another project's. That
 # is why we persist a PER-PROJECT dir, not the host's global ~/.claude/agents (a global RW mount
 # would let a guest inject a subagent read by every future session in every project).
@@ -361,7 +361,7 @@ resolve_api_key() {
 
 # Reject a resolved secret value that could break out of `export VAR='<value>'` single-quoting
 # in the macOS ~/.augur-env writer, or smuggle control bytes into the guest environment. This is
-# the "C3" validator the auth seam always flagged as future work: a single quote is the only
+# the per-value credential validator the auth seam flagged as future work: a single quote is the only
 # character that can escape a single-quoted shell string, and control bytes (newline/CR/tab/…)
 # have no place in a credential token. Container mode is not shell-exposed (values go to argv),
 # but validating in one place keeps both datapaths safe. Fails closed — a malformed secret must
@@ -398,8 +398,8 @@ validate_secret_value() {
 # still names the offending variable because validate_secret_value does.
 # AUGUR_AGENT_SEAM | credential CHECK — the agent DECLARES names + host sources (agent_auth_specs)
 # and the core owns both the resolver (resolve_api_key) and the validator (validate_secret_value).
-# CONTRACT (C3): a future multi-agent build adds its per-spec VALIDATOR field here, in ONE place,
-# rather than at each injection site.
+# CONTRACT (credentials): a future multi-agent build adds its per-spec VALIDATOR field here, in ONE
+# place, rather than at each injection site.
 validate_resolved_credentials() {
     local _genv _henv _hfile _hvalidator _aval _gh
     _gh="$(gh auth token 2>/dev/null || true)"
@@ -415,15 +415,15 @@ validate_resolved_credentials() {
 # Persist a captured Claude subscription token to the host token file augur reads on
 # every `up` (resolve_api_key picks it up as CLAUDE_CODE_OAUTH_TOKEN). Validates the
 # shape and writes it 0600. The host never needs claude installed for this.
-# AUGUR_AGENT_SEAM | token persistence — Claude-specific shape (sk-ant-*) + dest file. CONTRACT (C3):
-# this charset/length check is the only credential validator today; generalize it to every agent's
-# resolved credential value before broadening agent_auth_specs. See docs §4 C3.
+# AUGUR_AGENT_SEAM | token persistence — Claude-specific shape (sk-ant-*) + dest file.
+# CONTRACT (credentials): this charset/length check is the only credential validator today;
+# generalize it to every agent's resolved credential value before broadening agent_auth_specs.
 save_oauth_token() {
     local token="$1" dest="$HOME/.claude_code_oauth_token"
     # Validate the shape conservatively: the sk-ant- prefix, a sane length, and only
     # token-safe characters (no whitespace / control bytes). The value comes from
     # `claude setup-token` run inside the guest, so a stricter check limits the blast
-    # radius of a tampered or lookalike flow (addendum A2).
+    # radius of a tampered or lookalike flow.
     if [[ -z "$token" || "$token" != sk-ant-* ]] \
        || (( ${#token} < 20 || ${#token} > 500 )) \
        || [[ "$token" == *[!A-Za-z0-9._-]* ]]; then
@@ -441,7 +441,7 @@ save_oauth_token() {
 # Security notice shown before the operator pastes a setup-token. The token is produced by
 # `claude setup-token` running INSIDE the guest, rendered on the operator's own terminal,
 # and the guest's `claude` binary is guest-writable — so a compromised guest could present
-# a lookalike sign-in pointing at an attacker's OAuth flow (addendum A2). Warn before the
+# a lookalike sign-in pointing at an attacker's OAuth flow. Warn before the
 # host persists and replays whatever is pasted into every future guest.
 # AUGUR_AGENT_SEAM | operator warning before pasting a token (mentions the genuine claude.ai flow).
 setup_token_security_notice() {
@@ -452,10 +452,10 @@ setup_token_security_notice() {
 
 # True iff the running container's `claude` is byte-identical to the image's copy. The agent
 # runs as the binary's owner (uid 1001) and can replace it, so before setup-token attaches
-# it to the operator's TTY (addendum A2) we confirm it was not tampered with. The image
+# it to the operator's TTY we confirm it was not tampered with. The image
 # disables the autoupdater, so a mismatch means modification, not version drift; a freshly
 # `up`-ped container matches, a reused one a prior session tampered with does not.
-# AUGUR_AGENT_SEAM | integrity-verify (container engine) — A2 gate before TTY attach; see docs §4 C2.
+# AUGUR_AGENT_SEAM | integrity-verify (container engine) — integrity gate before TTY attach.
 agent_verify_integrity_engine() {
     local img_hash cont_hash
     img_hash="$(eng run --rm "$IMAGE_NAME" sh -c 'sha256sum "$(readlink -f "$(command -v claude)")"' 2>/dev/null | awk '{print $1}')"
@@ -465,8 +465,8 @@ agent_verify_integrity_engine() {
 
 # True iff the guest VM's `claude` binary is Anthropic-signed (the same signer the base-VM
 # build pins). The binary is guest-writable, so re-checking here refuses to run setup-token
-# against a tampered lookalike that would phish the token on the operator's TTY (addendum A2).
-# AUGUR_AGENT_SEAM | integrity-verify (macOS) — A2 gate; codesign signer (provenance), see docs §4 C2.
+# against a tampered lookalike that would phish the token on the operator's TTY.
+# AUGUR_AGENT_SEAM | integrity-verify (macOS) — integrity gate; codesign signer (provenance).
 agent_verify_integrity_macos() {
     ssh_macos "$1" 'codesign -dvv "$HOME/.local/bin/claude" 2>&1 | grep -qi "Anthropic"'
 }
@@ -499,14 +499,14 @@ require_vz() {
 }
 
 # Host's macOS major version (e.g. "27" for "27.0.1"), or empty if undetectable (non-Darwin,
-# or `sw_vers` missing). Used only to gate macOS 27's automated guest provisioning
-# (ADR-0018) — every other macOS-mode code path is version-independent.
+# or `sw_vers` missing). Used only to gate macOS 27's automated guest provisioning — every
+# other macOS-mode code path is version-independent.
 host_macos_major_version() {
     command -v sw_vers &>/dev/null || { echo ""; return; }
     sw_vers -productVersion 2>/dev/null | cut -d. -f1
 }
 
-# Does the resolved augur-vm actually carry ADR-0018's automated provisioning? The host's own
+# Does the resolved augur-vm actually support macOS 27's automated provisioning? The host's own
 # OS version is not evidence: `VZMacGuestProvisioningOptions` exists only in the macOS 27 SDK,
 # so augur-vm compiles the feature out when built against an older one (see Run.swift's
 # `#if compiler(>=6.4)`), and `install` builds it from whatever Xcode the host had AT THAT TIME.
@@ -521,8 +521,7 @@ vm_cli_supports_provisioning() {
 # Keyed on basename + workspace_path_hash (mirrors the container-mode
 # host_hist_dir key), not basename alone: two distinct directories that happen to
 # share a basename (e.g. ~/work/myapp and ~/archive/myapp) must never collide onto
-# the same VM/history-dir/egress-config (see
-# docs/decisions/0004-no-special-worktree-support.md §6/§9). Changing this key means any
+# the same VM/history-dir/egress-config. Changing this key means any
 # project VM cloned under the old (basename-only) name is orphaned — a one-time
 # fresh clone on next `up`, not data loss (the old VM/clone is left in place;
 # `augur list --macos` still shows it and it can be removed manually).
@@ -560,7 +559,7 @@ macos_vm_ip() {
 # conflate the two. Under the old manual Setup Assistant flow this distinction never mattered:
 # the operator's "Remote Login enabled? Ready to continue?" prompt already gated on a human
 # confirming sshd was up before that flow ever called macos_vm_ip. The automated provisioning
-# path (ADR-0018) has no such gate — the guest's network interface (hence its IP) routinely
+# path has no such gate — the guest's network interface (hence its IP) routinely
 # comes up well before VZMacGuestProvisioningOptions finishes creating the account, logging it
 # in, and starting Remote Login — so a caller that stops at macos_vm_ip can start SSHing into
 # an IP with nothing listening on port 22 yet ("Connection refused"). Bash's /dev/tcp avoids a
@@ -612,7 +611,7 @@ vm_known_hosts_file() {
 }
 
 # The base VM's admin account password — see MACOS_ADMIN_PASSWORD_FILE's comment. Defaults
-# to the fixed ADR-0007 credential when no override file exists (the common case: a base VM
+# to the fixed admin/admin credential when no override file exists (the common case: a base VM
 # built via the legacy manual Setup Assistant flow, or before this feature existed at all).
 macos_admin_password() {
     if [[ -f "$MACOS_ADMIN_PASSWORD_FILE" ]]; then
@@ -623,7 +622,7 @@ macos_admin_password() {
 }
 
 # macos_admin_password() is ONE file for the whole host, rewritten every time `augur build --macos`
-# provisions a fresh base VM (ADR-0018). A project VM is an APFS clone taken at some earlier build,
+# provisions a fresh base VM. A project VM is an APFS clone taken at some earlier build,
 # so its real admin password is frozen at whatever the base had THEN — if the base has been rebuilt
 # since, sudo on that older clone is authenticating against a password that no longer matches what's
 # on disk, and sync_macos_guest_clock's `sudo -S` call fails the same way a network hiccup would.
@@ -709,8 +708,8 @@ ssh_macos_bootstrap() {
         || { error "Failed to create SSH askpass helper."; exit 1; }
     chmod 700 "$askpass"
     # Embed the password via %q (safe regardless of its content); reply to password prompts
-    # only, else exit 1. Fixed "admin" (ADR-0007) unless this base VM was built with macOS
-    # 27's automated provisioning (ADR-0018), in which case it's the generated random one.
+    # only, else exit 1. Fixed "admin" unless this base VM was built with macOS 27's automated
+    # provisioning, in which case it's the generated random one.
     printf '#!/bin/bash\ncase "$1" in *[Pp]assword:*) printf "%%s\\n" %q ;; *) exit 1 ;; esac\n' \
         "$(macos_admin_password)" > "$askpass"
     # Explicit cleanup (not `trap … RETURN`): a RETURN trap is not function-local — it would
@@ -794,7 +793,7 @@ proxy_running() {
 #     on every `up` made both fire unconditionally — a pointless reload, and a warning that cried
 #     wolf forever.
 #   • `mv` is atomic (rename(2), same directory). The old truncate-in-place let a poller read a
-#     PREFIX of the file. That never fell open — a prefix is only ever NARROWER, so I6 held — but
+#     PREFIX of the file. That never fell open — a prefix is only ever NARROWER — but
 #     the rename removes the window entirely.
 # The temp file's 0600 mode also tightens this file from the previous umask-dependent mode. Only
 # augur-proxy and gvproxy read it, both as this same user, so nothing loses access.
@@ -814,7 +813,7 @@ write_merged_allowlist() {
         # SNAPSHOTTED (host-side, guest-inaccessible) at approval time — NOT a fresh read of the live
         # mounted file. Re-reading the live file here would reopen a TOCTOU: a guest could mutate
         # ./.augur/allowlist.conf between approval and this merge (e.g. during another engine mode's
-        # slow VM clone/boot on the same repo) and get UNAPPROVED domains honored (invariant I7).
+        # slow VM clone/boot on the same repo) and get UNAPPROVED domains honored.
         # The snapshot is written on every approval path; if it is missing, fail closed by omitting
         # the project block (a more restrictive allowlist) rather than trusting the live file.
         if [[ -f "$AUGUR_PROJECT_CONF" ]]; then
@@ -840,7 +839,7 @@ write_merged_allowlist() {
 # Validate a single ./.augur/allowlist.conf line against the proxy's domain grammar: an optional
 # '*.' / '.' prefix plus a strict LDH hostname, and NO byte outside [A-Za-z0-9.*-]. The
 # project conf is guest-writable, so this is the chokepoint that (a) stops a hostile conf
-# from injecting terminal-escape bytes into the approval UI / `status` (addendum A1) and
+# from injecting terminal-escape bytes into the approval UI / `status` and
 # (b) keeps the displayed list identical to what the proxy will actually honor. Mirrors
 # augur-proxy's isValidHostname (Hostname.swift). Returns 0 iff the line is a valid pattern.
 conf_line_valid() {
@@ -1039,15 +1038,13 @@ workspace_path_hash() {
 #
 # $WORKSPACE_DIR is mounted READ-WRITE into the guest — `-v "${WORKSPACE_DIR}:…"` in
 # container mode, `--dir="${MACOS_SHARE}:${WORKSPACE_DIR}"` in macOS mode — so anything
-# under it is guest-writable. That is accepted for a project checkout
-# (docs/security-reviews/2026-07-23-egress.md §6 item 12: the guest can attack the repo you
-# gave it). It is NOT acceptable for $HOME or $AUGUR_DIR, because `~/.augur` holds the
+# under it is guest-writable. Accepted trade-off for a project checkout: the guest can attack the
+# repo you gave it. It is NOT acceptable for $HOME or $AUGUR_DIR, because `~/.augur` holds the
 # host-executed binaries `install` puts FIRST on the host's PATH (install:150) — augur,
 # augur-proxy, augur-gvproxy, augur-vm — which resolve_proxy_cli/resolve_gvproxy then run as
 # the host user on every `up`. A guest that can write there owns the host account, and it can
 # also edit the merged allowlist `augur-proxy` hot-reloads on mtime change every ~2s, which
-# is a direct I7 violation ("written host-side … outside the project tree").
-# See docs/decisions/0014-workspace-must-not-contain-augur.md.
+# lets the guest widen its own allowlist, the very thing writing it host-side prevents.
 #
 # Reads $WORKSPACE_DIR / $HOME / $AUGUR_DIR as globals at call time so a test can set them.
 # Compares PHYSICAL paths: $WORKSPACE_DIR is `$(pwd)` — the LOGICAL path — so `cd ~/link`
@@ -1101,7 +1098,7 @@ require_safe_workspace() {
 # Host-side record of approved project-conf fingerprints (TOFU). Under ~/.augur — NEVER the
 # project tree or a mounted share — so the guest cannot forge its own approval. Keyed on the
 # FULL workspace path (slug + path hash), so a hostile repo that shares a basename with a
-# trusted project cannot inherit that project's egress approval (addendum: slug collision).
+# trusted project cannot inherit that project's egress approval.
 project_conf_hash_file() {
     mkdir -p "$AUGUR_DIR/project-hashes"
     echo "$AUGUR_DIR/project-hashes/$(workspace_slug)-$(workspace_path_hash)"
@@ -1130,7 +1127,7 @@ check_project_conf_approved() {
     hash_file="$(project_conf_hash_file)"
     snap_file="${hash_file}.domains"
 
-    # TOCTOU fix (I7): copy the GUEST-WRITABLE conf to a host-side file ONCE, then derive the
+    # TOCTOU fix: copy the GUEST-WRITABLE conf to a host-side file ONCE, then derive the
     # fingerprint, the approval display, AND the stored domain snapshot ALL from that copy. The
     # honored policy is later rebuilt by write_merged_allowlist from $snap_file — NOT a fresh read
     # of the live mounted file — so a guest that races ./.augur/allowlist.conf between this approval
@@ -1175,7 +1172,7 @@ check_project_conf_approved() {
     while IFS= read -r d; do
         # printf %s (NOT echo -e) on the guest-derived domain; conf_line_valid already
         # guarantees a clean LDH pattern, so the approval list cannot be spoofed by
-        # embedded terminal-escape bytes (addendum A1).
+        # embedded terminal-escape bytes.
         [[ -n "$d" ]] || continue
         printf '    %b+ %s%b\n' "$YELLOW" "$d" "$RESET"; had=1
     done <<< "$snap_content"
@@ -1578,8 +1575,9 @@ stop_gvproxy() {
     rm -f "$AUGUR_PROXY_DIR/$(workspace_slug).vfkit.sock" 2>/dev/null || true
 }
 
-# Boot self-test, macOS-VM peer of verify_egress_locked — I1's tripwire on this engine. Read that
-# function first: this one deliberately keeps its shape, including the property that matters most.
+# Boot self-test, macOS-VM peer of verify_egress_locked — the fail-closed tripwire on this engine.
+# Read that function first: this one deliberately keeps its shape, including the property that
+# matters most.
 #
 # A probe that only checks "direct egress fails" reports SUCCESS when the guest has NO network at
 # all. Both halves are therefore load-bearing, exactly as in the container version:
@@ -1610,7 +1608,7 @@ verify_macos_egress_locked() {
     info "Running egress self-test (in-guest)..."
     local leaked=false
     # PATH pinning, same reason as verify_egress_locked's and the same blast radius: `down --macos`
-    # KEEPS the clone (ADR-0006/ADR-0010), and augur's own ~/.augur-env puts $HOME/.local/bin FIRST
+    # KEEPS the clone, and augur's own ~/.augur-env puts $HOME/.local/bin FIRST
     # in the PATH of every guest shell — including the non-login shell `ssh <host> <cmd>` runs, which
     # still sources ~/.zshenv. A prior guest session could otherwise plant ~/.local/bin/curl|dig|
     # dscacheutil|ping and fake every isolated answer below. The real tools live in system dirs a
@@ -1661,7 +1659,7 @@ verify_macos_egress_locked() {
         # IPv6 literal, so one blackholed/rerouted address (or a v6-only leak the v4 probes would
         # miss) cannot make a routable network look isolated. Only :443 — unlike container's
         # routeless --internal network, the deny here comes from the proxy refusing an IP-literal
-        # destination unconditionally (I4), which is port-agnostic, so container's second :80 pass
+        # destination unconditionally, which is port-agnostic, so container's second :80 pass
         # would buy no coverage and cost another full timeout. --max-time is 4 rather than
         # container's 6 for the same reason it matters at all: gvproxy's netstack ACCEPTS the
         # connection and the SOCKS deny closes it afterwards, so a severed IP-literal probe burns
@@ -1858,7 +1856,8 @@ container_fingerprint() {
         # else-less `if`, NOT `[[ -f ]] && echo`: the &&-form returns 1 when no ~/.gitconfig, and
         # under `set -o pipefail` that 1 becomes the pipeline's (hence the function's) exit status,
         # which would abort the STANDALONE write_container_fingerprint call under `set -e` — skipping
-        # finish_up and its I1 boot self-test on a fresh up. An else-less if with a false test returns 0.
+        # finish_up and its boot self-test on a fresh up. An else-less if with a false test
+        # returns 0.
         if [[ -f "$HOME/.gitconfig" ]]; then echo "gitconfig=present"; fi
     } | { if command -v sha256sum &>/dev/null; then sha256sum; else shasum -a 256; fi; } | awk '{print $1}'
 }
@@ -1951,11 +1950,11 @@ apply_guest_profile() {
 # in ~/.claude rather than under one of the mounts, so it goes with it.
 #
 # Scope is deliberately JUST the prompt history. augur does not snapshot ~/.claude.json: augur
-# makes no per-container write to that file on purpose (ADR-0012), and its per-project entry
+# makes no per-container write to that file on purpose, and its per-project entry
 # carries folder trust and tool permissions — replaying those across a recreate would quietly
 # re-grant approvals the operator gave to a container that no longer exists, undoing that choice.
 #
-# `destroy` DROPS the snapshot rather than feeding it forward: it is the clean-guest button (the A2
+# `destroy` DROPS the snapshot rather than feeding it forward: it is the clean-guest button (the
 # integrity remedy), and carrying guest-written data across it would defeat the guarantee asked for.
 #
 # BOUNDED twice over — by lines AND by bytes. The only in-guest write mechanism this codebase has
@@ -1970,7 +1969,7 @@ guest_carryover_dir() {
     d="$AUGUR_DIR/$(agent_state_carryover_host_subdir)/$(workspace_slug)-$(workspace_path_hash)"
     # `umask 077` in a subshell, NOT mkdir-then-chmod: this holds guest-written data, and the
     # chmod-after form leaves a window where it is group/world readable. Same shape as
-    # write_container_fingerprint. Kept OUTSIDE the host's own ~/.claude (the A3 discipline the
+    # write_container_fingerprint. Kept OUTSIDE the host's own ~/.claude (the same discipline the
     # history/agents mounts follow). Failure is non-fatal — every caller is best-effort.
     ( umask 077; mkdir -p "$d" ) 2>/dev/null || true
     echo "$d"
@@ -2044,14 +2043,14 @@ drop_guest_history() {
 
 # Shared tail of `up` — ALL THREE paths (fresh create, stopped→running reuse, and the
 # already-running reconcile): bring the host egress proxy up now that the container has attached,
-# run the boot self-test (I1's tripwire — runs on EVERY up, never cached from a prior boot), and
+# run the fail-closed boot self-test (runs on EVERY up, never cached from a prior boot), and
 # print the ready banner.
 #
 # On the already-running path this one line buys three distinct things:
 #   • start_egress_proxy → start_proxy rewrites the merged allowlist AND REVIVES A DEAD PROXY. That
 #     is the only recovery from a proxy killed out from under a live session; nothing else in
 #     `up`/`claude` restarts one.
-#   • verify_egress_locked restores I1's tripwire on that path.
+#   • verify_egress_locked restores the boot self-test on that path.
 #   • apply_guest_profile picks up a structural profile change.
 finish_up() {
     if egress_enabled; then
@@ -2099,7 +2098,7 @@ reconcile_running_container() {
         error "changed since). A running container cannot pick those up: ${BOLD}augur down && augur up${RESET}"
         exit 1
     fi
-    finish_up                            # restores I1's boot self-test on this path
+    finish_up                            # restores the boot self-test on this path
 }
 
 # Build a fresh container from the image: drop any old one, assemble the `container run` argv,
@@ -2128,8 +2127,8 @@ recreate_container() {
     # See resolve_container_memory for the override precedence.
     run_args+=(--memory "$(resolve_container_memory)")
 
-    # Container mode has no clock-skew defect (the guest shares the host kernel's clock — see
-    # ADR-0015's scope note), but it DOES default to UTC like any bare Linux image: nothing here
+    # Container mode has no clock-skew defect (the guest shares the host kernel's clock, unlike a
+    # macOS VM guest), but it DOES default to UTC like any bare Linux image: nothing here
     # otherwise tells the guest what zone the host is in. Baked here so PID 1 and anything that
     # never goes through `exec` still gets a sane starting value. Deliberately NOT in
     # container_fingerprint: unlike egress/memory/credentials/mounts, a stale TZ doesn't need a
@@ -2214,7 +2213,8 @@ _add_auth_run_args() {
     # the guest off the host's ~/.claude entirely.
     # AUGUR_AGENT_SEAM | auth injection — core enforces named-only (never wholesale host env,
     # never a mounted credential store); the agent only DECLARES the names + host sources
-    # (agent_auth_specs). CONTRACT (C3): a future multi-agent build validates each value here.
+    # (agent_auth_specs). CONTRACT (credentials): a future multi-agent build validates each value
+    # here.
     local _genv _henv _hfile _hvalidator _aval
     while IFS='|' read -r _genv _henv _hfile _hvalidator; do
         [[ -z "$_genv" ]] && continue
@@ -2228,17 +2228,17 @@ _add_auth_run_args() {
 
 _add_state_mount_run_args() {
     # AUGUR_AGENT_SEAM | history mount — core decides where history lives and who can see it;
-    # the agent only declares its guest paths (ADR-0003 C7).
+    # the agent only declares its guest paths.
     # Persist this project's agent history across down/up:
     # - Host side: ~/.augur/claude-projects/<slug>-<path hash>, OUTSIDE the host's own
     #   ~/.claude/projects. The guest can write anything into this mount, and a forged transcript
-    #   resumed by the host's Claude could inject instructions into that higher-privilege agent
-    #   (security review 2026-06-28, finding A3). The path hash keeps two same-named projects
-    #   apart: no other project's history, and nothing else of the host's ~/.claude, is reachable.
+    #   resumed by the host's Claude could inject instructions into that higher-privilege agent.
+    #   The path hash keeps two same-named projects apart: no other project's history, and nothing
+    #   else of the host's ~/.claude, is reachable.
     # - Guest side: Claude keeps one leaf dir per cwd (projects/-workspace-<slug>). The whole
     #   projects/ parent is mounted, not one leaf, so every leaf this project creates (the main
     #   checkout, ad-hoc `claude --worktree` sessions) persists.
-    #   Accepted trade-off: those leaves can read and modify each other (ADR-0004 §3 Option A).
+    #   Accepted trade-off: those leaves can read and modify each other.
     # - The image pre-bakes projects/ and a minimal ~/.claude.json (Dockerfile) only as a
     #   fallback; this mount normally shadows them.
     local agent_proj_leaf host_hist_dir
@@ -2323,7 +2323,7 @@ cmd_up() {
 
     # Already running: the container itself can't change, but the host side is rebuilt on
     # every `up` — rewrite the allowlist (augur-proxy hot-reloads it, so a revocation takes
-    # effect), check the config fingerprint, and re-run the boot self-test (INVARIANTS I1).
+    # effect), check the config fingerprint, and re-run the boot self-test.
     if container_running; then
         reconcile_running_container
         return 0
@@ -2419,7 +2419,7 @@ cmd_setup_token() {
     # saved to the host for future `up`s regardless; an already-running container is left untouched.
     local started_here=false
     if ! container_running; then cmd_up; started_here=true; fi
-    # A2: the guest can overwrite its own (uid 1001-owned) claude binary, and setup-token
+    # Integrity gate: the guest can overwrite its own (uid 1001-owned) claude binary, and setup-token
     # attaches that binary to the operator's TTY. Refuse if it differs from the image's pristine
     # copy — a freshly-CREATED container matches; a reused one tampered with by a prior session
     # does not. Now that `down` only STOPS (the tampered filesystem persists), the clean-binary
@@ -2505,7 +2505,7 @@ cmd_destroy() {
     fi
     # Drop the reconcile fingerprint and tear down the whole egress datapath (proxy + network).
     rm -f "$(container_fingerprint_file)" 2>/dev/null || true
-    # `destroy` is the clean-guest button (the A2 integrity remedy), so the carried-over prompt
+    # `destroy` is the clean-guest button (the integrity remedy), so the carried-over prompt
     # history goes too. Feeding guest-written data forward across an explicit destroy would defeat
     # exactly the guarantee the operator asked for. A drift-recreate inside `up` keeps it.
     drop_guest_history
@@ -2740,8 +2740,8 @@ cmd_build_macos() {
             --ipsw)      ipsw_path="${2:?'--ipsw requires a file path'}";           shift 2 ;;
             --xcode-xip) xcode_xip_path="${2:?'--xcode-xip requires a file path'}"; shift 2 ;;
             --platforms) platforms="${2:?'--platforms requires a value'}";          shift 2 ;;
-            # Escape hatch out of ADR-0018's automated provisioning: take the manual Setup
-            # Assistant flow (ADR-0007) even on a macOS 27+ host/guest pair. Without it, a host
+            # Escape hatch out of macOS 27's automated provisioning: take the manual Setup
+            # Assistant flow even on a macOS 27+ host/guest pair. Without it, a host
             # where the automated first boot doesn't complete (for any reason — the guest side
             # of it is opaque and unattended) would have no way to build a base VM at all. The
             # manual flow stays the known-good fallback.
@@ -2799,7 +2799,7 @@ cmd_build_macos() {
     # Step 3: First boot. VZMacGuestProvisioningOptions only takes effect on a guest's FIRST
     # boot after restore (and only if the HOST is macOS 27+; the framework silently ignores it
     # on an older guest OS too), so this decision has to be made right here, before the very
-    # first `run` — see ADR-0018. When both sides qualify, provision the admin account
+    # first `run`. When both sides qualify, provision the admin account
     # automatically and go straight to a headless boot; otherwise fall back to the manual
     # Setup Assistant flow.
     local host_major guest_major auto_setup=false
@@ -2872,7 +2872,7 @@ cmd_build_macos() {
         # Persist the generated password only now that the guest demonstrably came up with it.
         # Writing it before the boot would leave every later macos_admin_password() caller
         # trusting a credential no VM ever had, if the boot failed — including a subsequent
-        # --manual-setup build, whose account really is the fixed ADR-0007 one.
+        # --manual-setup build, whose account really is the fixed admin/admin one.
         # umask for the create, then chmod unconditionally — the same pairing cmd_setup_token
         # uses, and for the same reason: `>` truncates an ALREADY-EXISTING file while keeping
         # its mode, so umask alone leaves a rebuild writing the new password into whatever
@@ -2882,7 +2882,7 @@ cmd_build_macos() {
         ( umask 077 && printf '%s' "$new_password" > "$MACOS_ADMIN_PASSWORD_FILE" )
         chmod 600 "$MACOS_ADMIN_PASSWORD_FILE"
     else
-        # The account this flow creates is the fixed ADR-0007 admin/admin one, so drop any
+        # The account this flow creates is the fixed admin/admin one, so drop any
         # override left behind by an earlier automated build (or a failed attempt at one) —
         # otherwise macos_admin_password() would keep feeding sudo a stale random password.
         rm -f "$MACOS_ADMIN_PASSWORD_FILE"
@@ -3030,7 +3030,7 @@ cmd_build_macos() {
         # and gh respects GH_TOKEN automatically, so installing the binary is all that is needed for
         # an authenticated gh (no hosts.yml / Keychain handling required). See cmd_up_macos.
         brew install gh
-        # AUGUR_AGENT_SEAM | macOS base-VM agent install + provenance (codesign signer). See docs §4 C2.
+        # AUGUR_AGENT_SEAM | macOS base-VM agent install + provenance (codesign signer).
         # Claude Code: do NOT use npm. The npm-distributed native binary arrives with a code
         # signature that gets corrupted during tar extraction, so Apple Silicon AMFI kills it
         # on launch (SIGKILL / "zsh: killed"). The official installer downloads a correctly
@@ -3055,7 +3055,7 @@ cmd_build_macos() {
 
     # Scrub any ~/.claude.json this base VM has accumulated (e.g. a manual `claude` login during
     # Setup Assistant / manual verification) before it's frozen into the base image. augur never
-    # seeds this file with real account state on purpose (ADR-0012) — a leaked account here would
+    # seeds this file with real account state on purpose — a leaked account here would
     # otherwise be inherited by every `augur up --macos` clone forever. Neither this build script
     # nor run_base_provisioning invokes `claude` interactively, so this is normally a no-op; it
     # exists to guarantee the invariant even when a human has poked at the VM by hand.
@@ -3155,8 +3155,8 @@ ensure_macos_workspace() {
 # subdir name Claude derives from the guest cwd lands inside the shared parent, so no path-encoding
 # assumption is needed. Auth is NOT shared (see the ~/.claude note above). Idempotent.
 # AUGUR_AGENT_SEAM | macOS state symlink — in-VM agent projects dir → shared share.
-# CONTRACT (A3/C7): the share name MUST equal agent_state_host_subdir; the in-VM path is
-# the agent's projects dir. Keep both in lockstep when swapping agents. See docs §4 C7.
+# CONTRACT (state dir): the share name MUST equal agent_state_host_subdir; the in-VM path is
+# the agent's projects dir. Keep both in lockstep when swapping agents.
 ensure_macos_claude_projects() {
     local vm="$1"
     ssh_macos "$vm" '
@@ -3289,9 +3289,9 @@ warn_if_macos_egress_pinned() {
 #
 # Run from BOTH cmd_build_macos and cmd_update_macos so a base VM built before this existed
 # self-heals on the next routine update instead of needing a full rebuild — the same reason the
-# ~/.claude.json scrub (ADR-0012) runs in both.
+# ~/.claude.json scrub runs in both.
 #
-# HONEST SCOPE: the base VM's account is the published admin/admin (ADR-0007), so this is a policy
+# HONEST SCOPE: the base VM's account is the published admin/admin, so this is a policy
 # DEFAULT, not a tamper-proof control — anyone with that password can rewrite it. It still does the
 # job it is here for: stopping a repository's own settings from re-enabling the auto-updater and
 # swapping out the binary the integrity gate verifies. In Container mode the same file IS
@@ -3311,8 +3311,8 @@ install_macos_managed_settings() {
     }
     # `sudo -S` works whether or not the build-time NOPASSWD grant is still present, which is what
     # lets `update --macos` reach a base VM that no longer has it. The password is whatever this
-    # base VM's admin account actually has — the documented fixed one (ADR-0007) unless it was
-    # built via automated provisioning (ADR-0018) — no privilege here augur's build doesn't already take.
+    # base VM's admin account actually has — the documented fixed one unless it was built via
+    # automated provisioning — no privilege here augur's build doesn't already take.
     ssh_macos "$vm" "echo '$(macos_admin_password)' | sudo -S -p '' sh -c '
         mkdir -p \"${parent}\" &&
         mv \"${staged}\" \"${dst}\" &&
@@ -3398,16 +3398,15 @@ _macos_guest_epoch() {
 # Set the guest's wall clock from the host's, over SSH, on every path that hands a guest to the
 # agent. A cloned macOS guest boots a fixed ~95 min behind the host (the offset is inherited from
 # the base VM), so a freshly issued token looks not-yet-valid and git/TLS timestamps are skewed.
-# - Not NTP: UDP has no path out of the egress datapath, by design (INVARIANTS I9).
+# - Not NTP: UDP has no path out of the egress datapath, by design.
 # - The host's clock, not the guest's own kern.monotonicclock: nothing guarantees the latter
 #   tracks real time on another host or Virtualization.framework version.
 # - Written with `sudo -S` fed the admin password, as for every privileged command in a project
-#   guest (clones have no passwordless sudo). This is guest-side; ADR-0001's sudo-free rule is
+#   guest (clones have no passwordless sudo). This is guest-side; augur's sudo-free rule is
 #   about the host. `/bin/date` is absolute because ~/.augur-env puts ~/.local/bin first, where a
 #   previous guest session could shadow `date` (hygiene, not a security control).
 # - Best-effort: warns and continues, never fails `up`. A wrong clock degrades the guest but does
 #   not uncontain it — unlike verify_macos_egress_locked, which must exit on failure.
-# Measurements and full reasoning: docs/decisions/0015-guest-clock-from-host.md
 sync_macos_guest_clock() {
     local vm="$1" tol="$_MACOS_CLOCK_TOLERANCE_S" host_epoch guest_epoch drift adrift stamp setout
     # Read first. This is what makes the correction idempotent across the four call sites (a second
@@ -3542,16 +3541,16 @@ cmd_up_macos() {
         # The one guest-side thing this branch CAN still reconcile. The measured offset is a
         # boot-invariant constant, so a single correction per boot is enough for the defect as
         # observed — but a VM this branch exists to serve is by definition long-lived (`down --macos`
-        # keeps the clone, ADR-0006/0010), and a guest paused while the host sleeps has its
+        # keeps the clone), and a guest paused while the host sleeps has its
         # CLOCK_REALTIME frozen while the host's advances, which would reintroduce drift no boot-time
         # correction can reach. Idempotent: it re-reads first and only writes when it must.
         sync_macos_guest_clock "$project_vm"
         sync_macos_guest_timezone "$project_vm"
-        # I1's tripwire on THIS path too, mirroring container mode: finish_up (and therefore
-        # verify_egress_locked) runs on cmd_up's already-running branch, and ADR-0010 already
-        # accepted the consequence — "`augur up` against a running container can now end an
-        # operator's session, but only on a DETECTED leak, which is precisely when I1 says it
-        # should." A live check on a running VM is if anything MORE valuable than one on a fresh
+        # The boot self-test on THIS path too, mirroring container mode: finish_up (and therefore
+        # verify_egress_locked) runs on cmd_up's already-running branch. Accepted trade-off:
+        # `augur up` against a running guest can end an operator's session, but only on a
+        # DETECTED leak, which is precisely when it should. A live check on a running VM
+        # is if anything MORE valuable than one on a fresh
         # boot: this branch is the only place a proxy killed out from under a live session is
         # revived, and the self-test is what proves that revival actually restored enforcement. It
         # runs LAST so the pinned-state warning above is still printed on the way out.
@@ -3688,14 +3687,14 @@ cmd_up_macos() {
     # below this line does: the self-test's TLS handshakes evaluate certificate validity windows, the
     # ~/.augur-env push hands over a JWT whose `nbf`/`exp` the agent will check against this clock,
     # and the git credential helper's token is the same object. It is deliberately the one step that
-    # precedes I1's tripwire, and that is safe for a reason the tripwire's own comment names: what
+    # precedes the self-test, and that is safe for a reason the tripwire's own comment names: what
     # must not reach an uncontained guest is a CREDENTIAL, and the host's wall-clock time is not one
     # — the guest can already read it off the mtimes of the virtiofs share it is mounting. Going
     # second instead would leave the self-test's own positive half judging a certificate window 95
     # minutes early, i.e. able to tear down a healthy VM over a certificate rotated minutes ago.
     sync_macos_guest_clock "$project_vm"
 
-    # I1's boot tripwire, as early as it can possibly run: the moment a command can be run in the
+    # The boot self-test, as early as it can possibly run: the moment a command can be run in the
     # guest, and BEFORE any of the wiring below — in particular before ~/.augur-env pushes an
     # Anthropic token and a gh token into it. A guest whose egress is not contained is exactly the
     # guest that must not receive credentials, so this deliberately precedes the injection rather
@@ -3717,21 +3716,21 @@ cmd_up_macos() {
 
     # Copy git config, and seed a minimal .claude.json one-way for onboarding state only (NOT auth —
     # on macOS the OAuth token lives in the Keychain, not in this file; see docs/macos-vm-architecture-review.md;
-    # and NOT folder-trust — augur does not pre-trust the workspace, see docs/decisions/0012-drop-workspace-trust-seed.md).
+    # and NOT folder-trust — augur deliberately does not pre-trust the workspace).
     # We deliberately do NOT copy the host's ~/.claude.json (not even a stripped copy): it enumerates
     # every repo on the host (`projects`) and can hold third-party MCP API keys (`mcpServers`), and the
     # guest needs none of it. Seed the exact same static onboarding stub the container image bakes
     # (Dockerfile), independent of the host config and of whether jq is installed.
     #
     # WRITE-ONCE, gated on `_fresh_clone` (this `up` just created the VM above) — NOT on the
-    # file's absence. `down --macos` keeps the clone (ADR-0006/ADR-0010), so unlike a throwaway VM
+    # file's absence. `down --macos` keeps the clone, so unlike a throwaway VM
     # this file accumulates real guest state after the first boot — prompt history, guest-side MCP
     # servers, caches, whatever folder-trust decision the operator made — and an unconditional
     # overwrite on a REUSED VM would silently destroy all of that. A fresh clone gets the opposite
     # treatment: overwrite unconditionally, regardless of whether the inherited disk already has
     # some `.claude.json`. Keying off "did we just clone" rather than "does the file exist" matters
     # because the base VM is a long-lived, mutable disk that can itself accumulate a stale/real
-    # `.claude.json` between builds (see cmd_build_macos/cmd_update_macos's scrub and ADR-0012) —
+    # `.claude.json` between builds (see cmd_build_macos/cmd_update_macos's scrub) —
     # an existence check alone would silently inherit that into every new project clone again.
     if $_fresh_clone; then
         local _cj; _cj="$(mktemp)"
@@ -3748,9 +3747,9 @@ cmd_up_macos() {
     # Precedence (official): ANTHROPIC_API_KEY > CLAUDE_CODE_OAUTH_TOKEN — if both are set the
     # API key wins. Provide either via env or a file (~/.anthropic_api_key / ~/.claude_code_oauth_token).
     # AUGUR_AGENT_SEAM | auth injection — core enforces named-only; the agent DECLARES names +
-    # host sources (agent_auth_specs). CONTRACT (C3): these values are interpolated into a SOURCED
-    # shell file; a future multi-agent build must validate each value (reject quotes/control bytes)
-    # before this point. See docs §4 C3.
+    # host sources (agent_auth_specs). CONTRACT (credentials): these values are interpolated into a
+    # SOURCED shell file; a future multi-agent build must validate each value (reject quotes/control
+    # bytes) before this point.
     local gh_token _genv _henv _hfile _hvalidator _aval
     gh_token="$(gh auth token 2>/dev/null || true)"
     # Re-run the SAME check immediately before the write — one helper, no second validator to drift.
@@ -3810,7 +3809,7 @@ cmd_claude_macos() {
     warn_if_macos_egress_pinned "$project_vm"
     ensure_macos_claude_bin "$project_vm"
     info "Launching $(agent_display_name) in '${project_vm}'..."
-    # AUGUR_AGENT_SEAM | interactive launch (macOS: interpolated into SSH string — see C4 on agent_launch_argv)
+    # AUGUR_AGENT_SEAM | interactive launch (macOS: interpolated into SSH string — see agent_launch_argv)
     local _renv _rargv
     _renv="$(agent_fixed_env)"; _rargv="$(agent_launch_argv)"
     ssh_macos "$project_vm" -t "zsh -l -c 'cd ~/${MACOS_SHARE} && ${_renv} ${_rargv}'"
@@ -3847,7 +3846,7 @@ cmd_setup_token_macos() {
     local started_here=false
     if ! macos_vm_running "$project_vm"; then cmd_up_macos; started_here=true; fi
     ensure_macos_claude_bin "$project_vm"
-    # A2: the guest is root and can replace its claude binary; setup-token attaches it to
+    # Integrity gate: the guest is root and can replace its claude binary; setup-token attaches it to
     # the operator's TTY. Refuse an unsigned/lookalike binary (the build pins the Anthropic
     # signer) — a tampered one could phish the token flow.
     if ! agent_verify_integrity_macos "$project_vm"; then
@@ -3860,7 +3859,7 @@ cmd_setup_token_macos() {
     info "Complete the browser sign-in; when it prints the token, copy it."
     # Run attached to the terminal (no pipe) so the full-screen TUI renders cleanly;
     # the token is pasted back here instead of being captured.
-    # AUGUR_AGENT_SEAM | login launch (macOS: interpolated into SSH string — see C4)
+    # AUGUR_AGENT_SEAM | login launch (macOS: interpolated into SSH string — see agent_launch_argv)
     ssh_macos "$project_vm" -t "zsh -l -c '$(agent_login_argv)'" || true
     stty sane 2>/dev/null || true   # restore cooked mode if the TUI left the tty raw
     # Same guard as the container path: an attached interactive client (`ssh -t` here)
@@ -3891,6 +3890,9 @@ cmd_down_macos() {
         warn "No VM found for this directory (${project_vm})."
         return 0
     fi
+    # Deliberately stops and KEEPS the clone (never `vm delete`): the Xcode state inside it —
+    # DerivedData, Simulator runtimes, resolved dependencies — is expensive to rebuild.
+    # `destroy --macos` is the full removal.
     info "Stopping VM '${project_vm}'..."
     # Keep the `|| true` (a stop failure must not abort the rest of this teardown), but re-check the
     # REAL state instead of reporting success unconditionally — the same re-check cmd_down does after
@@ -4279,7 +4281,7 @@ cmd_update_macos() {
     # the operator created those files. See run_base_provisioning.
     run_base_provisioning "$MACOS_BASE_VM" "$vm_pid"
 
-    # Same scrub as cmd_build_macos (ADR-0012): re-assert the no-account-state invariant on every
+    # Same scrub as cmd_build_macos: re-assert the no-account-state invariant on every
     # update too, not just at build. The base VM is long-lived and mutable, so a human can log
     # into `claude` by hand between updates (the actual leak vector — neither build's provisioning
     # nor this update step ever runs `claude` interactively); running this on every update makes
@@ -4832,8 +4834,8 @@ run_base_provisioning() {
     # mid-build VM already has this grant from its own Step 4; a standalone base-VM
     # 'augur update --macos' does not, since the original build already revoked it — this
     # establishes it fresh in that case). Same admin credential the rest of the build already
-    # depends on (see cmd_build_macos and macos_admin_password) — fixed admin/admin (ADR-0007)
-    # unless this base VM was built via automated provisioning (ADR-0018).
+    # depends on (see cmd_build_macos and macos_admin_password) — fixed admin/admin
+    # unless this base VM was built via automated provisioning.
     ssh_macos_provision "$vm" \
         "echo '$(macos_admin_password)' | sudo -S -p '' bash -c \
             'echo \"${MACOS_SSH_USER} ALL=(ALL) NOPASSWD:ALL\" > /etc/sudoers.d/augur \
@@ -5204,7 +5206,7 @@ MACOS_SHARE="workspace-$(workspace_slug)"
 #     had already created from $HOME — exactly the case that needs refusing.
 # It also runs BEFORE require_vz (called from inside the macOS cmd_* functions), so the
 # refusal names the workspace rather than the host OS.
-# NOT gated, on purpose (see the ADR): down/destroy/list/status must keep working here so a
+# Deliberately NOT gated: down/destroy/list/status must keep working here so a
 # container/VM a pre-fix augur made in $HOME can still be cleaned up; init-conf/build/update/
 # install-cert/version/help never hand this directory to a guest (`build` uses $SCRIPT_DIR as
 # its context).
