@@ -149,13 +149,21 @@ What you get instead is a directory you populate on purpose:
 - **Your own files are never deleted.** If the guest already had a real `~/.claude/commands` or
   `~/.claude/skills` when you first populate the profile, augur moves it aside to
   `<name>.pre-profile` rather than replacing it (an empty one is simply dropped).
-- **macOS VM mode caveat — host-side edits need a VM restart.** The profile works there (it is
-  shared read-only into the VM and wired the same way), but macOS mode reaches it over a **virtiofs
-  share** rather than a bind mount, and the macOS guest's virtiofs client keeps serving **stale file
-  data** after a host-side edit. So if you change the profile while a VM is running, run
-  `augur down --macos && augur up --macos` to pick it up. Container mode is unaffected.
+- **macOS VM mode caveat on macOS 26.x — host-side edits need a VM restart.** The profile works
+  there (it is shared read-only into the VM and wired the same way), but macOS mode reaches it over
+  a **virtiofs share** rather than a bind mount. When the host or the guest runs macOS 26.x, the
+  guest's virtiofs client keeps serving **stale file data** after a host-side edit. So if you change
+  the profile while a VM is running, run `augur down --macos && augur up --macos` to pick it up.
+  Container mode is unaffected.
 
-  Three things are worth knowing, because each is the opposite of what seems reasonable:
+  **On macOS 27.0+ (host and guest) the defect no longer reproduces**, and host-side edits show up
+  in a running guest within about a second. That was confirmed on one machine (M1 Max, build
+  26A428), not across hardware or 27.x point releases. See
+  [ADR-0019](./docs/decisions/0019-macos27-virtiofs-staleness-resolved.md) for what was tested and
+  what it does not establish.
+
+  On macOS 26.x, three things are worth knowing, because each is the opposite of what seems
+  reasonable:
 
   - **It is not specific to read-only shares.** The read-write workspace share behaves identically,
     so this is not only about the profile — edit a source file on the host and a running guest may
@@ -167,11 +175,11 @@ What you get instead is a directory you populate on purpose:
     `vm run` rebuilds the share device — Virtualization.framework cannot rebuild a share device on a
     live VM in any case.
 
-  This is a platform defect, and augur accepts it rather than working around it — see
-  [ADR-0017](./docs/decisions/0017-accept-virtiofs-staleness.md) for the measurements, the
-  mitigation augur decided against, and what would bring it back.
+  On macOS 26.x this is a platform defect, and augur accepts it rather than working around it — see
+  [ADR-0017](./docs/decisions/0017-accept-virtiofs-staleness.md) for the measurements, why the
+  mitigation was removed, and what would bring it back.
   Issues [#124](https://github.com/h1d3mun3/augur/issues/124) and
-  [#135](https://github.com/h1d3mun3/augur/issues/135).
+  [#135](https://github.com/h1d3mun3/augur/issues/135) (closed by ADR-0019).
 
 Your **repository's** own `.claude/settings.json`, `CLAUDE.md`, `.claude/commands/`,
 `.claude/skills/` and `.mcp.json` already work with no setup — they arrive inside the workspace
