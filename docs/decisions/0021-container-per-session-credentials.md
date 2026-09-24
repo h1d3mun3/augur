@@ -44,7 +44,7 @@ injected per session instead, only on the `container exec` that starts `augur cl
 - **Mid-session token rotation** is picked up by the next session, not live.
 
 The corresponding updates to `README.md`, `docs/security-reviews/INVARIANTS.md` (I10) and
-`docs/security-reviews/host-env-exposure-review.md` ship with the implementation PR, so the docs
+`docs/host-env-exposure-review.md` ship with the implementation PR, so the docs
 never describe behavior that is not merged.
 
 ## Context
@@ -122,7 +122,10 @@ sees the baked one. Two consequences:
 - `augur setup-token` and ad-hoc `container exec` sessions run without credentials.
 - Credentials exist only in the environment of augur-started session processes in the guest, for
   the life of those processes.
-- macOS VM mode is unchanged.
+- macOS VM mode is unchanged. It is not exposed to the duplicate-env problem either:
+  `sync_macos_guest_timezone` sets the guest's system timezone with `systemsetup -settimezone` on
+  `up`, `claude` and `shell` rather than exporting `TZ`, and `~/.augur-env` is rewritten whole at
+  every VM start, so no variable is ever present twice.
 
 ## Related
 
