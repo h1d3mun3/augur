@@ -214,7 +214,8 @@ stop_provision_gvproxy >/dev/null 2>&1
 # ── Guest RUNNING: the gate, driven through the REAL cmd_* functions ─────────────────────────────
 # Only the engine / VM / guest side is stubbed. Every gated call runs in $(…), which contains the
 # gate's `exit 1`.
-require_engine() { :; }; require_vz() { :; }; ensure_image() { :; }
+require_engine() { :; }; require_engine_version() { :; }; require_vz() { :; }; ensure_image() { :; }
+container_fingerprint_matches() { return 0; }   # the running container is current; only the gate is under test
 apply_guest_profile() { :; }; save_guest_history() { :; }
 eng() { [[ "$1" == exec ]] && echo "AGENT_LAUNCHED"; return 0; }
 ssh_macos() { echo "AGENT_LAUNCHED"; }
@@ -332,8 +333,8 @@ gate_before() {   # FN RUNNING_CHECK — the gate line precedes the first runnin
   if [[ -n "$gl" && -n "$rl" && "$gl" -lt "$rl" ]]; then ok "$1: gate before '$2'"; else fail "$1: gate missing or after '$2'" "gate=$gl running=$rl"; fi
 }
 gate_before cmd_up container_running
-gate_before cmd_claude container_running
-gate_before cmd_shell container_running
+gate_before cmd_claude ensure_session_container   # container mode's claude/shell branch lives there
+gate_before cmd_shell ensure_session_container
 gate_before cmd_setup_token container_running
 gate_before cmd_up_macos macos_vm_running
 gate_before cmd_claude_macos macos_vm_running

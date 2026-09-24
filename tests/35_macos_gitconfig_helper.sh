@@ -16,7 +16,7 @@
 # Under augur's `set -e` that would abort `up` after the clone, the sizing, the boot and the SSH
 # wait, tearing none of it down — the stranded-guest shape the pre-clone credential check (34)
 # exists to prevent. Container mode is immune: it bind-mounts ~/.gitconfig read-only and injects
-# the same helper through GIT_CONFIG_KEY_0/VALUE_0, never touching the file. The remedy is
+# the same helper per session through GIT_CONFIG_KEY_0/VALUE_0, never touching the file. The remedy is
 # --replace-all, which collapses the duplicates to the single value augur intends, plus `|| warn`
 # for the residue --replace-all cannot fix (a ~/.gitconfig git cannot parse at all fails with 128).
 #
@@ -193,10 +193,13 @@ up_macos_body="$(awk '/^cmd_up_macos\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")
 up_body="$(awk       '/^cmd_up\(\)/{f=1}       f{print} f&&/^}/{exit}' "$AUGUR")"
 fn_body() { awk -v n="$1" '$0 ~ "^"n"\\(\\) \\{"{f=1} f{print} f&&/^}/{exit}' "$AUGUR"; }
 host_config_body="$(fn_body _add_host_config_run_args)"
-# The whole container-up path: cmd_up plus every function it was split into.
+session_env_body="$(fn_body _add_session_exec_env)"
+# The whole container-up path: cmd_up plus every function it was split into, plus the per-session
+# env the claude/shell exec adds.
 up_path_body="$up_body"
-for _f in reconcile_running_container recreate_container _add_egress_run_args _add_auth_run_args \
-          _add_state_mount_run_args _add_host_config_run_args migrate_pre_option_a_history; do
+for _f in reconcile_running_container recreate_container _add_egress_run_args \
+          _add_state_mount_run_args _add_host_config_run_args migrate_pre_option_a_history \
+          _add_session_exec_env session_credential_env ensure_session_container; do
   _fb="$(fn_body "$_f")"
   [[ -n "$_fb" ]] || fail "source guard: could not extract $_f() from augur" "the up-path guard below would pass vacuously"
   up_path_body+=$'\n'"$_fb"
@@ -216,9 +219,10 @@ fi
 
 # Container mode's immunity is the reason only one mode is exposed to this, and it is a property worth
 # pinning: the mounted ~/.gitconfig is read-only there, so the helper MUST arrive via env vars.
-hasnt "$up_path_body" 'git config --global' "container up (cmd_up and every helper it calls) never mutates the mounted ~/.gitconfig"
-has   "$host_config_body" 'GIT_CONFIG_KEY_0=credential.https://github.com.helper' \
-                                       "container up injects the same helper through GIT_CONFIG_* env vars instead"
+hasnt "$up_path_body" 'git config --global' "container up/session (cmd_up and every helper it calls) never mutates the mounted ~/.gitconfig"
+has   "$session_env_body" 'GIT_CONFIG_KEY_0=credential.https://github.com.helper' \
+                                       "container sessions get the same helper through GIT_CONFIG_* env vars instead"
+hasnt "$host_config_body" 'GIT_CONFIG_' "container \`run\` bakes no GIT_CONFIG_* (the helper is per session)"
 has   "$host_config_body" '.gitconfig:/home/dev/.gitconfig:ro' "container up mounts ~/.gitconfig READ-ONLY"
 
 finish

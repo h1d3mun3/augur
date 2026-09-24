@@ -20,8 +20,8 @@ same command is safe in CI, the Linux dev container, and on a macOS host.
 | File | Needs | What it proves |
 |---|---|---|
 | `00_seam_unit.sh` | nothing | Every pure `agent_*` function emits its expected DATA (byte-equivalence floor). |
-| `11_construct_container.sh` | nothing | The **real** `cmd_up` / `cmd_claude` build the expected `container run` / `container exec` argv from the seam — auth env (named-only), cwd-keyed history mount, fixed env, launch argv. Also covers the pre-Option-A flat-history migration. Uses a `container` **shim**, so no runtime. |
-| `21_container_live.sh` | Apple Container (macOS 26+) | The built image actually runs the agent; auto-skips unless the `container` CLI + service are present, so it's a no-op on Linux/CI and macOS < 26. `AUGUR_TEST_LIVE=1` adds a real `up → exec → down` lifecycle. |
+| `11_construct_container.sh` | nothing | The **real** `cmd_up` / `cmd_claude` / `cmd_shell` / `cmd_setup_token` build the expected `container run` / `container exec` argv from the seam — cwd-keyed history mount, fixed env, launch argv — and credentials (named-only) reach **only** the `claude` / `shell` exec, through `--env-file <(…)`: never on any argv, never on `container run`, never on `setup-token` or augur's own execs. Also covers rotation without recreate, the stale-running-container refusal, session-start credential validation, the Apple Container ≥ 1.0.0 floor, and the pre-Option-A flat-history migration. Uses a `container` **shim**, so no runtime. |
+| `21_container_live.sh` | Apple Container (macOS 26+) | The built image actually runs the agent; auto-skips unless the `container` CLI + service are present, so it's a no-op on Linux/CI and macOS < 26. `AUGUR_TEST_LIVE=1` adds a real `up → exec → down` lifecycle, including a secrets-zero check (`container inspect` shows no credential name or value, and no `TZ`) and a live `exec --env-file <(…)` round-trip. |
 | `22_egress_failclosed.sh` | Apple Container (macOS 26+) + `bash install` + built image | **The security layer** (a LOCAL gate — Apple Container has no free CI runner). Brings up egress mode (firing augur's boot self-test `verify_egress_locked`) and asserts the agent's only way out is the allowlist proxy: allowlisted domain reachable **via the proxy**, non-allowlisted **blocked (403)**, external **DNS does not resolve**, **direct** egress **severed**. `AUGUR_TEST_LIVE=1` runs it (skips if a prereq is absent); **`AUGUR_TEST_REQUIRE_EGRESS=1` makes a missing prereq a FAILURE, not a skip** — a security check must fail closed. |
 | `30_macos_vm.sh` | (guards: nothing) / macOS host | Source guards: the macOS launch/state paths consume the seam (no re-hardcoded `claude`). Live smoke is gated on macOS + `augur-vm` + `AUGUR_TEST_LIVE=1`. |
 
@@ -34,7 +34,11 @@ inside it, which no GitHub-hosted runner can do. See the repo README "Pre-releas
 `11_construct_container.sh` puts `tests/shims/` first on `PATH`, so augur calls our fake
 `container` (and `gh`). The shim fakes just enough preflight (`system status`, `image
 inspect`, `inspect`) for augur to reach the real `container run` / `container exec` it
-constructs, then records that argv to `$AUGUR_TEST_SHIMLOG.{run,exec}` for assertions.
+constructs, then records that argv to `$AUGUR_TEST_SHIMLOG.{run,exec}` for assertions. For every
+`--env-file P` it also appends P's content to `$AUGUR_TEST_SHIMLOG.envfile` (it reads the
+`/dev/fd/N` pipe while it runs), so a test can see what a session received without the values
+being on the argv. `AUGUR_TEST_CONTAINER_VERSION` overrides its `--version` (default 1.4.1), and
+the `gh` shim prints `AUGUR_TEST_GH_TOKEN` for `gh auth token` when set.
 Egress is turned off (`--no-egress`) so no proxy/network is needed. This is the design
 doc's "verify the constructed argv is byte-identical" check (§5 DoD) without a live
 container.

@@ -75,7 +75,7 @@ Don't need Xcode? `augur build && augur claude` gives you the lightweight
 | **One-time setup** | ~5 min (image build) | ~75 min (base VM build; unattended on macOS 27+) |
 | **Per-project start** | fast (container kept on `down`) | thin clone of the base VM, kept on `down` |
 | **Disk usage** | ~2 GB | ~70 GB+ |
-| **Requires** | Apple Container (macOS 26+) | augur-vm (bundled), IPSW, Xcode XIP |
+| **Requires** | Apple Container 1.0.0+ (macOS 26+) | augur-vm (bundled), IPSW, Xcode XIP |
 
 > **Workspace rule.** augur works in any directory except one that contains augur itself.
 > `augur up`/`claude`/`shell` refuse to run in `$HOME`, in `~/.augur`, or in any parent of either,
@@ -413,15 +413,15 @@ augur version                   # show augur version
 | `~/.claude/projects/-workspace-<project>` | **only this project's** Claude history is shared (read/write) — not the rest of `~/.claude`, so other projects' transcripts and host auth/settings stay invisible |
 | `~/.claude/agents/` | **this project's** user-level custom subagent definitions (`/agents`) are persisted (read/write), keyed per-project under `~/.augur/claude-agents/<project>` — so they survive `augur down`/`up` **and** `destroy`/recreate. Isolated per project (not the host's global `~/.claude/agents`), so a guest can't plant a subagent read by another project. Project-level `.claude/agents/` in the repo work too, via the workspace mount. |
 | `~/.augur/claude-profile/` | **opt-in** operator profile, mounted **read-only** — your personal `commands/`, `skills/`, `rules/`, `output-styles/`, `workflows/`, `themes/`, `CLAUDE.md`, `settings.json` and `keybindings.json` are wired into the guest's `~/.claude/`. Absent or empty (the default) wires nothing. See [Operator profile](#operator-profile). |
-| `~/.config/gh/` | mounted **read-only** (the container can read but not rewrite it; the token is injected via `GH_TOKEN`) |
+| `~/.config/gh/` | mounted **read-only** (the container can read but not rewrite it). The token itself is injected as `GH_TOKEN` **per session** — see Claude auth below |
 | `~/.gitconfig` | mounted read-only |
-| Claude auth | injected via env (`CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY`) — the host's credential store is never mounted |
+| Claude auth | injected via env (`CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY`) **per session**: only into the `augur claude` / `augur shell` session, never into the container at creation. The values go through an `--env-file` pipe, so they are on no command line, not on disk, and not in the container's saved config (`container inspect` shows none). The host's credential store is never mounted |
 | Everything else | **not visible to the container** — including the rest of `~/.claude` and the host's `~/.claude.json`, which augur never reads, copies, or mounts ([ADR-0013](docs/decisions/0013-claude-config-inheritance.md)) |
 
 #### Prompt history across a recreate
 
-augur recreates the container for its own reasons — a rotated credential, an egress toggle, a memory
-change, `augur build`/`update`/`install-cert`. That discards the writable layer, and your up-arrow
+augur recreates the container for its own reasons — an egress toggle, a memory change,
+`augur build`/`update`/`install-cert`. That discards the writable layer, and your up-arrow
 prompt history (`~/.claude/history.jsonl`) lives there rather than on a mount. So augur keeps a
 small, capped snapshot of just that file under `~/.augur/claude-carryover/<project>` (mode `0600`) —
 taken when you exit `augur claude`/`shell`, on `augur down`, and before `build`/`update` throw the
@@ -462,7 +462,9 @@ project: it aborts any build in flight anywhere else on the Mac. See
 
 ### Requirements
 
-- **Apple Container** (`container`) on macOS 26+
+- **Apple Container** (`container`) **1.0.0 or newer**, on macOS 26+. augur refuses `up` /
+  `claude` / `shell` / `setup-token` on an older CLI (`down`, `destroy` and `list` still work, so
+  you can clean up first).
 - bash
 
 ---
@@ -590,6 +592,13 @@ export CLAUDE_CODE_OAUTH_TOKEN="..."   # or save it to ~/.claude_code_oauth_toke
 augur reads `CLAUDE_CODE_OAUTH_TOKEN` (env or `~/.claude_code_oauth_token`) and injects it
 into the container/VM. `ANTHROPIC_API_KEY` takes priority if both are set.
 
+In Container mode, credentials are injected per session: each `augur claude` / `augur shell`
+resolves them afresh, so a rotated key or token takes effect on the next session with no
+container recreate. A session already running keeps the value it started with. `augur
+setup-token` runs with **no** credentials injected (it exists to mint one), and neither does a
+`container exec` you run by hand outside augur. In macOS VM mode they are written to
+`~/.augur-env` when the VM starts.
+
 **GitHub CLI:**
 
 ```bash
@@ -598,7 +607,8 @@ gh auth login
 ```
 
 `gh` credentials are shared automatically in both modes: the host's `gh auth token` is injected
-as `GH_TOKEN`, and a guest-only git credential helper makes HTTPS `git push` work off it. In
+as `GH_TOKEN` (per session in Container mode, like the Claude credentials above), and a guest-only
+git credential helper makes HTTPS `git push` work off it. In
 Container mode the host's `~/.config/gh` is also mounted read-only (so the guest can't rewrite it);
 macOS VM mode does not share `~/.config/gh` at all.
 

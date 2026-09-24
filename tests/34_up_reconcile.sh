@@ -12,7 +12,7 @@
 #      allowlist and running `augur up` would print one yellow line, exit 0, and leave the live
 #      proxy enforcing the old policy.
 #   2. The boot self-test would not run: verify_egress_locked lives in finish_up, also below it.
-#   3. A flipped egress mode / rotated credential would not be surfaced: the container_fingerprint
+#   3. A flipped egress mode / resized memory limit would not be surfaced: the container_fingerprint
 #      reconcile that exists to catch exactly that sits below it too.
 #
 # The two modes are deliberately ASYMMETRIC. Container mode can refuse (`exit 1`) because it HAS a
@@ -26,8 +26,9 @@
 # already-running path with a credential-less guest in the first place. Validated only at the
 # ~/.augur-env writer — after clone, sizing, boot and the SSH wait — a value that could not be
 # injected would abort `up` with a VM already running and nothing torn down; the retry would then
-# hit the branch above, which cannot re-push ~/.augur-env. So the check runs before the clone,
-# like container mode's runs before `container run`.
+# hit the branch above, which cannot re-push ~/.augur-env. So the check runs before the clone.
+# (Container mode injects credentials per session, so its check runs at session start instead;
+# tests/11_construct_container.sh covers that.)
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/.." && pwd)"
 source "$HERE/lib.sh"
 AUGUR="$REPO/augur"
@@ -73,6 +74,7 @@ logged() { grep -qx "$1" "$LOG" 2>/dev/null; }   # exact-line match against the 
 section "Tier 1 — container: up on a RUNNING container reconciles instead of no-opping"
 
 require_engine() { :; }
+require_engine_version() { :; }
 ensure_image()   { :; }
 container_running() { return 0; }
 container_exists()  { return 0; }
@@ -311,7 +313,9 @@ hasnt "$pinned_fn" 'ssh_macos'   "the pinned-state check never reads the guest"
 hasnt "$pinned_fn" '$VM_CLI'     "the pinned-state check never asks the VM backend"
 has   "$pinned_fn" 'gvproxy_pidfile' "the pinned-state check keys off the gvproxy pidfile (no new state file)"
 # The container half refuses; the macOS half must NOT (no fingerprint ⇒ no reliable drift signal).
-has   "$reconcile_body" 'exit 1' "container up's running path (reconcile_running_container) can refuse on drift (it has container_fingerprint)"
+current_body="$(fn_body require_running_container_current)"
+has   "$reconcile_body" 'require_running_container_current' "container up's running path (reconcile_running_container) goes through the drift refusal"
+has   "$current_body"   'exit 1' "container up's running path can refuse on drift (it has container_fingerprint)"
 if printf '%s\n' "$up_macos_body" | sed -n '/already running/,/^    fi$/p' | grep -q 'exit 1'
 then fail "cmd_up_macos refuses on the already-running path" "macOS has no drift signal to refuse on"
 else ok "cmd_up_macos returns 0 on the already-running path (no fingerprint ⇒ no drift refusal)"; fi

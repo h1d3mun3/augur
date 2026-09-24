@@ -46,12 +46,33 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if ( cd "$proj" && bash "$REPO/augur" up --no-egress ) >/dev/null 2>&1; then
+# A throwaway API key for the up below, so the secrets-zero check has a known value to look for.
+probe_key="sk-ant-augur-live-probe-$$"
+if ( cd "$proj" && ANTHROPIC_API_KEY="$probe_key" bash "$REPO/augur" up --no-egress ) >/dev/null 2>&1; then
   ok "augur up brought a container online"
   # Container name embeds the workspace path hash (cross-project isolation): augur-<slug>-<hash>-swift-<tag>.
   cont="augur-${slug}-${phash}-swift-$(printf '%s' "${SWIFT_VERSION:-latest}" | tr '.' '-')"
   cver="$(container exec "$cont" sh -lc 'claude --version' 2>/dev/null || true)"
   if [[ -n "$cver" ]]; then ok "agent runs inside the live container ($cont)"; else fail "agent did not run inside '$cont'"; fi
+
+  # ── Secrets-zero at rest: `container inspect` prints the persisted run config (the init process's
+  #    env included). Credentials are injected per session, so none may appear here — neither
+  #    names nor values — and neither may TZ (a baked TZ would shadow the per-session one). ──
+  insp="$(container inspect "$cont" 2>/dev/null || true)"
+  if [[ -z "$insp" ]]; then fail "container inspect returned nothing for '$cont'"
+  else
+    for n in ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN GH_TOKEN GIT_CONFIG_ "$probe_key" '"TZ='; do
+      hasnt "$insp" "$n" "container inspect shows no ${n} (nothing credential-shaped baked at run)"
+    done
+    host_gh="$(gh auth token 2>/dev/null || true)"
+    if [[ -n "$host_gh" ]]; then hasnt "$insp" "$host_gh" "container inspect shows no host gh token value"; fi
+  fi
+  # The per-session transport itself: this CLI reads --env-file from a process-substitution pipe
+  # and the value reaches the exec'd process (and is absent from the container's own config).
+  fifo_out="$(container exec --env-file <(printf 'AUGUR_FIFO_PROBE=%s\n' "$probe_key") "$cont" \
+                sh -c 'printf %s "$AUGUR_FIFO_PROBE"' 2>/dev/null || true)"
+  eq "$probe_key" "$fifo_out" "container exec --env-file <(…) delivers the value to the session process"
+  hasnt "$(container inspect "$cont" 2>/dev/null)" "AUGUR_FIFO_PROBE" "an exec-time env-file value is not persisted in the container config"
 
   # ── Persistence: `down` keeps the container; `up` reuses it and the writable layer survives ──
   # Write a marker OUTSIDE the bind-mounted workspace (in the container's own writable layer),
