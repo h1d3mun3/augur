@@ -127,10 +127,11 @@ in time," this **prescribes** "what must never break." It changes rarely.
   metadata 169.254.169.254, IPv4-mapped, etc. are classified non-public, while public IPs and
   each block boundary are classified public). Not passing `--allow-private` in production is a
   structural guarantee (addendum A6) — ⚠ **grep-only**: no test asserts `start_proxy`'s argv, and
-  inserting the flag at `augur:1162` leaves the entire offline suite green. The same gap covers
-  `start_gvproxy`'s `--socks-upstream` / `--dns-allowlist` / `--deny-direct` and `container run`'s
-  `--no-dns`. A one-line source guard per call site — the shape `tests/30_macos_vm.sh:186` already
-  uses — would close all five cheaply.
+  inserting the flag into `start_proxy`'s `augur-proxy` argv leaves the entire offline suite green.
+  The same gap covers `start_gvproxy`'s `--socks-upstream` / `--dns-allowlist` / `--deny-direct` and
+  `container run`'s `--no-dns`. A one-line source guard per call site — the `grep -Eq … "$AUGUR"`
+  shape `tests/30_macos_vm.sh` already uses for the read-only profile share — would close all five
+  cheaply.
 
 ### I9. macOS guest network isolation  🟡 partial
 - **Rule:** The guest's NIC is a **single** host-owned socket (`VZFileHandleNetworkDeviceAttachment`).
