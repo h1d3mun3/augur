@@ -149,12 +149,13 @@ What you get instead is a directory you populate on purpose:
 - **Your own files are never deleted.** If the guest already had a real `~/.claude/commands` or
   `~/.claude/skills` when you first populate the profile, augur moves it aside to
   `<name>.pre-profile` rather than replacing it (an empty one is simply dropped).
-- **macOS VM mode caveat on macOS 26.x — host-side edits need a VM restart.** The profile works
-  there (it is shared read-only into the VM and wired the same way), but macOS mode reaches it over
-  a **virtiofs share** rather than a bind mount. When the host or the guest runs macOS 26.x, the
-  guest's virtiofs client keeps serving **stale file data** after a host-side edit. So if you change
-  the profile while a VM is running, run `augur down --macos && augur up --macos` to pick it up.
-  Container mode is unaffected.
+- **macOS VM mode reaches the profile over a virtiofs share.** The profile works there (it is shared
+  read-only into the VM and wired the same way), but through a **virtiofs share** rather than a bind
+  mount, on every macOS version.
+- **macOS VM mode caveat on macOS 26.x — host-side edits need a VM restart.** When the host or the
+  guest runs macOS 26.x, the guest's virtiofs client keeps serving **stale file data** after a
+  host-side edit. So if you change the profile while a VM is running, run
+  `augur down --macos && augur up --macos` to pick it up. Container mode is unaffected.
 
   **On macOS 27.0+ (host and guest) the defect no longer reproduces**, and host-side edits show up
   in a running guest within about a second. That was confirmed on one machine (M1 Max, build
