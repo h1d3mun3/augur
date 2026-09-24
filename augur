@@ -549,9 +549,9 @@ macos_vm_ip() {
 
 # Poll until the guest's SSH daemon actually accepts a TCP connection — NOT the same thing
 # macos_vm_ip checks (a DHCP-leased IP), and callers waiting for "SSH is ready" must not
-# conflate the two. Under the old manual Setup Assistant flow this distinction never mattered:
-# the operator's "Remote Login enabled? Ready to continue?" prompt already gated on a human
-# confirming sshd was up before that flow ever called macos_vm_ip. The automated provisioning
+# conflate the two. Under the manual Setup Assistant flow this distinction does not matter:
+# the operator's "Remote Login enabled? Ready to continue?" prompt already gates on a human
+# confirming sshd is up before that flow calls macos_vm_ip. The automated provisioning
 # path has no such gate — the guest's network interface (hence its IP) routinely
 # comes up well before VZMacGuestProvisioningOptions finishes creating the account, logging it
 # in, and starting Remote Login — so a caller that stops at macos_vm_ip can start SSHing into
@@ -790,14 +790,14 @@ proxy_running() {
 # alone would make every call a "change"). Two reasons this matters:
 #   • The file's mtime is a SIGNAL, not just metadata. augur-proxy hot-reloads on mtime change
 #     (main.swift polls every ~2s) and warn_if_macos_egress_pinned uses "allowlist newer than the
-#     gvproxy pidfile" to detect a policy gvproxy snapshotted before it changed. A header rewritten
-#     on every `up` made both fire unconditionally — a pointless reload, and a warning that cried
-#     wolf forever.
-#   • `mv` is atomic (rename(2), same directory). The old truncate-in-place let a poller read a
-#     PREFIX of the file. That never fell open — a prefix is only ever NARROWER — but
+#     gvproxy pidfile" to detect a policy gvproxy snapshotted before it changed. Rewriting the
+#     header on every `up` would make both fire unconditionally — a pointless reload, and a
+#     warning that cries wolf forever.
+#   • `mv` is atomic (rename(2), same directory). Truncating in place would let a poller read a
+#     PREFIX of the file. That would not fall open — a prefix is only ever NARROWER — but
 #     the rename removes the window entirely.
-# The temp file's 0600 mode also tightens this file from the previous umask-dependent mode. Only
-# augur-proxy and gvproxy read it, both as this same user, so nothing loses access.
+# The temp file's 0600 mode keeps this file owner-only regardless of umask. Only augur-proxy and
+# gvproxy read it, both as this same user, so nothing loses access.
 write_merged_allowlist() {
     mkdir -p "$AUGUR_PROXY_DIR"
     local out snap tmp cur_body new_body
@@ -1066,7 +1066,7 @@ require_safe_workspace() {
     fi
 
     local why=""
-    # R1 needs its own branch: "$ws"/* is //* when ws=/ and matches nothing.
+    # The filesystem root needs its own branch: "$ws"/* is //* when ws=/ and matches nothing.
     if [[ "$ws" == "/" ]]; then
         why="it is the filesystem root"
     elif [[ "$ws" == "$home" ]]; then
@@ -1108,7 +1108,7 @@ project_conf_hash() {
     fi
 }
 
-# L1 (trust-on-first-use): a project's ./.augur/allowlist.conf widens the egress allowlist, so
+# Trust-on-first-use: a project's ./.augur/allowlist.conf widens the egress allowlist, so
 # treat it as untrusted input (a hostile repo, or an agent that wrote it). Require the
 # operator to approve it on first sight and again whenever it changes — the same TOFU
 # model as the SSH host keys above. Approved fingerprints live host-side under
@@ -1366,7 +1366,7 @@ stop_egress() {
     stop_proxy
     engine_network_rm "$(egress_network_name)" &>/dev/null || true
     # Migration: also reap the pre-hash name (augur-<slug>-net) an older augur created for this
-    # project. It is no longer looked up anywhere, so nothing else would ever remove it and
+    # project. It is not looked up anywhere else, so nothing else would ever remove it and
     # `destroy` would leave its subnet allocated for good. Best-effort, same as above: on a
     # same-basename pair the sibling project may own that name, and `network delete` refuses a
     # network with attached containers — which is exactly the right outcome there.
@@ -2241,11 +2241,10 @@ _add_state_mount_run_args() {
     agent_proj_leaf="$(agent_state_guest_leaf "$(workspace_slug)")"
     host_hist_dir="$AUGUR_DIR/$(agent_state_host_subdir)/$(workspace_slug)-$(workspace_path_hash)"
     mkdir -p "$host_hist_dir"
-    # One-time, idempotent migration: pre-Option-A installs wrote this project's
-    # *.jsonl directly under host_hist_dir (it used to be mounted at exactly one
-    # guest leaf path). Now that the whole parent is mounted below, those files
-    # need to live one level deeper — under host_hist_dir/$agent_proj_leaf/ — to
-    # keep surfacing at the same guest path Claude already expects.
+    # One-time, idempotent migration: installs from an older augur wrote this
+    # project's *.jsonl directly under host_hist_dir. The whole parent is mounted
+    # below, so move them one level deeper — under host_hist_dir/$agent_proj_leaf/ —
+    # so they surface at the guest path Claude expects.
     migrate_pre_option_a_history "$host_hist_dir" "$agent_proj_leaf"
     run_args+=(-v "${host_hist_dir}:$(agent_state_guest_projects_dir)")
 
@@ -2418,7 +2417,7 @@ cmd_setup_token() {
     # Integrity gate: the guest can overwrite its own (uid 1001-owned) claude binary, and setup-token
     # attaches that binary to the operator's TTY. Refuse if it differs from the image's pristine
     # copy — a freshly-CREATED container matches; a reused one tampered with by a prior session
-    # does not. Now that `down` only STOPS (the tampered filesystem persists), the clean-binary
+    # does not. Because `down` only STOPS (the tampered filesystem persists), the clean-binary
     # remedy is `augur destroy` (full removal) followed by `augur up`, NOT `down && up`.
     if ! agent_verify_integrity_engine; then
         error "The claude binary in '${CONTAINER_NAME}' differs from the image — it may have been modified by the guest."
@@ -3143,7 +3142,7 @@ ensure_macos_workspace() {
 }
 
 # Point the guest's Claude history (projects/ only) at the per-VM isolated share so this project's
-# conversation history persists on the host across clones. For isolation (fix M2) the host side is a
+# conversation history persists on the host across clones. For isolation the host side is a
 # per-VM directory (~/.augur/claude-projects/<vm>), NOT the host's shared ~/.claude/projects — the
 # guest can therefore neither read other projects' transcripts nor write into them. Consequence:
 # cross-mode (container<->macOS) resume is not shared and pre-existing sessions under the host's
@@ -3711,7 +3710,7 @@ cmd_up_macos() {
     ensure_macos_claude_bin "$project_vm"
 
     # Copy git config, and seed a minimal .claude.json one-way for onboarding state only (NOT auth —
-    # on macOS the OAuth token lives in the Keychain, not in this file; see docs/macos-vm-architecture-review.md;
+    # on macOS the OAuth token lives in the Keychain, not in this file;
     # and NOT folder-trust — augur deliberately does not pre-trust the workspace).
     # We deliberately do NOT copy the host's ~/.claude.json (not even a stripped copy): it enumerates
     # every repo on the host (`projects`) and can hold third-party MCP API keys (`mcpServers`), and the
@@ -4318,7 +4317,7 @@ files_content_hash() {
     } | { if command -v sha256sum &>/dev/null; then sha256sum; else shasum -a 256; fi; } | awk '{print $1}'
 }
 
-# Shared TOFU decision core (L1, trust-on-first-use — same model as check_project_conf_approved):
+# Shared TOFU decision core (trust-on-first-use — same model as check_project_conf_approved):
 # $1 = host-side cache file recording the last-approved hash, $2 = the CURRENT content hash
 # (already computed by the caller via files_content_hash), $3 = a human label for prompts,
 # $4 = the name of a function the caller defines that prints what changed (invoked only when

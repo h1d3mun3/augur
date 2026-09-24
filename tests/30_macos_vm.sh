@@ -113,8 +113,9 @@ eq "$name_a" "$name_a2" "macos_project_vm: same directory is stable across calls
 section "Tier 2 — macOS network isolation (entitlements, run anywhere)"
 # The guest gets one host-owned NIC and no bridged networking. The machine-checkable part is
 # the entitlement set — bridged networking would require com.apple.vm.networking, which augur
-# must NOT ship. (NIC count and the gvproxy UDP/ICMP drop stay review-only: they need a real VM
-# host.)
+# must NOT ship. (The gvproxy UDP/ICMP drop is probed live by verify_macos_egress_locked on every
+# `up --macos` and pinned offline by tests/36 and tests/38; only the NIC count needs a real VM host
+# and stays review-only.)
 ent="$REPO/augur-vm/augur-vm.entitlements"
 if [[ -f "$ent" ]]; then
   # Match the granted <key>…</key> ELEMENTS, not any substring — the file mentions
