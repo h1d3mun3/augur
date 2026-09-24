@@ -166,8 +166,9 @@ in time," this **prescribes** "what must never break." It changes rarely.
   shows no credential. macOS mode ⚠ review-only.
 - **Note:** The rule does not cover the macOS guest's admin password (`macos_admin_password`).
   The `sudo -S` call sites embed it in the remote command string, so it is on the host's local
-  `ssh` argv for the length of each call. That is an accepted residual (snapshot 2026-09-21, item
-  44), not an I10 guarantee.
+  `ssh` argv for the length of each call. That is a known **open** finding outside I10 (item 44,
+  "[LOW–MEDIUM; STILL OPEN]", in [`2026-09-24-egress.md`](./2026-09-24-egress.md)), not an
+  accepted residual: no decision record accepts it.
 
 ---
 
