@@ -45,6 +45,9 @@ AUGUR="$REPO/augur"
 
 TMPD="$(mktemp -d)"
 trap 'rm -rf "$TMPD"' EXIT
+# The scripted guest's `sudo -S` branch reads stdin like real ssh. Detach this script's own stdin so
+# a caller that pipes nothing in reads EOF instead of blocking the suite on a developer's TTY.
+exec </dev/null
 
 # BOOT-PROOFING (the technique tests/30_macos_vm.sh, 34, 35, 36 and 37 use): point AUGUR_VM_BIN at a
 # path that cannot exist BEFORE sourcing, so the resolved $VM_CLI can never be a real augur-vm. The
@@ -106,7 +109,8 @@ ssh_macos() {
             [[ "$G_NOISE" == 1 ]] && echo "Welcome to the guest!"
             printf '%s\n' "$(( $(date +%s) + $(cat "$OFFSET_FILE") ))"
             return 0 ;;
-        *"sudo -S -p ''"*)                                 # the privileged SET
+        *"sudo -S -p ''"*)                                 # the privileged SET; `sudo -S` reads
+            cat > "$TMPD/sudo-stdin"                       # the password from ssh's stdin
             if [[ "$G_SET_RC" != 0 ]]; then
                 if [[ "$G_SET_BADREASON" == 1 ]]; then
                     echo "date: illegal time format" >&2   # a failure that is NOT a rejected password
@@ -145,7 +149,7 @@ sync() {   # sets $out / $rc; truncates the log first
 at()      { grep -nxF "$1" "$SSHLOG" | head -n1 | cut -d: -f1; }   # exact whole-line match
 at_re()   { grep -nE  "$1" "$SSHLOG" | head -n1 | cut -d: -f1; }
 n_calls() { wc -l < "$SSHLOG" | tr -d ' '; }
-SET_RE="^echo '${MACOS_SSH_USER}' \| sudo -S -p '' /bin/date -u '[0-9]{12}\.[0-9]{2}'$"
+SET_RE="^sudo -S -p '' /bin/date -u '[0-9]{12}\.[0-9]{2}'$"
 did_set() { grep -qE "$SET_RE" "$SSHLOG"; }
 READ_CMD='/bin/date +%s'
 
@@ -192,10 +196,12 @@ eq "3" "$(n_calls)" "skewed guest: exactly three round-trips (nothing extra, not
 # The command SHAPE, pinned as a literal contract with the guest: the `sudo -S` mechanism
 # install_macos_managed_settings established (a project clone has NO passwordless sudo), an absolute
 # /bin/date so ~/.local/bin cannot shadow it, and -u so the stamp is read as UTC.
-if did_set; then ok "skewed guest: the set is 'echo <user> | sudo -S -p '' /bin/date -u <stamp>'"
+if did_set; then ok "skewed guest: the set is 'sudo -S -p '' /bin/date -u <stamp>'"
 else fail "skewed guest: the privileged set does not have the intended shape" "log: [$(tr '\n' ' ' < "$SSHLOG")]"; fi
 has "$(cat "$SSHLOG")" "sudo -S -p ''" "skewed guest: uses \`sudo -S\` (a project clone has no NOPASSWD grant)"
 has "$(cat "$SSHLOG")" "/bin/date"     "skewed guest: pins date's absolute path (no \$HOME/.local/bin shadowing)"
+eq "$MACOS_SSH_USER" "$(head -n1 "$TMPD/sudo-stdin" 2>/dev/null)" "skewed guest: sudo's password arrives on ssh's stdin"
+hasnt "$(cat "$SSHLOG")" "echo '" "skewed guest: no password is echoed inside the remote command"
 
 # …and the VALUE is the HOST's time now. $_before/$_after bracket the run, so this fails for a
 # hard-coded stamp, for the guest's own (skewed) clock, and for a mis-ordered format string — while
@@ -244,7 +250,7 @@ else fail "a 20s-behind guest was left alone" "the tolerance is far too wide; lo
 
 section "Tier 1 — the read-back is load-bearing: a set that did not stick is REPORTED, not claimed"
 
-# The exit status of `echo <pw> | sudo -S date …` covers a rejected password and a malformed stamp.
+# The exit status of `sudo -S date …` covers a rejected password and a malformed stamp.
 # It cannot see a guest that accepts the command and stays wrong (`timed` is live in the guest). This
 # is that case: the set exits 0 and the clock does not move.
 reset_guest; g_offset -5733; G_SET_TO=-5733
