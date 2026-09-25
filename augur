@@ -2106,10 +2106,6 @@ container_fingerprint() {
         # finish_up and its boot self-test on a fresh up. An else-less if with a false test
         # returns 0.
         if [[ -f "$HOME/.gitconfig" ]]; then echo "gitconfig=present"; fi
-        # Records that ~/.config/gh is NOT mounted (see _add_host_config_run_args). A container
-        # created by an older augur carries that mount and has no such line, so it mismatches and
-        # is recreated once, dropping the mount instead of keeping it until a `destroy`.
-        echo "gh_config=unmounted"
     } | { if command -v sha256sum &>/dev/null; then sha256sum; else shasum -a 256; fi; } | awk '{print $1}'
 }
 
