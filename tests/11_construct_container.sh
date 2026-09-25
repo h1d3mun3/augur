@@ -58,6 +58,12 @@ if [[ -f "$run" ]]; then
   if grep -Eq ":/home/dev/\.claude/projects$" "$run"; then ok "up: mounts the whole projects parent, not one leaf (Option A)"
   else fail "up: does not mount the projects parent exactly" "expected a line ending exactly in :/home/dev/.claude/projects"; fi
   hasnt "$body" ":/home/dev/.claude/projects/-workspace-${slug}" "up: no leftover leaf-scoped mount target"
+  # The host's gh config is not handed to the guest: gh there authenticates only via the
+  # per-session GH_TOKEN, and a mounted hosts.yml would show a dead Keychain-backed account or,
+  # after `gh auth login --insecure-storage`, expose a plaintext token.
+  hasnt "$body" ".config/gh"                                    "up: run argv carries no ~/.config/gh mount"
+  [[ ! -e "$HOME/.config/gh" ]] && ok "up: augur does not create ~/.config/gh on the host" \
+                                || fail "up: augur created ~/.config/gh on the host"
   if grep -Eq "claude-projects/${slug}-[0-9a-f]{12}:" "$run"; then ok "up: history host dir keyed on full-path hash (A3/C7)"
   else fail "up: history host dir not keyed on path hash"; fi
   # User-level subagent defs (~/.claude/agents): same per-project, path-hash-keyed, outside-host-~/.claude
@@ -135,6 +141,38 @@ has "$trace" "container run"        "up: recreates the container from the image 
 
 # Back to the default memory (another recreate), so the stored fingerprint matches the plain config.
 ( cd "$proj" && bash "$AUGUR" up --no-egress ) >/dev/null 2>&1 || true
+
+# A container created while ~/.config/gh was still mounted must be recreated once, not reused with
+# that mount. Its stored fingerprint is the digest of the same inputs minus the gh_config line, so
+# rebuild exactly that digest from the current one's inputs and check that up recreates on it.
+fp_file_gh="$(find "$HOME/.augur/container-state" -name '*.fingerprint' 2>/dev/null | head -1)"
+fp_inputs="$(sed -n '/^container_fingerprint() {/,/^}/p' "$AUGUR")"
+has "$fp_inputs" 'echo "gh_config=unmounted"' "fingerprint: records that ~/.config/gh is not mounted"
+if [[ -n "$fp_file_gh" ]]; then
+  # Digest of container_fingerprint with every line containing the fixed string $1 dropped, run in a
+  # subshell with the inputs of the plain `up --no-egress` above stubbed in.
+  fp_with() (
+    cd "$proj" || exit 1
+    eval "$(printf '%s\n' "$fp_inputs" | grep -vF -e "$1")"
+    egress_enabled() { return 1; }
+    resolve_container_memory() { echo 4g; }
+    agent_profile_guest_mount() { echo /home/dev/.augur-profile; }
+    WORKSPACE_DIR="$(pwd)"; WORKSPACE_MOUNT="/workspace-${slug}"
+    container_fingerprint
+  )
+  # Control: the rebuild reproduces the stored digest exactly, so the mismatch below comes from the
+  # missing gh_config line alone and not from a stubbed input that drifted.
+  eq "$(cat "$fp_file_gh")" "$(fp_with 'no line contains this')" "fingerprint: the test rebuild reproduces the stored digest"
+  old_fp="$(fp_with 'gh_config=unmounted')"
+  printf '%s\n' "$old_fp" > "$fp_file_gh"
+  rm -f "$AUGUR_TEST_SHIMLOG.trace"
+  ( cd "$proj" && bash "$AUGUR" up --no-egress ) >/dev/null 2>&1 || true
+  trace="$(cat "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null)"
+  has "$trace" "delete --force" "up: a container fingerprinted before gh_config existed is removed"
+  has "$trace" "container run"  "up: ...and recreated without the ~/.config/gh mount"
+else
+  fail "fingerprint: could not locate the fingerprint file" "looked under $HOME/.augur/container-state"
+fi
 
 # ── Credential rotation never recreates: nothing credential-shaped is baked or fingerprinted ──
 rm -f "$AUGUR_TEST_SHIMLOG.trace"
