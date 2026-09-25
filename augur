@@ -687,8 +687,8 @@ vm_known_hosts_file() {
 # Every project VM is an APFS clone of the base VM and inherits whichever password the base VM
 # had, so this file (or its absence) governs sudo/SSH auth for every clone, not just the build
 # (for a clone older than the latest base rebuild, see warn_if_stale_admin_password).
-# Must never contain a single quote: callers embed it unescaped in single-quoted
-# "echo '<password>' | sudo -S" strings, which is why cmd_build_macos generates it with base64.
+# Never interpolate it into a remote command string: that puts it on the host's `ssh` argv and
+# on the guest's process list. Feed it to `sudo -S` through macos_admin_password_stdin instead.
 macos_admin_password() {
     if [[ -f "$MACOS_ADMIN_PASSWORD_FILE" ]]; then
         cat "$MACOS_ADMIN_PASSWORD_FILE"
@@ -696,6 +696,16 @@ macos_admin_password() {
         echo "$MACOS_SSH_USER"
     fi
 }
+
+# The admin password as one line on stdout, for every guest `sudo -S`:
+#   macos_admin_password_stdin | ssh_macos "$vm" "sudo -S -p '' <cmd>"
+# ssh forwards its stdin to the remote command, and `sudo -S` reads the password from there.
+# `printf` is a bash builtin, so the password is never on any argv: not the host's `ssh` command
+# line (readable by `ps`) and not the guest's process list. The remote <cmd> must not read stdin;
+# when NOPASSWD sudo is already granted, sudo leaves the line unread and <cmd> would see it.
+# The ssh wrapper must forward stdin: ssh_macos does; ssh_macos_provision passes `-n`, so use
+# ssh_macos_provision_stdin there.
+macos_admin_password_stdin() { printf '%s\n' "$(macos_admin_password)"; }
 
 # macos_admin_password() is ONE file for the whole host, rewritten every time `augur build --macos`
 # provisions a fresh base VM. A project VM is an APFS clone taken at some earlier build,
@@ -3122,10 +3132,9 @@ cmd_build_macos() {
     local vm_pid vm_ip
     if $auto_setup; then
         info "Host and guest are both macOS 27+ — provisioning the admin account automatically (no manual Setup Assistant needed)."
-        # base64 on purpose: its alphabet ([A-Za-z0-9+/=]) has no shell metacharacters, so this
-        # value is safe to embed unescaped in the single-quoted "echo '<password>' | sudo -S"
-        # strings elsewhere in this file (macos_admin_password's callers) — do not switch
-        # generators without re-auditing those call sites.
+        # base64: its alphabet ([A-Za-z0-9+/=]) has no quotes, whitespace or newlines, so the
+        # value survives every hop unchanged (augur-vm's stdin, the 0600 file, and the one-line
+        # `sudo -S` feed in macos_admin_password_stdin).
         local new_password
         new_password="$(openssl rand -base64 24)"
 
@@ -3245,10 +3254,10 @@ cmd_build_macos() {
 
     # Configure passwordless sudo so subsequent ssh_macos calls don't need a TTY. The key is
     # installed now, so this runs over key auth (no login-password prompt); the sudo password is
-    # still piped via `sudo -S`.
+    # still fed to `sudo -S` (see macos_admin_password_stdin).
     info "Configuring passwordless sudo..."
-    ssh_macos "$MACOS_BUILD_VM" \
-        "echo '$(macos_admin_password)' | sudo -S -p '' bash -c \
+    macos_admin_password_stdin | ssh_macos "$MACOS_BUILD_VM" \
+        "sudo -S -p '' bash -c \
             'echo \"${MACOS_SSH_USER} ALL=(ALL) NOPASSWD:ALL\" > /etc/sudoers.d/augur \
              && chmod 440 /etc/sudoers.d/augur'"
 
@@ -3609,7 +3618,7 @@ install_macos_managed_settings() {
     # lets `update --macos` reach a base VM that no longer has it. The password is this base VM's
     # own admin password (see macos_admin_password()) — no privilege here augur's build doesn't
     # already take.
-    ssh_macos "$vm" "echo '$(macos_admin_password)' | sudo -S -p '' sh -c '
+    macos_admin_password_stdin | ssh_macos "$vm" "sudo -S -p '' sh -c '
         mkdir -p \"${parent}\" &&
         mv \"${staged}\" \"${dst}\" &&
         chown root:wheel \"${dst}\" &&
@@ -3727,7 +3736,7 @@ sync_macos_guest_clock() {
     # host side, so this line does not depend on BSD `date` (`date -r <seconds>` would have, and the
     # offline test tier runs on a Linux runner).
     stamp="$(date -u +%m%d%H%M%Y.%S)"
-    setout="$(ssh_macos "$vm" "echo '$(macos_admin_password)' | sudo -S -p '' /bin/date -u '${stamp}'" 2>&1)" || {
+    setout="$(macos_admin_password_stdin | ssh_macos "$vm" "sudo -S -p '' /bin/date -u '${stamp}'" 2>&1)" || {
         warn "Could not set the guest's clock (${drift}s off the host's): ${setout%%$'\n'*}"
         warn "  Tokens, TLS validity windows and commit timestamps in the guest will use that skewed clock."
         warn_if_stale_admin_password "$setout"
@@ -3791,7 +3800,7 @@ sync_macos_guest_timezone() {
     if [[ "$guest_tz" == "$host_tz" ]]; then return 0; fi
 
     info "Guest timezone is '${guest_tz}' (host is '${host_tz}') — correcting from the host."
-    setout="$(ssh_macos "$vm" "echo '$(macos_admin_password)' | sudo -S -p '' systemsetup -settimezone '${host_tz}'" 2>&1)" || {
+    setout="$(macos_admin_password_stdin | ssh_macos "$vm" "sudo -S -p '' systemsetup -settimezone '${host_tz}'" 2>&1)" || {
         warn "Could not set the guest's timezone (guest is '${guest_tz}', host is '${host_tz}'): ${setout%%$'\n'*}"
         warn "  Local timestamps in the guest (date, logs) will keep reading in ${guest_tz}."
         warn_if_stale_admin_password "$setout"
@@ -4992,13 +5001,17 @@ stop_provision_gvproxy() {
 # build already guarantees brew exists at this path by the time provisioning ever runs; if
 # that assumption were ever wrong, the actual command right after would fail anyway with the
 # same diagnostic.
-ssh_macos_provision() {
-    local vm="$1"; shift
+ssh_macos_provision() { _ssh_macos_provision -n "$@"; }
+# The same, minus `-n`: forwards stdin to the remote command. Only for a caller that pipes
+# something in on purpose (macos_admin_password_stdin), never from inside the manifest loop.
+ssh_macos_provision_stdin() { _ssh_macos_provision "" "$@"; }
+_ssh_macos_provision() {
+    local stdin_opt="$1" vm="$2"; shift 2
     local key_opts=()
     if [[ -f "$MACOS_SSH_KEY" ]]; then
         key_opts=(-i "$MACOS_SSH_KEY" -o PasswordAuthentication=no -o BatchMode=yes)
     fi
-    ssh -n -F /dev/null \
+    ssh ${stdin_opt:+"$stdin_opt"} -F /dev/null \
         -p "$AUGUR_SSH_FWD_PORT_PROVISION" \
         -o StrictHostKeyChecking=accept-new \
         -o UserKnownHostsFile="$(vm_known_hosts_file "$vm")" \
@@ -5153,8 +5166,8 @@ run_base_provisioning() {
     # 'augur update --macos' does not, since the original build already revoked it — this
     # establishes it fresh in that case). Same admin credential the rest of the build already
     # depends on — see macos_admin_password().
-    ssh_macos_provision "$vm" \
-        "echo '$(macos_admin_password)' | sudo -S -p '' bash -c \
+    macos_admin_password_stdin | ssh_macos_provision_stdin "$vm" \
+        "sudo -S -p '' bash -c \
             'echo \"${MACOS_SSH_USER} ALL=(ALL) NOPASSWD:ALL\" > /etc/sudoers.d/augur \
              && chmod 440 /etc/sudoers.d/augur'" \
         || provision_fail "Failed to grant temporary sudo for provisioning."

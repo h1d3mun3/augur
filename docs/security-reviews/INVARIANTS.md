@@ -164,11 +164,15 @@ in time," this **prescribes** "what must never break." It changes rarely.
   no engine argv holds a value; `setup-token` and the profile/history execs carry no `--env-file`.
   `tests/21_container_live.sh` (live, `AUGUR_TEST_LIVE=1`) additionally checks `container inspect`
   shows no credential. macOS mode ⚠ review-only.
-- **Note:** The rule does not cover the macOS guest's admin password (`macos_admin_password`).
-  The `sudo -S` call sites embed it in the remote command string, so it is on the host's local
-  `ssh` argv for the length of each call. That is a known **open** finding outside I10 (item 44,
-  "[LOW–MEDIUM; STILL OPEN]", in [`2026-09-24-egress.md`](./2026-09-24-egress.md)), not an
-  accepted residual: no decision record accepts it.
+- **Note:** The rule does not cover the macOS guest's admin password (`macos_admin_password`),
+  but it is kept off argv the same way: every guest `sudo -S` call gets it on ssh's stdin via
+  `macos_admin_password_stdin` (the bash builtin `printf` piped into `ssh_macos` /
+  `ssh_macos_provision_stdin`), so it is on neither the host's local `ssh` argv nor the guest's
+  process list. `tests/44_macos_sudo_password_stdin.sh` asserts this through a recording `ssh`
+  stub, plus a source guard that every `sudo -S` in `augur` is fed that way. This closes item 44
+  of [`2026-09-24-egress.md`](./2026-09-24-egress.md) ("[LOW–MEDIUM; STILL OPEN]" there). The
+  first-boot SSH login in `ssh_macos_bootstrap` hands the password to OpenSSH through a 0700
+  `SSH_ASKPASS` helper file, also not argv.
 
 ---
 
