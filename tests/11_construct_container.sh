@@ -58,6 +58,12 @@ if [[ -f "$run" ]]; then
   if grep -Eq ":/home/dev/\.claude/projects$" "$run"; then ok "up: mounts the whole projects parent, not one leaf (Option A)"
   else fail "up: does not mount the projects parent exactly" "expected a line ending exactly in :/home/dev/.claude/projects"; fi
   hasnt "$body" ":/home/dev/.claude/projects/-workspace-${slug}" "up: no leftover leaf-scoped mount target"
+  # The host's gh config is not handed to the guest: gh there authenticates only via the
+  # per-session GH_TOKEN, and a mounted hosts.yml would show a dead Keychain-backed account or,
+  # after `gh auth login --insecure-storage`, expose a plaintext token.
+  hasnt "$body" ".config/gh"                                    "up: run argv carries no ~/.config/gh mount"
+  [[ ! -e "$HOME/.config/gh" ]] && ok "up: augur does not create ~/.config/gh on the host" \
+                                || fail "up: augur created ~/.config/gh on the host"
   if grep -Eq "claude-projects/${slug}-[0-9a-f]{12}:" "$run"; then ok "up: history host dir keyed on full-path hash (A3/C7)"
   else fail "up: history host dir not keyed on path hash"; fi
   # User-level subagent defs (~/.claude/agents): same per-project, path-hash-keyed, outside-host-~/.claude

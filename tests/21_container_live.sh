@@ -79,7 +79,7 @@ if ( cd "$proj" && ANTHROPIC_API_KEY="$probe_key" bash "$REPO/augur" up --no-egr
   # then down (stop) + up (reuse) and confirm it's still there — proof the container was not
   # recreated. A rebuild-on-up would start from the image and lose the marker.
   # /home/dev is owned by the exec user (dev, uid 1001) and is NOT a bind mount (only
-  # /workspace-<slug>, ~/.claude/projects/<slug>, ~/.gitconfig, ~/.config/gh are), so a marker here
+  # /workspace-<slug>, ~/.claude/projects/<slug>, ~/.gitconfig are), so a marker here
   # lives in the container's persistent writable layer. /root would fail (dev cannot write it).
   marker="/home/dev/augur-persist-marker-$$"
   container exec "$cont" sh -lc "echo alive > '$marker'" 2>/dev/null || true

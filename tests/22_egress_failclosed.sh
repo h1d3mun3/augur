@@ -171,7 +171,7 @@ assert_egress_locked "$cont" "fresh"
 
 # ── Phase 2: persistence reuse — down (stop, keep) → up (reuse via `container start`) ─────────
 # Drop a marker OUTSIDE the bind mounts (in the container's own writable layer, dev-writable
-# /home/dev — only /workspace-<slug>, ~/.claude/projects, ~/.gitconfig, ~/.config/gh are mounted)
+# /home/dev — only /workspace-<slug>, ~/.claude/projects, ~/.gitconfig are mounted)
 # so we can PROVE the next up reused this exact container rather than rebuilding it.
 marker="/home/dev/augur-reuse-marker-$$"
 container exec "$cont" sh -lc "echo alive > '$marker'" >/dev/null 2>&1 || true

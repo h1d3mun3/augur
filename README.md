@@ -308,7 +308,7 @@ warning, not a failed `up`. See
 |------|-------------|
 | Current directory | exposed at `~/workspace-<project>` in the VM (read/write, virtiofs auto-mount) |
 | `~/.gitconfig` | **copied** on VM start (unlike container mode, which mounts it read-only). augur then rewrites `credential.https://github.com.helper` in **the guest's copy** so HTTPS `git push` works off `GH_TOKEN`; any helper the host set for `github.com` is replaced, including the pair `gh auth setup-git` writes, because those need a host path or the host Keychain the guest does not have. Your host file is never modified. |
-| `~/.config/gh/` | **not shared** in macOS VM mode. A share would land under `/Volumes/My Shared Files/` and nothing wires it to `~/.config/gh` inside the VM, so the config would never be read — exposure without a feature. `gh` works there off the injected `GH_TOKEN`, which is the real auth path on a macOS host anyway (the token lives in the Keychain, not in `hosts.yml`). Container mode mounts it read-only at the guest's real path, where it does work. |
+| `~/.config/gh/` | **not shared**, as in Container mode. `gh` works off the injected `GH_TOKEN` alone; see [API keys and authentication](#api-keys-and-authentication) for why the host's gh config stays on the host. (A share would also be inert here: it would land under `/Volumes/My Shared Files/` and nothing wires it to `~/.config/gh` inside the VM.) |
 | Claude history | **only this project's** history is shared, in a per-VM isolated dir (`~/.augur/claude-projects/<vm>`), so other projects' transcripts stay invisible. History is not shared across modes, so a container session can't be resumed in the macOS VM or vice versa. |
 | Claude auth | **not** shared — injected via env (the macOS Keychain is unreadable over SSH; see above) |
 | Everything else | **not visible to the VM** |
@@ -413,7 +413,7 @@ augur version                   # show augur version
 | `~/.claude/projects/-workspace-<project>` | **only this project's** Claude history is shared (read/write) — not the rest of `~/.claude`, so other projects' transcripts and host auth/settings stay invisible |
 | `~/.claude/agents/` | **this project's** user-level custom subagent definitions (`/agents`) are persisted (read/write), keyed per-project under `~/.augur/claude-agents/<project>` — so they survive `augur down`/`up` **and** `destroy`/recreate. Isolated per project (not the host's global `~/.claude/agents`), so a guest can't plant a subagent read by another project. Project-level `.claude/agents/` in the repo work too, via the workspace mount. |
 | `~/.augur/claude-profile/` | **opt-in** operator profile, mounted **read-only** — your personal `commands/`, `skills/`, `rules/`, `output-styles/`, `workflows/`, `themes/`, `CLAUDE.md`, `settings.json` and `keybindings.json` are wired into the guest's `~/.claude/`. Absent or empty (the default) wires nothing. See [Operator profile](#operator-profile). |
-| `~/.config/gh/` | mounted **read-only** (the container can read but not rewrite it). The token itself is injected as `GH_TOKEN` **per session** — see Claude auth below |
+| `~/.config/gh/` | **not mounted**. `gh` authenticates with the host's token, injected as `GH_TOKEN` **per session** like the Claude auth below |
 | `~/.gitconfig` | mounted read-only |
 | Claude auth | injected via env (`CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY`) **per session**: only into the `augur claude` / `augur shell` session, never into the container at creation. The values go through an `--env-file` pipe, so they are on no command line, not on disk, and not in the container's saved config (`container inspect` shows none). The host's credential store is never mounted |
 | Everything else | **not visible to the container** — including the rest of `~/.claude` and the host's `~/.claude.json`, which augur never reads, copies, or mounts ([ADR-0013](docs/decisions/0013-claude-config-inheritance.md)) |
@@ -608,9 +608,11 @@ gh auth login
 
 `gh` credentials are shared automatically in both modes: the host's `gh auth token` is injected
 as `GH_TOKEN` (per session in Container mode, like the Claude credentials above), and a guest-only
-git credential helper makes HTTPS `git push` work off it. In
-Container mode the host's `~/.config/gh` is also mounted read-only (so the guest can't rewrite it);
-macOS VM mode does not share `~/.config/gh` at all.
+git credential helper makes HTTPS `git push` work off it. Neither mode shares the host's
+`~/.config/gh`: on a macOS host gh keeps the token in the Keychain, so a shared `hosts.yml` would
+only make `gh auth status` show a second, failed login next to the working `GH_TOKEN` one, and after
+`gh auth login --insecure-storage` it would hand the guest a plaintext token. The trade-off is that
+your gh config (aliases, `git_protocol`, editor, GHE host entries) does not apply inside the guest.
 
 ---
 
