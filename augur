@@ -266,6 +266,17 @@ agent_managed_settings_json() { printf '{"env":{"DISABLE_AUTOUPDATER":"1"}}\n'; 
 # The container engine binary (run/exec/build/start/image inspect/network create/inspect).
 eng() { container "$@"; }
 
+# The shell the boot self-test and the setup-token integrity gate exec in the guest. Deliberately an
+# absolute path, never a bare `sh`: Apple Container appends exec `-e` after the container's baked env
+# without de-duplicating, and the runtime resolves a slash-less program name through the FIRST
+# `PATH=` in that env, which is the image's and starts with /home/dev/.local/bin. The guest user can
+# write there, and the container is kept across `down`/`up`, so a stub a prior session left as
+# ~/.local/bin/sh would run in place of the shell and could fake every check. An absolute path skips
+# the lookup entirely; an `-e PATH=` pin cannot, because it only applies inside the program that has
+# already been picked. The same reasoning applies to any tool those checks run: name it by absolute
+# path, or under a PATH pinned to system directories inside this shell.
+ENGINE_CHECK_SH="/bin/sh"
+
 # Human label for messages.
 engine_label() { echo "Apple Container"; }
 
@@ -500,12 +511,24 @@ setup_token_security_notice() {
 # it to the operator's TTY we confirm it was not tampered with. The image
 # disables the autoupdater, so a mismatch means modification, not version drift; a freshly
 # `up`-ped container matches, a reused one a prior session tampered with does not.
+#
+# On success sets AGENT_VERIFIED_BIN to the absolute path it hashed, and the setup-token launch
+# runs exactly that path. That is what makes the check and the launch agree: a launch by bare name
+# would be resolved again through the guest-writable image PATH (see ENGINE_CHECK_SH), so it could
+# run a different file from the one checked. The path comes from a name lookup in the pristine
+# image, never in the container; the container side runs /usr/bin/sha256sum directly, with no shell
+# and no lookup a prior session could have influenced.
 # AUGUR_AGENT_SEAM | integrity-verify (container engine) — integrity gate before TTY attach.
 agent_verify_integrity_engine() {
-    local img_hash cont_hash
-    img_hash="$(eng run --rm "$IMAGE_NAME" sh -c 'sha256sum "$(readlink -f "$(command -v claude)")"' 2>/dev/null | awk '{print $1}')"
-    cont_hash="$(eng exec "$CONTAINER_NAME" sh -c 'sha256sum "$(readlink -f "$(command -v claude)")"' 2>/dev/null | awk '{print $1}')"
-    [[ -n "$img_hash" && "$img_hash" == "$cont_hash" ]]
+    AGENT_VERIFIED_BIN=""
+    local img_line img_hash bin cont_hash
+    # sha256sum prints "HASH  PATH"; the PATH is the one the image resolves `claude` to.
+    img_line="$(eng run --rm "$IMAGE_NAME" "$ENGINE_CHECK_SH" -c '/usr/bin/sha256sum "$(command -v claude)"' 2>/dev/null | head -n1)"
+    img_hash="${img_line%%  *}"; bin="${img_line#*  }"
+    [[ "$img_hash" =~ ^[0-9a-f]{64}$ && "$bin" =~ ^/[A-Za-z0-9._/+-]+$ ]] || return 1
+    cont_hash="$(eng exec "$CONTAINER_NAME" /usr/bin/sha256sum "$bin" 2>/dev/null | awk '{print $1}')"
+    [[ "$img_hash" == "$cont_hash" ]] || return 1
+    AGENT_VERIFIED_BIN="$bin"
 }
 
 # True iff the guest VM's `claude` binary is Anthropic-signed (the same signer the base-VM
@@ -1608,34 +1631,32 @@ verify_egress_locked() {
     # distinct public IPv4 AND IPv6 anycast addresses on both :443 and :80 so a single
     # blackholed/rerouted IP (or a v6-only leak the v4 probes would miss) can't make a
     # routable network look isolated. ANY success is a leak.
-    # Pin PATH to system dirs (excluding the dev-writable ~/.local/bin, which is FIRST in the image
-    # PATH) for every probe below: with the container PERSISTED across down/up, a prior guest
-    # session (uid 1001, no root) could plant ~/.local/bin/curl|getent stubs that fake the isolated
-    # answers and pass this self-test on the reuse path. curl/getent/sh all live in /usr/bin//bin, so
-    # this can never cause a "not found" false failure — it only stops the tripwire being shadowed.
-    # Deliberately run through `sh -c`, never curl/getent directly: Apple Container appends exec
-    # `-e` after the container's baked env without de-duplicating, so the baked HTTP_PROXY and PATH
-    # stay in the environment too. The shell keeps the LAST duplicate and passes one clean copy on;
-    # curl called directly would read the FIRST (baked) HTTP_PROXY through libc and send every
-    # "direct" probe via the proxy, so the test could no longer see a leak.
+    # Every probe runs ENGINE_CHECK_SH by absolute path with PATH pinned to root-owned system dirs
+    # inside it, so neither the shell nor curl/getent can be a stub a prior guest session planted in
+    # ~/.local/bin (see ENGINE_CHECK_SH). curl and getent live in /usr/bin, so the pin can never
+    # cause a "not found" false failure; it only stops the tripwire being shadowed.
+    # Deliberately run through a shell, never curl/getent directly: the baked HTTP_PROXY and PATH stay
+    # in the environment next to the exec `-e` copies. The shell keeps the LAST duplicate and passes
+    # one clean copy on; curl called directly would read the FIRST (baked) HTTP_PROXY through libc
+    # and send every "direct" probe via the proxy, so the test could no longer see a leak.
     local _probe_path="/usr/bin:/bin:/usr/local/bin"
     local _probe
     for _probe in https://example.com https://1.1.1.1 https://8.8.8.8 http://1.1.1.1 http://8.8.8.8 \
                   'https://[2606:4700:4700::1111]' 'http://[2001:4860:4860::8888]'; do
         if eng exec -e PATH="$_probe_path" -e HTTP_PROXY= -e HTTPS_PROXY= -e http_proxy= -e https_proxy= -e NO_PROXY="*" \
-            "$CONTAINER_NAME" sh -c "curl -s --max-time 6 -o /dev/null ${_probe}" 2>/dev/null; then
+            "$CONTAINER_NAME" "$ENGINE_CHECK_SH" -c "curl -s --max-time 6 -o /dev/null ${_probe}" 2>/dev/null; then
             leaked=true; error "Self-test: the container reached ${_probe} directly (not isolated)."
         fi
     done
     # External DNS must fail closed (--no-dns leaves the guest no external resolver).
-    if eng exec -e PATH="$_probe_path" "$CONTAINER_NAME" sh -c 'getent hosts dns-leak-probe.example' &>/dev/null; then
+    if eng exec -e PATH="$_probe_path" "$CONTAINER_NAME" "$ENGINE_CHECK_SH" -c 'getent hosts dns-leak-probe.example' &>/dev/null; then
         leaked=true; error "Self-test: the container resolved an external name (DNS not fail-closed)."
     fi
     # The proxy MUST be reachable: a request through it (even a 403 deny) must return an HTTP
     # status, not a connection failure. curl prints 000 (and exits nonzero) on failure, so
     # `|| true` keeps the failure on the fail-closed branch below instead of aborting under set -e.
     local pcode
-    pcode="$(eng exec -e PATH="$_probe_path" "$CONTAINER_NAME" sh -c \
+    pcode="$(eng exec -e PATH="$_probe_path" "$CONTAINER_NAME" "$ENGINE_CHECK_SH" -c \
         "curl -s -o /dev/null -w '%{http_code}' --max-time 8 -x '${purl}' http://egress-proxy-probe.invalid/" 2>/dev/null || true)"
     if [[ -z "$pcode" || "$pcode" == "000" ]]; then
         leaked=true
@@ -2705,8 +2726,10 @@ cmd_setup_token() {
     local _lenv=() _largv=() kv
     for kv in $(agent_fixed_env); do _lenv+=(-e "$kv"); done
     read -ra _largv <<< "$(agent_login_argv)"
-    # empty-safe expansion (bash 3.2 + set -u)
-    eng exec -it ${_lenv[@]+"${_lenv[@]}"} "$CONTAINER_NAME" ${_largv[@]+"${_largv[@]}"} || true
+    # Run the exact file the integrity gate hashed, not a fresh lookup of the name (see
+    # agent_verify_integrity_engine).
+    _largv[0]="$AGENT_VERIFIED_BIN"
+    eng exec -it ${_lenv[@]+"${_lenv[@]}"} "$CONTAINER_NAME" "${_largv[@]}" || true
     stty sane 2>/dev/null || true   # restore cooked mode if the TUI left the tty raw
     # Apple's `container exec -it` returns with our inherited stdin (fd 0) left in
     # non-blocking mode. O_NONBLOCK is an open-file-description status flag (fcntl),

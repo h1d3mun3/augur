@@ -443,7 +443,8 @@ has   "$(cat "$envf" 2>/dev/null)" "ANTHROPIC_API_KEY=sk-ant-test123" "shell (no
 # makes the integrity gate's two sha256 probes agree so the flow reaches its interactive exec.
 section "Tier 1 — setup-token and augur's own execs get no credentials"
 rm -f "$AUGUR_TEST_SHIMLOG.trace" "$envf"
-( cd "$proj" && AUGUR_TEST_CLAUDE_SHA256=abc123 bash "$AUGUR" setup-token --no-egress ) </dev/null >/dev/null 2>&1 || true
+claude_sha="$(printf 'a%.0s' {1..64})"
+( cd "$proj" && AUGUR_TEST_CLAUDE_SHA256="$claude_sha" bash "$AUGUR" setup-token --no-egress ) </dev/null >/dev/null 2>&1 || true
 st_trace="$(cat "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null)"
 st_launch="$(printf '%s\n' "$st_trace" | grep -E '^container exec -it ' | tail -n1)"
 if [[ -n "$st_launch" ]]; then
@@ -456,6 +457,49 @@ if [[ -n "$st_launch" ]]; then
 else
   fail "setup-token: never reached its interactive exec" "trace: $st_trace"
 fi
+
+# ── setup-token's integrity gate: absolute programs only, and the launch runs what was hashed ──
+# A persisted container's ~/.local/bin (first in the image PATH, writable by the guest user) is
+# where the runtime resolves any bare program name, so a bare `sh`/`sha256sum`/`claude` could be a
+# stub left by a prior session. The gate must name every program by absolute path, and the launch
+# must run the exact path the gate hashed rather than looking `claude` up again.
+section "Tier 1 — setup-token integrity gate runs absolute programs and launches the hashed path"
+gate_run="$(printf '%s\n' "$st_trace" | grep -F 'container run --rm' | grep -F sha256sum | tail -n1)"
+gate_exec="$(printf '%s\n' "$st_trace" | grep -E '^container exec ' | grep -F sha256sum | tail -n1)"
+has   "$gate_run"  "/bin/sh -c /usr/bin/sha256sum" "gate (image side): /bin/sh and /usr/bin/sha256sum by absolute path"
+if grep -Eq '(^| )sh -c' <<<"$gate_run"; then fail "gate (image side): uses a bare 'sh -c'" "$gate_run"
+else ok "gate (image side): no bare 'sh -c'"; fi
+eq    "container exec ${cname} /usr/bin/sha256sum /home/dev/.local/bin/claude" "$gate_exec" \
+      "gate (container side): /usr/bin/sha256sum of the image-resolved path, no shell, no lookup"
+has   "$st_launch" "${cname} /home/dev/.local/bin/claude setup-token" "setup-token: launches the exact path the gate hashed"
+# Tampered binary: the container's hash differs → refuse before any interactive exec.
+rm -f "$AUGUR_TEST_SHIMLOG.trace"
+out="$( cd "$proj" && AUGUR_TEST_CLAUDE_SHA256="$claude_sha" AUGUR_TEST_CLAUDE_SHA256_EXEC="$(printf 'b%.0s' {1..64})" \
+        bash "$AUGUR" setup-token --no-egress 2>&1 </dev/null )"; rc=$?
+[[ $rc -ne 0 ]] && ok "setup-token: refuses a container whose claude hash differs" || fail "setup-token: accepted a differing hash"
+hasnt "$(cat "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null)" "exec -it" "setup-token: a differing hash never reaches the interactive exec"
+# An image-reported path that is not a plain absolute path is never launched.
+rm -f "$AUGUR_TEST_SHIMLOG.trace"
+( cd "$proj" && AUGUR_TEST_CLAUDE_SHA256="$claude_sha" AUGUR_TEST_CLAUDE_PATH="claude" \
+    bash "$AUGUR" setup-token --no-egress ) </dev/null >/dev/null 2>&1; rc=$?
+[[ $rc -ne 0 ]] && ok "setup-token: refuses a non-absolute claude path from the image" || fail "setup-token: accepted a relative claude path"
+hasnt "$(cat "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null)" "exec -it" "setup-token: a relative path never reaches the interactive exec"
+
+# ── The boot self-test's probes: /bin/sh by absolute path, PATH pinned inside it ──
+# Egress is off in this tier, so `up` never reaches verify_egress_locked; call it directly from a
+# sourced augur. The shim's exec always succeeds, so the self-test "sees a leak" and exits 1 — only
+# the constructed probe argv matters here.
+section "Tier 1 — boot self-test probes exec /bin/sh by absolute path"
+rm -f "$AUGUR_TEST_SHIMLOG.trace"
+( cd "$proj" && bash -c 'AUGUR_SOURCE_ONLY=1 source "$1" >/dev/null 2>&1
+    CONTAINER_NAME="$2"; stop_egress() { :; }; egress_proxy_url() { echo http://192.0.2.1:3128; }
+    verify_egress_locked' _ "$AUGUR" "$cname" ) >/dev/null 2>&1 || true
+probes="$(grep -E '^container exec ' "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null)"
+eq "9" "$(grep -c . <<<"$probes")" "self-test: ran 9 probe execs (7 direct, DNS, through-proxy)"
+eq "9" "$(grep -cF " ${cname} /bin/sh -c " <<<"$probes")" "self-test: every probe execs /bin/sh by absolute path"
+eq "9" "$(grep -cF "PATH=/usr/bin:/bin:/usr/local/bin " <<<"$probes")" "self-test: every probe pins PATH to system dirs"
+if grep -Eq '(^| )sh -c' <<<"$probes"; then fail "self-test: a probe uses a bare 'sh -c'" "$probes"
+else ok "self-test: no probe uses a bare 'sh -c'"; fi
 
 # ── A RUNNING container with a stale fingerprint: claude/shell refuse before any exec -it ──
 # Includes a container an older augur created with credentials/TZ baked into `container run`: exec
