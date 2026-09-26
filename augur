@@ -1792,6 +1792,21 @@ gvproxy_running() {
     [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
 }
 
+# The host-side SSH forward port of a macOS VM's running gvproxy, for ANY project's VM (not just
+# the current one); fails when that VM has no live gvproxy (the base VM, an egress-off run).
+# The pidfile name is the VM name minus its `augur-macos-` prefix — both are `<slug>-<path hash>`
+# (see gvproxy_pidfile, macos_project_vm). The port is read back from gvproxy's own argv because
+# it is derived from the project's full path, which the VM name does not carry.
+macos_vm_gvproxy_fwd_port() {
+    local pf="$AUGUR_PROXY_DIR/${1#augur-macos-}.gvproxy.pid" pid args
+    [[ -f "$pf" ]] || return 1
+    pid="$(cat "$pf" 2>/dev/null)"
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null || return 1
+    args="$(ps -o args= -p "$pid" 2>/dev/null)" || return 1
+    [[ "$args" =~ --ssh-port[[:space:]]+([0-9]+) ]] || return 1
+    echo "${BASH_REMATCH[1]}"
+}
+
 # Start gvproxy: creates the vfkit unixgram socket the VM attaches to, and routes
 # guest egress to augur-proxy's SOCKS5. Fail closed if the fork isn't installed.
 start_gvproxy() {
@@ -4444,11 +4459,17 @@ cmd_list_macos() {
     fi
 
     echo -e "  ${BOLD}$(printf '%-28s %-10s %s' NAME STATE IP)${RESET}"
-    local name state ip color
+    local name state ip color port
     while read -r name state; do
         [[ -z "$name" ]] && continue
         if [[ "$state" == "running" ]]; then
-            ip="$("$VM_CLI" ip "$name" 2>/dev/null || echo '-')"
+            # An egress-on VM has no DHCP lease (its NIC is gvproxy's), so `augur-vm ip` finds
+            # nothing for it; show the forward ssh_macos connects through instead.
+            if port="$(macos_vm_gvproxy_fwd_port "$name")"; then
+                ip="127.0.0.1:${port} (gvproxy fwd)"
+            else
+                ip="$("$VM_CLI" ip "$name" 2>/dev/null || echo '-')"
+            fi
             color="$GREEN"
         else
             ip="-"
