@@ -121,6 +121,19 @@ eq "2" "$(n_calls)" "managed policy: stage + privileged move (two calls)"
 has "$(cat "$LOG/1.stdin")" "DISABLE_AUTOUPDATER" "managed policy: the JSON still travels on the staging call's stdin"
 check_site "managed policy"
 
+section "Tier 1 — select_macos_full_xcode"
+reset_log
+select_macos_full_xcode testvm >/dev/null 2>&1; rc=$?
+eq "0" "$rc" "xcode-select: succeeded against a sudo that reads stdin"
+has "$(cat "$LOG/1.argv")" "xcode-select -s '/Applications/Xcode.app/Contents/Developer'" \
+    "xcode-select: selects the full Xcode install, not the Command Line Tools"
+check_site "xcode-select"
+GUEST_PW="some-other-password"; reset_log
+select_macos_full_xcode testvm >/dev/null 2>&1; rc=$?
+GUEST_PW="$SECRET"
+if [[ "$rc" -ne 0 ]]; then ok "xcode-select, wrong password: reports failure to the caller"
+else fail "xcode-select, wrong password: returned 0" "build would save a base VM with the CLT selected"; fi
+
 section "Tier 1 — the provisioning wrappers"
 reset_log
 macos_admin_password_stdin | ssh_macos_provision_stdin testvm "sudo -S -p '' true"
@@ -153,6 +166,6 @@ eq "" "$_bad" "every \`sudo -S\` is fed by macos_admin_password_stdin piped into
 hasnt "$code" 'macos_admin_password_stdin | ssh_macos_provision "' \
     "the password is never piped into ssh_macos_provision (its -n would drop it; use ssh_macos_provision_stdin)"
 _sites="$(printf '%s\n' "$code" | grep -c 'macos_admin_password_stdin | ssh_macos')"
-eq "5" "$_sites" "five sudo -S call sites use the helper (build, provisioning, managed policy, clock, timezone)"
+eq "6" "$_sites" "six sudo -S call sites use the helper (build, provisioning, managed policy, xcode-select, clock, timezone)"
 
 finish
