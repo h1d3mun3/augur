@@ -4332,7 +4332,9 @@ cmd_status_macos() {
     # Toolchain is read from the running project VM only — status never boots a VM.
     # When the VM is stopped we just point at `augur up --macos` instead.
     echo -e "${BOLD}Toolchain:${RESET}"
-    if macos_vm_running "$project_vm" && macos_vm_ip "$project_vm" &>/dev/null; then
+    # Gate on the address ssh_macos will actually use: with egress on, that is gvproxy's local
+    # forward and the guest has no DHCP lease, so a lease-based check would never pass.
+    if macos_vm_running "$project_vm" && [[ -n "$(macos_ssh_host "$project_vm")" ]]; then
         # SSH runs a non-login shell, so ~/.zprofile (where the build pins DEVELOPER_DIR)
         # is not sourced. Pin it here too so xcodebuild uses the full Xcode install instead
         # of the CLT, which would otherwise fail and show "(unable to fetch)".
