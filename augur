@@ -3373,10 +3373,11 @@ cmd_build_macos() {
         bash "$_claude_installer" latest
         rm -f "$_claude_installer"
         echo '\''export PATH="$HOME/.local/bin:$PATH"'\'' >> ~/.zprofile
-        # Pin the Xcode developer directory via DEVELOPER_DIR so xcodebuild/xcrun always
-        # use the full Xcode installation even if Homebrew later resets xcode-select to CLT.
-        # This avoids needing sudo xcode-select at project VM startup.
-        echo '\''export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer'\'' >> ~/.zprofile
+        # Pin the Xcode developer directory via DEVELOPER_DIR so xcodebuild/xcrun use the full
+        # Xcode install regardless of what xcode-select points at. ~/.zshenv, not ~/.zprofile:
+        # zsh reads it for every invocation, including the non-login `ssh host "cmd"` shells
+        # augur and provisioning hooks run.
+        echo '\''export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer'\'' >> ~/.zshenv
         codesign -dvv "$HOME/.local/bin/claude" 2>&1 | grep -qi "Anthropic" \
             || { echo "augur: ERROR claude binary is not signed by Anthropic — aborting build" >&2; exit 1; }
     '
@@ -3397,6 +3398,11 @@ cmd_build_macos() {
     # augur's managed Claude Code policy — the one settings layer a repo cannot override. Must land
     # before the sudo revoke below, and before the base VM is frozen, since /Library is root-owned.
     install_macos_managed_settings "$MACOS_BUILD_VM"
+
+    # Last, after Homebrew and any custom provisioning: either can leave the Command Line Tools
+    # selected, and whatever is selected here is what every project VM clone inherits.
+    select_macos_full_xcode "$MACOS_BUILD_VM" \
+        || { error "Could not select the full Xcode install in '${MACOS_BUILD_VM}'."; exit 1; }
 
     # Step 7: Save as base VM
     # Revoke the build-time NOPASSWD sudo grant before saving. Project VMs are cloned from
@@ -3652,6 +3658,18 @@ install_macos_managed_settings() {
         chmod 644 \"${dst}\"'" \
         || warn "Could not install the managed Claude Code policy in the VM; continuing without it."
     return 0
+}
+
+# Point the VM's system-wide developer directory at the full Xcode install. Homebrew's installer
+# adds the Command Line Tools and switches `xcode-select` to them, and a shell that does not set
+# DEVELOPER_DIR itself (e.g. a plain `ssh_macos "$vm" "xcodebuild …"`) then fails with "tool
+# 'xcodebuild' requires Xcode". Callers run this after everything that might install the CLT.
+# `sudo -S` for the same reason as install_macos_managed_settings: it works with or without the
+# build-time NOPASSWD grant. Returns non-zero if the selection did not take.
+select_macos_full_xcode() {
+    local vm="$1" dev="/Applications/Xcode.app/Contents/Developer"
+    info "Selecting the full Xcode install as the developer directory..."
+    macos_admin_password_stdin | ssh_macos "$vm" "sudo -S -p '' xcode-select -s '${dev}' && [ \"\$(xcode-select -p)\" = '${dev}' ]"
 }
 
 # AUGUR_AGENT_SEAM | macOS agent install / self-heal (official installer into ~/.local/bin).
@@ -4096,6 +4114,9 @@ cmd_up_macos() {
         echo '# augur (regenerated at VM startup)'
         echo 'eval "$(/opt/homebrew/bin/brew shellenv)" 2>/dev/null || true'
         echo 'export PATH="$HOME/.local/bin:$PATH"   # claude (official installer)'
+        # Also written into the base VM's ~/.zshenv at build time; repeated here because a base VM
+        # built by an older augur has it only in ~/.zprofile, which non-login SSH shells never read.
+        echo 'export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer'
         while IFS='|' read -r _genv _henv _hfile _hvalidator; do
             [[ -z "$_genv" ]] && continue
             _aval="$(resolve_api_key "${!_henv:-}" "$_hfile")"
@@ -4335,14 +4356,11 @@ cmd_status_macos() {
     # Gate on the address ssh_macos will actually use: with egress on, that is gvproxy's local
     # forward and the guest has no DHCP lease, so a lease-based check would never pass.
     if macos_vm_running "$project_vm" && [[ -n "$(macos_ssh_host "$project_vm")" ]]; then
-        # SSH runs a non-login shell, so ~/.zprofile (where the build pins DEVELOPER_DIR)
-        # is not sourced. Pin it here too so xcodebuild uses the full Xcode install instead
-        # of the CLT, which would otherwise fail and show "(unable to fetch)".
+        # DEVELOPER_DIR (full Xcode, not the CLT) comes from ~/.augur-env; see cmd_up_macos.
         # AUGUR_AGENT_SEAM | agent version (macOS, in-VM; runs `claude --version`)
         ssh_macos "$project_vm" '
             eval "$(/opt/homebrew/bin/brew shellenv)" 2>/dev/null
             export PATH="$HOME/.local/bin:$PATH"
-            export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
             echo "    xcode:  $(xcodebuild -version 2>/dev/null | head -1 || echo "(unable to fetch)")"
             echo "    claude: $(claude --version 2>/dev/null || echo "(unable to fetch)")"
         ' | sanitize_guest_lines || true
@@ -4629,6 +4647,11 @@ cmd_update_macos() {
     # VM built before this existed self-heals on routine maintenance instead of needing a full
     # rebuild. Idempotent (it overwrites the same file with the same bytes).
     install_macos_managed_settings "$MACOS_BASE_VM"
+
+    # Same as the end of cmd_build_macos, re-run here so a base VM built with the Command Line
+    # Tools left selected self-heals without a rebuild, and provisioning above cannot undo it.
+    select_macos_full_xcode "$MACOS_BASE_VM" \
+        || warn "Could not select the full Xcode install; xcodebuild over plain SSH may hit the Command Line Tools."
 
     stop_and_reap_macos_vm "$MACOS_BASE_VM" "$vm_pid"
     success "CLI tools updated in '${MACOS_BASE_VM}'."
