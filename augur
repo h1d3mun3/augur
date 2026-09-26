@@ -15,12 +15,12 @@ MACOS_MODE=false
 MACOS_GUI=false
 
 # ANSI colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-RESET='\033[0m'
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[1;33m'
+CYAN=$'\033[0;36m'
+BOLD=$'\033[1m'
+RESET=$'\033[0m'
 
 # macOS VM mode: VM names and SSH key
 MACOS_BASE_VM="augur-macos-base"
@@ -120,10 +120,37 @@ AUGUR_SSH_FWD_PORT_PROVISION="${AUGUR_SSH_FWD_PORT_PROVISION:-20999}"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-info()    { echo -e "${CYAN}[augur]${RESET} $*"; }
-success() { echo -e "${GREEN}[augur]${RESET} $*"; }
-warn()    { echo -e "${YELLOW}[augur]${RESET} $*"; }
-error()   { echo -e "${RED}[augur]${RESET} $*" >&2; }
+# The message is printed verbatim: a backslash in it (a path, a printf format shown to the
+# operator) stays a backslash instead of being interpreted as an escape.
+info()    { printf '%s\n' "${CYAN}[augur]${RESET} $*"; }
+success() { printf '%s\n' "${GREEN}[augur]${RESET} $*"; }
+warn()    { printf '%s\n' "${YELLOW}[augur]${RESET} $*"; }
+error()   { printf '%s\n' "${RED}[augur]${RESET} $*" >&2; }
+
+# Make text that came from a guest (VM or container) safe to show on the operator's terminal.
+# The guest is untrusted, and a terminal acts on control bytes it prints: an ESC sequence can
+# erase or rewrite augur's own status lines, and some terminals let one set the host clipboard
+# (OSC 52). Every C0 control byte and DEL becomes a visible `\xNN`; the backslash is escaped
+# first so that a guest-written literal `\x1b` stays distinguishable from a real ESC byte.
+# UTF-8 text passes through unchanged. Same scheme as DecisionLog.sanitize in augur-proxy.
+# Print guest text through this (or sanitize_guest_lines) before info/warn/error or echo.
+sanitize_guest_text() {
+    local s="${1//\\/\\\\}" i c hex
+    for i in {1..31} 127; do
+        printf -v hex '%02x' "$i"
+        # shellcheck disable=SC2059  # Deliberately a format: it turns "\x1b" into the byte itself.
+        printf -v c "\\x${hex}"
+        s="${s//"$c"/\\x${hex}}"
+    done
+    printf '%s' "$s"
+}
+# sanitize_guest_text for a stream: each stdin line comes out sanitised, newline-terminated.
+sanitize_guest_lines() {
+    local _l
+    while IFS= read -r _l || [[ -n "$_l" ]]; do
+        printf '%s\n' "$(sanitize_guest_text "$_l")"
+    done
+}
 
 # ══ AGENT SEAM (AUGUR_AGENT_SEAM) ═══════════════════════════════════════════════
 # Anti-Corruption Layer between augur (the sandbox) and the coding agent it runs.
@@ -1183,7 +1210,7 @@ clamp_resource_int() {
     if [[ "$v" =~ ^[0-9]+$ ]] && (( ${#v} <= 15 )) && (( v >= min && v <= max )); then
         echo "$v"; return
     fi
-    warn "Ignoring out-of-range ${label}='${v}' in .augur/resources.conf (allowed ${min}-${max}); using ${def}." >&2
+    warn "Ignoring out-of-range ${label}='$(sanitize_guest_text "$v")' in .augur/resources.conf (allowed ${min}-${max}); using ${def}." >&2
     echo "$def"
 }
 
@@ -1205,7 +1232,7 @@ clamp_container_memory_value() {
         # guarantees num >= 1, so anything within the ceiling is a valid positive size.
         if (( num <= max / mult )); then echo "$v"; return; fi
     fi
-    warn "Ignoring out-of-range/invalid MEMORY='${v}' in .augur/resources.conf (max 128g); using 4g." >&2
+    warn "Ignoring out-of-range/invalid MEMORY='$(sanitize_guest_text "$v")' in .augur/resources.conf (max 128g); using 4g." >&2
     echo "4g"
 }
 
@@ -1754,7 +1781,7 @@ macos_dump_build_vm_log() {
     error "  VM log: ${log}"
     if [[ -s "$log" ]]; then
         error "  ---- last VM lines ----"
-        tail -n 20 "$log" 2>/dev/null | while IFS= read -r _l; do error "  | $_l"; done
+        tail -n 20 "$log" 2>/dev/null | sanitize_guest_lines | while IFS= read -r _l; do error "  | $_l"; done
     fi
 }
 
@@ -2937,11 +2964,11 @@ engine_toolchain_versions() {
         echo -e "    ${YELLOW}(image not built — run: augur up)${RESET}"
         return 0
     fi
-    "${runner[@]}" swift --version 2>/dev/null || echo "    swift:  (unable to fetch)"
+    "${runner[@]}" swift --version 2>/dev/null | sanitize_guest_lines || echo "    swift:  (unable to fetch)"
     # AUGUR_AGENT_SEAM | agent version probe
     local _vcmd=(); read -ra _vcmd <<< "$(agent_version_cmd)"
-    "${runner[@]}" ${_vcmd[@]+"${_vcmd[@]}"} 2>/dev/null || echo "    $(agent_cli_name): (unable to fetch)"
-    "${runner[@]}" gh --version 2>/dev/null | head -1 || echo "    gh:     (unable to fetch)"
+    "${runner[@]}" ${_vcmd[@]+"${_vcmd[@]}"} 2>/dev/null | sanitize_guest_lines || echo "    $(agent_cli_name): (unable to fetch)"
+    "${runner[@]}" gh --version 2>/dev/null | head -1 | sanitize_guest_lines || echo "    gh:     (unable to fetch)"
 }
 
 # Is the host egress proxy up?
@@ -3737,7 +3764,7 @@ sync_macos_guest_clock() {
     # offline test tier runs on a Linux runner).
     stamp="$(date -u +%m%d%H%M%Y.%S)"
     setout="$(macos_admin_password_stdin | ssh_macos "$vm" "sudo -S -p '' /bin/date -u '${stamp}'" 2>&1)" || {
-        warn "Could not set the guest's clock (${drift}s off the host's): ${setout%%$'\n'*}"
+        warn "Could not set the guest's clock (${drift}s off the host's): $(sanitize_guest_text "${setout%%$'\n'*}")"
         warn "  Tokens, TLS validity windows and commit timestamps in the guest will use that skewed clock."
         warn_if_stale_admin_password "$setout"
         return 0
@@ -3801,7 +3828,7 @@ sync_macos_guest_timezone() {
 
     info "Guest timezone is '${guest_tz}' (host is '${host_tz}') — correcting from the host."
     setout="$(macos_admin_password_stdin | ssh_macos "$vm" "sudo -S -p '' systemsetup -settimezone '${host_tz}'" 2>&1)" || {
-        warn "Could not set the guest's timezone (guest is '${guest_tz}', host is '${host_tz}'): ${setout%%$'\n'*}"
+        warn "Could not set the guest's timezone (guest is '${guest_tz}', host is '${host_tz}'): $(sanitize_guest_text "${setout%%$'\n'*}")"
         warn "  Local timestamps in the guest (date, logs) will keep reading in ${guest_tz}."
         warn_if_stale_admin_password "$setout"
         return 0
@@ -3966,18 +3993,18 @@ cmd_up_macos() {
         # One probe with stderr shown — the wait loop suppresses it, which hides the
         # common cases (a changed/pinned host key, or auth failure) behind the timeout.
         error "  ---- ssh probe (stderr) ----"
-        ssh_macos "$project_vm" true 2>&1 | head -n 6 | while IFS= read -r _l; do error "  | $_l"; done || true
+        ssh_macos "$project_vm" true 2>&1 | head -n 6 | sanitize_guest_lines | while IFS= read -r _l; do error "  | $_l"; done || true
         error "  VM log:      $(macos_vm_log)"
         if egress_enabled; then
             error "  gvproxy log: $(gvproxy_log)"
             if [[ -s "$(gvproxy_log)" ]]; then
                 error "  ---- last gvproxy lines ----"
-                tail -n 20 "$(gvproxy_log)" 2>/dev/null | while IFS= read -r _l; do error "  | $_l"; done
+                tail -n 20 "$(gvproxy_log)" 2>/dev/null | sanitize_guest_lines | while IFS= read -r _l; do error "  | $_l"; done
             fi
         fi
         if [[ -s "$(macos_vm_log)" ]]; then
             error "  ---- last VM lines ----"
-            tail -n 10 "$(macos_vm_log)" 2>/dev/null | while IFS= read -r _l; do error "  | $_l"; done
+            tail -n 10 "$(macos_vm_log)" 2>/dev/null | sanitize_guest_lines | while IFS= read -r _l; do error "  | $_l"; done
         fi
         # Tear down what we started so a stranded VM/gvproxy/proxy isn't left behind.
         "$VM_CLI" stop "$project_vm" 2>/dev/null || true
@@ -4316,7 +4343,7 @@ cmd_status_macos() {
             export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
             echo "    xcode:  $(xcodebuild -version 2>/dev/null | head -1 || echo "(unable to fetch)")"
             echo "    claude: $(claude --version 2>/dev/null || echo "(unable to fetch)")"
-        ' || true
+        ' | sanitize_guest_lines || true
     else
         echo -e "    ${YELLOW}(VM not running — run: augur up --macos)${RESET}"
     fi
@@ -4541,12 +4568,12 @@ cmd_update_macos() {
         error "  base VM SSH host (from DHCP lease): ${_bhost:-<none — VM did not boot or never got an IP>}"
         if [[ -n "$_bhost" ]]; then
             error "  ---- ssh probe (stderr) ----"
-            ssh_macos "$MACOS_BASE_VM" true 2>&1 | head -n 6 | while IFS= read -r _l; do error "  | $_l"; done || true
+            ssh_macos "$MACOS_BASE_VM" true 2>&1 | head -n 6 | sanitize_guest_lines | while IFS= read -r _l; do error "  | $_l"; done || true
         fi
         error "  VM log:      $(macos_base_vm_log)"
         if [[ -s "$(macos_base_vm_log)" ]]; then
             error "  ---- last VM lines ----"
-            tail -n 15 "$(macos_base_vm_log)" 2>/dev/null | while IFS= read -r _l; do error "  | $_l"; done
+            tail -n 15 "$(macos_base_vm_log)" 2>/dev/null | sanitize_guest_lines | while IFS= read -r _l; do error "  | $_l"; done
         fi
         stop_and_reap_macos_vm "$MACOS_BASE_VM" "$vm_pid"
         error "The base VM may just be slow to boot — re-run ${BOLD}augur update --macos${RESET}."
