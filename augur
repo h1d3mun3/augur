@@ -15,12 +15,12 @@ MACOS_MODE=false
 MACOS_GUI=false
 
 # ANSI colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-RESET='\033[0m'
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[1;33m'
+CYAN=$'\033[0;36m'
+BOLD=$'\033[1m'
+RESET=$'\033[0m'
 
 # macOS VM mode: VM names and SSH key
 MACOS_BASE_VM="augur-macos-base"
@@ -120,10 +120,12 @@ AUGUR_SSH_FWD_PORT_PROVISION="${AUGUR_SSH_FWD_PORT_PROVISION:-20999}"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-info()    { echo -e "${CYAN}[augur]${RESET} $*"; }
-success() { echo -e "${GREEN}[augur]${RESET} $*"; }
-warn()    { echo -e "${YELLOW}[augur]${RESET} $*"; }
-error()   { echo -e "${RED}[augur]${RESET} $*" >&2; }
+# The message is printed verbatim: a backslash in it (a path, a printf format shown to the
+# operator) stays a backslash instead of being interpreted as an escape.
+info()    { printf '%s\n' "${CYAN}[augur]${RESET} $*"; }
+success() { printf '%s\n' "${GREEN}[augur]${RESET} $*"; }
+warn()    { printf '%s\n' "${YELLOW}[augur]${RESET} $*"; }
+error()   { printf '%s\n' "${RED}[augur]${RESET} $*" >&2; }
 
 # ══ AGENT SEAM (AUGUR_AGENT_SEAM) ═══════════════════════════════════════════════
 # Anti-Corruption Layer between augur (the sandbox) and the coding agent it runs.
