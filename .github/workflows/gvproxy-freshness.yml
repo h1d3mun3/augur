@@ -24,6 +24,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The check lists gvproxy's build graph with `go list`; GOTOOLCHAIN=auto in the
+      # script fetches a newer Go if upstream's go.mod asks for one.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+
       - name: Run freshness check
         id: check
         continue-on-error: true          # non-zero just means "action warranted"
@@ -53,12 +60,18 @@ jobs:
             gh issue create --label gvproxy-freshness --title "$TITLE" --body-file "$BODY_FILE"
           fi
 
-      - name: Close tracking issue if caught up
-        if: steps.check.outputs.severity == 'CURRENT'
+      - name: Close tracking issue if nothing shipped is pending
+        if: steps.check.outputs.severity == 'CURRENT' || steps.check.outputs.severity == 'NOISE'
         env:
           GH_TOKEN: ${{ github.token }}
+          SEVERITY: ${{ steps.check.outputs.severity }}
         run: |
           num="$(gh issue list --label gvproxy-freshness --state open --json number --jq '.[0].number // empty')"
           if [ -n "$num" ]; then
-            gh issue close "$num" --comment "gvproxy pin caught up to upstream main; closing automatically."
+            if [ "$SEVERITY" = "CURRENT" ]; then
+              msg="gvproxy pin caught up to upstream main; closing automatically."
+            else
+              msg="Remaining upstream drift does not reach the shipped gvproxy binary (tooling/test-only); closing automatically."
+            fi
+            gh issue close "$num" --comment "$msg"
           fi

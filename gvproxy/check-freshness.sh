@@ -5,7 +5,15 @@
 # way that MATTERS — not raw commit count (that is mostly tools/vendor churn), but:
 #   - the augur patch no longer applies cleanly to upstream main, or
 #   - a security-flavoured commit landed in the shipped code (cmd/gvproxy, pkg/), or
-#   - the shipped dependency tree (go.mod / go.sum / vendor/) moved.
+#   - a dependency that is linked into the shipped binary moved, or
+#   - a go.mod setting that changes how the binary is built moved.
+#
+# A dependency counts as shipped only if `go list -deps ./cmd/gvproxy` (darwin/arm64,
+# with the augur patch applied) reaches it — see build_graph(). Test-only and tooling
+# modules (gomega, ginkgo, linters) sit in vendor/ but never reach the binary, so their
+# bumps are noise. Comparing module versions of the whole build graph, not just "which
+# module did the commit bump", also catches a test-only bump that drags a shared module
+# (e.g. golang.org/x/net) to a new version.
 #
 # Prints a human report, writes a Markdown issue body to $BODY_FILE, and exits
 # non-zero when action is warranted so a daily GitHub Actions cron can open/refresh
@@ -13,11 +21,13 @@
 #
 #   ACTION   patch no longer applies cleanly to main            (exit 1)
 #   REVIEW   security/code/dependency change in the shipped tree (exit 1)
-#   NOISE    behind, but only tooling/docs/CI churn              (exit 0)
+#   NOISE    behind, but nothing that reaches the shipped binary (exit 0)
 #   CURRENT  pin is at upstream main                             (exit 0)
 #
 # Usage:   bash gvproxy/check-freshness.sh
-# Requires: gh (authenticated: GH_TOKEN or `gh auth login`), git.
+# Requires: gh (authenticated: GH_TOKEN or `gh auth login`), git, go.
+#           Without a working go the build-graph comparison is skipped and any
+#           go.mod/go.sum/vendor change counts as shipped (fails toward REVIEW).
 # Honors:   BODY_FILE  (where to write the Markdown issue body; default ./gvproxy-freshness-body.md)
 #           GITHUB_OUTPUT (if set, writes severity=/title= for the workflow)
 set -euo pipefail
@@ -54,14 +64,17 @@ fi
 
 CMP="repos/$SLUG/compare/$PIN...$MAIN_SHA"
 AHEAD="$(gh api "$CMP" --jq '.ahead_by')"
-mapfile -t FILES   < <(gh api "$CMP" --jq '.files[].filename' 2>/dev/null || true)
-mapfile -t COMMITS < <(gh api "$CMP" --jq '.commits[] | "\(.sha[0:8])\t\(.commit.committer.date[0:10])\t\(.commit.message | split("\n")[0])"')
+# while-read rather than mapfile so this also runs on macOS's stock bash 3.2.
+FILES=();   while IFS= read -r l; do FILES+=("$l");   done < <(gh api "$CMP" --jq '.files[].filename' 2>/dev/null || true)
+COMMITS=(); while IFS= read -r l; do COMMITS+=("$l"); done < <(gh api "$CMP" --jq '.commits[] | "\(.sha[0:8])\t\(.commit.committer.date[0:10])\t\(.commit.message | split("\n")[0])"')
 
 # Classify changed files: shipped code / shipped deps vs. dev-only noise.
+# ${a[@]+"${a[@]}"} expands an empty array without tripping bash 3.2's `set -u`.
 code=(); dep=(); noise=()
-for f in "${FILES[@]}"; do
+for f in ${FILES[@]+"${FILES[@]}"}; do
   case "$f" in
     tools/*)                 noise+=("$f") ;;   # dev tooling (linters) — never shipped
+    *_test.go)               noise+=("$f") ;;   # tests are never compiled into the binary
     cmd/gvproxy/*|pkg/*)     code+=("$f")  ;;
     go.mod|go.sum|vendor/*)  dep+=("$f")   ;;
     *)                       noise+=("$f") ;;
@@ -70,21 +83,98 @@ done
 
 # Flag security-flavoured commit subjects (enriches the report; does not gate).
 sec=()
-for c in "${COMMITS[@]}"; do
+for c in ${COMMITS[@]+"${COMMITS[@]}"}; do
   msg="${c#*$'\t'}"; msg="${msg#*$'\t'}"
   if printf '%s' "$msg" | grep -qiE 'secur|cve|vuln|overflow|panic|leak|bypass|out.of.bounds|(^| )oob( |$)|denial|dos'; then
     sec+=("$c")
   fi
 done
 
+fetch_tree() {  # dir sha — shallow checkout of one upstream commit
+  git init --quiet "$1" &&
+    git -C "$1" fetch --quiet --depth 1 "$REPO_URL" "$2" &&
+    git -C "$1" checkout --quiet FETCH_HEAD
+}
+
+# Modules linked into the shipped binary, one "path@version[ => replacement]" per line.
+# Lists the darwin/arm64 build (what augur ships) whatever the host OS, and leaves out
+# the main module itself (its own code is classified by path above).
+build_graph() {  # dir
+  ( cd "$1" &&
+      GOTOOLCHAIN=auto GOFLAGS=-mod=vendor GOOS=darwin GOARCH=arm64 CGO_ENABLED=1 \
+      go list -deps -f '{{with .Module}}{{if not .Main}}{{.Path}}@{{.Version}}{{with .Replace}} => {{.Path}}@{{.Version}}{{end}}{{end}}{{end}}' ./cmd/gvproxy
+  ) | sort -u
+}
+
+# go.mod minus its require lines: the go/toolchain/godebug/replace/exclude settings
+# that change the build without any import changing. Requires are covered by
+# build_graph().
+build_settings() {  # go.mod
+  awk '
+    /^require[ \t]*\(/ { inreq = 1; next }
+    inreq && /^\)/     { inreq = 0; next }
+    inreq              { next }
+    /^require[ \t]/    { next }
+    /^[ \t]*(\/\/.*)?$/ { next }
+    { print }
+  ' "$1"
+}
+
+# "path version" for every vendored module, to name the bumps that stay out of the binary.
+vendored_modules() {  # dir
+  awk '/^# / { print $2, $3 }' "$1/vendor/modules.txt" | LC_ALL=C sort -u
+}
+
+WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
+
 # Does the augur patch still apply to current main? (highest-priority signal)
 PATCH_STATE="unknown"
-WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
-if git clone --quiet --depth 1 "$REPO_URL" "$WORK/gtv" 2>/dev/null; then
-  if git -C "$WORK/gtv" apply --check "$PATCH" 2>/dev/null; then PATCH_STATE="clean"; else PATCH_STATE="conflict"; fi
+if fetch_tree "$WORK/main" "$MAIN_SHA" 2>/dev/null; then
+  if git -C "$WORK/main" apply --check "$PATCH" 2>/dev/null; then PATCH_STATE="clean"; else PATCH_STATE="conflict"; fi
 fi
 
-relevant=$(( ${#code[@]} + ${#dep[@]} ))
+# Compare what actually goes into the binary at the pin vs. main, both with the augur
+# patch applied (the patch adds imports of its own). On a conflicting patch, main is
+# listed unpatched; the run is ACTION regardless.
+GRAPH_STATE="unavailable"
+graph_diff=""; settings_diff=""; other_bumps=""
+if [ "$PATCH_STATE" != "unknown" ] && command -v go >/dev/null &&
+   fetch_tree "$WORK/pin" "$PIN" 2>/dev/null &&
+   git -C "$WORK/pin" apply "$PATCH" 2>/dev/null; then
+  [ "$PATCH_STATE" = "clean" ] && git -C "$WORK/main" apply "$PATCH"
+  if build_graph "$WORK/pin"  > "$WORK/graph.pin" &&
+     build_graph "$WORK/main" > "$WORK/graph.main"; then
+    GRAPH_STATE="ok"
+    # "- path: old -> new" per module whose version (or presence) differs.
+    graph_diff="$(awk '
+      { split($0, a, "@"); path = a[1]; ver = substr($0, length(path) + 2) }
+      FNR == NR { old[path] = ver; next }
+      { new[path] = ver }
+      END {
+        for (p in old) if (!(p in new))        printf "- `%s`: %s -> (removed)\n", p, old[p]
+        for (p in new) if (!(p in old))        printf "- `%s`: (added) -> %s\n",   p, new[p]
+                       else if (old[p] != new[p]) printf "- `%s`: %s -> %s\n",     p, old[p], new[p]
+      }' "$WORK/graph.pin" "$WORK/graph.main" | sort)"
+    settings_diff="$(diff <(build_settings "$WORK/pin/go.mod") <(build_settings "$WORK/main/go.mod") | grep '^[<>]' || true)"
+    # Vendored modules that moved but are in neither build graph (test/dev-only).
+    LC_ALL=C join -a 1 -a 2 -e '(none)' -o '0,1.2,2.2' \
+      <(vendored_modules "$WORK/pin") <(vendored_modules "$WORK/main") > "$WORK/vendored"
+    other_bumps="$(awk 'FILENAME ~ /graph\.(pin|main)$/ { sub(/@.*/, ""); ship[$0] = 1; next }
+                        $2 != $3 && !($1 in ship) { printf "- `%s`: %s -> %s\n", $1, $2, $3 }' \
+      "$WORK/graph.pin" "$WORK/graph.main" "$WORK/vendored")"
+  fi
+fi
+
+# Without the build graph, fall back to treating any go.mod/go.sum/vendor change as
+# shipped. Deliberately fails toward REVIEW: a missing Go must not hide a real bump.
+if [ "$GRAPH_STATE" = "ok" ]; then
+  dep_relevant=0
+  if [ -n "$graph_diff" ] || [ -n "$settings_diff" ]; then dep_relevant=1; fi
+else
+  dep_relevant=${#dep[@]}
+fi
+
+relevant=$(( ${#code[@]} + dep_relevant ))
 if [ "$PATCH_STATE" = "conflict" ]; then
   SEV="ACTION"; TITLE="gvproxy: patch no longer applies to upstream main (action required)"
 elif [ "$relevant" -gt 0 ]; then
@@ -115,8 +205,26 @@ fi
     printf '%s\n' "${code[@]}" | sort -u | sed 's/^/- `/; s/$/`/'
     echo
   fi
-  if [ "${#dep[@]}" -gt 0 ]; then
-    echo "**Shipped dependencies changed (\`go.mod\`/\`vendor\`):**"
+  if [ "$GRAPH_STATE" = "ok" ]; then
+    if [ -n "$graph_diff" ]; then
+      echo "**Modules linked into the shipped binary changed (\`cmd/gvproxy\`, darwin/arm64):**"
+      printf '%s\n' "$graph_diff"
+      echo
+    fi
+    if [ -n "$settings_diff" ]; then
+      echo "**Build settings in \`go.mod\` changed (\`<\` pin, \`>\` main):**"
+      echo '```'
+      printf '%s\n' "$settings_diff"
+      echo '```'
+      echo
+    fi
+    if [ -n "$other_bumps" ]; then
+      echo "**Other dependency bumps (not linked into gvproxy — no action needed):**"
+      printf '%s\n' "$other_bumps"
+      echo
+    fi
+  elif [ "${#dep[@]}" -gt 0 ]; then
+    echo "**Dependency files changed (\`go.mod\`/\`vendor\`) — build-graph check could not run, so treated as shipped:**"
     printf '%s\n' "${dep[@]}" | sort -u | sed 's/^/- `/; s/$/`/'
     echo
   fi
@@ -134,7 +242,7 @@ fi
   echo "3. Run the macOS egress E2E on Apple Silicon (allowlisted host reachable, blocked host denied, SSH via gvproxy)."
   echo "4. If the patch conflicted, rebase it against main first, then re-run this check."
   echo
-  echo "_Filed automatically by \`gvproxy/check-freshness.sh\` (daily). Body refreshes in place; closes when the pin catches up._"
+  echo "_Filed automatically by \`gvproxy/check-freshness.sh\` (daily). Body refreshes in place; closes once nothing pending reaches the shipped binary._"
 } > "$BODY_FILE"
 
 # --- stdout human summary --------------------------------------------------
@@ -142,7 +250,11 @@ echo "SEVERITY: $SEV"
 echo "  pinned : $SHORT_PIN ($PIN_DATE)"
 echo "  main   : $SHORT_MAIN ($MAIN_DATE)   [$AHEAD ahead]"
 echo "  patch  : $PATCH_STATE"
-echo "  shipped code files : ${#code[@]}   shipped dep files : ${#dep[@]}   security-flagged commits : ${#sec[@]}   (noise: ${#noise[@]})"
+echo "  graph  : $GRAPH_STATE"
+if [ "$GRAPH_STATE" = "ok" ]; then
+  echo "  shipped modules changed : $(printf '%s' "$graph_diff" | grep -c . || true)   build settings changed : $(printf '%s' "$settings_diff" | grep -c . || true)   other bumps : $(printf '%s' "$other_bumps" | grep -c . || true)"
+fi
+echo "  shipped code files : ${#code[@]}   dep files : ${#dep[@]}   security-flagged commits : ${#sec[@]}   (noise: ${#noise[@]})"
 echo "  body   : $BODY_FILE"
 
 emit "$SEV" "$TITLE"
