@@ -1,5 +1,5 @@
 diff --git a/cmd/gvproxy/config.go b/cmd/gvproxy/config.go
-index 0b736f14..5e9301e4 100644
+index 16cbad47..2acbd9e5 100644
 --- a/cmd/gvproxy/config.go
 +++ b/cmd/gvproxy/config.go
 @@ -12,6 +12,7 @@ import (
@@ -10,27 +10,27 @@ index 0b736f14..5e9301e4 100644
  	"github.com/containers/gvisor-tap-vsock/pkg/transport"
  	"github.com/containers/gvisor-tap-vsock/pkg/types"
  	log "github.com/sirupsen/logrus"
-@@ -48,6 +49,9 @@ type GvproxyArgs struct {
- 	logFile            string
+@@ -49,6 +50,9 @@ type GvproxyArgs struct {
  	servicesEndpoint   string
  	ec2MetadataAccess  bool
+ 	apiTokenFile       string
 +	socksUpstream      string
 +	denyDirect         bool
 +	dnsAllowlistFile   string
  }
  
  type GvproxyConfig struct {
-@@ -139,6 +143,9 @@ func GvproxyArgParse(flagSet *flag.FlagSet, args *GvproxyArgs, argv []string) (*
- 	flagSet.StringVar(&args.servicesEndpoint, "services", "", "Exposes the same HTTP API as the --listen flag, without the /connect endpoint")
+@@ -142,6 +146,9 @@ func GvproxyArgParse(flagSet *flag.FlagSet, args *GvproxyArgs, argv []string) (*
  	flagSet.BoolVar(&args.ec2MetadataAccess, "ec2-metadata-access", false, "Permits access to EC2 Metadata Service and Amazon Time Sync Service")
  	flagSet.StringVar(&args.notificationSocket, "notification", "", "Socket to be used to send network-ready notifications")
+ 	flagSet.StringVar(&args.apiTokenFile, "api-token-file", "", "Path to file where API token will be read from (needs 0600 permissions on macOS and Linux)")
 +	flagSet.StringVar(&args.socksUpstream, "socks-upstream", "", "augur: dial all guest TCP through this SOCKS5 proxy (host:port) for allowlist enforcement")
 +	flagSet.BoolVar(&args.denyDirect, "deny-direct", false, "augur: disable UDP/ICMP forwarders so SOCKS-filtered TCP is the only egress")
 +	flagSet.StringVar(&args.dnsAllowlistFile, "dns-allowlist", "", "augur: only resolve names matching this allowlist file (same grammar as .augur/allowlist.conf); refuse the rest (closes DNS-exfil)")
  	if err := flagSet.Parse(argv); err != nil {
  		return nil, err
  	}
-@@ -275,6 +282,25 @@ func GvproxyConfigure(config *GvproxyConfig, args *GvproxyArgs, version string)
+@@ -278,6 +285,25 @@ func GvproxyConfigure(config *GvproxyConfig, args *GvproxyArgs, version string)
  	if args.vfkitSocket != "" {
  		config.Interfaces.Vfkit = args.vfkitSocket
  	}
@@ -57,10 +57,10 @@ index 0b736f14..5e9301e4 100644
  		config.Interfaces.VPNKit = args.vpnkitSocket
  	}
 diff --git a/cmd/gvproxy/main.go b/cmd/gvproxy/main.go
-index 2588f028..eaa0bb9e 100644
+index c61baf0d..7825facc 100644
 --- a/cmd/gvproxy/main.go
 +++ b/cmd/gvproxy/main.go
-@@ -157,15 +157,20 @@ func run(ctx context.Context, g *errgroup.Group, config *GvproxyConfig) error {
+@@ -179,11 +179,16 @@ func run(ctx context.Context, g *errgroup.Group, config *GvproxyConfig) error {
  		httpServe(ctx, g, ln, vn.ServicesMux())
  	}
  
@@ -75,17 +75,9 @@ index 2588f028..eaa0bb9e 100644
 +		if err != nil {
 +			return err
 +		}
-+		mux := http.NewServeMux()
-+		mux.Handle("/services/forwarder/all", vn.Mux())
-+		mux.Handle("/services/forwarder/expose", vn.Mux())
-+		mux.Handle("/services/forwarder/unexpose", vn.Mux())
-+		httpServe(ctx, g, ln, mux)
++		httpServe(ctx, g, ln, vn.GatewayMux())
  	}
--	mux := http.NewServeMux()
--	mux.Handle("/services/forwarder/all", vn.Mux())
--	mux.Handle("/services/forwarder/expose", vn.Mux())
--	mux.Handle("/services/forwarder/unexpose", vn.Mux())
--	httpServe(ctx, g, ln, mux)
+-	httpServe(ctx, g, ln, vn.GatewayMux())
  
  	if InDebugMode() {
  		g.Go(func() error {
@@ -681,10 +673,10 @@ index 613b32a1..439392ac 100644
  
  type Protocol string
 diff --git a/pkg/virtualnetwork/services.go b/pkg/virtualnetwork/services.go
-index 876ff917..44fcafef 100644
+index 3ed9a996..470ecaed 100644
 --- a/pkg/virtualnetwork/services.go
 +++ b/pkg/virtualnetwork/services.go
-@@ -27,12 +27,18 @@ func addServices(configuration *types.Configuration, s *stack.Stack, ipPool *tap
+@@ -26,12 +26,18 @@ func addServices(configuration *types.Configuration, s *stack.Stack, ipPool *tap
  	translation := parseNATTable(configuration)
  
  	tcpForwarder := forwarder.TCP(s, translation, &natLock, configuration.Ec2MetadataAccess,
@@ -708,7 +700,7 @@ index 876ff917..44fcafef 100644
  
  	dnsMux, err := dnsServer(configuration, s)
  	if err != nil {
-@@ -82,7 +88,7 @@ func dnsServer(configuration *types.Configuration, s *stack.Stack) (http.Handler
+@@ -77,7 +83,7 @@ func dnsServer(configuration *types.Configuration, s *stack.Stack) (http.Handler
  		return nil, err
  	}
  
