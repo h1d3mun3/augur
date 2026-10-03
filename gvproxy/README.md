@@ -98,22 +98,39 @@ an upstream hardening fix can be security-relevant to us. Two layers watch for t
 
 **Automated (primary).** `check-freshness.sh` runs daily via
 `.github/workflows/gvproxy-freshness.yml`. It does NOT build (the real E2E needs an
-Apple Silicon host) — it compares `PIN` against upstream `main`, ignores tooling/docs
+Apple Silicon host) — it compares `PIN` against upstream `main`, ignores tooling/docs/test
 noise, and grades what remains:
 
 | severity | meaning | issue? |
 |---|---|---|
 | `ACTION`  | `augur-egress.patch` no longer applies to `main` | yes |
-| `REVIEW`  | shipped code (`cmd/gvproxy`, `pkg/`) or deps (`go.mod`/`vendor`) moved | yes |
-| `NOISE`   | behind, but only `tools/`/docs/CI churn | no |
+| `REVIEW`  | upstream code compiled into the binary, a module linked into it, or a `go.mod` build setting moved | yes |
+| `NOISE`   | behind, but nothing that reaches the binary (`tools/`/docs/CI/tests, test-only deps) | closes the issue |
 | `CURRENT` | pin is at `main` | closes the issue |
 
-On `REVIEW`/`ACTION` it opens or refreshes a **single** issue labelled
-`gvproxy-freshness` (idempotent — no notification spam); on `CURRENT` it closes it.
-Do not gauge staleness by raw commit count — it is mostly `tools/vendor` churn; the
-signals that matter are "does the patch still apply" and "did shipped code/deps move".
+"Reaches the binary" is decided by `go list -deps ./cmd/gvproxy` for darwin/arm64 with
+the augur patch applied, at both the pin and `main`:
 
-Run it locally any time: `bash gvproxy/check-freshness.sh` (needs an authenticated `gh`).
+- **Upstream's own code** counts when the changed file sits in a package directory the
+  build reaches (or is embedded by one), not by folder name. If upstream moves code to
+  a new directory such as `internal/`, it is covered as soon as gvproxy imports it.
+- **Dependencies** count when their module is in the build graph, comparing versions.
+  So a Dependabot bump of a test-only library (gomega, ginkgo) is `NOISE`, but a bump
+  that drags a shipped module along (say `golang.org/x/net`) is still `REVIEW`.
+- **Build settings**: changes to `go.mod`'s `go`/`toolchain`/`godebug`/`replace` lines
+  are always `REVIEW`.
+
+Without a working `go` the build graph is skipped and the check falls back to paths:
+any change under `cmd/gvproxy/`/`pkg/` or to `go.mod`/`vendor` counts as `REVIEW`.
+
+On `REVIEW`/`ACTION` it opens or refreshes a **single** issue labelled
+`gvproxy-freshness` (idempotent — no notification spam); on `NOISE`/`CURRENT` it
+closes it. Do not gauge staleness by raw commit count — it is mostly `tools/vendor`
+churn; the signals that matter are "does the patch still apply" and "did anything that
+reaches the binary move".
+
+Run it locally any time: `bash gvproxy/check-freshness.sh` (needs an authenticated
+`gh` and Go).
 
 **Manual (backup).** Watch <https://github.com/containers/gvisor-tap-vsock> →
 **Custom → Releases + Security advisories** so an advisory reaches you even if the
