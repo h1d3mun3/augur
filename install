@@ -59,6 +59,9 @@ if [[ "$HERE" -eq 0 ]]; then
         git -C "$SCRIPT_DIR" archive origin/release | tar -x -C "$stage_dir"
         mkdir -p "$SRC_DIR"
         rsync -a --delete --exclude=.build "$stage_dir/" "$SRC_DIR/"
+        # exec replaces this shell, so the EXIT trap would never fire: clean up first.
+        rm -rf "$stage_dir"
+        trap - EXIT
         info "Installing release $(cat "$SRC_DIR/VERSION") from $SRC_DIR (this checkout is left as is)."
         exec bash "$SRC_DIR/install" --here
     fi
