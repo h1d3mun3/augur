@@ -87,22 +87,25 @@ Don't need Xcode? `augur build && augur claude` gives you the lightweight
 
 ## Install
 
-Both modes share one install. The `release` branch is the gated stable channel:
+Both modes share one install. `bash install` always installs the `release` branch, the gated
+stable channel, whichever branch your clone is on:
 
 ```bash
-git clone -b release https://github.com/h1d3mun3/augur.git
+git clone https://github.com/h1d3mun3/augur.git
 cd augur
 brew install go     # macOS VM mode only: needed for egress filtering (augur-gvproxy)
 bash install
 source ~/.zshrc     # or source ~/.bashrc
 ```
 
-The install script copies `augur` and `Dockerfile` to `~/.augur/`, refreshes the managed egress
+The install script first fetches `origin/release` and builds from a copy it keeps in `~/.augur/src`;
+your clone is left untouched. If the fetch fails, the install fails — it never falls back to an old
+copy or to your checked-out branch. It then copies `augur` and `Dockerfile` to `~/.augur/`, refreshes the managed egress
 baseline (`~/.augur/augur.conf.default`), builds the host egress proxy `augur-proxy` (needs Swift)
 and, on macOS, the VM backend `augur-vm` (needs Swift) and `augur-gvproxy` (needs Go), and
 configures `PATH`. Safe to re-run.
 
-> **Stable vs. bleeding-edge.** Cloning `-b release` installs the latest release that passed the full macOS-VM E2E gate — `augur version` then reports a bare `X.Y.Z`. To follow development instead, clone `main` (the default branch); `augur version` reports `X.Y.Z-dev+<sha>` so you can always tell the two apart. Pin an exact version with `git clone --branch vX.Y.Z`. See [Cutting a release](#cutting-a-release-structural-gate).
+> **Stable vs. bleeding-edge.** `bash install` installs the latest release that passed the full macOS-VM E2E gate — `augur version` then reports a bare `X.Y.Z`. To install your checkout as it is (for example `main` while developing augur), run `bash install --here`; `augur version` then reports `X.Y.Z-dev+<sha>` so you can always tell the two apart. Pin an exact version with `git clone --branch vX.Y.Z` followed by `bash install --here`. See [Cutting a release](#cutting-a-release-structural-gate).
 
 ---
 
