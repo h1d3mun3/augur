@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # augur install script
-# Usage: bash install
+# Usage: bash install [--here]
+#
+# By default this installs the latest `release` branch (the gated stable channel), whatever
+# branch this checkout is on: it fetches origin/release and builds from a copy kept in
+# ~/.augur/src, leaving this checkout untouched. It fails if the fetch fails; it never falls
+# back to a stale local copy or to the checked-out branch.
+#   --here   install exactly this checkout instead (for developing augur itself)
 
 set -euo pipefail
 
@@ -18,6 +24,48 @@ info()    { echo -e "${CYAN}[install]${RESET} $*"; }
 success() { echo -e "${GREEN}[install]${RESET} $*"; }
 warn()    { echo -e "${YELLOW}[install]${RESET} $*"; }
 error()   { echo -e "${RED}[install]${RESET} $*" >&2; }
+
+HERE=0
+for arg in "$@"; do
+    case "$arg" in
+        --here) HERE=1 ;;
+        -h|--help) sed -n '2,9p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) error "unknown argument: $arg (usage: bash install [--here])"; exit 2 ;;
+    esac
+done
+
+# Default channel: install the latest release, not whatever this checkout happens to be on.
+# The release is exported to ~/.augur/src (no .git, so the recorded version is the bare
+# release number) and that copy's own install runs with --here. rsync keeps .build/ between
+# runs so rebuilds stay incremental.
+if [[ "$HERE" -eq 0 ]]; then
+    if ! git -C "$SCRIPT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+        error "$SCRIPT_DIR is not a git checkout, so the release branch cannot be fetched."
+        error "Clone it (git clone -b release <repo>) or pass --here to install these files as they are."
+        exit 1
+    fi
+    info "Fetching the latest release..."
+    if ! git -C "$SCRIPT_DIR" fetch --quiet origin '+refs/heads/release:refs/remotes/origin/release'; then
+        error "Could not fetch the release branch from origin; nothing was installed."
+        error "Fix the connection and re-run, or pass --here to install this checkout as it is."
+        exit 1
+    fi
+    if [[ "$(git -C "$SCRIPT_DIR" rev-parse HEAD)" == "$(git -C "$SCRIPT_DIR" rev-parse origin/release)" ]]; then
+        info "This checkout is already the latest release."
+    else
+        SRC_DIR="$INSTALL_DIR/src"
+        stage_dir="$(mktemp -d)"
+        trap 'rm -rf "$stage_dir"' EXIT
+        git -C "$SCRIPT_DIR" archive origin/release | tar -x -C "$stage_dir"
+        mkdir -p "$SRC_DIR"
+        rsync -a --delete --exclude=.build "$stage_dir/" "$SRC_DIR/"
+        # exec replaces this shell, so the EXIT trap would never fire: clean up first.
+        rm -rf "$stage_dir"
+        trap - EXIT
+        info "Installing release $(cat "$SRC_DIR/VERSION") from $SRC_DIR (this checkout is left as is)."
+        exec bash "$SRC_DIR/install" --here
+    fi
+fi
 
 # Validate source files exist. VERSION is required: it is the single source of truth for
 # the version number (`augur version`), so a checkout missing it is a broken install source.

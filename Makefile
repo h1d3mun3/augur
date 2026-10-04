@@ -104,8 +104,8 @@ container-e2e: egress
 
 # Stage ~/.augur (host augur-proxy + managed allowlist).
 stage:
-	@echo "== stage: bash install =="
-	bash install
+	@echo "== stage: bash install --here =="
+	bash install --here
 
 # Build the agent image from the Dockerfile via Apple Container's BuildKit builder.
 image: stage
