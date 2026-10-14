@@ -8,7 +8,7 @@ egress is forced through `augur-proxy`'s allowlist**.
 
 ## What the fork changes
 
-`augur-egress.patch` (pinned commit `6dbb5d4f`) adds three flags to `gvproxy`:
+`augur-egress.patch` (pinned commit `1cd3f042`) adds three flags to `gvproxy`:
 
 - `--socks-upstream host:port` — the TCP forwarder dials every guest connection
   through this SOCKS5 proxy (the host-side `augur-proxy`) by destination IP,
