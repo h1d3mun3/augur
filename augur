@@ -1621,6 +1621,55 @@ container_egress_gateway() {
 # it yet.
 start_egress() {
     ensure_egress_network
+    restart_egress_network_helper
+}
+
+# Restart this project's network helper (the launchd service Apple Container runs per network)
+# so the container's coming attachment gets a bridge interface of its own.
+#
+# Apple Container fixes a network's bridge unit (bridge100, bridge101, …) at the network's first
+# attachment and keeps it after the bridge goes down. `down` keeps our network, so if another
+# network takes that unit meanwhile, our next attachment reconfigures that live bridge with our
+# gateway: the other project's containers fall off it and its augur-proxy, bound to the vanished
+# gateway, becomes unreachable (apple/container#2051). A restarted helper has no unit fixed yet,
+# so the attachment picks one no live bridge holds.
+#
+# Only for the moment before this project's container attaches: a restart drops the helper's live
+# attachments. It also cannot protect a project from networks augur does not restart (the default
+# network used by `container build` and --no-egress, or networks created by hand).
+#
+# Deliberately best-effort: the label and launchd domain are Apple Container internals, and a
+# skipped restart only leaves the collision possible, it never weakens egress filtering. So every
+# failure warns and returns 0.
+restart_egress_network_helper() {
+    command -v launchctl &>/dev/null || return 0
+    local label target="" dom
+    label="com.apple.container.container-network-vmnet.$(egress_network_name)"
+    # Apple Container registers its services in the gui domain from a desktop session and in the
+    # user domain otherwise (e.g. over SSH).
+    for dom in "gui/$(id -u)" "user/$(id -u)"; do
+        if launchctl print "$dom/$label" &>/dev/null; then target="$dom/$label"; break; fi
+    done
+    if [[ -z "$target" ]]; then
+        warn "Network helper '${label}' not found; skipping its restart."
+        warn "If another project's container loses its network after this one starts, run: ${BOLD}container system stop && container system start${RESET}"
+        return 0
+    fi
+    if ! launchctl kickstart -k "$target" &>/dev/null; then
+        warn "Could not restart network helper '${label}'; continuing without it."
+        return 0
+    fi
+    local t=40
+    until launchctl print "$target" 2>/dev/null | grep -q 'state = running'; do
+        if ((t-- <= 0)); then
+            warn "Network helper '${label}' did not report running after a restart; continuing."
+            return 0
+        fi
+        sleep 0.25
+    done
+    # `state = running` can be reported before the helper's XPC listener is ready; give it a
+    # moment so the attach right after does not race it.
+    sleep 1
 }
 
 # Start the host-side proxy once the agent container has ATTACHED to the host-only network.

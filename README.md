@@ -463,6 +463,28 @@ as a maintained wrapper. `container builder delete` is machine-wide, not scoped 
 project: it aborts any build in flight anywhere else on the Mac. See
 `docs/decisions/0005-no-prune-command.md`.
 
+### Running several projects at once
+
+Apple Container has an open bug ([apple/container#2051](https://github.com/apple/container/issues/2051))
+where two networks can end up sharing one host bridge: starting a container on one network then
+takes over the bridge of a container already running on the other, which silently loses all
+network access (in augur: Claude Code can no longer reach the egress proxy).
+
+augur avoids this between its own projects: right before a project's container starts, `augur up`
+restarts that project's network helper so the container gets a bridge no running container uses.
+That costs about a second on `up`, and if the restart is not possible augur only warns and carries
+on.
+
+It cannot protect an augur project from networks it does not manage: the `default` network used by
+`augur build` / `augur update` (the BuildKit builder) and by `--no-egress` containers, or networks
+you create yourself. If a running project loses its network after one of those starts, recover
+with:
+
+```bash
+container system stop && container system start   # stops EVERY Apple Container container
+augur up                                           # in each project you were using
+```
+
 ### Requirements
 
 - **Apple Container** (`container`) **1.0.0 or newer**, on macOS 26+. augur refuses `up` /

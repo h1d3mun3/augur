@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Test shim for macOS `launchctl`, enough for restart_egress_network_helper. Records every
+# invocation to $AUGUR_TEST_SHIMLOG.launchctl and fakes the service state:
+#   AUGUR_TEST_LAUNCHCTL=absent    (default) `print` fails: no such service in any domain.
+#   AUGUR_TEST_LAUNCHCTL=running   the service exists in the gui domain and reports running.
+#   AUGUR_TEST_LAUNCHCTL=user      same, but only in the user domain (a non-desktop session).
+#   AUGUR_TEST_LAUNCHCTL=kickfail  the service exists but `kickstart` fails.
+set -u
+log="${AUGUR_TEST_SHIMLOG:-/tmp/augur-shim}"
+printf '%s\n' "$*" >> "$log.launchctl"
+
+mode="${AUGUR_TEST_LAUNCHCTL:-absent}"
+case "${1:-}" in
+  print)
+    case "$mode" in
+      running|kickfail) [[ "${2:-}" == gui/* ]] || exit 113 ;;
+      user)             [[ "${2:-}" == user/* ]] || exit 113 ;;
+      *)                exit 113 ;;
+    esac
+    printf '%s = {\n\tstate = running\n}\n' "${2#*/*/}"
+    exit 0 ;;
+  kickstart)
+    [[ "$mode" == kickfail ]] && exit 1
+    exit 0 ;;
+esac
+exit 0
