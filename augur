@@ -1661,7 +1661,10 @@ restart_egress_network_helper() {
         return 0
     fi
     # Another augur run for this project (a second `claude`/`shell`) may have started the container
-    # since cmd_up checked; restarting now would cut it off.
+    # since cmd_up checked; restarting now would cut it off. This only narrows the window: a run
+    # that attaches between this check and the kickstart below is still cut off.
+    # Accepted trade-off: concurrent runs for the same project are not supported anyway (nothing
+    # serializes cmd_up, and two recreates can delete each other's container).
     if container_running; then return 0; fi
     if ! launchctl kickstart -k "$target" &>/dev/null; then
         warn "Could not restart network helper '${label}'; continuing without it."
