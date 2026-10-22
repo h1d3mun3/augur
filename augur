@@ -1574,7 +1574,9 @@ egress_network_name() { echo "augur-$(workspace_slug)-$(workspace_path_hash)-net
 # for this project. Never used to create or look up a network.
 legacy_egress_network_name() { echo "augur-$(workspace_slug)-net"; }
 
-# The agent's --internal "host-only" network (host reachable, internet severed).
+# The agent's --internal "host-only" network (host reachable, internet severed). Sets
+# EGRESS_NETWORK_CREATED when this run created it (see restart_egress_network_helper).
+EGRESS_NETWORK_CREATED=false
 ensure_egress_network() {
     local net; net="$(egress_network_name)"
     if ! eng network inspect "$net" &>/dev/null; then
@@ -1587,6 +1589,7 @@ ensure_egress_network() {
             error "Retry with a different subnet, e.g. ${BOLD}AUGUR_INTERNAL_SUBNET=172.31.42.0/28 augur up${RESET}"
             exit 1
         fi
+        EGRESS_NETWORK_CREATED=true
     fi
 }
 
@@ -1621,6 +1624,67 @@ container_egress_gateway() {
 # it yet.
 start_egress() {
     ensure_egress_network
+}
+
+# Restart this project's network helper (the launchd service Apple Container runs per network)
+# so the container's coming attachment gets a bridge interface of its own. Call it right before
+# `container run` / `container start`, and only while this project's container is not running.
+#
+# Apple Container fixes a network's bridge unit (bridge100, bridge101, …) at the network's first
+# attachment and keeps it after the bridge goes down. `down` keeps our network, so if another
+# network takes that unit meanwhile, our next attachment reconfigures that live bridge with our
+# gateway: the other project's containers fall off it and its augur-proxy, bound to the vanished
+# gateway, becomes unreachable (apple/container#2051). A restarted helper has no unit fixed yet,
+# so the attachment picks one no live bridge holds.
+#
+# A restart drops the helper's live attachments, hence "not running" above. It also cannot protect
+# a project from networks augur does not restart (the default network used by `container build`
+# and --no-egress, or networks created by hand).
+#
+# Deliberately best-effort: the label and launchd domain are Apple Container internals, and a
+# skipped restart only leaves the collision possible, it never weakens egress filtering. So every
+# failure warns and returns 0.
+restart_egress_network_helper() {
+    egress_enabled || return 0
+    # A network this run just created has never had an attachment, so it has no unit fixed yet.
+    $EGRESS_NETWORK_CREATED && return 0
+    command -v launchctl &>/dev/null || return 0
+    local label target="" dom state
+    label="com.apple.container.container-network-vmnet.$(egress_network_name)"
+    # Apple Container registers its services in the gui domain from a desktop session and in the
+    # user domain otherwise (e.g. over SSH).
+    for dom in "gui/$(id -u)" "user/$(id -u)"; do
+        if launchctl print "$dom/$label" &>/dev/null; then target="$dom/$label"; break; fi
+    done
+    if [[ -z "$target" ]]; then
+        warn "Network helper '${label}' not found, so augur cannot guard this project against Apple Container's shared-bridge bug (README: \"Running several projects at once\")."
+        return 0
+    fi
+    # Another augur run for this project (a second `claude`/`shell`) may have started the container
+    # since cmd_up checked; restarting now would cut it off. This only narrows the window: a run
+    # that attaches between this check and the kickstart below is still cut off.
+    # Accepted trade-off: concurrent runs for the same project are not supported anyway (nothing
+    # serializes cmd_up, and two recreates can delete each other's container).
+    if container_running; then return 0; fi
+    if ! launchctl kickstart -k "$target" &>/dev/null; then
+        warn "Could not restart network helper '${label}'; continuing without it."
+        return 0
+    fi
+    local t=40
+    while :; do
+        # Captured, not piped into `grep -q`: an early grep exit would SIGPIPE launchctl and, under
+        # pipefail, turn a match into a failure.
+        state="$(launchctl print "$target" 2>/dev/null || true)"
+        [[ "$state" == *"state = running"* ]] && break
+        if ((t-- <= 0)); then
+            warn "Network helper '${label}' did not report running after a restart; continuing."
+            return 0
+        fi
+        sleep 0.25
+    done
+    # `state = running` can be reported before the helper's XPC listener is ready; give it a
+    # moment so the attach right after does not race it.
+    sleep 1
 }
 
 # Start the host-side proxy once the agent container has ATTACHED to the host-only network.
@@ -2451,6 +2515,7 @@ recreate_container() {
     # running and exit 0 within ms of SIGTERM.)
     run_args+=("$IMAGE_NAME" sh -c 'trap "exit 0" TERM; sleep infinity & wait')
 
+    restart_egress_network_helper
     if ! eng "${run_args[@]}" &>/dev/null; then
         error "Failed to start the container."
         # Don't leave a started proxy / internal network orphaned.
@@ -2686,7 +2751,8 @@ cmd_up() {
         # The internal egress network is kept across `down`; ensure it still exists (idempotent)
         # so the container can re-attach.
         if egress_enabled; then start_egress; fi
-        if eng start "$CONTAINER_NAME" &>/dev/null; then
+        restart_egress_network_helper
+        if start_stopped_container; then
             finish_up
             return 0
         fi
@@ -2694,6 +2760,17 @@ cmd_up() {
     fi
 
     recreate_container
+}
+
+# Start the persisted container, retrying before the caller falls back to a recreate. A retry costs
+# seconds, but a recreate throws away the writable layer, so a transient failure must not reach it —
+# e.g. the network helper restart_egress_network_helper just restarted may still be coming up.
+start_stopped_container() {
+    local tries=3
+    while ! eng start "$CONTAINER_NAME" &>/dev/null; do
+        ((--tries > 0)) || return 1
+        sleep 1
+    done
 }
 
 cmd_claude() {
