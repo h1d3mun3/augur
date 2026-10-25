@@ -3405,6 +3405,9 @@ cmd_build_macos() {
         "
     fi
     ssh_macos "$MACOS_BUILD_VM" "sudo systemsetup -setsleep Off 2>/dev/null || true"
+    # Baked into the base too, so a clone's very first auto-login is already unlocked: applying it
+    # only after SSH is up cannot undo a lock the console received at that first login.
+    configure_macos_guest_session "$MACOS_BUILD_VM"
 
     # Step 5: Install Xcode via SSH
     # Use a fixed safe remote filename to avoid shell injection via the source path's basename.
@@ -3914,19 +3917,20 @@ sync_macos_guest_clock() {
 # screen saver. This relaxes the GUI lock only; SSH, sudo and the egress controls are untouched.
 # - System-wide settings go through `sudo -S` fed the admin password, as for the clock; the
 #   per-user ones (the session's screen saver) run as the admin itself, in the same round-trip.
-# - Re-applied on every fresh boot rather than baked into the base VM: the screen saver's idle time
-#   is a per-host preference that a clone does not reliably keep, and doing it here also covers a
-#   base VM built before this existed. The writes are idempotent.
+# - Applied in the base VM build (so a clone's first auto-login is already unlocked) AND again on every
+#   fresh boot: the screen saver's idle time is a per-host preference that a clone does not reliably
+#   keep, and the boot-time pass also covers a base VM built before this existed. The writes are
+#   idempotent. Absolute tool paths, because the guest's PATH starts at ~/.local/bin.
 # - Best-effort: warns and continues, never fails `up` — a locked screen degrades the --gui window,
 #   it does not uncontain anything.
 configure_macos_guest_session() {
     local vm="$1" out
-    out="$(macos_admin_password_stdin | ssh_macos "$vm" "sudo -S -p '' sh -c \
-            'defaults write /Library/Preferences/com.apple.loginwindow autoLoginUserScreenLocked -bool false \
-             && defaults write /Library/Preferences/com.apple.screensaver loginWindowIdleTime -int 0 \
-             && pmset -a displaysleep 0 sleep 0' \
-        && defaults write com.apple.screensaver askForPassword -int 0 \
-        && defaults -currentHost write com.apple.screensaver idleTime -int 0" 2>&1)" || {
+    out="$(macos_admin_password_stdin | ssh_macos "$vm" "sudo -S -p '' /bin/sh -c \
+            '/usr/bin/defaults write /Library/Preferences/com.apple.loginwindow autoLoginUserScreenLocked -bool false \
+             && /usr/bin/defaults write /Library/Preferences/com.apple.screensaver loginWindowIdleTime -int 0 \
+             && /usr/bin/pmset -a displaysleep 0 sleep 0' \
+        && /usr/bin/defaults write com.apple.screensaver askForPassword -int 0 \
+        && /usr/bin/defaults -currentHost write com.apple.screensaver idleTime -int 0" 2>&1)" || {
         warn "Could not disable the guest's screen lock and screen saver: $(sanitize_guest_text "${out%%$'\n'*}")"
         warn "  A --gui window may show a lock screen after a minute or so; log in with the admin password."
         warn_if_stale_admin_password "$out"

@@ -63,4 +63,11 @@ else
   fail "fresh bring-up does not configure the guest session after the clock sync" "clock@${clock_at:-none} session@${sess_at:-none}"
 fi
 
+section "Tier 1 - the base VM build applies it too"
+build_body="$(declare -f cmd_build_macos)"
+has "$build_body" 'configure_macos_guest_session "$MACOS_BUILD_VM"' "build: the base VM gets the settings, so a clone's first auto-login is unlocked"
+
+hasnt "$cmd" " defaults " "all tools are absolute paths (no bare defaults)"
+hasnt "$cmd" " pmset " "all tools are absolute paths (no bare pmset)"
+
 finish
