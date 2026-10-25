@@ -3905,6 +3905,36 @@ sync_macos_guest_clock() {
     return 0
 }
 
+# Keep the guest's console session usable from a --gui window. Auto-login does log the admin in, but
+# two things then put the lock screen — which looks just like a login screen — in front of it:
+# macOS 27's automated provisioning sets "log in automatically, then lock the screen", and the
+# virtual display goes to sleep after a minute or so of no input, which locks it again. Nothing
+# headless notices either, which is why only a window shows it. So: no lock after auto-login, no
+# display/system sleep, no screen saver on the login window or the session, no password after the
+# screen saver. This relaxes the GUI lock only; SSH, sudo and the egress controls are untouched.
+# - System-wide settings go through `sudo -S` fed the admin password, as for the clock; the
+#   per-user ones (the session's screen saver) run as the admin itself, in the same round-trip.
+# - Re-applied on every fresh boot rather than baked into the base VM: the screen saver's idle time
+#   is a per-host preference that a clone does not reliably keep, and doing it here also covers a
+#   base VM built before this existed. The writes are idempotent.
+# - Best-effort: warns and continues, never fails `up` — a locked screen degrades the --gui window,
+#   it does not uncontain anything.
+configure_macos_guest_session() {
+    local vm="$1" out
+    out="$(macos_admin_password_stdin | ssh_macos "$vm" "sudo -S -p '' sh -c \
+            'defaults write /Library/Preferences/com.apple.loginwindow autoLoginUserScreenLocked -bool false \
+             && defaults write /Library/Preferences/com.apple.screensaver loginWindowIdleTime -int 0 \
+             && pmset -a displaysleep 0 sleep 0' \
+        && defaults write com.apple.screensaver askForPassword -int 0 \
+        && defaults -currentHost write com.apple.screensaver idleTime -int 0" 2>&1)" || {
+        warn "Could not disable the guest's screen lock and screen saver: $(sanitize_guest_text "${out%%$'\n'*}")"
+        warn "  A --gui window may show a lock screen after a minute or so; log in with the admin password."
+        warn_if_stale_admin_password "$out"
+        return 0
+    }
+    return 0
+}
+
 # The guest's IANA zone name, or nothing at all. Same discipline as _macos_guest_epoch: `ssh <host>
 # <cmd>` runs under the guest's zsh (sources ~/.zshenv, hence ~/.augur-env), so the shape is
 # checked rather than scrubbed — anything a login shell ever printed on that path would otherwise
@@ -4133,6 +4163,7 @@ cmd_up_macos() {
     # second instead would leave the self-test's own positive half judging a certificate window 95
     # minutes early, i.e. able to tear down a healthy VM over a certificate rotated minutes ago.
     sync_macos_guest_clock "$project_vm"
+    configure_macos_guest_session "$project_vm"
 
     # The boot self-test, as early as it can possibly run: the moment a command can be run in the
     # guest, and BEFORE any of the wiring below — in particular before ~/.augur-env pushes an

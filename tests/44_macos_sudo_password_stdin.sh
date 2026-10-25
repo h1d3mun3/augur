@@ -166,6 +166,6 @@ eq "" "$_bad" "every \`sudo -S\` is fed by macos_admin_password_stdin piped into
 hasnt "$code" 'macos_admin_password_stdin | ssh_macos_provision "' \
     "the password is never piped into ssh_macos_provision (its -n would drop it; use ssh_macos_provision_stdin)"
 _sites="$(printf '%s\n' "$code" | grep -c 'macos_admin_password_stdin | ssh_macos')"
-eq "6" "$_sites" "six sudo -S call sites use the helper (build, provisioning, managed policy, xcode-select, clock, timezone)"
+eq "7" "$_sites" "seven sudo -S call sites use the helper (build, provisioning, managed policy, xcode-select, clock, timezone, guest session)"
 
 finish
