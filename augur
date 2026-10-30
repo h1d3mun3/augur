@@ -13,6 +13,11 @@ WORKSPACE_DIR="$(pwd)"
 SWIFT_VERSION="${SWIFT_VERSION:-}"
 MACOS_MODE=false
 MACOS_GUI=false
+# Set only by `augur destroy <name>` (see adopt_target_name): the slug/hash parsed out of the
+# named container/VM, which workspace_slug/workspace_path_hash then return instead of deriving
+# them from the current directory.
+TARGET_SLUG=""
+TARGET_HASH=""
 
 # ANSI colors
 RED=$'\033[0;31m'
@@ -381,6 +386,7 @@ engine_network_rm() { container network delete "$@"; }
 # ══ end Apple Container ══════════════════════════════════════════════════════════
 
 workspace_slug() {
+    [[ -n "$TARGET_SLUG" ]] && { echo "$TARGET_SLUG"; return; }
     local dir_name
     dir_name="$(basename "$WORKSPACE_DIR")"
     echo "$dir_name" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]' '-' | sed 's/^-//;s/-$//'
@@ -393,6 +399,29 @@ make_container_name() {
     # re-attach to project A's persisted container — with A's mounts, credentials, and any
     # foothold a prior session left behind. Mirrors the macOS project-VM name (macos_project_vm).
     echo "augur-$(workspace_slug)-$(workspace_path_hash)-swift-${SWIFT_IMAGE_TAG//./-}"
+}
+
+# Point every per-project helper at a container/VM NAME given on the command line instead of the
+# current directory: `augur destroy <name>`. The name carries the project's slug and path hash
+# (see make_container_name / macos_project_vm), and all per-project host state is keyed on exactly
+# those two, so parsing them back out is enough to find and clean up everything the project owns.
+# $1 is "container" or "macos". Refuses a name that is not in augur's own naming scheme, so
+# `destroy <name>` can never be aimed at someone else's container.
+adopt_target_name() {
+    local kind="$1" name="$2" re
+    if [[ "$kind" == macos ]]; then
+        re='^augur-macos-(.+)-([0-9a-f]{12})$'
+    else
+        re='^augur-(.+)-([0-9a-f]{12})-swift-(.+)$'
+    fi
+    if [[ ! "$name" =~ $re ]]; then
+        error "'${name}' is not an augur-managed $([[ "$kind" == macos ]] && echo "macOS VM" || echo container) name."
+        echo -e "  List them with: ${BOLD}augur list$([[ "$kind" == macos ]] && echo " --macos")${RESET}" >&2
+        return 1
+    fi
+    TARGET_SLUG="${BASH_REMATCH[1]}"
+    TARGET_HASH="${BASH_REMATCH[2]}"
+    CONTAINER_NAME="$name"
 }
 
 # In-container mount/workdir, suffixed with the project slug so each project gets
@@ -620,9 +649,7 @@ vm_cli_supports_provisioning() {
 # fresh clone on next `up`, not data loss (the old VM/clone is left in place;
 # `augur list --macos` still shows it and it can be removed manually).
 macos_project_vm() {
-    local dir_name
-    dir_name="$(basename "$WORKSPACE_DIR" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]' '-' | sed 's/^-//;s/-$//')"
-    echo "augur-macos-${dir_name}-$(workspace_path_hash)"
+    echo "augur-macos-$(workspace_slug)-$(workspace_path_hash)"
 }
 
 macos_vm_exists() {
@@ -1297,6 +1324,7 @@ resolve_macos_vm_memory_mb() {
 # a collision is harmless and unobservable, so make_workspace_mount (/workspace-<slug>) and
 # MACOS_SHARE (~/workspace-<slug>) deliberately stay slug-based and readable.
 workspace_path_hash() {
+    [[ -n "$TARGET_HASH" ]] && { echo "$TARGET_HASH"; return; }
     local h
     if command -v sha256sum &>/dev/null; then
         h="$(printf '%s' "$WORKSPACE_DIR" | sha256sum)"
@@ -2920,6 +2948,9 @@ cmd_down() {
 # keep-it behavior (mirrors `augur destroy --macos`). Use it to reclaim disk, or to force a
 # from-scratch container (e.g. after a suspected guest compromise, or to pick up a rebuilt image).
 cmd_destroy() {
+    if (( $# > 1 )); then error "Usage: augur destroy [<container-name>]"; exit 1; fi
+    # With a name (as shown by `augur list`), remove that container instead of this directory's.
+    if [[ -n "${1:-}" ]]; then adopt_target_name container "$1" || exit 1; fi
     require_engine
     if container_exists; then
         info "Stopping and removing container '${CONTAINER_NAME}'..."
@@ -4403,6 +4434,9 @@ cmd_down_macos() {
 }
 
 cmd_destroy_macos() {
+    if (( $# > 1 )); then error "Usage: augur destroy --macos [<vm-name>]"; exit 1; fi
+    # With a name (as shown by `augur list --macos`), remove that VM instead of this directory's.
+    if [[ -n "${1:-}" ]]; then adopt_target_name macos "$1" || exit 1; fi
     require_vz
     local project_vm
     project_vm="$(macos_project_vm)"
@@ -5584,7 +5618,7 @@ cmd_help() {
     echo -e "    augur ${CYAN}setup-token${RESET}                Get a Claude token in the guest, save it on the host"
     echo -e "    augur ${CYAN}install-cert${RESET} <cert.crt>    Trust a custom CA (PEM X.509) in the guest"
     echo -e "    augur ${CYAN}down${RESET}                       Stop the container (kept for a fast restart)"
-    echo -e "    augur ${CYAN}destroy${RESET}                    Stop and remove the container entirely"
+    echo -e "    augur ${CYAN}destroy${RESET} [name]              Stop and remove the container entirely (name: from augur list)"
     echo -e "    augur ${CYAN}status${RESET}                     Check status and toolchain"
     echo -e "    augur ${CYAN}list${RESET}                       List all augur containers and their state"
     echo -e "    augur ${CYAN}build${RESET}   [--swift VERSION]  Build the container image"
@@ -5600,7 +5634,7 @@ cmd_help() {
     echo -e "    augur ${CYAN}setup-token${RESET} --macos                              Get a Claude token in the VM, save it on the host"
     echo -e "    augur ${CYAN}install-cert${RESET} --macos <cert.crt>                   Trust a custom CA (PEM X.509) in the base VM"
     echo -e "    augur ${CYAN}down${RESET}    --macos                                   Stop the VM (keep the clone)"
-    echo -e "    augur ${CYAN}destroy${RESET} --macos                                   Stop and remove the VM clone"
+    echo -e "    augur ${CYAN}destroy${RESET} --macos [name]                             Stop and remove the VM clone (name: from augur list --macos)"
     echo -e "    augur ${CYAN}status${RESET}  --macos                                   Check VM status and toolchain"
     echo -e "    augur ${CYAN}list${RESET}    --macos                                   List all VMs and their state"
     echo -e "    augur ${CYAN}update${RESET}  --macos                                   Update CLI tools in base VM"
@@ -5737,7 +5771,7 @@ if $MACOS_MODE; then
         setup-token)    cmd_setup_token_macos ;;
         install-cert)   cmd_install_cert_macos "$@" ;;
         down)           cmd_down_macos ;;
-        destroy)        cmd_destroy_macos ;;
+        destroy)        cmd_destroy_macos "$@" ;;
         status)         cmd_status_macos ;;
         init-conf)      cmd_init_conf ;;
         list)           cmd_list_macos ;;
@@ -5754,7 +5788,7 @@ else
         setup-token)    cmd_setup_token ;;
         install-cert)   cmd_install_cert "$@" ;;
         down)           cmd_down ;;
-        destroy)        cmd_destroy ;;
+        destroy)        cmd_destroy "$@" ;;
         status)         cmd_status ;;
         init-conf)      cmd_init_conf ;;
         list)           cmd_list ;;

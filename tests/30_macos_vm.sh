@@ -116,7 +116,9 @@ section "Tier 2 — per-project VM naming is path-hash keyed, not basename-only 
 project_vm_fns="$(mktemp)"
 work="$(mktemp -d)"
 trap 'rm -f "$project_vm_fns"; rm -rf "$work"' EXIT
+TARGET_SLUG=""; TARGET_HASH=""
 {
+  awk '/^workspace_slug\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR"
   awk '/^workspace_path_hash\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR"
   awk '/^macos_project_vm\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR"
 } > "$project_vm_fns"

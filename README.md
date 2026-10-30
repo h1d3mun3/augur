@@ -264,7 +264,7 @@ augur claude --macos    # launch Claude Code  (starts VM if not running)
 augur shell --macos     # open a bash shell   (starts VM if not running)
 augur setup-token --macos  # get a Claude subscription token (runs in the VM, saves on the host)
 augur down --macos      # stop the VM (keeps the clone — next up is fast)
-augur destroy --macos   # stop and remove the project VM clone
+augur destroy --macos   # stop and remove the project VM clone (or: augur destroy --macos <name>)
 augur status --macos    # show VM status, toolchain, and auth info
 augur list --macos      # list all VMs and their state
 augur update --macos    # update CLI tools in the base VM
@@ -344,16 +344,19 @@ If builds are flaky from the shared mount (virtiofs is not tuned for heavy I/O �
 
 ### Disk cleanup
 
-`augur destroy --macos` removes the *current* project's VM clone — but augur names a clone
-from its project directory, so if that directory is later renamed or moved, the old clone
-becomes unreachable by `destroy` (it's still on disk, just under a name `destroy` doesn't
-compute). `augur list --macos` still shows it; remove it directly:
+`augur destroy --macos` removes the *current* project's VM clone. To remove a different one —
+for instance a clone orphaned because its project directory was renamed or moved — pass its
+name, exactly as `augur list --macos` prints it (works from any directory):
 
 ```bash
-augur list --macos       # every VM the store knows about, by name — not just this project's
-augur-vm stop <name>     # if it's running
-augur-vm delete <name>   # remove that VM/clone
+augur list --macos                 # every VM the store knows about, by name
+augur destroy --macos <name>       # stop it if running, remove it, and clean up its egress state
 ```
+
+The container-mode equivalent is `augur list` then `augur destroy <name>`. Only names in
+augur's own naming scheme are accepted, so this can't be pointed at another tool's container.
+`augur-vm delete <name>` still works too, but removes only the VM bundle, not the egress
+proxy/gvproxy state or pinned SSH host key that `destroy` also cleans up.
 
 Same story for `~/.augur/claude-projects/<vm>/` — a per-clone Claude-history directory that
 `destroy --macos` doesn't touch either; it's plain files, safe to `rm -rf` once you know the
@@ -400,6 +403,7 @@ augur shell                     # open a bash shell (for debugging)
 augur setup-token               # get a Claude subscription token (runs in the guest, saves on the host)
 augur down                      # stop the container (kept for a fast, cache-preserving restart)
 augur destroy                   # stop and remove the container entirely (+ its egress network)
+augur destroy <name>            # same, for any container shown by `augur list` (run from anywhere)
 augur status                    # show status, toolchain, and auth info
 augur list                      # list all augur containers across projects, with state + address
 augur build [--swift VERSION]   # build the container image
