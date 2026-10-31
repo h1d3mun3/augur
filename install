@@ -85,6 +85,11 @@ cp "$SCRIPT_DIR/Dockerfile" "$INSTALL_DIR/Dockerfile"
 # tiny — otherwise the multi-GB VM images under ~/.augur/vms get swept into `augur build`.
 cp "$SCRIPT_DIR/.dockerignore" "$INSTALL_DIR/.dockerignore"
 chmod +x "$INSTALL_DIR/augur"
+# Shell completion scripts; the rc-file hook that loads them is added with the PATH entry below.
+if [[ -d "$SCRIPT_DIR/completions" ]]; then
+    mkdir -p "$INSTALL_DIR/completions"
+    cp "$SCRIPT_DIR/completions/augur.bash" "$SCRIPT_DIR/completions/augur.zsh" "$INSTALL_DIR/completions/"
+fi
 
 # Stamp the installed version. The NUMBER comes from the committed VERSION file (single
 # source of truth — never derived from git tags). Git only adds dev-build traceability,
@@ -206,6 +211,20 @@ elif grep -q 'export PATH=.*\.augur' "$SHELL_CONFIG" 2>/dev/null; then
 else
     printf '\n# augur\nexport PATH="$HOME/.augur:$PATH"\n' >> "$SHELL_CONFIG"
     success "Added PATH entry to $SHELL_CONFIG"
+fi
+
+# Tab completion (subcommands, options, and the container/VM names `augur destroy` takes). The
+# script matches the rc file's shell; the hook is skipped if it is already there, so re-running
+# install never duplicates it.
+if [[ -n "$SHELL_CONFIG" && -d "$INSTALL_DIR/completions" ]]; then
+    comp_ext="bash"; [[ "$SHELL_CONFIG" == *zshrc ]] && comp_ext="zsh"
+    if grep -q '\.augur/completions/' "$SHELL_CONFIG" 2>/dev/null; then
+        warn "Completion already configured in $SHELL_CONFIG"
+    else
+        printf '[ -f "$HOME/.augur/completions/augur.%s" ] && source "$HOME/.augur/completions/augur.%s"\n' \
+            "$comp_ext" "$comp_ext" >> "$SHELL_CONFIG"
+        success "Added tab completion to $SHELL_CONFIG"
+    fi
 fi
 
 echo ""
