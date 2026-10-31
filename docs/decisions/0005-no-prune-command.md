@@ -94,3 +94,24 @@ disk reclamation, on either backend, is not.
 - [`0001-sudo-free.md`](./0001-sudo-free.md) — the "is this augur's job to own" framing this
   decision reuses.
 - README, "Disk cleanup" subsections under Container mode and macOS VM mode.
+
+## Addendum — `augur destroy <name>`
+
+`augur destroy [--macos] <name>` removes a container/VM by the name `augur list` prints, from any
+directory. This does **not** reopen the `prune` decision, and the reasoning above is why:
+
+- It is not a disk-reclamation or bulk command. It is the existing per-project `destroy`, pointed
+  at a different project, and it is the same teardown — it does not forward to the underlying
+  tool.
+- It meets the bar this ADR sets for a wrapper ("scoping, safety, or a materially better UX").
+  The raw tools (`container delete`, `augur-vm delete`) remove only the container or VM bundle;
+  `destroy` also stops that project's egress proxy/gvproxy, deletes its egress network, and drops
+  its reconcile fingerprint, carried-over prompt history, and pinned SSH host key. Deleting by
+  hand leaves those behind. Names are also hash-suffixed, which made the hand-run route error
+  prone.
+- It is safe to expose: only names in augur's own naming scheme are accepted, so it cannot be
+  aimed at another tool's container, and a name can never carry path components.
+
+What stays as written above: there is still no bulk `prune`, no builder/image reclamation
+command, and `~/.augur/claude-projects/<…>` (and `claude-agents`) are still not removed by
+`destroy`. Reclaiming disk beyond a named project's teardown remains the underlying tools' job.

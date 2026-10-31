@@ -406,13 +406,15 @@ make_container_name() {
 # (see make_container_name / macos_project_vm), and all per-project host state is keyed on exactly
 # those two, so parsing them back out is enough to find and clean up everything the project owns.
 # $1 is "container" or "macos". Refuses a name that is not in augur's own naming scheme, so
-# `destroy <name>` can never be aimed at someone else's container.
+# `destroy <name>` can never be aimed at someone else's container. The character classes below
+# are deliberately tight (what workspace_slug and the Swift tag can produce): the parsed slug and
+# name become path components under ~/.augur, so a `/` or `..` must never get through.
 adopt_target_name() {
     local kind="$1" name="$2" re
     if [[ "$kind" == macos ]]; then
-        re='^augur-macos-(.+)-([0-9a-f]{12})$'
+        re='^augur-macos-([a-z0-9-]+)-([0-9a-f]{12})$'
     else
-        re='^augur-(.+)-([0-9a-f]{12})-swift-(.+)$'
+        re='^augur-([a-z0-9-]+)-([0-9a-f]{12})-swift-([A-Za-z0-9_-]+)$'
     fi
     if [[ ! "$name" =~ $re ]]; then
         error "'${name}' is not an augur-managed $([[ "$kind" == macos ]] && echo "macOS VM" || echo container) name."

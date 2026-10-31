@@ -43,7 +43,10 @@ other_slug="$(basename "$other")"
 hasnt "$trace" "augur-${other_slug}-" "destroy <name>: never touches a name derived from the current directory"
 
 # ── Scenario 2: a name outside augur's naming scheme is refused ────────────────
-for bad in "postgres" "augur-nohash-swift-latest" "augur-app-ZZZZZZZZZZZZ-swift-latest" "augur-macos-app-0123456789ab"; do
+# The `../` cases matter most: the parsed slug and the name become path components under
+# ~/.augur (fingerprint, history dir, proxy pidfile), so they must never escape it.
+for bad in "postgres" "augur-nohash-swift-latest" "augur-app-ZZZZZZZZZZZZ-swift-latest" "augur-macos-app-0123456789ab" \
+           "augur-../../outside-0123456789ab-swift-latest" "augur-app-0123456789ab-swift-../x" "augur-a/b-0123456789ab-swift-latest"; do
   rm -f "$AUGUR_TEST_SHIMLOG.trace"
   out="$( cd "$other" && bash "$AUGUR" destroy "$bad" 2>&1 )"; rc=$?
   trace="$(cat "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null)"
@@ -97,5 +100,57 @@ eq "augur-${slug}-${hash}-net" "$(egress_network_name)" "container name: egress 
 TARGET_SLUG=""; TARGET_HASH=""
 adopt_target_name macos "augur-${slug}-${hash}-swift-latest" >/dev/null 2>&1; rc=$?
 eq "1" "$rc" "a container name is not accepted as a macOS VM name"
+adopt_target_name macos "augur-macos-../../x-${hash}" >/dev/null 2>&1; rc=$?
+eq "1" "$rc" "a macOS name with a path traversal is refused"
+eq "" "$TARGET_SLUG" "a refused name leaves no target slug behind"
+
+# ── cmd_destroy_macos <name>: the whole named teardown, with a recording augur-vm ──
+# Real stop_gvproxy / stop_proxy / vm_known_hosts_file run against files in the sandbox, so the
+# assertions are on what actually got removed. The VM CLI is a recorder (nothing is ever cloned,
+# booted or deleted for real; AUGUR_VM_BIN-style boot-proofing is the recorder itself).
+section "Tier 1 — destroy --macos <name> cleans the NAMED VM's state"
+TARGET_SLUG=""; TARGET_HASH=""; CONTAINER_NAME=""
+MACOS_MODE=true
+WORKSPACE_DIR="$other"                     # the current directory is NOT the target
+mkdir -p "$AUGUR_PROXY_DIR" "$AUGUR_DIR/known_hosts"
+vmlog="$work/vmcli"; : > "$vmlog"
+vm_cli_rec() { printf '%s\n' "$*" >> "$vmlog"; return 0; }
+VM_CLI=vm_cli_rec
+require_vz() { :; }
+macos_vm_exists() { [[ "$1" == "$vm" ]]; }
+
+mk() { : > "$1"; }
+target_files=(
+  "$AUGUR_PROXY_DIR/${slug}-${hash}-macos.pid"
+  "$AUGUR_PROXY_DIR/${slug}-${hash}.gvproxy.pid"
+  "$AUGUR_PROXY_DIR/${slug:0:24}-${hash}.vfkit.sock"
+  "$AUGUR_DIR/known_hosts/${vm}"
+)
+# A different project's state sits next to it and must survive.
+here_slug="$(basename "$other")"
+here_files=(
+  "$AUGUR_PROXY_DIR/${here_slug}-ffffffffffff-macos.pid"
+  "$AUGUR_DIR/known_hosts/augur-macos-${here_slug}-ffffffffffff"
+)
+for f in "${target_files[@]}" "${here_files[@]}"; do mk "$f"; done
+
+( cmd_destroy_macos "$vm" ) >/dev/null 2>&1; rc=$?
+eq "0" "$rc" "destroy --macos <name>: exits 0"
+has "$(cat "$vmlog")" "stop ${vm}"   "destroy --macos <name>: stops THAT VM"
+has "$(cat "$vmlog")" "delete ${vm}" "destroy --macos <name>: deletes THAT VM"
+hasnt "$(cat "$vmlog")" "$here_slug" "destroy --macos <name>: never names the current directory's VM"
+for f in "${target_files[@]}"; do
+  [[ ! -e "$f" ]] && ok "destroy --macos <name>: removed ${f#"$AUGUR_DIR"/}" \
+                  || fail "destroy --macos <name>: ${f#"$AUGUR_DIR"/} still present"
+done
+for f in "${here_files[@]}"; do
+  [[ -e "$f" ]] && ok "destroy --macos <name>: left the other project's ${f#"$AUGUR_DIR"/}" \
+                || fail "destroy --macos <name>: wrongly removed ${f#"$AUGUR_DIR"/}"
+done
+
+: > "$vmlog"
+( cmd_destroy_macos "augur-macos-../../x-${hash}" ) >/dev/null 2>&1; rc=$?
+eq "1" "$rc" "destroy --macos <bad name>: refused with exit 1"
+eq "" "$(cat "$vmlog")" "destroy --macos <bad name>: no augur-vm call at all"
 
 finish
