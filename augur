@@ -401,6 +401,19 @@ make_container_name() {
     echo "augur-$(workspace_slug)-$(workspace_path_hash)-swift-${SWIFT_IMAGE_TAG//./-}"
 }
 
+# The names augur mints for a project's container / VM (make_container_name, macos_project_vm),
+# as a regex with the slug and path hash captured. $1 is "container" or "macos". Shared by
+# adopt_target_name (what `destroy <name>` accepts) and the completion name lister, so what
+# completion offers is exactly what `destroy` accepts — e.g. the base VM and build helpers, which
+# also start with `augur-`, are neither.
+target_name_re() {
+    if [[ "$1" == macos ]]; then
+        echo '^augur-macos-([a-z0-9-]+)-([0-9a-f]{12})$'
+    else
+        echo '^augur-([a-z0-9-]+)-([0-9a-f]{12})-swift-([A-Za-z0-9_-]+)$'
+    fi
+}
+
 # Point every per-project helper at a container/VM NAME given on the command line instead of the
 # current directory: `augur destroy <name>`. The name carries the project's slug and path hash
 # (see make_container_name / macos_project_vm), and all per-project host state is keyed on exactly
@@ -411,11 +424,7 @@ make_container_name() {
 # name become path components under ~/.augur, so a `/` or `..` must never get through.
 adopt_target_name() {
     local kind="$1" name="$2" re
-    if [[ "$kind" == macos ]]; then
-        re='^augur-macos-([a-z0-9-]+)-([0-9a-f]{12})$'
-    else
-        re='^augur-([a-z0-9-]+)-([0-9a-f]{12})-swift-([A-Za-z0-9_-]+)$'
-    fi
+    re="$(target_name_re "$kind")"
     if [[ ! "$name" =~ $re ]]; then
         error "'${name}' is not an augur-managed $([[ "$kind" == macos ]] && echo "macOS VM" || echo container) name."
         echo -e "  List them with: ${BOLD}augur list$([[ "$kind" == macos ]] && echo " --macos")${RESET}" >&2
@@ -4553,10 +4562,8 @@ cmd_status_macos() {
 # address, so we only trust the IP field for a RUNNING row (where it is present, hence unshifted)
 # and require it to look address-shaped; everything else degrades to "-". STATE sits at a column
 # that is never blank, so field-splitting resolves it reliably.
-cmd_list() {
-    require_engine
-    local rows
-    rows="$(eng list --all 2>/dev/null | awk '
+list_container_rows() {
+    eng list --all 2>/dev/null | awk '
         NR == 1 {
             for (i = 1; i <= NF; i++) {
                 u = toupper($i)
@@ -4574,7 +4581,13 @@ cmd_list() {
             addr = (state == "running" && ac && $ac ~ /[.:]/) ? $ac : "-"
             print $nc, state, addr
         }
-    ')"
+    '
+}
+
+cmd_list() {
+    require_engine
+    local rows
+    rows="$(list_container_rows)"
     if [[ -z "$rows" ]]; then
         info "No augur containers found."
         echo -e "  Create one with: ${BOLD}augur up${RESET}"
@@ -4596,6 +4609,31 @@ cmd_list() {
         if [[ "$state" == "running" ]]; then color="$GREEN"; else color="$YELLOW"; fi
         echo -e "  $(printf "%-${width}s" "$name") ${color}$(printf '%-10s' "$state")${RESET} ${addr}"
     done <<< "$rows"
+}
+
+# Bare names, one per line, for the shell completion scripts (`augur destroy <TAB>`). Hidden: not in
+# `augur help`. Unlike `list` it must be quiet and fast and never change anything, so it does NOT
+# call require_engine (which would start the container service on a TAB press). With no `container`
+# CLI it prints nothing and succeeds; with the service down it prints nothing and exits 3, so the
+# completion script can tell "no containers" from "service not running" and say so.
+cmd_names() {
+    command -v container &>/dev/null || return 0
+    container system status &>/dev/null || return 3
+    print_destroyable_names container < <(list_container_rows | awk '{print $1}')
+}
+
+cmd_names_macos() {
+    command -v "$VM_CLI" &>/dev/null || return 0
+    print_destroyable_names macos < <("$VM_CLI" list 2>/dev/null | awk 'NR>1 {print $2}')
+}
+
+# Echo the names on stdin that `destroy <name>` would accept (see target_name_re).
+print_destroyable_names() {
+    local re name; re="$(target_name_re "$1")"
+    while IFS= read -r name; do
+        [[ "$name" =~ $re ]] && echo "$name"
+    done
+    return 0
 }
 
 cmd_list_macos() {
@@ -5777,6 +5815,7 @@ if $MACOS_MODE; then
         status)         cmd_status_macos ;;
         init-conf)      cmd_init_conf ;;
         list)           cmd_list_macos ;;
+        __names)        cmd_names_macos ;;
         update)         cmd_update_macos ;;
         version)        cmd_version_macos ;;
         help|--help|-h) cmd_help ;;
@@ -5794,6 +5833,7 @@ else
         status)         cmd_status ;;
         init-conf)      cmd_init_conf ;;
         list)           cmd_list ;;
+        __names)        cmd_names ;;
         update)         cmd_update ;;
         version)        cmd_version ;;
         build)          cmd_build ;;
