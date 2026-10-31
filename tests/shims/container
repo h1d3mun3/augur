@@ -45,7 +45,8 @@ case "${1:-}" in
     printf 'container CLI version %s (build: release, commit: 1a2b3c4)\n' "${AUGUR_TEST_CONTAINER_VERSION:-1.4.1}"
     exit 0 ;;
   system)
-    # `system status` → service up (exit 0); `system start` → succeed.
+    # `system status` → service up (exit 0), or down (exit 1) with AUGUR_TEST_SERVICE_DOWN=1; `system start` → succeed.
+    if [[ "${AUGUR_TEST_SERVICE_DOWN:-0}" == 1 && "${2:-}" == status ]]; then exit 1; fi
     exit 0 ;;
   image)
     # `image inspect IMAGE` → image "exists" (exit 0, skip build).

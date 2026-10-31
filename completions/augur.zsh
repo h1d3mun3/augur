@@ -3,6 +3,7 @@
 
 _augur() {
     local -a cmds names macos
+    local out
     cmds=(
         'up:Start the container / VM'
         'claude:Launch Claude Code'
@@ -40,7 +41,14 @@ _augur() {
         destroy)
             (( ${words[(I)--macos]} )) && macos=(--macos)
             # `augur __names` is the hidden, quiet, read-only list of this mode's container/VM names.
-            names=( ${(f)"$($words[1] __names $macos 2>/dev/null)"} )
+            out=$($words[1] __names $macos 2>/dev/null)
+            # Exit 3 = the container service is stopped. Completion never starts it (a TAB press
+            # must not have side effects), so say why there is nothing to offer.
+            if (( $? == 3 )); then
+                _message 'Apple Container service is not running (run: augur list)'
+                return
+            fi
+            names=( ${(f)out} )
             compadd -a names
             ;;
     esac

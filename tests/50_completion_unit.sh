@@ -18,6 +18,14 @@ eq "0" "$rc" "__names: exits 0"
 eq $'augur-alpha-0011aabbccdd-swift-latest\naugur-beta-eeff22334455-swift-6-0' "$out" \
   "__names: bare augur container names only, one per line (running and stopped, no header, no colour)"
 
+# Service stopped: nothing printed and a distinct exit 3 (the zsh script turns that into a hint),
+# and `__names` must NOT have started the service (no `system start` reaches the CLI).
+rm -f "$AUGUR_TEST_SHIMLOG.trace"
+out="$( AUGUR_TEST_SERVICE_DOWN=1 PATH="$HERE/shims:$PATH" bash "$AUGUR" __names 2>&1 )"; rc=$?
+eq "3" "$rc" "__names: exits 3 when the container service is not running"
+eq ""  "$out" "__names: prints nothing when the container service is not running"
+hasnt "$(cat "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null)" "system start" "__names: never starts the container service"
+
 # No `container` CLI at all: nothing printed, and still success (a TAB press must never error).
 if PATH="/usr/bin:/bin" command -v container >/dev/null 2>&1; then
   skip "__names without the container CLI" "a container CLI is installed in /usr/bin or /bin"

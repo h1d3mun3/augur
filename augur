@@ -4604,10 +4604,12 @@ cmd_list() {
 
 # Bare names, one per line, for the shell completion scripts (`augur destroy <TAB>`). Hidden: not in
 # `augur help`. Unlike `list` it must be quiet and fast and never change anything, so it does NOT
-# call require_engine (which would start the container service on a TAB press): when the service
-# is down it prints nothing and succeeds.
+# call require_engine (which would start the container service on a TAB press). With no `container`
+# CLI it prints nothing and succeeds; with the service down it prints nothing and exits 3, so the
+# completion script can tell "no containers" from "service not running" and say so.
 cmd_names() {
-    command -v container &>/dev/null && container system status &>/dev/null || return 0
+    command -v container &>/dev/null || return 0
+    container system status &>/dev/null || return 3
     list_container_rows | awk '{print $1}'
 }
 
