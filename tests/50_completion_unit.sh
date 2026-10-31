@@ -41,6 +41,8 @@ cat > "$work/fake-augur-vm" <<'VM'
 printf '%s\n' 'ID  NAME                              STATE'
 printf '%s\n' '1   augur-macos-app-0123456789ab      stopped'
 printf '%s\n' '2   not-an-augur-vm                   running'
+printf '%s\n' '3   augur-macos-base                  stopped'
+printf '%s\n' '4   augur-macos-build-helper          stopped'
 VM
 chmod +x "$work/fake-augur-vm"
 out="$( AUGUR_VM_BIN="$work/fake-augur-vm" bash "$AUGUR" __names --macos 2>&1 )"; rc=$?

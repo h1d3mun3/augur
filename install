@@ -221,7 +221,8 @@ if [[ -n "$SHELL_CONFIG" && -d "$INSTALL_DIR/completions" ]]; then
     if grep -q '\.augur/completions/' "$SHELL_CONFIG" 2>/dev/null; then
         warn "Completion already configured in $SHELL_CONFIG"
     else
-        printf '[ -f "$HOME/.augur/completions/augur.%s" ] && source "$HOME/.augur/completions/augur.%s"\n' \
+        # Leading newline: an rc file with no trailing newline must not get the hook glued onto its last line.
+        printf '\n[ -f "$HOME/.augur/completions/augur.%s" ] && source "$HOME/.augur/completions/augur.%s"\n' \
             "$comp_ext" "$comp_ext" >> "$SHELL_CONFIG"
         success "Added tab completion to $SHELL_CONFIG"
     fi
