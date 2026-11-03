@@ -170,9 +170,12 @@ macos_vm_running() { return $_vm_running; }
 ssh_macos() {
   printf '%s\n' "$*" > "$SSHARGS"; cat > "$SSHIN"
   case "$_ssh_mode" in
-    ok)   (( _stop_after_ssh )) && echo 1 > "$TMPD/vmstate"; return 0 ;;
-    fail) return 255 ;;
-    hang) exec sleep 31.37 ;;
+    ok)       echo AUGUR_POWEROFF_SENT; (( _stop_after_ssh )) && echo 1 > "$TMPD/vmstate"; return 0 ;;
+    fail)     return 255 ;;                                  # never landed: no marker
+    badpw)    echo "Sorry, try again."; return 1 ;;          # sudo rejected the password: no marker
+    dropped)  echo AUGUR_POWEROFF_SENT; (sleep 3; echo 1 > "$TMPD/vmstate") & return 255 ;;   # landed, link died, guest stops in 3s
+    lingering) echo AUGUR_POWEROFF_SENT; echo 1 > "$TMPD/vmstate"; exec sleep 31.39 ;;   # guest already down, ssh never returns
+    hang)     exec sleep 31.37 ;;
     stubborn) trap '' TERM; exec sleep 31.38 ;;   # SIGTERM stays ignored across the exec
   esac
 }
@@ -214,6 +217,33 @@ if (( elapsed <= 7 )); then ok "poweroff: a SIGTERM-ignoring ssh is still cut of
 else fail "poweroff: SIGTERM-ignoring ssh blocked for ${elapsed}s" "budget was 3s"; fi
 if pgrep -x -f '^sleep 31\.38$' >/dev/null; then fail "poweroff: the SIGTERM-ignoring ssh was left running" "$(pgrep -x -f '^sleep 31\.38$')"; pkill -KILL -x -f '^sleep 31\.38$'
 else ok "poweroff: the SIGTERM-ignoring ssh process tree was killed"; fi
+
+_ssh_mode=dropped
+run_poweroff 20 2
+eq "0" "$prc" "poweroff: request landed but the link dropped → keeps waiting and sees the stop (not cut to the grace)"
+
+_ssh_mode=lingering
+run_poweroff 30 2
+eq "0" "$prc" "poweroff: guest already down while ssh lingers → returns 0"
+if (( elapsed <= 7 )); then ok "poweroff: notices the stop without waiting for the lingering ssh (${elapsed}s)"
+else fail "poweroff: waited ${elapsed}s on a lingering ssh after the guest stopped" "budget was 30s"; fi
+if pgrep -x -f '^sleep 31\.39$' >/dev/null; then fail "poweroff: the lingering ssh was left running" "$(pgrep -x -f '^sleep 31\.39$')"; pkill -KILL -x -f '^sleep 31\.39$'
+else ok "poweroff: the lingering ssh process tree was killed"; fi
+
+_ssh_mode=badpw
+run_poweroff 30 2 >"$TMPD/pw_err" 2>&1
+eq "1" "$prc" "poweroff: rejected sudo password → returns 1"
+has "$(cat "$TMPD/pw_err")" "rejected sudo password" "poweroff: a rejected password is surfaced, not swallowed"
+
+# Ctrl-C/SIGTERM mid-wait: the helper must reap its ssh and exit 130. Run it in a background subshell
+# (an async job ignores SIGINT on entry, so SIGTERM stands in for the same trap).
+_ssh_mode=hang
+rm -f "$TMPD/vmstate"
+( macos_guest_poweroff "$VM" 30 2 ) & bgpid=$!
+sleep 1; kill -TERM "$bgpid" 2>/dev/null; wait "$bgpid" 2>/dev/null; brc=$?
+eq "130" "$brc" "poweroff: SIGTERM mid-wait exits 130"
+if pgrep -x -f '^sleep 31\.37$' >/dev/null; then fail "poweroff: an interrupted run left its ssh running" "$(pgrep -x -f '^sleep 31\.37$')"; pkill -KILL -x -f '^sleep 31\.37$'
+else ok "poweroff: an interrupted run reaped its ssh"; fi
 
 # restore the cmd_down_macos-level stubs for the sections below
 macos_guest_poweroff() { echo "poweroff $1" >> "$LOG"; return 0; }

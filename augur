@@ -4417,30 +4417,47 @@ macos_kill_tree() {
 # there to click, so the stop only ever ends via its 30s force-kill. `shutdown -h now` has no dialog
 # and lets the guest flush its disks, so this is both faster and gentler.
 # Best-effort by design: the caller's `augur-vm stop` remains the fallback whenever this returns 1.
-# $2 bounds the WHOLE function: the SSH request runs in the background and is killed when the
-# budget runs out, because ssh's own timeouts do not cover a connected session whose sudo or
-# shutdown hangs. If the request fails (sshd not up yet, forward missing) nothing was sent, so the
-# wait shrinks to $3 — long enough for a request that did land but whose connection dropped with
-# the guest to be seen as a stop, short enough not to stall the fallback. Needs gvproxy still up,
-# because ssh_macos reaches the project VM through its forward — so callers must run this BEFORE
-# stop_gvproxy.
+# Needs gvproxy still up, because ssh_macos reaches the project VM through its forward — so callers
+# must run this BEFORE stop_gvproxy.
+# $2 bounds the WHOLE function. The SSH request runs in the background so a connected session whose
+# sudo or shutdown hangs (ssh's own timeouts do not cover that) is SIGKILLed when the budget runs
+# out, and so a guest that already powered off is noticed even while ssh is still waiting on a
+# connection that never closed. Ctrl-C reaps the request too, so an aborted `down` cannot go on to
+# deliver a shutdown afterwards.
+# The remote side prints a marker only AFTER sudo accepted the password, which is what tells a
+# request that never landed (sshd not up, forward missing, wrong password) from one that landed and
+# whose connection then dropped with the guest — ssh exits non-zero for both. The former waits only
+# $3 before the caller's fallback; the latter keeps the full budget, because the guest is mid-
+# shutdown and must be left to finish flushing rather than have its network cut and be force-killed.
 macos_guest_poweroff() {
     local vm="$1" max_secs="${2:-60}" grace_secs="${3:-10}"
-    local deadline=$(( SECONDS + max_secs )) pid rc=0
-    { macos_admin_password_stdin | ssh_macos "$vm" "sudo -S -p '' /sbin/shutdown -h now"; } &>/dev/null &
+    local deadline=$(( SECONDS + max_secs )) pid out rc=0 n=0 sent=false stopped=false
+    out="$(mktemp)"
+    { macos_admin_password_stdin | ssh_macos "$vm" "sudo -S -p '' sh -c 'echo AUGUR_POWEROFF_SENT; exec /sbin/shutdown -h now'"; } >"$out" 2>&1 &
     pid=$!
+    trap 'macos_kill_tree "$pid"; rm -f "$out"; exit 130' INT TERM
     while kill -0 "$pid" 2>/dev/null; do
-        if (( SECONDS >= deadline )); then macos_kill_tree "$pid"; break; fi
+        if (( ++n % 5 == 0 )) && ! macos_vm_running "$vm"; then stopped=true; break; fi
+        if (( SECONDS >= deadline )); then break; fi
         sleep 0.2
     done
+    if kill -0 "$pid" 2>/dev/null; then macos_kill_tree "$pid"; fi
     wait "$pid" 2>/dev/null || rc=$?
-    if (( rc != 0 )) && (( SECONDS + grace_secs < deadline )); then deadline=$(( SECONDS + grace_secs )); fi
-    while (( SECONDS < deadline )); do
-        macos_vm_running "$vm" || return 0
-        sleep 1
-    done
-    macos_vm_running "$vm" || return 0
-    return 1
+    if grep -q AUGUR_POWEROFF_SENT "$out"; then sent=true; fi
+    if ! $stopped; then
+        if ! $sent && (( SECONDS + grace_secs < deadline )); then deadline=$(( SECONDS + grace_secs )); fi
+        while (( SECONDS < deadline )); do
+            if ! macos_vm_running "$vm"; then stopped=true; break; fi
+            sleep 1
+        done
+        if ! $stopped && ! macos_vm_running "$vm"; then stopped=true; fi
+    fi
+    # A request that never landed is invisible otherwise; a stale admin password (a clone older than
+    # the latest base rebuild) is the one cause the operator can fix.
+    if ! $stopped && ! $sent; then warn_if_stale_admin_password "$(cat "$out")"; fi
+    trap - INT TERM
+    rm -f "$out"
+    $stopped
 }
 
 cmd_down_macos() {
