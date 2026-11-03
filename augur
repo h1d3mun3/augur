@@ -4401,12 +4401,14 @@ cmd_setup_token_macos() {
     return $rc
 }
 
-# Kill a process and all its descendants. ssh_macos is a function, so the real `ssh` is a
-# grandchild of anything that backgrounds it; killing only the direct child would orphan it.
+# SIGKILL a process and all its descendants. SIGKILL rather than SIGTERM on purpose: the caller
+# abandons the process, and one that ignores or traps SIGTERM would let the caller's `wait` block
+# past its deadline. ssh_macos is a function, so the real `ssh` is a grandchild of anything that
+# backgrounds it; killing only the direct child would orphan it.
 macos_kill_tree() {
     local c
     for c in $(pgrep -P "$1" 2>/dev/null); do macos_kill_tree "$c"; done
-    kill "$1" 2>/dev/null || true
+    kill -KILL "$1" 2>/dev/null || true
 }
 
 # Ask a running guest to power itself off from the inside, then wait for its `run` process to

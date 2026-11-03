@@ -173,6 +173,7 @@ ssh_macos() {
     ok)   (( _stop_after_ssh )) && echo 1 > "$TMPD/vmstate"; return 0 ;;
     fail) return 255 ;;
     hang) exec sleep 31.37 ;;
+    stubborn) trap '' TERM; exec sleep 31.38 ;;   # SIGTERM stays ignored across the exec
   esac
 }
 # The VM reads as running until the stub ssh "powers it off" by writing $TMPD/vmstate.
@@ -205,6 +206,14 @@ if (( elapsed <= 7 )); then ok "poweroff: a hung ssh is cut off at the budget ($
 else fail "poweroff: hung ssh blocked for ${elapsed}s" "budget was 3s"; fi
 if pgrep -x -f '^sleep 31\.37$' >/dev/null; then fail "poweroff: the hung ssh process was left running" "$(pgrep -x -f '^sleep 31\.37$')"; pkill -x -f '^sleep 31\.37$'
 else ok "poweroff: the hung ssh process tree was killed"; fi
+
+_ssh_mode=stubborn
+run_poweroff 3 1
+eq "1" "$prc" "poweroff: ssh that ignores SIGTERM → still returns 1 at the deadline"
+if (( elapsed <= 7 )); then ok "poweroff: a SIGTERM-ignoring ssh is still cut off at the budget (${elapsed}s)"
+else fail "poweroff: SIGTERM-ignoring ssh blocked for ${elapsed}s" "budget was 3s"; fi
+if pgrep -x -f '^sleep 31\.38$' >/dev/null; then fail "poweroff: the SIGTERM-ignoring ssh was left running" "$(pgrep -x -f '^sleep 31\.38$')"; pkill -KILL -x -f '^sleep 31\.38$'
+else ok "poweroff: the SIGTERM-ignoring ssh process tree was killed"; fi
 
 # restore the cmd_down_macos-level stubs for the sections below
 macos_guest_poweroff() { echo "poweroff $1" >> "$LOG"; return 0; }
