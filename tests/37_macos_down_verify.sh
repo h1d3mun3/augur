@@ -65,6 +65,10 @@ VM="$(macos_project_vm)"
 require_vz()   { :; }
 stop_gvproxy() { echo "stop_gvproxy" >> "$LOG"; }
 stop_proxy()   { echo "stop_proxy"   >> "$LOG"; }
+_gvproxy_up=0                             # 0 = gvproxy (hence the SSH forward) is up, 1 = down
+gvproxy_running() { return $_gvproxy_up; }
+_real_poweroff_defs="$(declare -f macos_guest_poweroff macos_kill_tree)"
+macos_guest_poweroff() { echo "poweroff $1" >> "$LOG"; return 0; }
 _vm_exists=0                              # 0 = a clone exists for this dir, 1 = none
 _vm_running=0                             # 0 = still running after the stop, 1 = stopped
 _delete_rc=0                              # exit status the recorder returns for `delete`
@@ -133,6 +137,119 @@ eq "0" "$rc" "down --macos: exits 0 after a clean stop"
 if grep -q '^delete ' "$VMLOG"; then fail "down --macos: deleted the VM" "$(cat "$VMLOG")"
 else ok "down --macos: never invokes 'delete' (the clone is kept)"; fi
 
+section "Tier 1 — down --macos: the guest is powered off from inside, before gvproxy goes"
+
+_vm_exists=0; _vm_running=0; _gvproxy_up=0
+run_down
+if logged "poweroff ${VM}"; then ok "down --macos: asks the running guest to power itself off"
+else fail "down --macos: no in-guest poweroff requested" "log: $(cat "$LOG")"; fi
+# SSH reaches the project VM through gvproxy's forward, so the poweroff must precede its teardown.
+p_at="$(grep -nx "poweroff ${VM}" "$LOG" | head -n1 | cut -d: -f1)"
+g_at="$(grep -nx stop_gvproxy "$LOG" | head -n1 | cut -d: -f1)"
+if [[ -n "$p_at" && -n "$g_at" && "$p_at" -lt "$g_at" ]]
+then ok "down --macos: poweroff runs BEFORE stop_gvproxy (poweroff@$p_at < gvproxy@$g_at)"
+else fail "down --macos: poweroff not ordered before gvproxy teardown" "log: $(cat "$LOG")"; fi
+if grep -qx "stop ${VM}" "$VMLOG"; then ok "down --macos: still falls back to 'augur-vm stop'"
+else fail "down --macos: dropped the augur-vm stop fallback" "vm log: $(cat "$VMLOG")"; fi
+
+_gvproxy_up=1                             # no SSH forward → nothing to ssh through
+run_down
+if logged "poweroff ${VM}"; then fail "down --macos: tried an in-guest poweroff with gvproxy down" "log: $(cat "$LOG")"
+else ok "down --macos: skips the in-guest poweroff when gvproxy is down"; fi
+if grep -qx "stop ${VM}" "$VMLOG"; then ok "down --macos: gvproxy down → still stops via 'augur-vm stop'"
+else fail "down --macos: gvproxy down and no stop recorded" "vm log: $(cat "$VMLOG")"; fi
+_gvproxy_up=0
+
+section "Tier 1 — macos_guest_poweroff (the real helper, ssh_macos and the VM state stubbed)"
+
+eval "$_real_poweroff_defs"                # the real helpers, over the call-recording stub above
+SSHIN="$TMPD/ssh_stdin"; SSHARGS="$TMPD/ssh_args"
+_ssh_mode=ok; _stop_after_ssh=1
+macos_admin_password_stdin() { printf 'pw-for-test\n'; }
+macos_vm_running() { return $_vm_running; }
+ssh_macos() {
+  printf '%s\n' "$*" > "$SSHARGS"; cat > "$SSHIN"
+  case "$_ssh_mode" in
+    ok)       echo AUGUR_POWEROFF_SENT; (( _stop_after_ssh )) && echo 1 > "$TMPD/vmstate"; return 0 ;;
+    fail)     return 255 ;;                                  # never landed: no marker
+    badpw)    echo "Sorry, try again."; return 1 ;;          # sudo rejected the password: no marker
+    dropped)  echo AUGUR_POWEROFF_SENT; (sleep 3; echo 1 > "$TMPD/vmstate") & return 255 ;;   # landed, link died, guest stops in 3s
+    lingering) echo AUGUR_POWEROFF_SENT; echo 1 > "$TMPD/vmstate"; exec sleep 31.39 ;;   # guest already down, ssh never returns
+    hang)     exec sleep 31.37 ;;
+    stubborn) trap '' TERM; exec sleep 31.38 ;;   # SIGTERM stays ignored across the exec
+  esac
+}
+# The VM reads as running until the stub ssh "powers it off" by writing $TMPD/vmstate.
+macos_vm_running() { [[ ! -s "$TMPD/vmstate" ]]; }
+run_poweroff() { rm -f "$TMPD/vmstate" "$SSHIN" "$SSHARGS"; local t0=$SECONDS; macos_guest_poweroff "$VM" "$@"; prc=$?; elapsed=$(( SECONDS - t0 )); }
+
+_ssh_mode=ok; _stop_after_ssh=1
+run_poweroff 20 3
+eq "0" "$prc" "poweroff: returns 0 once the VM has stopped"
+if grep -q 'shutdown -h now' "$SSHARGS" 2>/dev/null; then ok "poweroff: asks the guest for 'shutdown -h now'"
+else fail "poweroff: no shutdown command sent" "args: $(cat "$SSHARGS" 2>/dev/null)"; fi
+if grep -q 'sudo -S' "$SSHARGS" 2>/dev/null && ! grep -q 'pw-for-test' "$SSHARGS"; then ok "poweroff: sudo -S, password never on the ssh argv"
+else fail "poweroff: sudo/argv shape wrong" "args: $(cat "$SSHARGS" 2>/dev/null)"; fi
+eq "pw-for-test" "$(cat "$SSHIN" 2>/dev/null)" "poweroff: the password reaches ssh on stdin"
+
+_stop_after_ssh=0; _ssh_mode=ok            # request accepted but the VM never stops: use the full budget
+run_poweroff 3 1
+eq "1" "$prc" "poweroff: returns 1 when the VM is still running at the deadline"
+
+_ssh_mode=fail
+run_poweroff 30 2
+eq "1" "$prc" "poweroff: ssh failure + VM still running → returns 1"
+if (( elapsed <= 6 )); then ok "poweroff: ssh failure waits only the short grace, not the full budget (${elapsed}s)"
+else fail "poweroff: ssh failure still waited ${elapsed}s" "budget was 30s, grace 2s"; fi
+
+_ssh_mode=hang
+run_poweroff 3 1
+eq "1" "$prc" "poweroff: hung ssh → returns 1 at the deadline"
+if (( elapsed <= 7 )); then ok "poweroff: a hung ssh is cut off at the budget (${elapsed}s)"
+else fail "poweroff: hung ssh blocked for ${elapsed}s" "budget was 3s"; fi
+if pgrep -x -f '^sleep 31\.37$' >/dev/null; then fail "poweroff: the hung ssh process was left running" "$(pgrep -x -f '^sleep 31\.37$')"; pkill -x -f '^sleep 31\.37$'
+else ok "poweroff: the hung ssh process tree was killed"; fi
+
+_ssh_mode=stubborn
+run_poweroff 3 1
+eq "1" "$prc" "poweroff: ssh that ignores SIGTERM → still returns 1 at the deadline"
+if (( elapsed <= 7 )); then ok "poweroff: a SIGTERM-ignoring ssh is still cut off at the budget (${elapsed}s)"
+else fail "poweroff: SIGTERM-ignoring ssh blocked for ${elapsed}s" "budget was 3s"; fi
+if pgrep -x -f '^sleep 31\.38$' >/dev/null; then fail "poweroff: the SIGTERM-ignoring ssh was left running" "$(pgrep -x -f '^sleep 31\.38$')"; pkill -KILL -x -f '^sleep 31\.38$'
+else ok "poweroff: the SIGTERM-ignoring ssh process tree was killed"; fi
+
+_ssh_mode=dropped
+run_poweroff 20 2
+eq "0" "$prc" "poweroff: request landed but the link dropped → keeps waiting and sees the stop (not cut to the grace)"
+
+_ssh_mode=lingering
+run_poweroff 30 2
+eq "0" "$prc" "poweroff: guest already down while ssh lingers → returns 0"
+if (( elapsed <= 7 )); then ok "poweroff: notices the stop without waiting for the lingering ssh (${elapsed}s)"
+else fail "poweroff: waited ${elapsed}s on a lingering ssh after the guest stopped" "budget was 30s"; fi
+if pgrep -x -f '^sleep 31\.39$' >/dev/null; then fail "poweroff: the lingering ssh was left running" "$(pgrep -x -f '^sleep 31\.39$')"; pkill -KILL -x -f '^sleep 31\.39$'
+else ok "poweroff: the lingering ssh process tree was killed"; fi
+
+_ssh_mode=badpw
+run_poweroff 30 2 >"$TMPD/pw_err" 2>&1
+eq "1" "$prc" "poweroff: rejected sudo password → returns 1"
+has "$(cat "$TMPD/pw_err")" "rejected sudo password" "poweroff: a rejected password is surfaced, not swallowed"
+
+# Ctrl-C/SIGTERM mid-wait: the helper must reap its ssh and exit 130. Run it in a background subshell
+# (an async job ignores SIGINT on entry, so SIGTERM stands in for the same trap).
+_ssh_mode=hang
+rm -f "$TMPD/vmstate"
+( macos_guest_poweroff "$VM" 30 2 ) & bgpid=$!
+sleep 1; kill -TERM "$bgpid" 2>/dev/null; wait "$bgpid" 2>/dev/null; brc=$?
+eq "130" "$brc" "poweroff: SIGTERM mid-wait exits 130"
+if pgrep -x -f '^sleep 31\.37$' >/dev/null; then fail "poweroff: an interrupted run left its ssh running" "$(pgrep -x -f '^sleep 31\.37$')"; pkill -KILL -x -f '^sleep 31\.37$'
+else ok "poweroff: an interrupted run reaped its ssh"; fi
+
+# restore the cmd_down_macos-level stubs for the sections below
+macos_guest_poweroff() { echo "poweroff $1" >> "$LOG"; return 0; }
+macos_vm_running() { return $_vm_running; }
+unset -f ssh_macos macos_admin_password_stdin
+
 section "Tier 1 — down --macos: no VM for this directory"
 
 _vm_exists=1; _vm_running=0               # _vm_running would report "running" if it were consulted
@@ -173,7 +290,7 @@ destroy_body="$(awk '/^cmd_destroy_macos\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUG
 # The re-check must come AFTER the stop. Before it, it would report the state the stop was about to
 # change and the warning would fire on every teardown.
 s_at="$(printf '%s\n' "$down_body" | grep -n '"\$VM_CLI" stop'  | head -n1 | cut -d: -f1)"
-r_at="$(printf '%s\n' "$down_body" | grep -n 'macos_vm_running' | head -n1 | cut -d: -f1)"
+r_at="$(printf '%s\n' "$down_body" | grep -n 'macos_vm_running' | tail -n1 | cut -d: -f1)"
 if [[ -n "$s_at" && -n "$r_at" && "$s_at" -lt "$r_at" ]]
 then ok "down --macos re-checks AFTER the stop (stop@$s_at < recheck@$r_at)"
 else fail "down --macos does not re-check after the stop" "stop@${s_at:-none} recheck@${r_at:-none}"; fi
