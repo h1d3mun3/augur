@@ -282,6 +282,46 @@ run_destroy
 has "$dout" "has been removed" "destroy --macos: reports removal when the delete succeeded"
 eq "0" "$drc" "destroy --macos: exits 0 when the delete succeeded"
 
+section "Tier 1 — destroy --macos: the guest is powered off from inside, before gvproxy goes"
+
+_vm_exists=0; _vm_running=0; _gvproxy_up=0; _delete_rc=0
+run_destroy
+if logged "poweroff ${VM}"; then ok "destroy --macos: asks the running guest to power itself off"
+else fail "destroy --macos: no in-guest poweroff requested" "log: $(cat "$LOG")"; fi
+p_at="$(grep -nx "poweroff ${VM}" "$LOG" | head -n1 | cut -d: -f1)"
+g_at="$(grep -nx stop_gvproxy "$LOG" | head -n1 | cut -d: -f1)"
+if [[ -n "$p_at" && -n "$g_at" && "$p_at" -lt "$g_at" ]]
+then ok "destroy --macos: poweroff runs BEFORE stop_gvproxy (poweroff@$p_at < gvproxy@$g_at)"
+else fail "destroy --macos: poweroff not ordered before gvproxy teardown" "log: $(cat "$LOG")"; fi
+if grep -qx "stop ${VM}" "$VMLOG" && grep -qx "delete ${VM}" "$VMLOG"
+then ok "destroy --macos: still stops via 'augur-vm stop' and then deletes"
+else fail "destroy --macos: stop/delete not both recorded" "vm log: $(cat "$VMLOG")"; fi
+
+_delete_rc=1                              # a refused delete must still fail closed after the poweroff
+run_destroy
+if [[ "$drc" -ne 0 ]]; then ok "destroy --macos: still fails closed on a refused delete after the poweroff"
+else fail "destroy --macos: exited 0 after a refused delete" "log: $(cat "$LOG")"; fi
+_delete_rc=0
+
+_gvproxy_up=1                             # no SSH forward → nothing to ssh through
+run_destroy
+if logged "poweroff ${VM}"; then fail "destroy --macos: tried an in-guest poweroff with gvproxy down" "log: $(cat "$LOG")"
+else ok "destroy --macos: skips the in-guest poweroff when gvproxy is down"; fi
+if grep -qx "delete ${VM}" "$VMLOG"; then ok "destroy --macos: gvproxy down → still deletes"
+else fail "destroy --macos: gvproxy down and no delete recorded" "vm log: $(cat "$VMLOG")"; fi
+_gvproxy_up=0
+
+_vm_exists=1; _vm_running=0               # no clone: no poweroff, no augur-vm call, egress still reaped
+run_destroy
+if logged "poweroff ${VM}"; then fail "destroy --macos: powered off a VM that does not exist" "log: $(cat "$LOG")"
+else ok "destroy --macos: no poweroff when no VM exists"; fi
+if [[ -s "$VMLOG" ]]; then fail "destroy --macos: touched the augur-vm CLI with no VM present" "$(cat "$VMLOG")"
+else ok "destroy --macos: never invokes the augur-vm CLI when no VM exists"; fi
+if logged stop_gvproxy && logged stop_proxy
+then ok "destroy --macos: still tears down gvproxy+proxy with no VM"
+else fail "destroy --macos: skipped the egress teardown when no VM exists" "log: $(cat "$LOG")"; fi
+_vm_exists=0
+
 section "Tier 1 — source guards: the re-check is wired where behaviour cannot see it"
 
 down_body="$(awk '/^cmd_down_macos\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
