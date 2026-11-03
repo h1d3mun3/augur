@@ -4401,10 +4401,37 @@ cmd_setup_token_macos() {
     return $rc
 }
 
+# Ask a running guest to power itself off from the inside, then wait (bounded) for its `run`
+# process to exit. The host-side alternative, `augur-vm stop`, presses the guest's virtual power
+# button, and a logged-in macOS guest answers that with a "Are you sure you want to shut down?"
+# dialog nobody is there to click, so the stop only ever ends via its 30s force-kill. `shutdown -h
+# now` has no dialog and lets the guest flush its disks, so this is both faster and gentler.
+# Best-effort by design: if SSH is unreachable (no gvproxy forward, a VM still booting) this returns
+# quietly and the caller's `augur-vm stop` remains the fallback. Needs gvproxy still up, because
+# ssh_macos reaches the project VM through its forward — so callers must run this BEFORE
+# stop_gvproxy.
+macos_guest_poweroff() {
+    local vm="$1" max_secs="${2:-60}"
+    local deadline=$(( SECONDS + max_secs ))
+    macos_admin_password_stdin | ssh_macos "$vm" "sudo -S -p '' /sbin/shutdown -h now" &>/dev/null || true
+    while (( SECONDS < deadline )); do
+        macos_vm_running "$vm" || return 0
+        sleep 1
+    done
+    return 1
+}
+
 cmd_down_macos() {
     require_vz
     local project_vm
     project_vm="$(macos_project_vm)"
+    # Power the guest off from the inside while its SSH forward still exists (see
+    # macos_guest_poweroff). Its failure is not an error here: the `augur-vm stop` below is the
+    # fallback and the re-check after it is the authority on whether the VM is down.
+    if macos_vm_exists "$project_vm" && macos_vm_running "$project_vm" && gvproxy_running; then
+        info "Shutting down VM '${project_vm}'..."
+        macos_guest_poweroff "$project_vm" || true
+    fi
     # Always tear down the host-side egress (gvproxy/proxy) so a stranded one from a
     # crashed VM is cleaned up, even if the VM clone itself is already gone.
     stop_gvproxy

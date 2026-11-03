@@ -65,6 +65,9 @@ VM="$(macos_project_vm)"
 require_vz()   { :; }
 stop_gvproxy() { echo "stop_gvproxy" >> "$LOG"; }
 stop_proxy()   { echo "stop_proxy"   >> "$LOG"; }
+_gvproxy_up=0                             # 0 = gvproxy (hence the SSH forward) is up, 1 = down
+gvproxy_running() { return $_gvproxy_up; }
+macos_guest_poweroff() { echo "poweroff $1" >> "$LOG"; return 0; }
 _vm_exists=0                              # 0 = a clone exists for this dir, 1 = none
 _vm_running=0                             # 0 = still running after the stop, 1 = stopped
 _delete_rc=0                              # exit status the recorder returns for `delete`
@@ -133,6 +136,29 @@ eq "0" "$rc" "down --macos: exits 0 after a clean stop"
 if grep -q '^delete ' "$VMLOG"; then fail "down --macos: deleted the VM" "$(cat "$VMLOG")"
 else ok "down --macos: never invokes 'delete' (the clone is kept)"; fi
 
+section "Tier 1 — down --macos: the guest is powered off from inside, before gvproxy goes"
+
+_vm_exists=0; _vm_running=0; _gvproxy_up=0
+run_down
+if logged "poweroff ${VM}"; then ok "down --macos: asks the running guest to power itself off"
+else fail "down --macos: no in-guest poweroff requested" "log: $(cat "$LOG")"; fi
+# SSH reaches the project VM through gvproxy's forward, so the poweroff must precede its teardown.
+p_at="$(grep -nx "poweroff ${VM}" "$LOG" | head -n1 | cut -d: -f1)"
+g_at="$(grep -nx stop_gvproxy "$LOG" | head -n1 | cut -d: -f1)"
+if [[ -n "$p_at" && -n "$g_at" && "$p_at" -lt "$g_at" ]]
+then ok "down --macos: poweroff runs BEFORE stop_gvproxy (poweroff@$p_at < gvproxy@$g_at)"
+else fail "down --macos: poweroff not ordered before gvproxy teardown" "log: $(cat "$LOG")"; fi
+if grep -qx "stop ${VM}" "$VMLOG"; then ok "down --macos: still falls back to 'augur-vm stop'"
+else fail "down --macos: dropped the augur-vm stop fallback" "vm log: $(cat "$VMLOG")"; fi
+
+_gvproxy_up=1                             # no SSH forward → nothing to ssh through
+run_down
+if logged "poweroff ${VM}"; then fail "down --macos: tried an in-guest poweroff with gvproxy down" "log: $(cat "$LOG")"
+else ok "down --macos: skips the in-guest poweroff when gvproxy is down"; fi
+if grep -qx "stop ${VM}" "$VMLOG"; then ok "down --macos: gvproxy down → still stops via 'augur-vm stop'"
+else fail "down --macos: gvproxy down and no stop recorded" "vm log: $(cat "$VMLOG")"; fi
+_gvproxy_up=0
+
 section "Tier 1 — down --macos: no VM for this directory"
 
 _vm_exists=1; _vm_running=0               # _vm_running would report "running" if it were consulted
@@ -173,7 +199,7 @@ destroy_body="$(awk '/^cmd_destroy_macos\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUG
 # The re-check must come AFTER the stop. Before it, it would report the state the stop was about to
 # change and the warning would fire on every teardown.
 s_at="$(printf '%s\n' "$down_body" | grep -n '"\$VM_CLI" stop'  | head -n1 | cut -d: -f1)"
-r_at="$(printf '%s\n' "$down_body" | grep -n 'macos_vm_running' | head -n1 | cut -d: -f1)"
+r_at="$(printf '%s\n' "$down_body" | grep -n 'macos_vm_running' | tail -n1 | cut -d: -f1)"
 if [[ -n "$s_at" && -n "$r_at" && "$s_at" -lt "$r_at" ]]
 then ok "down --macos re-checks AFTER the stop (stop@$s_at < recheck@$r_at)"
 else fail "down --macos does not re-check after the stop" "stop@${s_at:-none} recheck@${r_at:-none}"; fi
