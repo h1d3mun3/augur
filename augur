@@ -4401,23 +4401,43 @@ cmd_setup_token_macos() {
     return $rc
 }
 
-# Ask a running guest to power itself off from the inside, then wait (bounded) for its `run`
-# process to exit. The host-side alternative, `augur-vm stop`, presses the guest's virtual power
-# button, and a logged-in macOS guest answers that with a "Are you sure you want to shut down?"
-# dialog nobody is there to click, so the stop only ever ends via its 30s force-kill. `shutdown -h
-# now` has no dialog and lets the guest flush its disks, so this is both faster and gentler.
-# Best-effort by design: if SSH is unreachable (no gvproxy forward, a VM still booting) this returns
-# quietly and the caller's `augur-vm stop` remains the fallback. Needs gvproxy still up, because
-# ssh_macos reaches the project VM through its forward — so callers must run this BEFORE
+# Kill a process and all its descendants. ssh_macos is a function, so the real `ssh` is a
+# grandchild of anything that backgrounds it; killing only the direct child would orphan it.
+macos_kill_tree() {
+    local c
+    for c in $(pgrep -P "$1" 2>/dev/null); do macos_kill_tree "$c"; done
+    kill "$1" 2>/dev/null || true
+}
+
+# Ask a running guest to power itself off from the inside, then wait for its `run` process to
+# exit. The host-side alternative, `augur-vm stop`, presses the guest's virtual power button, and a
+# logged-in macOS guest answers that with a "Are you sure you want to shut down?" dialog nobody is
+# there to click, so the stop only ever ends via its 30s force-kill. `shutdown -h now` has no dialog
+# and lets the guest flush its disks, so this is both faster and gentler.
+# Best-effort by design: the caller's `augur-vm stop` remains the fallback whenever this returns 1.
+# $2 bounds the WHOLE function: the SSH request runs in the background and is killed when the
+# budget runs out, because ssh's own timeouts do not cover a connected session whose sudo or
+# shutdown hangs. If the request fails (sshd not up yet, forward missing) nothing was sent, so the
+# wait shrinks to $3 — long enough for a request that did land but whose connection dropped with
+# the guest to be seen as a stop, short enough not to stall the fallback. Needs gvproxy still up,
+# because ssh_macos reaches the project VM through its forward — so callers must run this BEFORE
 # stop_gvproxy.
 macos_guest_poweroff() {
-    local vm="$1" max_secs="${2:-60}"
-    local deadline=$(( SECONDS + max_secs ))
-    macos_admin_password_stdin | ssh_macos "$vm" "sudo -S -p '' /sbin/shutdown -h now" &>/dev/null || true
+    local vm="$1" max_secs="${2:-60}" grace_secs="${3:-10}"
+    local deadline=$(( SECONDS + max_secs )) pid rc=0
+    { macos_admin_password_stdin | ssh_macos "$vm" "sudo -S -p '' /sbin/shutdown -h now"; } &>/dev/null &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        if (( SECONDS >= deadline )); then macos_kill_tree "$pid"; break; fi
+        sleep 0.2
+    done
+    wait "$pid" 2>/dev/null || rc=$?
+    if (( rc != 0 )) && (( SECONDS + grace_secs < deadline )); then deadline=$(( SECONDS + grace_secs )); fi
     while (( SECONDS < deadline )); do
         macos_vm_running "$vm" || return 0
         sleep 1
     done
+    macos_vm_running "$vm" || return 0
     return 1
 }
 

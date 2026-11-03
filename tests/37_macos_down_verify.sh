@@ -67,6 +67,7 @@ stop_gvproxy() { echo "stop_gvproxy" >> "$LOG"; }
 stop_proxy()   { echo "stop_proxy"   >> "$LOG"; }
 _gvproxy_up=0                             # 0 = gvproxy (hence the SSH forward) is up, 1 = down
 gvproxy_running() { return $_gvproxy_up; }
+_real_poweroff_defs="$(declare -f macos_guest_poweroff macos_kill_tree)"
 macos_guest_poweroff() { echo "poweroff $1" >> "$LOG"; return 0; }
 _vm_exists=0                              # 0 = a clone exists for this dir, 1 = none
 _vm_running=0                             # 0 = still running after the stop, 1 = stopped
@@ -158,6 +159,57 @@ else ok "down --macos: skips the in-guest poweroff when gvproxy is down"; fi
 if grep -qx "stop ${VM}" "$VMLOG"; then ok "down --macos: gvproxy down → still stops via 'augur-vm stop'"
 else fail "down --macos: gvproxy down and no stop recorded" "vm log: $(cat "$VMLOG")"; fi
 _gvproxy_up=0
+
+section "Tier 1 — macos_guest_poweroff (the real helper, ssh_macos and the VM state stubbed)"
+
+eval "$_real_poweroff_defs"                # the real helpers, over the call-recording stub above
+SSHIN="$TMPD/ssh_stdin"; SSHARGS="$TMPD/ssh_args"
+_ssh_mode=ok; _stop_after_ssh=1
+macos_admin_password_stdin() { printf 'pw-for-test\n'; }
+macos_vm_running() { return $_vm_running; }
+ssh_macos() {
+  printf '%s\n' "$*" > "$SSHARGS"; cat > "$SSHIN"
+  case "$_ssh_mode" in
+    ok)   (( _stop_after_ssh )) && echo 1 > "$TMPD/vmstate"; return 0 ;;
+    fail) return 255 ;;
+    hang) exec sleep 31.37 ;;
+  esac
+}
+# The VM reads as running until the stub ssh "powers it off" by writing $TMPD/vmstate.
+macos_vm_running() { [[ ! -s "$TMPD/vmstate" ]]; }
+run_poweroff() { rm -f "$TMPD/vmstate" "$SSHIN" "$SSHARGS"; local t0=$SECONDS; macos_guest_poweroff "$VM" "$@"; prc=$?; elapsed=$(( SECONDS - t0 )); }
+
+_ssh_mode=ok; _stop_after_ssh=1
+run_poweroff 20 3
+eq "0" "$prc" "poweroff: returns 0 once the VM has stopped"
+if grep -q 'shutdown -h now' "$SSHARGS" 2>/dev/null; then ok "poweroff: asks the guest for 'shutdown -h now'"
+else fail "poweroff: no shutdown command sent" "args: $(cat "$SSHARGS" 2>/dev/null)"; fi
+if grep -q 'sudo -S' "$SSHARGS" 2>/dev/null && ! grep -q 'pw-for-test' "$SSHARGS"; then ok "poweroff: sudo -S, password never on the ssh argv"
+else fail "poweroff: sudo/argv shape wrong" "args: $(cat "$SSHARGS" 2>/dev/null)"; fi
+eq "pw-for-test" "$(cat "$SSHIN" 2>/dev/null)" "poweroff: the password reaches ssh on stdin"
+
+_stop_after_ssh=0; _ssh_mode=ok            # request accepted but the VM never stops: use the full budget
+run_poweroff 3 1
+eq "1" "$prc" "poweroff: returns 1 when the VM is still running at the deadline"
+
+_ssh_mode=fail
+run_poweroff 30 2
+eq "1" "$prc" "poweroff: ssh failure + VM still running → returns 1"
+if (( elapsed <= 6 )); then ok "poweroff: ssh failure waits only the short grace, not the full budget (${elapsed}s)"
+else fail "poweroff: ssh failure still waited ${elapsed}s" "budget was 30s, grace 2s"; fi
+
+_ssh_mode=hang
+run_poweroff 3 1
+eq "1" "$prc" "poweroff: hung ssh → returns 1 at the deadline"
+if (( elapsed <= 7 )); then ok "poweroff: a hung ssh is cut off at the budget (${elapsed}s)"
+else fail "poweroff: hung ssh blocked for ${elapsed}s" "budget was 3s"; fi
+if pgrep -x -f '^sleep 31\.37$' >/dev/null; then fail "poweroff: the hung ssh process was left running" "$(pgrep -x -f '^sleep 31\.37$')"; pkill -x -f '^sleep 31\.37$'
+else ok "poweroff: the hung ssh process tree was killed"; fi
+
+# restore the cmd_down_macos-level stubs for the sections below
+macos_guest_poweroff() { echo "poweroff $1" >> "$LOG"; return 0; }
+macos_vm_running() { return $_vm_running; }
+unset -f ssh_macos macos_admin_password_stdin
 
 section "Tier 1 — down --macos: no VM for this directory"
 
