@@ -82,11 +82,16 @@ else fail "build: the base VM is no longer a clone of the build VM" "the credent
 
 # up/update check the credential before booting anything.
 up="$(declare -f cmd_up_macos)"
-req_at="$(printf '%s\n' "$up" | grep -n 'require_macos_admin_password "$project_vm"' | head -n1 | cut -d: -f1)"
+req_at="$(printf '%s\n' "$up" | grep -n 'require_macos_admin_password "$project_vm"' | tail -n1 | cut -d: -f1)"
 set_at="$(printf '%s\n' "$up" | grep -n '"$VM_CLI" set "$project_vm"' | head -n1 | cut -d: -f1)"
 if [[ -n "$req_at" && -n "$set_at" && "$req_at" -lt "$set_at" ]]; then
   ok "up --macos: checks the project VM's credential before set/run"
 else fail "up --macos: does not check the project VM's credential before set/run" "require@${req_at:-?} set@${set_at:-?}"; fi
+# The already-running branch returns early, so it needs its own check before that return.
+running_branch="$(printf '%s\n' "$up" | awk '/if macos_vm_running "\$project_vm"; then/{f=1} f{print} f&&/return 0/{exit}')"
+if [[ "$running_branch" == *'require_macos_admin_password "$project_vm"'* ]]; then
+  ok "up --macos: the already-running branch checks the credential before returning"
+else fail "up --macos: the already-running branch returns without checking the credential" "${running_branch:0:80}"; fi
 update="$(declare -f cmd_update_macos)"
 req_at="$(printf '%s\n' "$update" | grep -n 'require_macos_admin_password "$MACOS_BASE_VM"' | head -n1 | cut -d: -f1)"
 run_at="$(printf '%s\n' "$update" | grep -n '"$VM_CLI" run' | head -n1 | cut -d: -f1)"

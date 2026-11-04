@@ -14,7 +14,7 @@ hand, or flips on Remote Login in System Settings — `cmd_build_macos` goes str
 headless first boot and waits for SSH.
 
 On this path the account password is **generated randomly** per base-VM build (`openssl rand
--base64 24`) and persisted host-side at `~/.augur/macos-admin-password` (mode 600). It is
+-base64 24`) and persisted host-side (mode 600; per VM since the 2026-11-04 amendment). It is
 **not** the fixed `admin`/`admin` credential ADR-0007 kept.
 
 Everything else is unchanged, and unconditionally so: **any other combination — host below
@@ -132,6 +132,32 @@ moment `macos_admin_password()` is always correct for it, never against an alrea
 project clone. Only `sync_macos_guest_clock` needed the hint. See the corrected "Why every
 clone..." section above, which named all three (plus `ssh_macos_bootstrap`) as clone-facing
 before this amendment.
+
+## Amendment (2026-11-04, the credential moves into each VM's bundle)
+
+The host-wide `~/.augur/macos-admin-password` is gone. Each VM now carries its own admin
+password at `~/.augur/vms/<vm>/admin-password` (mode 600), inside the bundle directory
+`augur-vm` keeps for it. `augur-vm clone` is a `clonefile(2)` of the whole bundle, so build VM →
+base VM → project VM inherit the credential their disk was built with, and `augur-vm delete`
+removes it with the VM. Both build flows write it explicitly (the random password on the
+automated path, `admin` on the manual one) right after `create`; nothing infers `admin` from a
+missing file any more.
+
+This removes the stale-clone problem the 2026-09-19 amendment diagnosed, instead of diagnosing
+it: rebuilding the base no longer changes any existing clone's credential, so
+`warn_if_stale_admin_password()` was deleted along with the host-wide file. It also fixes a gap
+that amendment did not cover: the manual flow used to delete the host-wide file before the
+operator had finished Setup Assistant, so an aborted manual build stranded clones of an earlier
+automated base.
+
+A VM without the file — any base or clone built by an earlier augur — is refused by
+`require_macos_admin_password()` with the remedy (rebuild the base, then `augur destroy --macos
+&& augur up --macos` per project), checked before `up` (including on an already-running VM),
+`update` and `install-cert` touch the VM. There is deliberately no migration path: augur is a
+personal tool and rebuilding is the expected remedy.
+
+The rest of this ADR's text that says "`~/.augur/macos-admin-password`" describes the
+superseded layout.
 
 ## Context
 

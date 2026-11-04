@@ -4043,6 +4043,9 @@ cmd_up_macos() {
     # drift: macOS mode has no container_fingerprint, so there is no reliable drift signal. The only
     # way this path ends non-zero is the self-test detecting a leak.
     if macos_vm_running "$project_vm"; then
+        # Same refusal as the stopped/fresh path below: a running VM without a stored admin
+        # password would otherwise reconcile "successfully" while every sudo into it fails.
+        require_macos_admin_password "$project_vm"
         warn "VM '${project_vm}' is already running — reconciling host-side state only."
         if egress_enabled; then
             check_project_conf_approved      # the gate runs wherever policy is written

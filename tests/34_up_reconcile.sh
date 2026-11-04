@@ -126,6 +126,7 @@ MACOS_MODE=true
 require_vz()        { :; }
 macos_vm_exists()   { return 0; }
 macos_vm_running()  { return 0; }
+require_macos_admin_password() { :; }   # its refusal is covered by 41_macos_admin_password_unit.sh
 start_gvproxy()     { echo "start_gvproxy" >> "$LOG"; }
 stop_gvproxy()      { :; }
 stop_proxy()        { :; }
