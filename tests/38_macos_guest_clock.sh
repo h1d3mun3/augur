@@ -69,6 +69,11 @@ HOME="$TMPD/home"; mkdir -p "$HOME"
 AUGUR_DIR="$TMPD/augur"
 AUGUR_PROXY_DIR="$TMPD/proxy"; mkdir -p "$AUGUR_PROXY_DIR"
 WORKSPACE_DIR="$TMPD/proj"; mkdir -p "$WORKSPACE_DIR"
+# The stored admin credentials of the VMs this file sudoes into (see macos_admin_password()): the
+# fixed manual-setup one, so sudo's stdin can be checked against MACOS_SSH_USER.
+for _vm in testvm "$(macos_project_vm)"; do
+    mkdir -p "$AUGUR_DIR/vms/$_vm"; macos_store_admin_password "$_vm" "$MACOS_SSH_USER"
+done
 unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN
 gh() { return 1; }                        # no host gh token: keeps the credential-helper wiring a no-op
 
@@ -280,18 +285,17 @@ eq "0" "$rc" "set refused: returns 0 (\`up\` must not die with the VM already bo
 has "$out" "Could not set the guest's clock" "set refused: warns that the set failed"
 has "$out" "Sorry, try again." "set refused: surfaces sudo's own diagnostic (not swallowed)"
 has "$out" "Tokens, TLS validity windows and commit timestamps" "set refused: names what will be wrong"
-has "$out" "augur destroy && augur up --macos" "set refused: hints that a stale clone password can cause exactly this"
 hasnt "$out" "Guest clock synchronised with the host" "set refused: never claims success"
 # The recorded-call proof of the early return: the read-back must NOT be attempted after a failed set.
 eq "2" "$(n_calls)" "set refused: stops after the failed set (no pointless read-back)"
 
-# (a2) the set fails for some OTHER reason — the stale-password hint must not fire on every failure,
-# only on the one PAM message that actually means "the password was wrong".
+# (a2) the set fails for some OTHER reason: the same best-effort warning, carrying that failure's
+# own diagnostic.
 reset_guest; g_offset -5733; G_SET_RC=1; G_SET_BADREASON=1
 sync
 eq "0" "$rc" "set refused (other reason): returns 0"
 has "$out" "Could not set the guest's clock" "set refused (other reason): still warns that the set failed"
-hasnt "$out" "augur destroy && augur up --macos" "set refused (other reason): no stale-password hint on an unrelated failure"
+has "$out" "illegal time format" "set refused (other reason): surfaces that failure's own diagnostic"
 
 # (b) the guest is unreachable. Nothing may be sent — least of all a privileged command whose
 # argument would be derived from an unread clock.

@@ -181,6 +181,7 @@ hasnt "$build_macos" 'ssh -F /dev/null'    "build has no raw password 'ssh -F /d
 has "$boot_fn" 'SSH_ASKPASS_REQUIRE=force'        "bootstrap forces askpass even with a TTY / no DISPLAY (OpenSSH >=8.4)"
 has "$boot_fn" 'StrictHostKeyChecking=accept-new' "bootstrap pre-accepts the fresh host key (keeps the yes/no prompt off askpass)"
 has "$boot_fn" '*[Pp]assword:*'                   "bootstrap askpass replies to password prompts only (never feeds the host-key question)"
+has "$boot_fn" 'macos_admin_password "$vm"'       "bootstrap answers with the password stored for the VM it connects to"
 # (3) key install must precede the passwordless-sudo config (so sudo config runs over key auth).
 key_ln="$(printf '%s\n' "$build_macos"  | grep -n 'Setting up SSH key authentication' | head -1 | cut -d: -f1)"
 sudo_ln="$(printf '%s\n' "$build_macos" | grep -n 'Configuring passwordless sudo'      | head -1 | cut -d: -f1)"
@@ -202,7 +203,7 @@ section "Tier 2 — macOS build SSH bootstrap: cleanup + status (execution guard
 # build aborts, temp helper still removed.
 boot_src="$(mktemp)"; boot_td="$(mktemp -d)"
 awk '/^ssh_macos_bootstrap\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR" > "$boot_src"
-_stubs='error(){ :; }; vm_known_hosts_file(){ echo /dev/null; }; MACOS_SSH_USER=admin;'
+_stubs='error(){ :; }; vm_known_hosts_file(){ echo /dev/null; }; macos_admin_password(){ echo admin; }; MACOS_SSH_USER=admin;'
 # success path
 out_s="$(TMPDIR="$boot_td" bash -euo pipefail -c '
   source "$1"; '"$_stubs"'

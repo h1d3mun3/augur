@@ -70,6 +70,8 @@ CONTAINER_NAME="$(make_container_name)"
 WORKSPACE_MOUNT="$(make_workspace_mount)"
 MACOS_SHARE="workspace-$(workspace_slug)"
 MACOS_MODE=true
+# The project VM's stored admin credential (which the real `augur-vm clone` copies from the base).
+mkdir -p "$AUGUR_DIR/vms/$(macos_project_vm)"; macos_store_admin_password "$(macos_project_vm)" admin
 
 LOG="$TMPD/calls"       # teardown / reconcile recorder, one anchor line per call
 SSHLOG="$TMPD/sshlog"   # every remote command string the self-test issued, in order
