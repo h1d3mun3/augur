@@ -182,6 +182,6 @@ done <<< "$code"
 eq "" "$_bad" "every \`sudo -S\` is fed by macos_admin_password_stdin for the same VM, piped into an ssh_macos* wrapper"
 eq "0" "$(printf '%s\n' "$code" | grep -cE 'macos_admin_password_stdin "[^"]*" \| ssh_macos_provision "')" \
     "the password is never piped into ssh_macos_provision (its -n would drop it; use ssh_macos_provision_stdin)"
-eq "8" "$_sites" "eight sudo -S call sites use the helper (build, provisioning, managed policy, xcode-select, clock, timezone, guest session, guest poweroff)"
+eq "9" "$_sites" "nine sudo -S call sites use the helper (build sudoers, manual-flow auto-login, provisioning, managed policy, xcode-select, clock, timezone, guest session, guest poweroff)"
 
 finish

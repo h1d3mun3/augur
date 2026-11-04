@@ -171,12 +171,16 @@ section "Tier 2 — macOS build SSH bootstrap: no human-typed password (source g
 # interactive login-password prompt — augur feeds the fixed admin password via OpenSSH's own
 # SSH_ASKPASS (SSH_ASKPASS_REQUIRE=force, ssh_macos_bootstrap), so the operator types nothing
 # after Setup Assistant. The key is installed FIRST, so the sudo-config and everything after run
-# over key auth (a single password-auth connection).
+# over key auth (the shared path's only password-auth connection; the manual flow's auto-login
+# step, which runs before any key exists, is the other one).
 build_macos="$(awk '/^cmd_build_macos\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
 boot_fn="$(awk '/^ssh_macos_bootstrap\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
 # (1) the build reaches the guest only via the ssh_macos* helpers — never a raw password `ssh`.
 has   "$build_macos" 'ssh_macos_bootstrap' "build installs the SSH key via ssh_macos_bootstrap (askpass), not a raw ssh"
 hasnt "$build_macos" 'ssh -F /dev/null'    "build has no raw password 'ssh -F /dev/null' left (all via ssh_macos* helpers)"
+manual_fn="$(awk '/^macos_first_boot_manual\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
+has   "$manual_fn" 'ssh_macos_bootstrap' "manual flow writes auto-login via ssh_macos_bootstrap (askpass)"
+hasnt "$manual_fn" 'ssh -F /dev/null'    "manual flow has no raw password ssh"
 # (2) the bootstrap helper forces askpass and answers ONLY password prompts.
 has "$boot_fn" 'SSH_ASKPASS_REQUIRE=force'        "bootstrap forces askpass even with a TTY / no DISPLAY (OpenSSH >=8.4)"
 has "$boot_fn" 'StrictHostKeyChecking=accept-new' "bootstrap pre-accepts the fresh host key (keeps the yes/no prompt off askpass)"
@@ -186,7 +190,7 @@ has "$boot_fn" 'macos_admin_password "$vm"'       "bootstrap answers with the pa
 key_ln="$(printf '%s\n' "$build_macos"  | grep -n 'Setting up SSH key authentication' | head -1 | cut -d: -f1)"
 sudo_ln="$(printf '%s\n' "$build_macos" | grep -n 'Configuring passwordless sudo'      | head -1 | cut -d: -f1)"
 if [[ -n "$key_ln" && -n "$sudo_ln" && "$key_ln" -lt "$sudo_ln" ]]; then
-  ok "build installs the SSH key before configuring passwordless sudo (single password-auth connection)"
+  ok "build installs the SSH key before configuring passwordless sudo (the shared path's only password-auth connection)"
 else
   fail "build orders key-install before sudo-config" "key@${key_ln:-?} sudo@${sudo_ln:-?}"
 fi

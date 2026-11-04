@@ -45,14 +45,14 @@ struct RunCommand: ParsableCommand {
     // the Makefile's `make unit`, and a plain `swift build`) and only a source-level condition
     // covers all of them identically.
     //
-    // These options are gated too, not just their implementation, so `run --help` is an honest
-    // report of what this binary can do — which is what augur probes before choosing the
-    // automated path (see vm_cli_supports_provisioning).
+    // These options are gated too, not just their implementation, so a binary without the feature
+    // rejects them as unknown instead of accepting and ignoring them. `provisioning-support`
+    // reports the same compile-time fact (with the host and guest checks) to augur.
     #if compiler(>=6.4)
     // Only meaningful on the guest's FIRST boot after `create` — the framework ignores these
     // once a guest has already been provisioned. See RunSession.swift.
     @Option(name: .customLong("provision-username"),
-            help: "Create this account automatically on first boot instead of waiting for a manually-run Setup Assistant. Requires --provision-password-stdin, --no-graphics, and a macOS 27+ host; has no effect on a guest whose OS predates macOS 27 (see `augur-vm guest-os-version`).")
+            help: "Create this account automatically on first boot instead of waiting for a manually-run Setup Assistant. Requires --provision-password-stdin, --no-graphics, and a macOS 27+ host; has no effect on a guest whose OS predates macOS 27 (`augur-vm provisioning-support <name>` reports whether host, guest and binary qualify).")
     var provisionUsername: String?
 
     // The password is read from stdin, never taken as an option: a process's arguments are

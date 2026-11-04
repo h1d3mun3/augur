@@ -108,8 +108,8 @@ final class RunSession: NSObject, VZVirtualMachineDelegate {
                 // Only meaningful on the guest's FIRST boot after `create` — Virtualization
                 // ignores these options on every later boot, and on a guest whose installed
                 // OS predates macOS 27 (RunCommand.swift's --no-graphics requirement plus this
-                // host check are the only gates here; augur's `cmd_build_macos` is what also checks
-                // the GUEST's OS version via `guest-os-version` before ever passing these flags).
+                // host check are the only gates here; augur asks `provisioning-support`, which also
+                // checks the GUEST's OS version, before ever passing these flags).
                 guard #available(macOS 27, *) else {
                     fail("--provision-username/--provision-password-stdin need a macOS 27+ host (Virtualization's automated guest provisioning is unavailable on this host)")
                     return
@@ -144,8 +144,8 @@ final class RunSession: NSObject, VZVirtualMachineDelegate {
     #if compiler(>=6.4)
     /// Builds start options that provision the guest's admin account on first boot
     /// (`VZMacGuestProvisioningOptions`, macOS 27+ host and guest only — see boot()).
-    /// `logsInAutomatically` replaces augur's kcpassword hack (the legacy manual-Setup-
-    /// Assistant path in `cmd_build_macos` still needs that hack; this path doesn't), and
+    /// `logsInAutomatically` replaces augur's kcpassword hack (augur's manual Setup
+    /// Assistant flow, `macos_first_boot_manual`, still needs that hack; this path doesn't), and
     /// `enablesRemoteLogin` replaces the manual "System Settings → Sharing → Remote Login"
     /// step, so the caller can go straight to a headless boot and wait for SSH.
     @available(macOS 27, *)
@@ -169,7 +169,7 @@ final class RunSession: NSObject, VZVirtualMachineDelegate {
     /// `com.apple.Virtualization.VirtualMachine` XPC service that outlives the `create`
     /// process which spawned it, so the lock can still be held for a while after `create`
     /// has exited and printed "created". A `run` issued immediately afterwards therefore
-    /// loses a race it wins a moment later. `cmd_build_macos`'s automated path does exactly
+    /// loses a race it wins a moment later. augur's `macos_first_boot_automated` does exactly
     /// that; the manual Setup Assistant flow only ever got away with it because its
     /// "press Enter to open the VM window" prompt made a human sit out the window.
     private func handleStartFailure(_ error: Error, attemptsLeft: Int) {
