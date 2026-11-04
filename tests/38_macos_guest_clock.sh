@@ -70,9 +70,9 @@ AUGUR_DIR="$TMPD/augur"
 AUGUR_PROXY_DIR="$TMPD/proxy"; mkdir -p "$AUGUR_PROXY_DIR"
 WORKSPACE_DIR="$TMPD/proj"; mkdir -p "$WORKSPACE_DIR"
 # The stored admin credentials of the VMs this file sudoes into (see macos_admin_password()): the
-# fixed manual-setup one, so sudo's stdin can be checked against MACOS_SSH_USER.
+# fixed manual-setup one, so sudo's stdin can be checked against MACOS_MANUAL_SETUP_PASSWORD.
 for _vm in testvm "$(macos_project_vm)"; do
-    mkdir -p "$AUGUR_DIR/vms/$_vm"; macos_store_admin_password "$_vm" "$MACOS_SSH_USER"
+    mkdir -p "$AUGUR_DIR/vms/$_vm"; macos_store_admin_password "$_vm" "$MACOS_MANUAL_SETUP_PASSWORD"
 done
 unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN
 gh() { return 1; }                        # no host gh token: keeps the credential-helper wiring a no-op
@@ -205,7 +205,7 @@ if did_set; then ok "skewed guest: the set is 'sudo -S -p '' /bin/date -u <stamp
 else fail "skewed guest: the privileged set does not have the intended shape" "log: [$(tr '\n' ' ' < "$SSHLOG")]"; fi
 has "$(cat "$SSHLOG")" "sudo -S -p ''" "skewed guest: uses \`sudo -S\` (a project clone has no NOPASSWD grant)"
 has "$(cat "$SSHLOG")" "/bin/date"     "skewed guest: pins date's absolute path (no \$HOME/.local/bin shadowing)"
-eq "$MACOS_SSH_USER" "$(head -n1 "$TMPD/sudo-stdin" 2>/dev/null)" "skewed guest: sudo's password arrives on ssh's stdin"
+eq "$MACOS_MANUAL_SETUP_PASSWORD" "$(head -n1 "$TMPD/sudo-stdin" 2>/dev/null)" "skewed guest: sudo's password arrives on ssh's stdin"
 hasnt "$(cat "$SSHLOG")" "echo '" "skewed guest: no password is echoed inside the remote command"
 
 # …and the VALUE is the HOST's time now. $_before/$_after bracket the run, so this fails for a

@@ -20,10 +20,12 @@ On this path the account password is **generated randomly** per base-VM build (`
 Everything else is unchanged, and unconditionally so: **any other combination — host below
 macOS 27, or an IPSW installing a guest OS below macOS 27 — takes the exact manual Setup
 Assistant flow ADR-0007 already shipped**, with the fixed `admin`/`admin` credential.
-`cmd_build_macos` decides from `sw_vers -productVersion` (host) and `augur-vm
-guest-os-version` (the guest OS version captured from
-`VZMacOSRestoreImage.operatingSystemVersion` at `create` time and persisted in the VM's
-`config.json`), and `--manual-setup` forces the manual flow even when both sides qualify.
+The decision comes from one probe, `augur-vm provisioning-support <vm>`, which checks the host
+OS, the guest OS version captured from `VZMacOSRestoreImage.operatingSystemVersion` at `create`
+time and persisted in the VM's `config.json`, and whether the binary was built with the feature
+(see the 2026-11-04 "one eligibility probe" amendment; this paragraph originally named `sw_vers
+-productVersion` and `augur-vm guest-os-version`). `--manual-setup` forces the manual flow even
+when both sides qualify.
 
 The password reaches `augur-vm` on **stdin** (`--provision-password-stdin`), never as a command
 argument: argv is observable for the whole life of the boot, and this is the same shape augur
@@ -158,6 +160,36 @@ personal tool and rebuilding is the expected remedy.
 
 The rest of this ADR's text that says "`~/.augur/macos-admin-password`" describes the
 superseded layout.
+
+## Amendment (2026-11-04, one eligibility probe)
+
+The automated-vs-manual decision used to be assembled in `augur` from three separate checks:
+`host_macos_major_version` (`sw_vers`), `augur-vm guest-os-version`, and
+`vm_cli_supports_provisioning` (a `run --help` probe for the compile-time-gated flags). It is
+now one question to `augur-vm`: `augur-vm provisioning-support <vm>` prints exactly one of
+`supported`, `host`, `guest` or `sdk`. It checks host → guest → SDK in that order, so `sdk` is
+reported only when host and guest both qualify, i.e. only when rebuilding `augur-vm` with
+Xcode 27+ would actually enable the feature. A missing VM or unreadable config exits 1; an
+`augur-vm` that predates the subcommand exits 64 (ArgumentParser's usage error), and the check
+deliberately lives in `run()`, not `validate()`, so the two stay distinguishable.
+
+`macos_setup_flow` turns that answer into a flow: `supported` → automated; `host`/`guest` →
+manual, silently (the OS pair simply does not qualify); `sdk` → manual with a warning naming the
+fix, never a silent downgrade; exit 64 → manual with a one-line `bash install` hint; anything
+else → an error that includes `augur-vm`'s own message. Its stdout is only the flow name; every
+message goes to stderr. `host_macos_major_version`, `vm_cli_supports_provisioning` and the
+`guest-os-version` subcommand are removed.
+
+`cmd_build_macos` no longer interleaves the two paths: each flow is one function
+(`macos_first_boot_automated`, `macos_first_boot_manual`), each storing its own credential. The
+manual flow's fixed password is the named constant `MACOS_MANUAL_SETUP_PASSWORD`, and the
+`/etc/kcpassword` bytes are the constant `MACOS_MANUAL_SETUP_KCPASSWORD`. Those bytes encode
+`admin` + NUL + filler and are kept as known-good bytes rather than derived at runtime, so
+`macos_first_boot_manual` refuses to run if the password constant is ever changed without
+re-encoding them.
+
+The rest of this ADR's text that names `sw_vers`, `guest-os-version`,
+`host_macos_major_version` or `vm_cli_supports_provisioning` describes the superseded mechanism.
 
 ## Context
 

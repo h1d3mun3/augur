@@ -232,7 +232,9 @@ This will:
 2. Provision the account — **automatically**, with no GUI window, when both this host and the
    IPSW's guest OS are macOS 27+ (with a randomly generated password); otherwise open the VM
    window for manual Setup Assistant completion (credentials: `admin` / `admin`, Remote Login
-   enabled). Pass `--manual-setup` to take the manual flow even on a macOS 27+ pair. Either way
+   enabled). The automated flow also needs `augur-vm` built with Xcode 27+ (`bash install`); when
+   only that is missing, the build says so and falls back to the manual flow. Pass `--manual-setup`
+   to take the manual flow even on a qualifying macOS 27+ pair. Either way
    the admin password is stored inside the VM's own bundle (`~/.augur/vms/<vm>/admin-password`,
    mode 600), so each project VM cloned from the base carries the password its disk was built
    with. A VM without that file (e.g. a base built by an older augur) is refused: rebuild the
