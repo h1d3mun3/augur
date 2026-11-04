@@ -643,7 +643,7 @@ host_macos_major_version() {
 
 # Does the resolved augur-vm actually support macOS 27's automated provisioning? The host's own
 # OS version is not evidence: `VZMacGuestProvisioningOptions` exists only in the macOS 27 SDK,
-# so augur-vm compiles the feature out when built against an older one (see Run.swift's
+# so augur-vm compiles the feature out when built against an older one (see RunCommand.swift's
 # `#if compiler(>=6.4)`), and `install` builds it from whatever Xcode the host had AT THAT TIME.
 # A host upgraded to macOS 27 without re-running `bash install` therefore reports 27 while
 # running a binary that never had the flags. Asking the binary keeps that case on the manual
@@ -697,8 +697,8 @@ macos_vm_ip() {
 # an IP with nothing listening on port 22 yet ("Connection refused"). Bash's /dev/tcp avoids a
 # dependency on `nc`. Wall-clock budget (mirrors wait_for_macos_ssh), not a fixed iteration
 # count, and generous: giving up early on a guest that is still legitimately mid-provisioning
-# makes the caller tear down (SIGKILL, per Stop.swift) a VM that was about to come up, turning
-# a slow boot into a failed build. Pass a larger budget for a cold first boot (see
+# makes the caller tear down (SIGKILL, per StopCommand.swift) a VM that was about to come up,
+# turning a slow boot into a failed build. Pass a larger budget for a cold first boot (see
 # cmd_build_macos's automated-provisioning call).
 macos_wait_for_ssh() {
     local ip="$1" port="${2:-22}" max_secs="${3:-180}"

@@ -21,8 +21,8 @@ final class RunSession: NSObject, VZVirtualMachineDelegate {
     private let netAllowNAT: Bool
     /// Automated first-boot account setup (VZMacGuestProvisioningOptions, macOS 27+ host
     /// only — see boot()). Both nil unless `augur-vm run --provision-username` plus
-    /// `--provision-password-stdin` was given (Run.swift's validate() guarantees they come as a
-    /// pair), and always nil in a build whose SDK predates macOS 27, where those flags and the
+    /// `--provision-password-stdin` was given (RunCommand.swift's validate() guarantees they come
+    /// as a pair), and always nil in a build whose SDK predates macOS 27, where those flags and the
     /// code behind them are compiled out entirely.
     private let provisionUsername: String?
     private let provisionPassword: String?
@@ -99,16 +99,16 @@ final class RunSession: NSObject, VZVirtualMachineDelegate {
             let announce = attemptsLeft == RunSession.auxLockRetryLimit
 
             // Compiled out when building against an SDK older than macOS 27, which has no
-            // VZMacGuestProvisioningOptions to reference — see Run.swift for why the gate is
-            // `compiler(>=6.4)` and why `@available` cannot do this job. With the feature out,
+            // VZMacGuestProvisioningOptions to reference — see RunCommand.swift for why the gate
+            // is `compiler(>=6.4)` and why `@available` cannot do this job. With the feature out,
             // provisionUsername is always nil (its flags do not exist), so every boot takes the
             // plain start below.
             #if compiler(>=6.4)
             if let username = provisionUsername, let password = provisionPassword {
                 // Only meaningful on the guest's FIRST boot after `create` — Virtualization
                 // ignores these options on every later boot, and on a guest whose installed
-                // OS predates macOS 27 (Run.swift's --no-graphics requirement plus this host
-                // check are the only gates here; augur's `cmd_build_macos` is what also checks
+                // OS predates macOS 27 (RunCommand.swift's --no-graphics requirement plus this
+                // host check are the only gates here; augur's `cmd_build_macos` is what also checks
                 // the GUEST's OS version via `guest-os-version` before ever passing these flags).
                 guard #available(macOS 27, *) else {
                     fail("--provision-username/--provision-password-stdin need a macOS 27+ host (Virtualization's automated guest provisioning is unavailable on this host)")
