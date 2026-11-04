@@ -75,7 +75,8 @@ complete_words() {
 
 eq $'down\ndestroy' "$(complete_words augur d)" "subcommand: 'd' completes down/destroy"
 has "$(complete_words augur '')" "destroy" "subcommand: empty word offers the subcommands"
-eq "--macos" "$(complete_words augur destroy --ma)" "option: '--ma' completes --macos"
+eq $'--macos\n--manual-setup' "$(complete_words augur build --ma)" "option: '--ma' completes --macos/--manual-setup"
+eq "--macos" "$(complete_words augur destroy --mac)" "option: '--mac' completes --macos"
 eq $'augur-c1-0011aabbccdd-swift-latest\naugur-c2-eeff22334455-swift-6-0' "$(complete_words augur destroy '')" \
   "destroy: offers the container names"
 eq "augur-c2-eeff22334455-swift-6-0" "$(complete_words augur destroy augur-c2)" "destroy: filters names by the typed prefix"

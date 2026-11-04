@@ -32,7 +32,7 @@ _augur() {
     esac
 
     if [[ $words[CURRENT] == -* ]]; then
-        compadd -- --macos --gui --egress --no-egress --swift --ipsw --xcode-xip --platforms
+        compadd -- --macos --gui --egress --no-egress --swift --ipsw --xcode-xip --platforms --manual-setup
         return
     fi
 

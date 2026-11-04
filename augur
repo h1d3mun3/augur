@@ -5742,7 +5742,7 @@ cmd_help() {
     echo -e "    augur ${CYAN}init-conf${RESET}                  Scaffold ./.augur/{allowlist,resources}.conf + ~/.augur/provision/*"
     echo ""
     echo -e "  ${BOLD}MACOS VM MODE${RESET}  ${YELLOW}(macOS VM — full Xcode, xcodebuild, Simulator)${RESET}"
-    echo -e "    augur ${CYAN}build${RESET}  --macos --ipsw <path> --xcode-xip <path> [--platforms <list>]  Build base VM (one-time)"
+    echo -e "    augur ${CYAN}build${RESET}  --macos --ipsw <path> --xcode-xip <path> [--platforms <list>] [--manual-setup]  Build base VM (one-time)"
     echo -e "    augur ${CYAN}up${RESET}     --macos [--gui]                           Start project VM (--gui opens a window)"
     echo -e "    augur ${CYAN}claude${RESET} --macos                                   Launch Claude Code"
     echo -e "    augur ${CYAN}shell${RESET}  --macos                                   Open bash shell"
@@ -5765,6 +5765,7 @@ cmd_help() {
     echo -e "    --xcode-xip <path> Xcode XIP file   (for: augur build --macos)"
     echo -e "    --platforms <list> Simulator platforms to bake into the base VM (for: augur build --macos)"
     echo -e "                       default: ${CYAN}iOS${RESET} — comma-separated (e.g. ${CYAN}iOS,watchOS${RESET}) or ${CYAN}all${RESET}"
+    echo -e "    --manual-setup     Use the manual Setup Assistant flow even on a macOS 27+ host and guest (for: augur build --macos)"
     echo ""
     echo -e "  ${BOLD}ENVIRONMENT${RESET}"
     # AUGUR_AGENT_SEAM | agent credential env-var docs (mirror agent_auth_specs)

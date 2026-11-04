@@ -20,7 +20,7 @@ _augur() {
     esac
 
     if [[ "$cur" == -* ]]; then
-        COMPREPLY=( $(compgen -W "--macos --gui --egress --no-egress --swift --ipsw --xcode-xip --platforms" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--macos --gui --egress --no-egress --swift --ipsw --xcode-xip --platforms --manual-setup" -- "$cur") )
         return 0
     fi
 
