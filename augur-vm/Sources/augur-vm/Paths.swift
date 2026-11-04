@@ -6,6 +6,8 @@ import Foundation
 ///     disk.img      main APFS-clonable disk image
 ///     nvram.bin     VZMacAuxiliaryStorage
 ///     run.pid       pidfile/lock written by `run`; used for running-state + stop
+///     admin-password  the guest admin account's password (mode 600), written and read by the
+///                   `augur` script, never by augur-vm; `clone` copies it with the rest
 enum Paths {
     static var home: URL { FileManager.default.homeDirectoryForCurrentUser }
     static var root: URL { home.appendingPathComponent(".augur/vms", isDirectory: true) }

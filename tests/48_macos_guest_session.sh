@@ -51,7 +51,7 @@ out="$( set -e; configure_macos_guest_session testvm 2>&1 )"; rc=$?
 eq "0" "$rc" "failing guest: still returns 0 under \`set -e\`"
 has "$out" "Could not disable the guest's screen lock" "failing guest: warns"
 has "$out" "lock screen" "failing guest: names the consequence"
-has "$out" "rejected sudo password" "failing guest: a rejected password is diagnosed as such"
+has "$out" "vms/testvm/admin-password" "failing guest: says where the admin password to log in with is stored"
 
 section "Tier 1 — cmd_up_macos wires it in after the clock correction"
 body="$(declare -f cmd_up_macos)"

@@ -223,6 +223,7 @@ sync_macos_guest_clock() { :; }; sync_macos_guest_timezone() { :; }; ensure_maco
 ensure_macos_claude_projects() { :; }; ensure_macos_claude_agents() { :; }; ensure_macos_claude_profile() { :; }
 ensure_macos_claude_bin() { :; }; warn_if_macos_egress_pinned() { :; }; macos_project_vm() { echo augur-test-vm; }
 check_project_conf_approved() { :; }; macos_vm_exists() { return 0; }
+require_macos_admin_password() { :; }   # its refusal is covered by 41_macos_admin_password_unit.sh
 reconcile_running_container() { echo "RECONCILE_CALLED"; }
 verify_macos_egress_locked() { echo "SELFTEST_CALLED"; }
 agent_verify_integrity_engine() { return 1; }   # setup-token stops right after the gate, before any tty read

@@ -32,8 +32,8 @@ AUGUR_DIR="$TMPD/augur"
 unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN
 
 SECRET='pW9+tEsT/sEcReT=='                # base64-alphabet, like cmd_build_macos's generator
-MACOS_ADMIN_PASSWORD_FILE="$TMPD/macos-admin-password"
-printf '%s\n' "$SECRET" > "$MACOS_ADMIN_PASSWORD_FILE"
+mkdir -p "$AUGUR_DIR/vms/testvm"           # testvm's bundle; its stored credential is the secret
+macos_store_admin_password testvm "$SECRET"
 # shellcheck disable=SC2034  # read by the sourced ssh wrappers: no key, so no -i/BatchMode opts
 MACOS_SSH_KEY="$TMPD/no-such-key"
 
@@ -92,13 +92,22 @@ out="$( set -e; sync_macos_guest_clock testvm 2>&1 )"
 has "$out" "Guest clock synchronised with the host" "clock: the set succeeded against a sudo that reads stdin"
 check_site "clock"
 
-# A stale password still surfaces as a rejected sudo password (warn_if_stale_admin_password).
+# A rejected password is still best-effort, and sudo's own diagnostic is what the operator sees.
 GUEST_PW="some-other-password"; reset_log
 out="$( set -e; sync_macos_guest_clock testvm 2>&1 )"; rc=$?
 GUEST_PW="$SECRET"
 eq "0" "$rc" "clock, wrong password: still best-effort (rc 0)"
 has "$out" "Sorry, try again." "clock, wrong password: sudo's diagnostic is still captured"
-has "$out" "augur destroy && augur up --macos" "clock, wrong password: the stale-password hint still fires"
+
+# A VM with no stored credential: no password reaches sudo, and the warning names why.
+reset_log
+out="$( set -e; sync_macos_guest_clock nocredvm 2>&1 )"; rc=$?
+eq "0" "$rc" "clock, VM without a stored credential: still best-effort (rc 0)"
+has "$out" "no stored admin password" "clock, VM without a stored credential: the warning names the missing credential"
+n="$(sudo_call)"
+if [[ -n "$n" ]] && grep -qF -- "$SECRET" "$LOG/$n.stdin"; then
+    fail "clock, VM without a stored credential: another VM's password was fed to sudo"
+else ok "clock, VM without a stored credential: no other VM's password is fed to sudo"; fi
 
 section "Tier 1 — sync_macos_guest_timezone"
 host_timezone()         { printf 'Asia/Tokyo'; }
@@ -109,9 +118,10 @@ has "$out" "Guest timezone synchronised with the host" "timezone: the set succee
 check_site "timezone"
 
 GUEST_PW="some-other-password"; reset_log
-out="$( set -e; sync_macos_guest_timezone testvm 2>&1 )"
+out="$( set -e; sync_macos_guest_timezone testvm 2>&1 )"; rc=$?
 GUEST_PW="$SECRET"
-has "$out" "augur destroy && augur up --macos" "timezone, wrong password: the stale-password hint still fires"
+eq "0" "$rc" "timezone, wrong password: still best-effort (rc 0)"
+has "$out" "Sorry, try again." "timezone, wrong password: sudo's diagnostic is still captured"
 
 section "Tier 1 — install_macos_managed_settings"
 reset_log
@@ -136,7 +146,7 @@ else fail "xcode-select, wrong password: returned 0" "build would save a base VM
 
 section "Tier 1 — the provisioning wrappers"
 reset_log
-macos_admin_password_stdin | ssh_macos_provision_stdin testvm "sudo -S -p '' true"
+macos_admin_password_stdin testvm | ssh_macos_provision_stdin testvm "sudo -S -p '' true"
 check_site "provision grant wrapper"
 if grep -qx -- '-n' "$LOG/1.argv"; then fail "ssh_macos_provision_stdin passes -n (stdin would be dropped)"
 else ok "ssh_macos_provision_stdin does not pass -n"; fi
@@ -147,25 +157,31 @@ else fail "ssh_macos_provision lost -n" "every remote command would drain run_pr
 
 section "Tier 0 — source guard over augur"
 code="$(grep -vE '^[[:space:]]*#' "$AUGUR")"
-hasnt "$code" "echo '\$(macos_admin_password)'" "no remote command echoes the admin password into sudo"
-# Every line interpolating the password, minus the two sanctioned ones: the stdin helper itself and
+hasnt "$code" "echo '\$(macos_admin_password" "no remote command echoes the admin password into sudo"
+hasnt "$code" '$(macos_admin_password)' "the password is always read for a named VM (no argument-less call)"
+# Every line reading the password, minus the two sanctioned ones: the stdin helper itself and
 # ssh_macos_bootstrap's askpass file (written by printf %q into a 0700 temp file, not an argv).
-_interp="$(printf '%s\n' "$code" | grep -F '$(macos_admin_password)' \
-    | grep -vF "macos_admin_password_stdin() { printf '%s\n' \"\$(macos_admin_password)\"; }" \
-    | grep -vxF '        "$(macos_admin_password)" > "$askpass"')"
-eq "" "$_interp" "the admin password is interpolated nowhere else"
-# Every `sudo -S` code line is fed by the helper, on the same line or the line before it.
-_bad=""; _prev=""
+_interp="$(printf '%s\n' "$code" | grep -F '$(macos_admin_password ' \
+    | grep -vxF '    password="$(macos_admin_password "$1")" || return 1' \
+    | grep -vxF '    password="$(macos_admin_password "$vm")" || exit 1')"
+eq "" "$_interp" "the admin password is read nowhere else"
+# Every `sudo -S` code line is fed by the helper, on the same line or the line before it, for the
+# same VM the ssh wrapper connects to.
+feeds_same_vm() {
+    [[ "$1" =~ macos_admin_password_stdin\ (\"\$[A-Za-z_]+\")\ \|\ ssh_macos[a-z_]*\ (\"\$[A-Za-z_]+\") ]] \
+        && [[ "${BASH_REMATCH[1]}" == "${BASH_REMATCH[2]}" ]]
+}
+_bad=""; _prev=""; _sites=0
 while IFS= read -r _line; do
-    if [[ "$_line" == *"sudo -S"* && "$_line$_prev" != *"macos_admin_password_stdin | ssh_macos"* ]]; then
+    if feeds_same_vm "$_line"; then _sites=$(( _sites + 1 )); fi
+    if [[ "$_line" == *"sudo -S"* ]] && ! feeds_same_vm "$_line" && ! feeds_same_vm "$_prev"; then
         _bad+="$_line"$'\n'
     fi
     _prev="$_line"
 done <<< "$code"
-eq "" "$_bad" "every \`sudo -S\` is fed by macos_admin_password_stdin piped into an ssh_macos* wrapper"
-hasnt "$code" 'macos_admin_password_stdin | ssh_macos_provision "' \
+eq "" "$_bad" "every \`sudo -S\` is fed by macos_admin_password_stdin for the same VM, piped into an ssh_macos* wrapper"
+eq "0" "$(printf '%s\n' "$code" | grep -cE 'macos_admin_password_stdin "[^"]*" \| ssh_macos_provision "')" \
     "the password is never piped into ssh_macos_provision (its -n would drop it; use ssh_macos_provision_stdin)"
-_sites="$(printf '%s\n' "$code" | grep -c 'macos_admin_password_stdin | ssh_macos')"
 eq "8" "$_sites" "eight sudo -S call sites use the helper (build, provisioning, managed policy, xcode-select, clock, timezone, guest session, guest poweroff)"
 
 finish

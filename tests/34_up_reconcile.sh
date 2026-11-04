@@ -126,6 +126,7 @@ MACOS_MODE=true
 require_vz()        { :; }
 macos_vm_exists()   { return 0; }
 macos_vm_running()  { return 0; }
+require_macos_admin_password() { :; }   # its refusal is covered by 41_macos_admin_password_unit.sh
 start_gvproxy()     { echo "start_gvproxy" >> "$LOG"; }
 stop_gvproxy()      { :; }
 stop_proxy()        { :; }
@@ -228,6 +229,8 @@ _clone_exists=1                                   # 0 = a stopped clone exists, 
 macos_vm_exists() { [[ "$1" == "$MACOS_BASE_VM" ]] && return 0; return $_clone_exists; }
 HOME="$TMPD/home"; mkdir -p "$HOME"               # host credential FILES live here; keep off the real ~
 AUGUR_DIR="$TMPD/augur"                           # known_hosts / vm-state writes stay in the sandbox
+# The project VM's stored admin credential (which the real `augur-vm clone` copies from the base).
+mkdir -p "$AUGUR_DIR/vms/$(macos_project_vm)"; macos_store_admin_password "$(macos_project_vm)" admin
 gh() { return 1; }                                # no host gh token unless a case installs one
 unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN   # this runner may well have one exported
 
