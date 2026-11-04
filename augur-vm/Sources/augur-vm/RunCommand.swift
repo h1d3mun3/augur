@@ -30,9 +30,6 @@ struct RunCommand: ParsableCommand {
           help: "Use unfiltered NAT instead of the egress-filtered socket. Opt-in only: without this flag a socket (--net-vfkit) is required, so a forgotten flag fails closed rather than silently granting full network access.")
     var netNAT = false
 
-    @Option(name: .customLong("provision-full-name"), help: "Full name for --provision-username.")
-    var provisionFullName: String = "augur"
-
     // ── Automated guest setup — macOS 27 SDK only ───────────────────────────────
     // `VZMacGuestProvisioningOptions` is declared only in the macOS 27 SDK, so on an older SDK
     // the symbol does not exist and no amount of `@available` helps: that gates RUNTIME
@@ -65,6 +62,9 @@ struct RunCommand: ParsableCommand {
     @Flag(name: .customLong("provision-password-stdin"),
           help: "Read the password for --provision-username from stdin (e.g. `printf %s \"$pw\" | augur-vm run …`). Trailing newlines are stripped.")
     var provisionPasswordStdin = false
+
+    @Option(name: .customLong("provision-full-name"), help: "Full name for --provision-username.")
+    var provisionFullName: String = "augur"
 
     private func validateProvisioning() throws {
         guard (provisionUsername == nil) != provisionPasswordStdin else {
@@ -109,20 +109,21 @@ struct RunCommand: ParsableCommand {
     }
 
     func run() throws {
-        var username: String?
-        var password: String?
         #if compiler(>=6.4)
-        if let requested = provisionUsername {
-            username = requested
+        var password: String?
+        if provisionUsername != nil {
             password = try readProvisioningPassword()
         }
-        #endif
-
         let session = RunSession(
             name: name, headless: noGraphics, dirs: dirs, netVfkitSocket: netVfkit, netAllowNAT: netNAT,
-            provisionUsername: username, provisionPassword: password,
+            provisionUsername: provisionUsername, provisionPassword: password,
             provisionFullName: provisionFullName
         )
+        #else
+        let session = RunSession(
+            name: name, headless: noGraphics, dirs: dirs, netVfkitSocket: netVfkit, netAllowNAT: netNAT
+        )
+        #endif
         RunSession.shared = session   // retain across the VM's lifetime
         try session.run()             // headless: dispatchMain; GUI: NSApplication.run — neither returns
     }
