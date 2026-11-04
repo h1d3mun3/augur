@@ -4040,8 +4040,8 @@ cmd_up_macos() {
 
     # Already running: like cmd_up, rebuild what the host owns — rewrite the allowlist (so a
     # revocation takes effect) and re-run the boot self-test. Unlike cmd_up, never refuse on config
-    # drift: macOS mode has no container_fingerprint, so there is no reliable drift signal. The only
-    # way this path ends non-zero is the self-test detecting a leak.
+    # drift: macOS mode has no container_fingerprint, so there is no reliable drift signal. Past the
+    # credential check, the only way this path ends non-zero is the self-test detecting a leak.
     if macos_vm_running "$project_vm"; then
         # Same refusal as the stopped/fresh path below: a running VM without a stored admin
         # password would otherwise reconcile "successfully" while every sudo into it fails.
