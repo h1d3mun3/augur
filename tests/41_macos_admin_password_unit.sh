@@ -217,6 +217,20 @@ eq "1" "$rc" "augur-vm failing (e.g. VM missing, exit 1) → an error, not a sil
 eq "" "$out" "augur-vm failing → no flow printed"
 has "$err" "provisioning-support buildvm" "augur-vm failing → names the failed command"
 
+# augur-vm's own diagnostic reaches the operator on the failure path, and only on stderr.
+: > "$FAKE_ARGV_LOG"
+out="$(FAKE_STDERR="Error: No such VM: buildvm" FAKE_RC=1 macos_setup_flow buildvm false 2>"$WORK/flow-err")"; rc=$?
+err="$(cat "$WORK/flow-err")"
+eq "1" "$rc" "augur-vm failing with a message → an error"
+has "$err" "augur-vm: Error: No such VM: buildvm" "augur-vm failing → shows augur-vm's own message"
+eq "" "$out" "augur-vm failing with a message → stdout stays empty"
+# Its stderr stays hidden when the answer is usable: stdout is only the flow name, stderr only augur's.
+out="$(FAKE_STDERR="some augur-vm chatter" FAKE_ANSWER=host FAKE_RC=0 macos_setup_flow buildvm false 2>"$WORK/flow-err")"
+eq "manual" "$out" "augur-vm chatter on a usable answer → stdout carries only the flow name"
+hasnt "$(cat "$WORK/flow-err")" "some augur-vm chatter" "augur-vm chatter on a usable answer → not shown"
+out="$(FAKE_STDERR="Error: Unknown subcommand" FAKE_RC=64 macos_setup_flow buildvm false 2>"$WORK/flow-err")"
+hasnt "$(cat "$WORK/flow-err")" "Unknown subcommand" "augur-vm without the subcommand → its usage error is replaced by the hint"
+
 decide "something-new" 0 false
 eq "1" "$rc" "an unrecognised answer → an error, never guessed"
 

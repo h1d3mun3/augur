@@ -644,14 +644,18 @@ require_vz() {
 # Assistant flow, macos_first_boot_manual); $2 is "true" when --manual-setup was given.
 # Eligibility is augur-vm's call (`augur-vm provisioning-support`: host OS, the VM's guest OS,
 # and whether the binary was built with the feature at all); this only maps its answer to a flow
-# and tells the operator why. Messages go to stderr because stdout is the answer.
+# and tells the operator why. Messages go to stderr because stdout is the answer. augur-vm's own
+# stderr is held back and shown only when the probe fails unexpectedly (e.g. "No such VM"); the
+# usage error of an augur-vm without the subcommand is replaced by augur's install hint.
 macos_setup_flow() {
-    local vm="$1" manual_flag="$2" answer rc=0
+    local vm="$1" manual_flag="$2" answer rc=0 errfile vm_err line
     if [[ "$manual_flag" == true ]]; then
         info "--manual-setup given: using the manual Setup Assistant flow." >&2
         echo manual; return 0
     fi
-    answer="$("$VM_CLI" provisioning-support "$vm" 2>/dev/null)" || rc=$?
+    errfile="$(mktemp "${TMPDIR:-/tmp}/augur-vm-err.XXXXXX")"
+    answer="$("$VM_CLI" provisioning-support "$vm" 2>"$errfile")" || rc=$?
+    vm_err="$(cat "$errfile")"; rm -f "$errfile"
     case "$rc:$answer" in
         0:supported)
             info "Host and guest are both macOS 27+ — provisioning the admin account automatically (no manual Setup Assistant needed)." >&2
@@ -673,6 +677,9 @@ macos_setup_flow() {
             echo manual ;;
         *)
             error "\`augur-vm provisioning-support ${vm}\` failed (exit ${rc}${answer:+, printed: ${answer}})."
+            if [[ -n "$vm_err" ]]; then
+                while IFS= read -r line; do error "  augur-vm: ${line}"; done <<<"$vm_err"
+            fi
             return 1 ;;
     esac
 }
