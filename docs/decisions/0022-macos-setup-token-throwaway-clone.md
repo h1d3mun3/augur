@@ -44,7 +44,12 @@ there and nowhere else.
 - **Nothing project-specific reaches it:** no workspace, history, agents or profile share; no
   `~/.augur-env`; no `GH_TOKEN`; no `~/.gitconfig`. It receives only the onboarding-only
   `~/.claude.json` stub (the same one every project clone gets) so the login does not start with
-  first-run onboarding.
+  first-run onboarding. As defense in depth, right after the clone boots and before anything from
+  it runs on the operator's TTY, `macos_scrub_augur_credentials` removes exactly the
+  credential-bearing files augur itself writes into a guest — `~/.augur-env`, the `~/.zshenv` line
+  that sources it, and `~/.gitconfig` (which carries the `GH_TOKEN` credential helper). augur writes
+  these into project VMs only, never into the base VM, so this is normally a no-op; a failure aborts.
+  It deliberately does not chase the Keychain or arbitrary files a human left in the base VM.
 - **Egress is enforced exactly like a normal `up --macos`:** augur-proxy + gvproxy on the
   file-handle datapath, the guest clock set from the host, then `verify_macos_egress_locked`, which
   tears down and exits on any leak. `--no-egress` / `AUGUR_EGRESS=0` are ignored with a warning.
@@ -61,10 +66,16 @@ there and nowhere else.
   collide with any project, and `target_name_re` does not match it, so `destroy <name>` and its
   completion never offer it. Ports are fixed (`13998`/`14998`/`20998`, overridable via
   `AUGUR_*_PORT_SETUP_TOKEN`), outside the per-project range and next to the provisioning ones.
-  A host-wide lock allows one run at a time: `~/.augur/setup-token-macos.lock` is a symlink whose
-  target is the holder's pid, so it is created atomically with its holder. Only a lock whose target
-  is a pid that is no longer alive is taken over, by renaming it to a private name and re-checking
-  it (put back if it changed meanwhile); anything else refuses.
+  A host-wide lock allows one run at a time: `~/.augur/setup-token-macos.lock`. Every augur host
+  lock (`host_lock_acquire`) is a symlink whose target names its holder as `<pid>:<command>`, so it
+  is created atomically with its holder. Only a lock whose target is a pid that is no longer alive
+  is taken over, by renaming it to a private name and re-checking it (put back if it changed
+  meanwhile); anything else — a live holder, an empty or non-pid target — refuses, naming the
+  command that holds it. A lock is released only by the process and command that took it.
+- **Never a clone of a base VM being replaced:** the clone itself is taken under the base-writer
+  lock (`~/.augur/macos-base-writer.lock`, below), held only for the `augur-vm clone`. While a
+  `build` or `update --macos` holds it, `setup-token --macos` refuses naming that command; a build
+  or update started during the clone is refused instead.
 - **Preflight:** it refuses (without stopping anything) when the base VM is running — an
   `install-cert` window or an interrupted run, and clonefile does not refuse a running source — and
   when two augur macOS VMs are already running, since macOS allows at most two guests and a third
@@ -89,16 +100,33 @@ on the absolute binary path, then requires `codesign -dvv` to print exactly `Tea
 signature, a certificate from another team, or a binary that fails verification is refused whatever
 its `Identifier` says.
 
+- **Where it runs: last, on the final guest state.** In both `build` and `update` the check runs
+  after every guest mutation — the installer, custom provisioning (whose `hook.sh` runs as root and
+  could replace the binary), the `~/.claude.json` scrub, the managed policy, the Xcode selection and
+  the sudo revoke — immediately before the VM is stopped and saved. Provisioning stops the scratch
+  VM's NAT session to boot it on the filtered provisioning datapath; `run_base_provisioning` then
+  restarts it on NAT, so every later step reaches a running VM. Accepted trade-off: the provisioned
+  guest has open NAT for those few steps, as it already has at the start of every later
+  `update --macos`.
 - `build --macos`: aborts, and its EXIT trap discards the build VM.
 - `update --macos`: now runs entirely on a staging clone of the base VM (`augur-macos-update`) and
-  replaces the base VM only after every step, this check included, has passed. Until then any
-  failure leaves the base VM exactly as it was. The replacement (delete the old base, clone the
-  staging copy into its place) ignores INT/TERM/HUP, and once the old base is gone the staging copy
-  is never deleted on a failure: augur prints the `augur-vm clone` that finishes the swap, so at
-  least one copy always survives. It never touches `augur-macos-build`, and it refuses while that
-  VM is running: a running build replaces the same base VM and uses the same fixed provisioning
-  ports. A stopped staging VM left by a crash is removed; a running one means another update and
-  refuses.
+  replaces the base VM only after every step has passed — this check, and the Xcode selection, which
+  is fatal in update as it is in build. Until then any failure leaves the base VM exactly as it was.
+- **The save** (`macos_save_scratch_as_base`, both commands): delete the old base, clone the scratch
+  VM into its place, with INT/TERM/HUP ignored. If that does not complete — including a failed clone
+  that left a partial destination, which is never treated as saved — the scratch VM is kept and augur
+  prints the `augur-vm` commands that finish the save, so at least one copy always survives. (In
+  build the old base is already gone, deleted at the start with the operator's consent.) Update keeps
+  the base VM's pinned SSH host key: the staging VM is a clone of it, so the key is unchanged.
+- **One base writer at a time.** `build` and `update --macos` both replace the base VM and use the
+  same fixed provisioning ports, so each holds the host-wide base-writer lock
+  (`~/.augur/macos-base-writer.lock`) from before it touches any VM until it ends; a second build or
+  update refuses naming the command that holds it, before cloning, stopping or deleting anything.
+  Their EXIT traps therefore only ever discard a scratch VM their own process owns: under the lock, a
+  staging VM that already exists (running or not) was left by a killed update and is stopped and
+  removed before the new clone. Update never touches `augur-macos-build`. `install-cert --macos`
+  writes into the base VM itself, so it holds the same lock for its whole trust window: an update
+  can no longer stop the base VM under it, nor a build delete it.
 - `ensure_macos_claude_bin` (project VMs): no self-install any more. A missing binary is an error
   pointing at `augur update --macos` / `augur build --macos`; `claude --macos` refuses, `up --macos`
   warns and continues (the VM is still usable with `shell --macos`). Base VMs built by an older
@@ -144,9 +172,17 @@ started with `--no-egress` is no longer "detected" as a leak and stopped under t
   the staging copy only after the check; `ensure_macos_claude_bin` never installing; and
   `setup-token --macos` using a throwaway clone of the base VM with no credentials, shares or
   project allowlist, launching the verified absolute path, and cleaning up on success, signature
-  failure, self-test failure and Ctrl-C, plus the stale-clone handling, the base-VM and VM-slot
-  preflights, and the lock (atomic create, refusal of a live or non-pid holder, race-safe reap).
-  For update: the build VM untouched and a running build refused, and the swap surviving an
-  interrupt and a failed save with the staging copy kept.
-- `tests/51_macos_egress_mode_unit.sh` — the egress-mode record and the refusals on `up`, `claude`
-  and `shell --macos`.
+  failure, self-test failure, credential-scrub failure and Ctrl-C, plus the stale-clone handling,
+  the base-VM and VM-slot preflights, the credential scrub (run against a stand-in guest home), the
+  clone taken only under the base-writer lock, and the host locks (atomic create, refusal of a live,
+  empty or non-pid holder, race-safe reap, release only by the holder). For update: the build VM
+  untouched, a running build, update or setup-token clone refused before any VM is touched, a
+  killed update's staging VM replaced, an Xcode-selection failure fatal, and the save surviving an
+  interrupt, a failed save and a partial one with the staging copy kept. For build and update with
+  provisioning files present: every later step reaches a running VM, the signer check runs last
+  (after the hook), a failing final check or hook saves nothing, and build keeps its VM on a failed
+  save.
+- `tests/51_macos_egress_mode_unit.sh` — the egress-mode record (keyed per project path) and the
+  refusals on `up`, `claude` and `shell --macos`. Accepted trade-off: two concurrent `up --macos`
+  for the same project can race the record; concurrent runs for one project are unsupported in
+  both modes.

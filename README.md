@@ -311,9 +311,12 @@ every `up` (the same way it does for the GitHub token):
   `claude` must pass `codesign --verify --strict` against Anthropic's Developer ID team before it
   is attached to your terminal, and the clone is deleted when the command ends (or on the next run
   if it was interrupted). It refuses while the base VM itself is running (e.g. an `install-cert`
-  window) and when two macOS VMs are already running (see
+  window), while an `augur build --macos` or `augur update --macos` is replacing the base VM, and
+  when two macOS VMs are already running (see
   [Concurrent VM limit](#concurrent-vm-limit)). `augur build --macos` and `augur update --macos` apply the same signature
-  check and refuse to save a base VM that fails it.
+  check, as their last step after any custom provisioning, and refuse to save a base VM that fails
+  it. Only one of them runs at a time: a second `build`/`update --macos` refuses, naming the one in
+  progress.
 - `ANTHROPIC_API_KEY` — Console API key (env or `~/.anthropic_api_key`). Takes priority if both are set.
 
 ### Guest clock
