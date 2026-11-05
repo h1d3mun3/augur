@@ -727,13 +727,19 @@ logged "pssh $MACOS_UPDATE_VM" && fail "update without provisioning files: a sud
 logged "manifest $MACOS_UPDATE_VM" && fail "update without provisioning files: the manifest ran" || ok "update without provisioning files: the manifest does not run"
 FILES=1
 
+# An unapproved hook.allowlist.conf never reaches an upgrade-only session (nothing prompts for it).
+AUGUR_PROVISION_HOOK_ALLOWLIST="$TMPD/hook.allowlist.conf"; printf 'evil.example.com\n' > "$AUGUR_PROVISION_HOOK_ALLOWLIST"
+FILES=0; eq "" "$(provision_hook_allowlist_domains)" "no manifest or hook: hook.allowlist.conf contributes nothing"
+FILES=1; eq "evil.example.com" "$(provision_hook_allowlist_domains)" "with a manifest or hook: it is merged (and was approved with them)"
+rm -f "$AUGUR_PROVISION_HOOK_ALLOWLIST"
+
 # The command itself: update, then upgrade, no sudo, and a failure of either stops it.
 eval "$brew_real"
 BREW_LOG="$TMPD/brew.log"; : > "$BREW_LOG"; BREW_FAIL=""
 ssh_macos_provision() { echo "$2" >> "$BREW_LOG"; [[ "$2" == "$BREW_FAIL" ]] && return 1; return 0; }
 run_brew_upgrade testvm >/dev/null 2>&1; rc=$?
 eq 0 "$rc" "run_brew_upgrade: succeeds"
-eq $'brew update\nbrew upgrade' "$(cat "$BREW_LOG")" "run_brew_upgrade: brew update, then brew upgrade, without sudo"
+eq $'brew update\nbrew upgrade --formula' "$(cat "$BREW_LOG")" "run_brew_upgrade: brew update, then a formula-only brew upgrade, without sudo"
 : > "$BREW_LOG"; BREW_FAIL="brew update"
 run_brew_upgrade testvm >/dev/null 2>&1; rc=$?
 [[ "$rc" -ne 0 ]] && ok "run_brew_upgrade: a failing brew update fails" || fail "run_brew_upgrade: brew update failure ignored"
