@@ -52,8 +52,8 @@ stop_proxy()    { echo "stop_proxy" >> "$LOG"; }
 verify_macos_egress_locked() { echo "selftest" >> "$LOG"; }
 warn_if_macos_egress_pinned() { :; }
 sync_macos_guest_clock() { :; }; sync_macos_guest_timezone() { :; }; configure_macos_guest_session() { :; }
-ensure_macos_workspace() { :; }; ensure_macos_claude_projects() { :; }; ensure_macos_claude_agents() { :; }
-ensure_macos_claude_profile() { :; }; ensure_macos_claude_bin() { :; }; ensure_macos_git_credential_helper() { :; }
+ensure_macos_workspace() { :; }; ensure_macos_agent_projects() { :; }; ensure_macos_agent_agents() { :; }
+ensure_macos_agent_profile() { :; }; ensure_macos_agent_bin() { :; }; ensure_macos_git_credential_helper() { :; }
 macos_poweroff_before_teardown() { :; }
 scp_to_macos() { :; }
 ssh_macos() { echo "ssh $*" >> "$LOG"; [[ "$*" == *" -t "* ]] && echo AGENT_ATTACHED; return 0; }

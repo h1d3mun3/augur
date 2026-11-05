@@ -29,7 +29,7 @@ could not hold:
    `CLAUDE_CODE_OAUTH_TOKEN` and `GH_TOKEN`; container mode deliberately gives `setup-token` none.
 
 The same weak pattern guarded the base VM: `build --macos` aborted on it, `update --macos` only
-warned and kept the updated base VM, and `ensure_macos_claude_bin` checked nothing and installed
+warned and kept the updated base VM, and `ensure_macos_agent_bin` checked nothing and installed
 `latest` into a project VM when the binary was missing (exiting 0 even when that failed).
 
 ## Decision
@@ -127,7 +127,7 @@ its `Identifier` says.
   removed before the new clone. Update never touches `augur-macos-build`. `install-cert --macos`
   writes into the base VM itself, so it holds the same lock for its whole trust window: an update
   can no longer stop the base VM under it, nor a build delete it.
-- `ensure_macos_claude_bin` (project VMs): no self-install any more. A missing binary is an error
+- `ensure_macos_agent_bin` (project VMs): no self-install any more. A missing binary is an error
   pointing at `augur update --macos` / `augur build --macos`; `claude --macos` refuses, `up --macos`
   warns and continues (the VM is still usable with `shell --macos`). Base VMs built by an older
   augur get no compatibility path.
@@ -169,7 +169,7 @@ started with `--no-egress` is no longer "detected" as a leak and stopped under t
 - `tests/52_macos_setup_token_unit.sh` — the signer check's verdicts (ad-hoc with "anthropic" in the
   Identifier, another team, a prefix-only team, a failed `--verify` all fail; the vendor team passes)
   and its exact requirement; `update --macos` never touching the base VM on failure and promoting
-  the staging copy only after the check; `ensure_macos_claude_bin` never installing; and
+  the staging copy only after the check; `ensure_macos_agent_bin` never installing; and
   `setup-token --macos` using a throwaway clone of the base VM with no credentials, shares or
   project allowlist, launching the verified absolute path, and cleaning up on success, signature
   failure, self-test failure, credential-scrub failure and Ctrl-C, plus the stale-clone handling,

@@ -138,7 +138,7 @@ count no adversary is needed to reach, which all three readings agree on.
 
 ## 3. Placement, and why the order is load-bearing
 
-The refresh runs **before** the `ensure_macos_*` wiring, not after. `ensure_macos_claude_profile`
+The refresh runs **before** the `ensure_macos_*` wiring, not after. `ensure_macos_agent_profile`
 `cp`s `settings.json`, `CLAUDE.md` and `keybindings.json` **out of the profile share**: a wiring pass
 that runs first copies stale bytes into the guest, and that copy stays wrong until the next attach.
 The tests assert this ordering on line numbers within each function, not by searching for a mention.

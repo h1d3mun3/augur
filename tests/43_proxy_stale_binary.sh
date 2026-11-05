@@ -220,8 +220,8 @@ apply_guest_profile() { :; }; save_guest_history() { :; }
 eng() { [[ "$1" == exec ]] && echo "AGENT_LAUNCHED"; return 0; }
 ssh_macos() { echo "AGENT_LAUNCHED"; }
 sync_macos_guest_clock() { :; }; sync_macos_guest_timezone() { :; }; ensure_macos_workspace() { :; }
-ensure_macos_claude_projects() { :; }; ensure_macos_claude_agents() { :; }; ensure_macos_claude_profile() { :; }
-ensure_macos_claude_bin() { :; }; warn_if_macos_egress_pinned() { :; }; macos_project_vm() { echo augur-test-vm; }
+ensure_macos_agent_projects() { :; }; ensure_macos_agent_agents() { :; }; ensure_macos_agent_profile() { :; }
+ensure_macos_agent_bin() { :; }; warn_if_macos_egress_pinned() { :; }; macos_project_vm() { echo augur-test-vm; }
 check_project_conf_approved() { :; }; macos_vm_exists() { return 0; }
 require_macos_admin_password() { :; }   # its refusal is covered by 41_macos_admin_password_unit.sh
 reconcile_running_container() { echo "RECONCILE_CALLED"; }

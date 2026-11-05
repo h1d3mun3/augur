@@ -9,7 +9,7 @@
 #      update hold one host-wide base-writer lock, so neither overlaps the other or itself.
 #      With provisioning files present, every step after provisioning still reaches a running VM,
 #      and the signature check runs last, on the guest as provisioning left it.
-#   3. ensure_macos_claude_bin never installs anything into a project VM; a missing binary is an
+#   3. ensure_macos_agent_bin never installs anything into a project VM; a missing binary is an
 #      error pointing at `update --macos` / `build --macos`, and `claude --macos` refuses.
 #   4. `setup-token --macos` runs in a throwaway clone of the base VM: never the project VM, no
 #      credentials, no workspace or state shares, the baseline + global allowlist only, the binary
@@ -103,23 +103,23 @@ sig && fail "a binary failing --verify --strict passes on its -dvv text" || ok "
 G_RC=255; G_OUT=""
 sig && fail "an unreachable guest passes" || ok "no answer from the guest fails"
 
-# ── 3. ensure_macos_claude_bin ────────────────────────────────────────────────────────────────
-section "Tier 1 — ensure_macos_claude_bin: a missing binary is an error, never a self-install"
+# ── 3. ensure_macos_agent_bin ────────────────────────────────────────────────────────────────
+section "Tier 1 — ensure_macos_agent_bin: a missing binary is an error, never a self-install"
 ssh_macos() { shift; printf '%s\n' "$*" > "$SIGCMD"; printf '%s\n' "$G_OUT"; return "$G_RC"; }
 G_RC=0; G_OUT="present"
-out="$(ensure_macos_claude_bin "$PV" 2>&1)"; rc=$?
+out="$(ensure_macos_agent_bin "$PV" 2>&1)"; rc=$?
 eq 0 "$rc" "present: returns 0"
 has "$(cat "$SIGCMD")" "'$BIN'" "probes the absolute install path"
 G_RC=0; G_OUT="missing"
-out="$(ensure_macos_claude_bin "$PV" 2>&1)"; rc=$?
+out="$(ensure_macos_agent_bin "$PV" 2>&1)"; rc=$?
 [[ "$rc" -ne 0 ]] && ok "missing: fails" || fail "missing: returned 0"
 has "$out" "augur update --macos" "missing: points at update --macos"
 has "$out" "augur build --macos"  "missing: and at build --macos"
 G_RC=255; G_OUT=""
-out="$(ensure_macos_claude_bin "$PV" 2>&1)"; rc=$?
+out="$(ensure_macos_agent_bin "$PV" 2>&1)"; rc=$?
 [[ "$rc" -ne 0 ]] && ok "unreachable: fails" || fail "unreachable: returned 0"
 has "$out" "Could not check" "unreachable: says it could not check (not 'missing')"
-bin_fn="$(declare -f ensure_macos_claude_bin)"
+bin_fn="$(declare -f ensure_macos_agent_bin)"
 hasnt "$bin_fn" "install.sh" "never runs the installer inside a project VM"
 hasnt "$bin_fn" "latest"     "never installs 'latest' inside a project VM"
 hasnt "$bin_fn" "codesign"   "no signature check at plain claude launch (a project VM is guest-controlled)"
@@ -128,8 +128,8 @@ hasnt "$bin_fn" "codesign"   "no signature check at plain claude launch (a proje
 (
   require_vz() { :; }; require_fresh_egress_helpers() { :; }; macos_vm_running() { return 0; }
   require_macos_egress_mode_current() { :; }; sync_macos_guest_clock() { :; }; sync_macos_guest_timezone() { :; }
-  ensure_macos_workspace() { :; }; ensure_macos_claude_projects() { :; }; ensure_macos_claude_agents() { :; }
-  ensure_macos_claude_profile() { :; }; warn_if_macos_egress_pinned() { :; }
+  ensure_macos_workspace() { :; }; ensure_macos_agent_projects() { :; }; ensure_macos_agent_agents() { :; }
+  ensure_macos_agent_profile() { :; }; warn_if_macos_egress_pinned() { :; }
   ssh_macos() { [[ "$*" == *" -t "* ]] && { echo AGENT_LAUNCHED; return 0; }; echo missing; }
   out="$( set -e; cmd_claude_macos 2>&1 )"; rc=$?
   [[ "$rc" -ne 0 ]] && ok "claude --macos with no binary: exits non-zero" || fail "claude --macos with no binary: exit 0"

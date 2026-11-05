@@ -271,10 +271,10 @@ resolve_macos_vm_cpu()          { echo 4; }
 resolve_macos_vm_memory_mb()    { echo 8192; }
 wait_for_macos_ssh()            { return 0; }
 ensure_macos_workspace()        { echo "wire:workspace" >> "$LOG"; }
-ensure_macos_claude_projects()  { :; }
-ensure_macos_claude_agents()    { :; }
-ensure_macos_claude_profile()   { :; }
-ensure_macos_claude_bin()       { :; }
+ensure_macos_agent_projects()  { :; }
+ensure_macos_agent_agents()    { :; }
+ensure_macos_agent_profile()   { :; }
+ensure_macos_agent_bin()       { :; }
 scp_to_macos()                  { :; }
 PV="$(macos_project_vm)"
 
