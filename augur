@@ -544,13 +544,15 @@ validate_secret_value() {
 # branch, which by design cannot re-push ~/.augur-env — so the guest would keep running with no
 # credentials at all until `down --macos && up --macos`. cmd_up_macos therefore calls this before
 # the clone. Container mode injects at session start instead, so cmd_claude / cmd_shell call it
-# before bringing the container up; cmd_up itself injects nothing there and does not check, which
-# keeps `augur setup-token` usable to replace a stored token that fails the check.
+# before bringing the container up; cmd_up itself injects nothing there and does not check.
+# Deliberately NOT called by setup-token in either mode: it injects no credentials (container mode
+# runs the login in the project container with no --env-file, macOS mode in a throwaway clone of the
+# base VM), so a stored token that fails the check can still be replaced by `augur setup-token`.
 #
 # Deliberately NOT an error: an ABSENT credential. A guest with no token is a supported state in both
-# modes (`augur setup-token` runs `claude setup-token` inside it), so this refuses only a value that
-# exists and cannot be injected — exactly what container mode refuses. Fails closed, and the message
-# still names the offending variable because validate_secret_value does.
+# modes (the operator mints one with `augur setup-token`), so this refuses only a value that exists
+# and cannot be injected — exactly what container mode refuses. Fails closed, and the message still
+# names the offending variable because validate_secret_value does.
 # AUGUR_AGENT_SEAM | credential CHECK — the agent DECLARES names + host sources (agent_auth_specs)
 # and the core owns both the resolver (resolve_api_key) and the validator (validate_secret_value).
 # CONTRACT (credentials): a future multi-agent build adds its per-spec VALIDATOR field here, in ONE
@@ -591,6 +593,11 @@ save_oauth_token() {
     chmod 600 "$dest"
     success "Saved subscription token to ${BOLD}${dest}${RESET} (chmod 600)."
     info "augur injects it as CLAUDE_CODE_OAUTH_TOKEN from the next session (macOS VM mode: the next 'up') — no host claude needed."
+    # resolve_api_key prefers the host env var over this file, so a set variable hides the new token.
+    if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+        warn "CLAUDE_CODE_OAUTH_TOKEN is set in this shell, and augur injects that value instead of ${dest}."
+        warn "  The new token is not used until you unset it (${BOLD}unset CLAUDE_CODE_OAUTH_TOKEN${RESET}, and remove it from your shell profile)."
+    fi
 }
 
 # Security notice shown before the operator pastes a setup-token. The token is produced by

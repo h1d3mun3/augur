@@ -63,4 +63,23 @@ reject "sk-ant-with space here more"       "contains a space"
 reject $'sk-ant-abc\x01defghijkl'          "contains a control byte"
 reject "sk-ant-abc'defghijklmno"           "contains a single quote"
 
+# ── A set CLAUDE_CODE_OAUTH_TOKEN hides the saved file: say so ────────────────
+# resolve_api_key prefers the host env var over ~/.claude_code_oauth_token, so a freshly saved token
+# is not what augur injects while the variable is set.
+section "warns when CLAUDE_CODE_OAUTH_TOKEN is set (it takes precedence over the saved file)"
+WARNED="$WORK/warned"
+warn() { printf '%s\n' "$*" >> "$WARNED"; }
+: > "$WARNED"
+( export CLAUDE_CODE_OAUTH_TOKEN="sk-ant-oat01-from-the-env-0123"; save_oauth_token "$valid" )
+has "$(cat "$WARNED")" "CLAUDE_CODE_OAUTH_TOKEN is set" "env var set: warns that it is set"
+has "$(cat "$WARNED")" "unset CLAUDE_CODE_OAUTH_TOKEN"  "env var set: says how to make the new token take effect"
+eq "$valid" "$(cat "$dest")" "env var set: the token is still saved"
+: > "$WARNED"
+( unset CLAUDE_CODE_OAUTH_TOKEN; save_oauth_token "$valid" )
+eq "" "$(cat "$WARNED")" "env var unset: no warning"
+: > "$WARNED"
+( export CLAUDE_CODE_OAUTH_TOKEN="sk-ant-oat01-from-the-env-0123"; rm -f "$dest"; save_oauth_token "not-a-token" )
+eq "" "$(cat "$WARNED")" "env var set but the save is refused: no precedence warning"
+warn() { :; }
+
 finish

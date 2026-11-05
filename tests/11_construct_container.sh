@@ -543,6 +543,19 @@ export AUGUR_TEST_CONTAINER_RUNNING=0
 rm -f "$AUGUR_TEST_SHIMLOG.trace"
 ( cd "$proj" && ANTHROPIC_API_KEY="sk-ant-it's-bad" bash "$AUGUR" up --no-egress ) >/dev/null 2>&1; rc=$?
 eq "0" "$rc" "up: proceeds with an uninjectable stored credential (setup-token must stay reachable)"
+# …and setup-token itself, from a stopped container, reaches its login with a stored token and a gh
+# token that the injection check would refuse: it injects neither, so it must not check them.
+for bad in "sk-ant-oat01-it's-bad-0123456789" $'sk-ant-oat01-bad\nEVIL=1'; do
+  label="setup-token (stored token with $([[ "$bad" == *\'* ]] && echo "a quote" || echo "a newline"))"
+  printf '%s\n' "$bad" > "$HOME/.claude_code_oauth_token"
+  rm -f "$AUGUR_TEST_SHIMLOG.trace"
+  out="$( cd "$proj" && AUGUR_TEST_CLAUDE_SHA256="$claude_sha" AUGUR_TEST_GH_TOKEN=$'gho_bad\nEVIL=1' \
+          bash "$AUGUR" setup-token --no-egress 2>&1 </dev/null )"
+  st_launch="$(grep -E '^container exec -it ' "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null | tail -n1)"
+  eq    "setup-token" "${st_launch##* }" "$label: reaches its interactive 'claude setup-token' exec"
+  hasnt "$out" "Refusing to inject"      "$label: no injection check refuses it"
+done
+rm -f "$HOME/.claude_code_oauth_token"
 
 # ── Apple Container CLI floor (1.0.0) ─────────────────────────────────────────
 section "Tier 1 — Apple Container version floor"
