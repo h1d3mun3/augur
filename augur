@@ -3198,13 +3198,7 @@ confirm_cert_install() {
 cmd_install_cert() {
     local cert="${1:-}"
     [[ -n "$cert" ]] || { error "Usage: augur install-cert <cert.crt>"; exit 1; }
-    # `--macos` selects the VM path, but the global flag parser stops at the first positional, so
-    # `install-cert <cert> --macos` would reach here (container) with --macos as a trailing arg.
-    # Reject it rather than silently baking into the Linux image when the VM was meant.
     local _a
-    for _a in "$@"; do
-        [[ "$_a" == "--macos" ]] && { error "Put ${BOLD}--macos${RESET} BEFORE the cert path: augur install-cert --macos <cert.crt>"; exit 1; }
-    done
     require_engine
     validate_cert_file "$cert" || exit 1
     # The image tag is shared by EVERY project built on this Swift tag (IMAGE_NAME=augur:swift-<tag>),
@@ -6211,7 +6205,7 @@ cmd_help() {
     echo -e "    augur ${CYAN}update${RESET}  --macos                                   Update CLI tools in base VM"
     echo -e "    augur ${CYAN}version${RESET} --macos                                   Show augur version (macOS mode)"
     echo ""
-    echo -e "  ${BOLD}OPTIONS${RESET}"
+    echo -e "  ${BOLD}OPTIONS${RESET}  (put them right after the command: ${CYAN}augur up --macos --gui${RESET}; a misplaced one is refused)"
     echo -e "    --swift VERSION    Swift version for container mode (default: ${CYAN}latest${RESET})"
     echo -e "    --macos            Use macOS VM with Xcode instead of a Linux container"
     echo -e "    --gui              Open a VM window in macOS VM mode (for: augur up --macos)"
@@ -6293,6 +6287,50 @@ cmd_help() {
 # errors, and `|| true` falls through to normal dispatch.
 if [[ "${AUGUR_SOURCE_ONLY:-0}" == "1" ]]; then return 0 2>/dev/null || true; fi
 
+# Refuse whatever the global flag loop below left unparsed for command $1 ($2… are those words).
+# That loop reads --macos/--gui/--egress/--no-egress/--swift only directly after the command and
+# stops at the first other word, so a flag placed later would otherwise be dropped without a word:
+# `augur down extra --macos` would stop the container, `augur build --ipsw X --xcode-xip Y --macos`
+# would build the container image. Every refusal exits 1 before anything runs.
+# - A global flag anywhere in the leftovers: say where it goes.
+# - `build` without --macos: the macOS base-VM build options mean --macos was left out.
+# - Any other leftover word, for a command that takes none.
+# Deliberately NOT checked: `build --macos` (cmd_build_macos parses its own options and refuses an
+# unknown one), the positional arguments of `install-cert` and `destroy` (their own usage checks
+# handle those; only a misplaced global flag is refused here), `help` (extra words are harmless),
+# and an unknown command (the dispatch reports it).
+reject_extra_args() {
+    local cmd="$1" a; shift
+    case "$cmd" in
+        help|--help|-h) return 0 ;;
+        build) $MACOS_MODE && return 0 ;;
+        up|claude|shell|setup-token|install-cert|down|destroy|status|init-conf|list|__names|update|version) ;;
+        *) return 0 ;;
+    esac
+    for a in "$@"; do
+        case "$a" in
+            --macos|--gui|--egress|--no-egress|--swift)
+                error "Put ${a} right after the command: augur ${cmd} ${a}$([[ "$a" == --swift ]] && echo " <version>") …"
+                exit 1 ;;
+        esac
+    done
+    case "$cmd" in
+        install-cert|destroy) return 0 ;;
+    esac
+    if [[ "$cmd" == build ]]; then
+        for a in "$@"; do
+            case "$a" in
+                --ipsw|--xcode-xip|--platforms|--manual-setup)
+                    error "${a} is an option of the macOS base-VM build: augur build --macos --ipsw <path> --xcode-xip <path> …"
+                    exit 1 ;;
+            esac
+        done
+    fi
+    (( $# == 0 )) && return 0
+    error "augur ${cmd} takes no arguments (got: $*)"
+    exit 1
+}
+
 COMMAND="${1:-help}"
 shift || true
 
@@ -6332,6 +6370,8 @@ MACOS_SHARE="workspace-$(workspace_slug)"
 # container/VM a pre-fix augur made in $HOME can still be cleaned up; init-conf/build/update/
 # install-cert/version/help never hand this directory to a guest (`build` uses $SCRIPT_DIR as
 # its context), and neither does `setup-token --macos` (its throwaway VM gets no workspace share).
+# The argument check comes first, so a misplaced flag is named even in a directory the gate refuses.
+reject_extra_args "$COMMAND" "$@"
 case "$COMMAND" in
     up|claude|shell) require_safe_workspace ;;
     setup-token)     $MACOS_MODE || require_safe_workspace ;;
