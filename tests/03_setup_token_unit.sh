@@ -82,4 +82,16 @@ eq "" "$(cat "$WARNED")" "env var unset: no warning"
 eq "" "$(cat "$WARNED")" "env var set but the save is refused: no precedence warning"
 warn() { :; }
 
+# ── The "when does it apply" hint is accurate for each mode ───────────────────
+section "the follow-up hint says when the token takes effect, per mode"
+INFOS="$WORK/infos"
+info() { printf '%s\n' "$*" >> "$INFOS"; }
+: > "$INFOS"; save_oauth_token "$valid"
+has "$(cat "$INFOS")" "every new session" "container hint: applies to every new session"
+hasnt "$(cat "$INFOS")" "augur down --macos" "container hint: no macOS restart advice"
+: > "$INFOS"; save_oauth_token "$valid" macos
+has "$(cat "$INFOS")" "augur down --macos && augur up --macos" "macOS hint: a running VM needs down + up"
+hasnt "$(cat "$INFOS")" "every new session" "macOS hint: does not claim it applies to the next session"
+info() { :; }
+
 finish

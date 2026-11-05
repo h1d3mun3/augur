@@ -568,7 +568,7 @@ section "Tier 1 — setup-token --macos replaces a stored token that cannot be i
 # The save is wrapped to supply the paste, so this holds with or without a terminal for /dev/tty.
 eval "$(declare -f save_oauth_token | sed '1s/^save_oauth_token/real_save_oauth_token/')"
 NEW_TOKEN="sk-ant-oat01-replacement_token-0123456789"
-save_oauth_token() { echo "save" >> "$LOG"; real_save_oauth_token "$NEW_TOKEN"; }
+save_oauth_token() { echo "save" >> "$LOG"; real_save_oauth_token "$NEW_TOKEN" "${2:-}"; }
 gh() { [[ "$*" == "auth token" ]] && printf '%s\n' $'ghp_bad\nEVIL=1'; }
 unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN
 for bad in "sk-ant-oat01-it's-bad-0123456789" $'sk-ant-oat01-bad\nEVIL=1'; do

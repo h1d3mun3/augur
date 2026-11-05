@@ -528,6 +528,7 @@ read_agent_token_from_tty() {
 # Persist a captured Claude subscription token to the host token file augur reads whenever it
 # injects credentials (resolve_api_key picks it up as CLAUDE_CODE_OAUTH_TOKEN). Validates the
 # shape and writes it 0600. The host never needs claude installed for this.
+# $2 is "macos" when the token was minted for macOS VM mode; it only selects the "next up" wording.
 # AUGUR_AGENT_SEAM | token persistence — Claude-specific shape (sk-ant-*) + dest file.
 # CONTRACT (credentials): this charset/length check is the only credential validator today;
 # generalize it to every agent's resolved credential value before broadening agent_auth_specs.
@@ -548,7 +549,11 @@ save_oauth_token() {
     ( umask 077; printf '%s\n' "$token" > "$dest" )
     chmod 600 "$dest"
     success "Saved subscription token to ${BOLD}${dest}${RESET} (chmod 600)."
-    info "augur injects it as CLAUDE_CODE_OAUTH_TOKEN from the next session (macOS VM mode: the next 'up') — no host claude needed."
+    if [[ "${2:-}" == macos ]]; then
+        info "augur writes it into the guest as CLAUDE_CODE_OAUTH_TOKEN each time a VM boots, so a VM that is already running keeps its old credentials until: ${BOLD}augur down --macos && augur up --macos${RESET}"
+    else
+        info "augur injects it as CLAUDE_CODE_OAUTH_TOKEN into every new session (claude, shell) — no host claude needed."
+    fi
     # resolve_api_key prefers the host env var over this file, so a set variable hides the new token.
     if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
         warn "CLAUDE_CODE_OAUTH_TOKEN is set in this shell, and augur injects that value instead of ${dest}."
@@ -4425,7 +4430,7 @@ cmd_up_macos() {
     # host sources (agent_auth_specs). CONTRACT (credentials): these values are interpolated into a
     # SOURCED shell file; a future multi-agent build must validate each value (reject quotes/control
     # bytes) before this point.
-    local gh_token _genv _henv _hfile _hvalidator _aval
+    local gh_token _genv _henv _hfile _hvalidator _aval _kv
     gh_token="$(gh auth token 2>/dev/null || true)"
     # Re-run the SAME check immediately before the write — one helper, no second validator to drift.
     # The early call (above the clone) is what keeps a bad credential from booting a VM; this one
@@ -4447,6 +4452,10 @@ cmd_up_macos() {
         # Also written into the base VM's ~/.zshenv at build time; repeated here because a base VM
         # built by an older augur has it only in ~/.zprofile, which non-login SSH shells never read.
         echo 'export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer'
+        # The agent's fixed env goes in the file so every guest zsh session (a shell, an ssh
+        # one-off, the agent started by hand) sees it, as in Container mode where it is part of
+        # the image environment. Keys and values are agent-declared constants, not operator input.
+        for _kv in $(agent_fixed_env); do echo "export ${_kv%%=*}='${_kv#*=}'"; done
         while IFS='|' read -r _genv _henv _hfile _hvalidator; do
             [[ -z "$_genv" ]] && continue
             _aval="$(resolve_api_key "${!_henv:-}" "$_hfile")"
@@ -4757,7 +4766,7 @@ cmd_setup_token_macos() {
     local token
     token="$(read_agent_token_from_tty)"
     local rc=0
-    save_oauth_token "$token" || rc=1
+    save_oauth_token "$token" macos || rc=1
     info "Removing the throwaway VM '${vm}'..."
     setup_token_vm_teardown
     host_lock_release "$MACOS_SETUP_TOKEN_LOCK" setup-token
