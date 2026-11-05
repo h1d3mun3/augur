@@ -56,16 +56,23 @@ there and nowhere else.
   working login.
 - **Identity:** the same override `destroy <name>` uses (`TARGET_SLUG`/`TARGET_HASH`), set to
   `_setup-token` / `throwaway`, so every per-VM helper (VM name `augur-macos-_setup-token-throwaway`,
-  proxy/gvproxy pidfiles, logs, socket, merged allowlist, egress-mode record, known-hosts file)
+  proxy/gvproxy pidfiles, logs, socket, merged allowlist, known-hosts file)
   points at it without duplicating that machinery. `workspace_slug` never emits `_`, so it cannot
   collide with any project, and `target_name_re` does not match it, so `destroy <name>` and its
   completion never offer it. Ports are fixed (`13998`/`14998`/`20998`, overridable via
   `AUGUR_*_PORT_SETUP_TOKEN`), outside the per-project range and next to the provisioning ones.
-  A host-wide lock (`~/.augur/setup-token-macos.lock`, holder pid) allows one run at a time; a lock
-  whose holder is dead is taken over.
-- **Cleanup:** an EXIT trap (INT/TERM converted to exit) powers the guest off, stops gvproxy and the
-  proxy, deletes the VM and removes its state files; the next run removes whatever a crash left
-  behind before cloning. It works the same whether or not the project VM exists or runs.
+  A host-wide lock allows one run at a time: `~/.augur/setup-token-macos.lock` is a symlink whose
+  target is the holder's pid, so it is created atomically with its holder. Only a lock whose target
+  is a pid that is no longer alive is taken over, by renaming it to a private name and re-checking
+  it (put back if it changed meanwhile); anything else refuses.
+- **Preflight:** it refuses (without stopping anything) when the base VM is running — an
+  `install-cert` window or an interrupted run, and clonefile does not refuse a running source — and
+  when two augur macOS VMs are already running, since macOS allows at most two guests and a third
+  would only fail as an SSH timeout. It never falls back to the project VM.
+- **Cleanup:** an EXIT trap (INT/TERM/HUP converted to exit) stops the VM directly (its disk is
+  deleted, so there is nothing to shut down gracefully), stops gvproxy and the proxy, deletes the VM
+  and removes its state files; the next run removes whatever a crash left behind before cloning. It
+  works the same whether or not the project VM exists or runs.
 - **Launch:** the binary the signature check verified, by absolute path
   (`/Users/admin/` + `agent_macos_cli_relpath`), with `agent_fixed_env`, attached to the TTY as
   before; the operator warning and `save_oauth_token` are unchanged.
@@ -83,9 +90,15 @@ signature, a certificate from another team, or a binary that fails verification 
 its `Identifier` says.
 
 - `build --macos`: aborts, and its EXIT trap discards the build VM.
-- `update --macos`: now runs entirely on a staging clone of the base VM (`augur-macos-build`, the
-  scratch name `build` uses) and replaces the base VM only after every step, this check included,
-  has passed. Any failure leaves the base VM exactly as it was.
+- `update --macos`: now runs entirely on a staging clone of the base VM (`augur-macos-update`) and
+  replaces the base VM only after every step, this check included, has passed. Until then any
+  failure leaves the base VM exactly as it was. The replacement (delete the old base, clone the
+  staging copy into its place) ignores INT/TERM/HUP, and once the old base is gone the staging copy
+  is never deleted on a failure: augur prints the `augur-vm clone` that finishes the swap, so at
+  least one copy always survives. It never touches `augur-macos-build`, and it refuses while that
+  VM is running: a running build replaces the same base VM and uses the same fixed provisioning
+  ports. A stopped staging VM left by a crash is removed; a running one means another update and
+  refuses.
 - `ensure_macos_claude_bin` (project VMs): no self-install any more. A missing binary is an error
   pointing at `augur update --macos` / `augur build --macos`; `claude --macos` refuses, `up --macos`
   warns and continues (the VM is still usable with `shell --macos`). Base VMs built by an older
@@ -103,7 +116,9 @@ verify" class. `cmd_up_macos` writes the egress mode (`on`/`off`) to a host-side
 (`macos_egress_mode_file`) just before `augur-vm run`; `down`/`destroy` remove it. On a running VM,
 `up`, `claude` and `shell --macos` compare it with the requested mode and, on a mismatch or a missing
 record, refuse with `augur down --macos && augur up --macos [--no-egress]` and exit non-zero
-without stopping the VM — the macOS peer of `require_running_container_current`. The
+without stopping the VM — the macOS peer of `require_running_container_current`. A missing record
+(for example a VM started by an augur from before this change) is deliberately refused too, with a
+message saying the mode is unknown and one restart fixes it. The
 already-running `up` runs the boot self-test only when egress is on and the modes match, so a VM
 started with `--no-egress` is no longer "detected" as a leak and stopped under the operator.
 
@@ -129,6 +144,9 @@ started with `--no-egress` is no longer "detected" as a leak and stopped under t
   the staging copy only after the check; `ensure_macos_claude_bin` never installing; and
   `setup-token --macos` using a throwaway clone of the base VM with no credentials, shares or
   project allowlist, launching the verified absolute path, and cleaning up on success, signature
-  failure, self-test failure and Ctrl-C, plus the stale-clone and lock handling.
+  failure, self-test failure and Ctrl-C, plus the stale-clone handling, the base-VM and VM-slot
+  preflights, and the lock (atomic create, refusal of a live or non-pid holder, race-safe reap).
+  For update: the build VM untouched and a running build refused, and the swap surviving an
+  interrupt and a failed save with the staging copy kept.
 - `tests/51_macos_egress_mode_unit.sh` — the egress-mode record and the refusals on `up`, `claude`
   and `shell --macos`.

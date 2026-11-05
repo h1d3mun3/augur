@@ -286,8 +286,12 @@ start it unfiltered).
 > **At most two macOS VMs can run at once.** Apple's macOS license permits up to two virtualized
 > macOS instances per Mac, and Virtualization.framework enforces that limit: starting a third
 > running macOS guest fails. That covers every macOS guest on the host, not just augur's. Each
-> project clone counts while it is running, and so does the build VM during `augur build --macos` /
-> `augur update --macos`. Stopped clones don't count, so you can keep as many as your disk allows.
+> project clone counts while it is running, and so do augur's short-lived VMs: the build VM during
+> `augur build --macos`, the staging VM (`augur-macos-update`) during `augur update --macos`, and the
+> throwaway VM (`augur-macos-_setup-token-throwaway`) during `augur setup-token --macos`.
+> `setup-token --macos` checks first and refuses, naming the running VMs, when two augur VMs are
+> already up (a macOS guest of another tool still surfaces as a boot failure).
+> Stopped clones don't count, so you can keep as many as your disk allows.
 > Run `augur down --macos` in a project you're not using (or check `augur list --macos`) to free a
 > slot. Container mode runs Linux guests and isn't affected.
 
@@ -306,7 +310,9 @@ every `up` (the same way it does for the GitHub token):
   baseline + `~/.augur/augur.conf` domains, egress-filtered and self-tested like a normal `up`),
   `claude` must pass `codesign --verify --strict` against Anthropic's Developer ID team before it
   is attached to your terminal, and the clone is deleted when the command ends (or on the next run
-  if it was interrupted). `augur build --macos` and `augur update --macos` apply the same signature
+  if it was interrupted). It refuses while the base VM itself is running (e.g. an `install-cert`
+  window) and when two macOS VMs are already running (see
+  [Concurrent VM limit](#concurrent-vm-limit)). `augur build --macos` and `augur update --macos` apply the same signature
   check and refuse to save a base VM that fails it.
 - `ANTHROPIC_API_KEY` — Console API key (env or `~/.anthropic_api_key`). Takes priority if both are set.
 
