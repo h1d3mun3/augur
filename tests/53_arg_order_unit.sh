@@ -62,6 +62,17 @@ done
 refused "augur down takes no arguments (got: --macos-typo)" down --macos-typo
 refused "augur up takes no arguments (got: foo bar)" up --macos foo bar
 
+section "Tier 1 — --help / -h after a command prints the usage and runs nothing"
+run_augur --help
+usage_top="$out"
+for args in "up --help" "build -h" "down --help" "status -h" "install-cert --help" "destroy -h" "up --macos --help" "build --macos -h" "up foo --help"; do
+  run_augur $args
+  eq 0 "$rc" "augur $args: exit 0"
+  eq "$usage_top" "$out" "augur $args: prints the same usage as the top-level help"
+  hasnt "$out" "takes no arguments" "augur $args: no stray-argument refusal"
+  eq "" "$trace" "augur $args: no engine call"
+done
+
 section "Tier 1 — correct command lines are not refused"
 notrefused() {   # notrefused <args…>
     run_augur "$@"
