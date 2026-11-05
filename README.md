@@ -100,7 +100,7 @@ source ~/.zshrc     # or source ~/.bashrc
 
 The install script first fetches `origin/release` and builds from a copy it keeps in `~/.augur/src`;
 your clone is left untouched. If the fetch fails, the install fails — it never falls back to an old
-copy or to your checked-out branch. It then copies `augur` and `Dockerfile` to `~/.augur/`, refreshes the managed egress
+copy or to your checked-out branch. It then copies `augur`, its agent definition `agents/claude.sh`, and `Dockerfile` to `~/.augur/`, refreshes the managed egress
 baseline (`~/.augur/augur.conf.default`), builds the host egress proxy `augur-proxy` (needs Swift)
 and, on macOS, the VM backend `augur-vm` (needs Swift) and `augur-gvproxy` (needs Go), and
 configures `PATH`. Safe to re-run.

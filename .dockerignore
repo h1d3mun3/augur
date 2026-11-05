@@ -22,6 +22,9 @@ known_hosts/
 proxy/
 *.img
 
+# host-trusted code that augur sources itself; never build input
+agents/
+
 # build artifacts (repo + staged sidecar source)
 .build/
 **/.build/

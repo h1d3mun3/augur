@@ -69,7 +69,7 @@ fi
 
 # Validate source files exist. VERSION is required: it is the single source of truth for
 # the version number (`augur version`), so a checkout missing it is a broken install source.
-for f in augur Dockerfile .dockerignore VERSION; do
+for f in augur agents/claude.sh Dockerfile .dockerignore VERSION; do
     if [[ ! -f "$SCRIPT_DIR/$f" ]]; then
         error "$f not found in $SCRIPT_DIR"
         exit 1
@@ -85,6 +85,11 @@ cp "$SCRIPT_DIR/Dockerfile" "$INSTALL_DIR/Dockerfile"
 # tiny — otherwise the multi-GB VM images under ~/.augur/vms get swept into `augur build`.
 cp "$SCRIPT_DIR/.dockerignore" "$INSTALL_DIR/.dockerignore"
 chmod +x "$INSTALL_DIR/augur"
+# The agent definition augur sources at startup. Always refreshed, never user-editable: it is
+# host-trusted code, so it sits in its own agents/ dir (nothing in there is ever mounted or shared
+# into a guest) and is replaced wholesale on every install.
+mkdir -p "$INSTALL_DIR/agents"
+cp "$SCRIPT_DIR/agents/claude.sh" "$INSTALL_DIR/agents/claude.sh"
 # Shell completion scripts; the rc-file hook that loads them is added with the PATH entry below.
 if [[ -d "$SCRIPT_DIR/completions" ]]; then
     mkdir -p "$INSTALL_DIR/completions"
