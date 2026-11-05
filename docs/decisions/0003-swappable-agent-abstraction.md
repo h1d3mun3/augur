@@ -200,6 +200,14 @@ makes the hash match a poisoned artifact.** That's a **supply-chain attack** —
 - macOS uses `verify_macos_claude_signed` (`augur:228`) — it checks the **codesign signer is
   "Anthropic"** (true provenance). Even a VM-root guest that rewrites the binary **cannot forge
   Anthropic's signature.**
+  > **Amended by [ADR-0022](./0022-macos-setup-token-throwaway-clone.md) (2026-11-05):** that claim
+  > did not hold for the gate as built. The check ran *inside* the guest it judged (through the
+  > guest-writable `~/.zshenv`, so `codesign`/`grep` could be faked), `grep -qi Anthropic` also
+  > matched an ad-hoc signature's `Identifier=` line, and the launch re-resolved `claude` via PATH.
+  > A guest cannot forge the signature, but it can forge the *verdict*. The macOS gate is now a
+  > `codesign --verify --strict` against a Developer ID requirement pinned to Anthropic's Team ID,
+  > run only in a guest whose disk augur alone wrote — `setup-token --macos` runs in a throwaway
+  > clone of the base VM — and the launch uses the verified absolute path.
 - Linux (Docker) uses `image-sha256`, but provenance is anchored by the install source being hardcoded
   to `claude.ai/install.sh` (Anthropic-notarized) and **not workspace-overridable.** Making the install
   source a manifest field removes that anchor — hence a **regression.**

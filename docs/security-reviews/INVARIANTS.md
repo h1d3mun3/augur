@@ -38,7 +38,13 @@ in time," this **prescribes** "what must never break." It changes rarely.
   container-only: `verify_egress_locked` had exactly one call site (`finish_up`), which macOS mode
   never reaches, so no macOS production path ever probed the guest's network. The macOS peer now
   runs on **both** `up --macos` paths (fresh boot and the already-running reconcile) and tears the
-  VM, gvproxy and the proxy down on a failure. Both self-tests are inherently live (they need a
+  VM, gvproxy and the proxy down on a failure. On the already-running path it runs only when the VM
+  was booted with egress on and this invocation asks for egress too: the egress mode a VM was booted
+  with is recorded host-side (`macos_egress_mode_file`), and `up`/`claude`/`shell --macos` refuse a
+  running VM whose record differs or is missing (`require_macos_egress_mode_current`) instead of
+  attaching to it — so a VM started with `--no-egress` is never silently used by a plain
+  `claude --macos` (`tests/51_macos_egress_mode_unit.sh`). `setup-token --macos` boots its throwaway
+  VM through the same datapath and self-test (`tests/52_macos_setup_token_unit.sh`). Both self-tests are inherently live (they need a
   booted guest); the *wiring* — invoked on both paths, and a NOT-locked verdict exits non-zero with
   the teardown having run — is covered offline by `tests/36_macos_egress_selftest.sh`, and
   `tests/34_up_reconcile.sh` pins the **already-running** path on both engines (container reaches
@@ -154,7 +160,10 @@ in time," this **prescribes** "what must never break." It changes rarely.
   `~/.augur-env` (chmod 600) via SSH stdin. In Container mode credentials are never passed to
   `container run` at all; they reach only the `container exec` that starts `augur claude` /
   `augur shell`, through `--env-file <(…)` written by the bash builtin `printf`
-  (`session_credential_env`). `augur setup-token` and augur's own execs get none.
+  (`session_credential_env`). `augur setup-token` and augur's own execs get none. In macOS VM mode
+  `augur setup-token --macos` never uses the project VM: it runs in a throwaway clone of the base VM
+  that receives no `~/.augur-env`, no `GH_TOKEN`, no git config and no share, and is deleted on every
+  exit path.
 - **Why:** Prevent a co-resident process from reading credentials via `ps` / `/proc`. In Container
   mode, keeping them off `container run` also keeps them out of the container's persisted config
   (plaintext in the container bundle, printed by `container inspect`).
@@ -163,7 +172,9 @@ in time," this **prescribes** "what must never break." It changes rarely.
   `claude` / `shell` exec carries `--env-file` whose captured content holds the credentials while
   no engine argv holds a value; `setup-token` and the profile/history execs carry no `--env-file`.
   `tests/21_container_live.sh` (live, `AUGUR_TEST_LIVE=1`) additionally checks `container inspect`
-  shows no credential. macOS mode ⚠ review-only.
+  shows no credential. macOS mode ⚠ review-only, except `setup-token --macos`:
+  `tests/52_macos_setup_token_unit.sh` asserts that no credential value (API key, OAuth token file,
+  gh token) and no `~/.augur-env` / `~/.gitconfig` reaches its throwaway VM.
 - **Note:** The rule does not cover the macOS guest's admin password (`macos_admin_password`),
   but it is kept off argv the same way: every guest `sudo -S` call gets it on ssh's stdin via
   `macos_admin_password_stdin` (the bash builtin `printf` piped into `ssh_macos` /
