@@ -6,7 +6,7 @@
   peel Claude Code off, the swap is **relatively safe and relatively quick**. The pluggable
   multi-agent machinery (registry / selection flag / IP path, …) is **not built now** (§5).
 - **Implementation:** §5 Step A–C (the ACL seam) is **implemented** in the working tree:
-  an in-script `agent_*` function family plus `AUGUR_AGENT_SEAM` markers across `augur`,
+  the `agent_*` data functions in `agents/claude.sh` (sourced by `augur`) plus `AUGUR_AGENT_SEAM` markers across `augur`,
   `Dockerfile`, and `augur.conf`. Behavior is **byte-identical** to before (unit-verified);
   Claude Code remains the one and only agent. `grep -rn AUGUR_AGENT_SEAM` lists the whole
   future change surface.
@@ -405,8 +405,8 @@ control up above the line and weakening it.
 ### Implemented now (= the ACL is shipped)
 
 - **Step A — pure refactor: move Claude behind the boundary.** Scattered Claude-specific values/commands
-  are funneled into **one function family** in the script (in-script `agent_*` functions, not an external
-  file):
+  are funneled into **one function family**, the `agent_*` data functions in `agents/claude.sh` (a host-trusted file
+  sourced by `augur` from the install dir):
   - `agent_display_name` → `Claude Code` · `agent_cli_name` → `claude`
   - `agent_launch_argv` / `agent_login_argv` → `claude` / `claude setup-token`
   - `agent_fixed_env` → `DISABLE_AUTOUPDATER=1` · `agent_version_cmd` → `claude --version`
