@@ -82,3 +82,17 @@ the host *chooses* the credential and no human types anything) would use macOS 2
 - The change is confined to `cmd_build_macos` and the new `ssh_macos_bootstrap` helper in `augur`,
   with source-guard and execution-guard regression tests in `tests/30_macos_vm.sh`. No egress-core
   change.
+
+## Amendment (2026-11-06, project VMs have no passwordless sudo)
+
+The Rationale's "the agent inside already has passwordless (`NOPASSWD`) sudo" does not describe the
+shipped code. The `NOPASSWD` grant exists only while the base VM is being built: `cmd_build_macos`
+(and `run_base_provisioning`, when it ran something) removes `/etc/sudoers.d/augur` before the base
+VM is saved, so no project clone carries it. Every privileged call augur makes into a clone feeds
+the admin password to `sudo -S` instead.
+
+What stays true is the conclusion. On this ADR's path the password is the fixed `admin`, so the
+agent can run `sudo` by typing it, and knowing the password grants it nothing it could not already
+do. The accurate statement is "root by a guessable password", not "passwordless root". Where
+ADR-0018's randomized password applies, the agent does not know the password and has no root in a
+project clone, which strengthens the case for that path; it does not change this decision.

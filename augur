@@ -4477,8 +4477,8 @@ cmd_up_macos() {
     success "VM '${project_vm}' is up."
     echo ""
     echo -e "  ${BOLD}augur claude --macos${RESET} → Launch $(agent_display_name)"
-    echo -e "  ${BOLD}augur shell --macos${RESET}  → Open bash shell"
-    echo -e "  ${BOLD}augur down --macos${RESET}   → Stop and remove"
+    echo -e "  ${BOLD}augur shell --macos${RESET}  → Open a zsh shell"
+    echo -e "  ${BOLD}augur down --macos${RESET}   → Stop the VM (keeps the clone)"
 }
 
 cmd_claude_macos() {
@@ -5231,6 +5231,7 @@ cmd_install_cert_macos() {
     success "Custom CA trusted in base VM '${MACOS_BASE_VM}'."
     warn "Newly cloned project VMs will trust it. ${BOLD}Existing${RESET} project VMs are NOT updated —"
     warn "re-clone a project with: ${BOLD}augur destroy --macos && augur up --macos${RESET}."
+    warn "Additive: CAs installed earlier stay trusted too (augur never removes one; delete it in the base VM by hand)."
     warn "A full ${BOLD}augur build --macos${RESET} (base VM rebuild) drops the CA — re-run install-cert."
     # Clean success: stop the VM ourselves and disarm the trap so the normal exit doesn't re-stop it.
     stop_and_reap_macos_vm "$MACOS_BASE_VM" "$vm_pid"
@@ -6214,14 +6215,14 @@ cmd_help() {
     echo -e "    augur ${CYAN}build${RESET}  --macos --ipsw <path> --xcode-xip <path> [--platforms <list>] [--manual-setup]  Build base VM (one-time)"
     echo -e "    augur ${CYAN}up${RESET}     --macos [--gui]                           Start project VM (--gui opens a window)"
     echo -e "    augur ${CYAN}claude${RESET} --macos                                   Launch Claude Code"
-    echo -e "    augur ${CYAN}shell${RESET}  --macos                                   Open bash shell"
+    echo -e "    augur ${CYAN}shell${RESET}  --macos                                   Open a zsh shell"
     echo -e "    augur ${CYAN}setup-token${RESET} --macos                              Get a Claude token in a throwaway clone of the base VM, save it on the host"
     echo -e "    augur ${CYAN}install-cert${RESET} --macos <cert.crt>                   Trust a custom CA (PEM X.509) in the base VM"
     echo -e "    augur ${CYAN}down${RESET}    --macos                                   Stop the VM (keep the clone)"
     echo -e "    augur ${CYAN}destroy${RESET} --macos [name]                             Stop and remove the VM clone (name: from augur list --macos)"
     echo -e "    augur ${CYAN}status${RESET}  --macos                                   Check VM status and toolchain"
     echo -e "    augur ${CYAN}list${RESET}    --macos                                   List all VMs and their state"
-    echo -e "    augur ${CYAN}update${RESET}  --macos                                   Update CLI tools in base VM"
+    echo -e "    augur ${CYAN}update${RESET}  --macos                                   Refresh Claude Code in the base VM (not Xcode/brew/gh)"
     echo -e "    augur ${CYAN}version${RESET} --macos                                   Show augur version (macOS mode)"
     echo ""
     echo -e "  ${BOLD}OPTIONS${RESET}  (put them right after the command: ${CYAN}augur up --macos --gui${RESET}; a misplaced one is refused)"
@@ -6293,7 +6294,7 @@ cmd_help() {
     echo -e "    • ${BOLD}install-cert${RESET}: trust a private/self-signed CA in the guest (edge case). Pass ONE PEM"
     echo -e "      X.509 cert (${CYAN}.crt${RESET}). Container bakes it into the image (dropped by ${BOLD}build${RESET}/${BOLD}update${RESET} — re-run);"
     echo -e "      macOS adds it to the base VM's System keychain (approve the prompt in the VM window; new"
-    echo -e "      clones inherit it). A trusted CA can MITM the guest's TLS — install only CAs you trust."
+    echo -e "      clones inherit it; earlier CAs stay trusted, only a full build --macos drops them). A trusted CA can MITM the guest's TLS — install only CAs you trust."
     echo ""
 }
 

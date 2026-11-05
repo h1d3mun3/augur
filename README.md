@@ -266,15 +266,31 @@ cd ~/projects/my-app
 augur up --macos        # clone base VM and start (first run clones automatically)
 augur up --macos --gui  # same, but also open a VM window (display + keyboard + pointer)
 augur claude --macos    # launch Claude Code  (starts VM if not running)
-augur shell --macos     # open a bash shell   (starts VM if not running)
+augur shell --macos     # open a zsh shell    (starts VM if not running)
 augur setup-token --macos  # get a Claude subscription token (runs in a throwaway clone of the base VM, saves on the host)
 augur down --macos      # stop the VM (keeps the clone — next up is fast)
 augur destroy --macos   # stop and remove the project VM clone (or: augur destroy --macos <name>)
 augur status --macos    # show VM status, toolchain, and auth info
 augur list --macos      # list all VMs and their state
-augur update --macos    # update CLI tools in the base VM (on a staging copy; the base is replaced only if every step passes)
+augur update --macos    # refresh Claude Code (+ custom provisioning) in the base VM; Xcode, Homebrew and gh are NOT updated (see below)
 augur version --macos   # show augur version (macOS mode)
 ```
+
+`augur update --macos` is narrower than Container mode's `augur update` (a full no-cache image
+rebuild). It reinstalls Claude Code with the official installer, re-runs your custom provisioning,
+and re-asserts augur's own base-VM settings, all on a staging copy that replaces the base VM only if
+every step passes. It does **not** update Xcode, Homebrew or `gh`, nor upgrade packages Homebrew
+installed earlier: those stay as built until you rebuild the base VM with `augur build --macos`.
+Project VMs cloned before an update are unaffected; to pick it up, `augur destroy --macos && augur up
+--macos` in each project, which discards that clone's state (DerivedData, Simulator devices, SwiftPM
+caches). Container mode's `update` also leaves other projects' containers on the old image until they
+are destroyed and brought up again, but it recreates the current project's container for you.
+
+`augur install-cert --macos` is additive: each run trusts one more CA in the base VM's System
+keychain, and a CA trusted earlier stays trusted. augur does not remove CAs, because it cannot tell
+which ones in that keychain you put there; delete one by hand in the base VM if you need to. Container
+mode's `install-cert` replaces its single custom CA instead. A full `augur build --macos` drops
+every CA installed this way.
 
 A VM keeps the egress mode it was started with. If it is running and you ask for the other one
 (e.g. `augur up --macos --no-egress`, then a plain `augur claude --macos`), augur refuses rather than
@@ -298,8 +314,8 @@ start it unfiltered).
 ### Authentication
 
 On macOS, Claude Code stores its OAuth login in the Keychain, which is unreadable over SSH and
-absent from a freshly cloned VM. So macOS mode injects a credential through the environment on
-every `up` (the same way it does for the GitHub token):
+absent from a freshly cloned VM. So macOS mode injects a credential through the environment
+each time the VM boots (the same way it does for the GitHub token; a VM that is already running keeps what it booted with until `augur down --macos && augur up --macos`):
 
 - `CLAUDE_CODE_OAUTH_TOKEN` — subscription token; either set the env var / save it to
   `~/.claude_code_oauth_token`, or run **`augur setup-token --macos`**: it runs `claude setup-token`
