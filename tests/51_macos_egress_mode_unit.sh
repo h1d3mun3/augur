@@ -150,6 +150,30 @@ eq 0 "$rc" "claude --macos on a stopped VM: not refused over a stale record"
 logged CMD_UP_MACOS && ok "claude --macos on a stopped VM: boots it via up" || fail "claude --macos did not call up"
 eval "$cmd_up_macos_real"
 
+section "Tier 1 — the record is per project: keyed on the full path, not the directory name"
+# Two projects with the same basename (~/work/app vs ~/archive/app): one's record must never answer
+# for the other, or a --no-egress VM of one could pass the other's egress check.
+WS_SAVE="$WORKSPACE_DIR"
+WORKSPACE_DIR="$TMPD/work/app";    rec_a="$(macos_egress_mode_file)"
+WORKSPACE_DIR="$TMPD/archive/app"; rec_b="$(macos_egress_mode_file)"
+[[ "$rec_a" != "$rec_b" ]] && ok "same basename, different paths: different record files" || fail "two projects share one record file" "$rec_a"
+has "$rec_a" "/app-" "the record name carries the project slug"
+WORKSPACE_DIR="$TMPD/work/app"; egress_on; record off
+WORKSPACE_DIR="$TMPD/archive/app"; rm -f "$rec_b"
+run_cmd require_macos_egress_mode_current somevm
+[[ "$rc" -ne 0 ]] && ok "another project's record does not satisfy this one (no record here: refused)" || fail "another project's record was read for this one"
+has "$out" "unknown egress mode" "…as an unknown egress mode"
+WORKSPACE_DIR="$TMPD/work/app"; record on
+WORKSPACE_DIR="$TMPD/archive/app"; record off
+WORKSPACE_DIR="$TMPD/work/app"
+eq "on" "$(cat "$(macos_egress_mode_file)")" "writing one project's record leaves the other's alone"
+# `destroy <name>` addresses another project through TARGET_SLUG/TARGET_HASH: the record it drops is
+# that project's, whatever the current directory.
+want="$rec_b"
+slug_b="$(WORKSPACE_DIR="$TMPD/archive/app"; workspace_slug)"; hash_b="$(WORKSPACE_DIR="$TMPD/archive/app"; workspace_path_hash)"
+eq "$want" "$(TARGET_SLUG="$slug_b"; TARGET_HASH="$hash_b"; macos_egress_mode_file)" "an explicit target resolves to that project's record from anywhere"
+WORKSPACE_DIR="$WS_SAVE"
+
 section "Tier 1 — down / destroy drop the record"
 egress_on
 for c in cmd_down_macos cmd_destroy_macos; do
