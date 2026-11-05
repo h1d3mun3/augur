@@ -272,15 +272,20 @@ augur down --macos      # stop the VM (keeps the clone — next up is fast)
 augur destroy --macos   # stop and remove the project VM clone (or: augur destroy --macos <name>)
 augur status --macos    # show VM status, toolchain, and auth info
 augur list --macos      # list all VMs and their state
-augur update --macos    # refresh Claude Code (+ custom provisioning) in the base VM; Xcode, Homebrew and gh are NOT updated (see below)
+augur update --macos    # update Claude Code, gh and Homebrew packages (+ custom provisioning) in the base VM (see below)
 augur version --macos   # show augur version (macOS mode)
 ```
 
-`augur update --macos` is narrower than Container mode's `augur update` (a full no-cache image
-rebuild). It reinstalls Claude Code with the official installer, re-runs your custom provisioning,
-and re-asserts augur's own base-VM settings, all on a staging copy that replaces the base VM only if
-every step passes. It does **not** update Xcode, Homebrew or `gh`, nor upgrade packages Homebrew
-installed earlier: those stay as built until you rebuild the base VM with `augur build --macos`.
+`augur update --macos` works on a staging copy that replaces the base VM only if every step passes
+(a failure leaves the base VM as it was). It reinstalls Claude Code with the official installer,
+runs `brew update` and `brew upgrade` (which upgrades `gh` and every other Homebrew package,
+including the ones your manifest installed), re-runs your custom provisioning, and re-asserts
+augur's own base-VM settings. The Homebrew step runs over the same egress-filtered session as custom
+provisioning, so it reaches only the provisioning allowlist (`formulae.brew.sh`, `ghcr.io`,
+`github.com`, `*.githubusercontent.com`, plus your `hook.allowlist.conf`); a package that needs
+another domain makes the update fail rather than widen the list. That session needs Go
+(`augur-gvproxy`), as egress filtering does everywhere in macOS mode. Xcode is not updated: rebuild
+the base VM with `augur build --macos` for that.
 Project VMs cloned before an update are unaffected; to pick it up, `augur destroy --macos && augur up
 --macos` in each project, which discards that clone's state (DerivedData, Simulator devices, SwiftPM
 caches). Container mode's `update` also leaves other projects' containers on the old image until they

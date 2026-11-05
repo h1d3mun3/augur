@@ -5291,7 +5291,7 @@ cmd_update_macos() {
     host_lock_acquire "$MACOS_BASE_WRITER_LOCK" update
     trap 'host_lock_release "$MACOS_BASE_WRITER_LOCK" update' EXIT
     trap 'exit 130' INT TERM HUP
-    info "Updating $(agent_display_name) in base VM '${MACOS_BASE_VM}'..."
+    info "Updating base VM '${MACOS_BASE_VM}' ($(agent_display_name), Homebrew packages incl. gh, custom provisioning)..."
     # Stop a stale base VM from a previous interrupted run: clonefile does not refuse a running source.
     macos_vm_running "$MACOS_BASE_VM" && "$VM_CLI" stop "$MACOS_BASE_VM" 2>/dev/null || true
     # With the lock held no other update runs, so a staging VM that exists now, running or not, was
@@ -5359,15 +5359,15 @@ cmd_update_macos() {
         rm -f "$_installer"
         grep -q "$_agent_bindir" ~/.zprofile 2>/dev/null || echo "export PATH=\"\$HOME/$_agent_bindir:\$PATH\"" >> ~/.zprofile
     '; then
-        error "Failed to update $(agent_display_name) (see the error above — often a transient network issue)."
+        error "Failed to update the agent (see the error above — often a transient network issue)."
         error "The base VM was left as-is. Try running 'augur update --macos' again."
         exit 1
     fi
 
-    # Optional custom provisioning (~/.augur/provision/manifest.conf and/or hook.sh) — kept
-    # in sync with the base VM on every update too, not just at first build. No-op unless
-    # the operator created those files. See run_base_provisioning.
-    run_base_provisioning "$MACOS_UPDATE_VM"
+    # Upgrade the Homebrew packages (gh included), then run the optional custom provisioning
+    # (~/.augur/provision/manifest.conf and/or hook.sh), both over the egress-filtered session.
+    # See run_base_provisioning.
+    run_base_provisioning "$MACOS_UPDATE_VM" upgrade
 
     # Same scrub as cmd_build_macos: re-assert the no-account-state invariant on every
     # update too, not just at build. The base VM is long-lived and mutable, so a human can log
@@ -5403,7 +5403,7 @@ cmd_update_macos() {
     macos_save_scratch_as_base "$MACOS_UPDATE_VM" update
     "$VM_CLI" delete "$MACOS_UPDATE_VM" || warn "Could not delete the staging VM '${MACOS_UPDATE_VM}'; the next update removes it."
     host_lock_release "$MACOS_BASE_WRITER_LOCK" update
-    success "$(agent_display_name) updated in '${MACOS_BASE_VM}'."
+    success "Base VM '${MACOS_BASE_VM}' updated ($(agent_display_name), Homebrew packages, custom provisioning)."
     warn "Project VMs cloned before this update will not be affected."
     warn "Run ${BOLD}augur destroy --macos && augur up --macos${RESET} to apply to the current project."
 }
@@ -5904,6 +5904,16 @@ run_provision_hook() {
     ssh_macos_provision "$vm" "sudo bash /tmp/augur-provision-hook.sh; rc=\$?; rm -f /tmp/augur-provision-hook.sh; exit \$rc" || return 1
 }
 
+# Upgrade everything Homebrew has installed in the base VM (gh and the manifest's packages
+# included) over the egress-filtered provisioning session, so only the provisioning allowlist's
+# domains are reachable. Explicit `|| return 1`, as in run_provision_manifest.
+run_brew_upgrade() {
+    local vm="$1"
+    info "Upgrading Homebrew packages (brew update, brew upgrade)..."
+    ssh_macos_provision "$vm" "brew update" || return 1
+    ssh_macos_provision "$vm" "brew upgrade" || return 1
+}
+
 # Shared failure path for run_base_provisioning: revoke any sudo grant this session may
 # have made, then tear down whatever this feature started (VM, gvproxy, proxy) before
 # exiting, so a failure never leaks a stray background process, a running VM, or a live
@@ -5928,7 +5938,8 @@ provision_fail() {
 
 # Run optional custom provisioning (~/.augur/provision/{manifest.conf,hook.sh,
 # hook.allowlist.conf}) inside the base-VM build/update, once, before it is cloned/saved.
-# No-op if none of those files exist — cmd_build_macos/cmd_update_macos are unaffected.
+# Without $2=upgrade it is a no-op if none of those files exist; with it, the session always runs
+# and first upgrades the Homebrew packages (run_brew_upgrade).
 # TOFU-gated (check_provision_approved) and executed over the dedicated, egress-filtered
 # provision proxy/gvproxy pair — not the open NAT the rest of the build uses. $1 = VM name
 # (MACOS_BUILD_VM or MACOS_UPDATE_VM, the scratch VM build or update works in), running on NAT
@@ -5936,8 +5947,9 @@ provision_fail() {
 # that NAT session is stopped for it and a new one started afterwards, so on return the VM is
 # running on NAT either way and MACOS_SCRATCH_VM_PID names its current `run`.
 run_base_provisioning() {
-    local vm="$1" outer_pid="${MACOS_SCRATCH_VM_PID:-}"
-    provision_files_present || return 0
+    local vm="$1" upgrade="${2:-}" outer_pid="${MACOS_SCRATCH_VM_PID:-}" files=false
+    provision_files_present && files=true
+    $files || [[ "$upgrade" == upgrade ]] || return 0
     # Set the cleanup globals BEFORE the two checks below (not after) — an invalid
     # manifest or a declined/unapproved TOFU prompt must still stop the caller's own NAT
     # session via provision_fail.
@@ -5962,22 +5974,31 @@ run_base_provisioning() {
         provision_fail "Aborting: provisioning network did not come up."
     fi
 
-    # Grant temporary passwordless sudo for this session (idempotent: cmd_build_macos's
-    # mid-build VM already has this grant from its own Step 4; a standalone base-VM
-    # 'augur update --macos' does not, since the original build already revoked it — this
-    # establishes it fresh in that case). Same admin credential the rest of the build already
-    # depends on — see macos_admin_password().
-    macos_admin_password_stdin "$vm" | ssh_macos_provision_stdin "$vm" \
-        "sudo -S -p '' bash -c \
-            'echo \"${MACOS_SSH_USER} ALL=(ALL) NOPASSWD:ALL\" > /etc/sudoers.d/augur \
-             && chmod 440 /etc/sudoers.d/augur'" \
-        || provision_fail "Failed to grant temporary sudo for provisioning."
+    # Brew upgrades come first, so packages the manifest installs afterwards are not upgraded
+    # twice. Homebrew refuses to run as root, so this needs no sudo grant.
+    if [[ "$upgrade" == upgrade ]]; then
+        run_brew_upgrade "$vm" || provision_fail "Upgrading Homebrew packages failed (see above). If the output shows a connection or DNS error, a domain Homebrew needs is not in the provisioning allowlist; augur does not widen it (add the domain to ~/.augur/provision/hook.allowlist.conf if you trust it). The base VM was left as-is."
+    fi
 
-    run_provision_manifest "$vm" || provision_fail "Base-VM manifest provisioning failed."
-    run_provision_hook "$vm"     || provision_fail "Base-VM provisioning hook failed."
+    # The manifest and the hook need root, so only a session that runs them gets the grant.
+    if $files; then
+        # Grant temporary passwordless sudo for this session (idempotent: cmd_build_macos's
+        # mid-build VM already has this grant from its own Step 4; a standalone base-VM
+        # 'augur update --macos' does not, since the original build already revoked it — this
+        # establishes it fresh in that case). Same admin credential the rest of the build already
+        # depends on — see macos_admin_password().
+        macos_admin_password_stdin "$vm" | ssh_macos_provision_stdin "$vm" \
+            "sudo -S -p '' bash -c \
+                'echo \"${MACOS_SSH_USER} ALL=(ALL) NOPASSWD:ALL\" > /etc/sudoers.d/augur \
+                 && chmod 440 /etc/sudoers.d/augur'" \
+            || provision_fail "Failed to grant temporary sudo for provisioning."
 
-    info "Revoking provisioning sudo grant..."
-    ssh_macos_provision "$vm" "sudo rm -f /etc/sudoers.d/augur" || provision_fail "Failed to revoke the provisioning sudo grant."
+        run_provision_manifest "$vm" || provision_fail "Base-VM manifest provisioning failed."
+        run_provision_hook "$vm"     || provision_fail "Base-VM provisioning hook failed."
+
+        info "Revoking provisioning sudo grant..."
+        ssh_macos_provision "$vm" "sudo rm -f /etc/sudoers.d/augur" || provision_fail "Failed to revoke the provisioning sudo grant."
+    fi
 
     stop_and_reap_macos_vm "$vm" "$PROVISION_CLEANUP_PID"
     stop_provision_gvproxy
@@ -6229,7 +6250,7 @@ cmd_help() {
     echo -e "    augur ${CYAN}destroy${RESET} --macos [name]                             Stop and remove the VM clone (name: from augur list --macos)"
     echo -e "    augur ${CYAN}status${RESET}  --macos                                   Check VM status and toolchain"
     echo -e "    augur ${CYAN}list${RESET}    --macos                                   List all VMs and their state"
-    echo -e "    augur ${CYAN}update${RESET}  --macos                                   Refresh Claude Code in the base VM (not Xcode/brew/gh)"
+    echo -e "    augur ${CYAN}update${RESET}  --macos                                   Update Claude Code, gh and Homebrew packages in the base VM"
     echo -e "    augur ${CYAN}version${RESET} --macos                                   Show augur version (macOS mode)"
     echo ""
     echo -e "  ${BOLD}OPTIONS${RESET}  (put them right after the command: ${CYAN}augur up --macos --gui${RESET}; a misplaced one is refused)"
@@ -6288,6 +6309,8 @@ cmd_help() {
     echo -e "                          ${CYAN}hook.sh${RESET} (+ ${CYAN}hook.allowlist.conf${RESET} for extra domains) for anything else."
     echo -e "                          Runs once, as root, during ${BOLD}augur build --macos${RESET} / ${BOLD}augur update --macos${RESET},"
     echo -e "                          over an egress-filtered proxy session — not the rest of the build's open NAT."
+    echo -e "                          ${BOLD}augur update --macos${RESET} also runs ${CYAN}brew update${RESET} + ${CYAN}brew upgrade${RESET} (gh included) in that"
+    echo -e "                          session; it fails, and leaves the base VM as-is, if a domain is not allowlisted."
     echo -e "        Apple Container:  ${CYAN}~/.augur/provision/container-packages.conf${RESET} (bare apt package names,"
     echo -e "                          one per line), baked into the image via a build-arg during"
     echo -e "                          ${BOLD}augur build${RESET} / ${BOLD}augur update${RESET}."
