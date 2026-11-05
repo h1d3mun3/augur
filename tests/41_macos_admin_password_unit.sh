@@ -88,7 +88,8 @@ if [[ -n "$store_at" && -n "$read_at" && "$store_at" -lt "$read_at" ]]; then
   ok "build, manual flow: the password is stored before the auto-login step reads it"
 else fail "build, manual flow: the password is not stored before it is read" "store@${store_at:-?} read@${read_at:-?}"; fi
 build="$(src_of cmd_build_macos)"
-clone_at="$(printf '%s\n' "$build" | grep -n '"$VM_CLI" clone "$MACOS_BUILD_VM" "$MACOS_BASE_VM"' | cut -d: -f1)"
+clone_at="$(printf '%s\n' "$build" | grep -n 'macos_save_scratch_as_base "$MACOS_BUILD_VM"' | cut -d: -f1)"
+has "$(declare -f macos_save_scratch_as_base)" '"$VM_CLI" clone "$scratch" "$MACOS_BASE_VM"' "the save clones the scratch VM into the base VM"
 if [[ -n "$clone_at" ]]; then ok "build: the base VM is a clone of the build VM (so it carries the credential)"
 else fail "build: the base VM is no longer a clone of the build VM" "the credential would not reach the base"; fi
 # up/update check the credential before booting anything.
@@ -105,7 +106,7 @@ if [[ "$running_branch" == *'require_macos_admin_password "$project_vm"'* ]]; th
 else fail "up --macos: the already-running branch returns without checking the credential" "${running_branch:0:80}"; fi
 update="$(declare -f cmd_update_macos)"
 req_at="$(printf '%s\n' "$update" | grep -n 'require_macos_admin_password "$MACOS_BASE_VM"' | head -n1 | cut -d: -f1)"
-run_at="$(printf '%s\n' "$update" | grep -n '"$VM_CLI" run' | head -n1 | cut -d: -f1)"
+run_at="$(printf '%s\n' "$update" | grep -n 'macos_boot_scratch_vm_nat' | head -n1 | cut -d: -f1)"
 if [[ -n "$req_at" && -n "$run_at" && "$req_at" -lt "$run_at" ]]; then
   ok "update --macos: checks the base VM's credential before booting it"
 else fail "update --macos: does not check the base VM's credential before booting it" "require@${req_at:-?} run@${run_at:-?}"; fi
@@ -131,7 +132,7 @@ if [[ -n "$known_at" && -n "$auto_at" && "$known_at" -lt "$auto_at" && "$known_a
   ok "build: the stale host key is discarded before either flow's first SSH connection"
 else fail "build: the stale host key is not discarded before the flows SSH in" "rm@${known_at:-?} auto@${auto_at:-?}"; fi
 has "$build" '"$MACOS_BUILD_VM_IP"' "build: the shared path uses the IP the flow handed back"
-has "$build" 'vm_pid="$MACOS_BUILD_VM_PID"' "build: the shared path reaps the pid the flow handed back"
+has "$build" 'MACOS_SCRATCH_VM_PID="$MACOS_BUILD_VM_PID"' "build: the shared path reaps the pid the flow handed back"
 for needle in '--provision-' 'kcpassword' 'Setup Assistant (manual)' 'macos_store_admin_password' 'openssl rand'; do
   hasnt "$build" "$needle" "build: no flow-specific step left inline ($needle)"
 done
