@@ -227,7 +227,7 @@ require_macos_admin_password() { :; }   # its refusal is covered by 41_macos_adm
 reconcile_running_container() { echo "RECONCILE_CALLED"; }
 verify_macos_egress_locked() { echo "SELFTEST_CALLED"; }
 agent_verify_integrity_engine() { return 1; }   # setup-token stops right after the gate, before any tty read
-agent_verify_integrity_macos() { return 1; }
+require_macos_egress_mode_current() { :; }   # its refusal is covered by 51_macos_egress_mode_unit.sh
 GUEST_UP=1
 container_running() { [[ "$GUEST_UP" == 1 ]]; }; macos_vm_running() { [[ "$GUEST_UP" == 1 ]]; }
 container_exists() { [[ "$GUEST_UP" == 1 ]]; }
@@ -340,13 +340,15 @@ gate_before cmd_setup_token container_running
 gate_before cmd_up_macos macos_vm_running
 gate_before cmd_claude_macos macos_vm_running
 gate_before cmd_shell_macos macos_vm_running
-gate_before cmd_setup_token_macos macos_vm_running
+# setup-token --macos never attaches to the project VM: it boots its own throwaway clone and helpers
+# (tests/52_macos_setup_token_unit.sh), so the project's helpers have nothing to gate there.
+hasnt "$(declare -f cmd_setup_token_macos)" "require_fresh_egress_helpers" "cmd_setup_token_macos is not gated by the project's helpers"
 for f in cmd_down cmd_destroy cmd_status cmd_list cmd_down_macos cmd_destroy_macos cmd_status_macos cmd_list_macos; do
   hasnt "$(declare -f "$f")" "require_fresh_egress_helpers" "$f is not gated"
 done
 
 # ── macOS VM mode ─────────────────────────────────────────────────────────────────────────────────
-section "Tier 1 — macOS, VM running, fresh proxy + gvproxy → claude/shell/up/setup-token proceed"
+section "Tier 1 — macOS, VM running, fresh proxy + gvproxy → claude/shell/up proceed"
 MACOS_MODE=true; GUEST_UP=1
 make_stub "$AUGUR_PROXY_BIN" m1
 make_stub "$AUGUR_GVPROXY_BIN" mg1
@@ -362,17 +364,15 @@ eq 0 "$rc" "claude --macos: exits 0"; has "$out" "AGENT_LAUNCHED" "claude --maco
 hasnt "$out" "CMD_UP_MACOS_CALLED" "claude --macos: running VM ⇒ no up"
 run_gated cmd_shell_macos
 has "$out" "AGENT_LAUNCHED" "shell --macos: attached"; hasnt "$out" "CMD_UP_MACOS_CALLED" "shell --macos: no up"
-run_gated cmd_setup_token_macos
-has "$out" "not Anthropic-signed" "setup-token --macos: passes the gate (reaches its integrity check)"
 eval "$cmd_up_macos_real"
 run_gated cmd_up_macos
 has "$out" "SELFTEST_CALLED" "up --macos: reaches the running-VM reconcile"
 eq "$m1" "$(cat "$pidfile")" "fresh proxy untouched"
 eq "$mg1" "$(cat "$gpf")" "fresh gvproxy untouched"
 
-section "Tier 1 — macOS, VM running, augur-proxy binary changed → all four refused"
+section "Tier 1 — macOS, VM running, augur-proxy binary changed → all three refused"
 make_stub "$AUGUR_PROXY_BIN" m2
-for c in cmd_claude_macos cmd_shell_macos cmd_up_macos cmd_setup_token_macos; do
+for c in cmd_claude_macos cmd_shell_macos cmd_up_macos; do
   run_gated "$c"
   expect_refused "$c" "$m1" "augur-proxy (pid ${m1})" "augur down --macos && augur up --macos"
 done
@@ -382,7 +382,7 @@ make_stub "$AUGUR_PROXY_BIN" m1; file_sha256 "$AUGUR_PROXY_BIN" > "$side"   # pr
 
 section "Tier 1 — macOS, VM running, augur-gvproxy not fresh → refused (gvproxy untouched)"
 make_stub "$AUGUR_GVPROXY_BIN" mg2
-for c in cmd_claude_macos cmd_shell_macos cmd_up_macos cmd_setup_token_macos; do
+for c in cmd_claude_macos cmd_shell_macos cmd_up_macos; do
   run_gated "$c"
   expect_refused "$c" "$mg1" "augur-gvproxy (pid ${mg1})" "augur down --macos && augur up --macos"
 done

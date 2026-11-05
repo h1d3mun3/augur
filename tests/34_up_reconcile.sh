@@ -15,12 +15,13 @@
 #   3. A flipped egress mode / resized memory limit would not be surfaced: the container_fingerprint
 #      reconcile that exists to catch exactly that sits below it too.
 #
-# The two modes are deliberately ASYMMETRIC. Container mode can refuse (`exit 1`) because it HAS a
-# drift signal; macOS mode has no fingerprint, so its half applies what the host owns and WARNS about
-# what a live VM cannot pick up (gvproxy's DNS allowlist is read once at startup, VM sizing needs the
-# VM stopped, ~/.augur-env is not re-pushed). It does re-run a boot self-test on this path —
-# verify_macos_egress_locked, whose behaviour tests/36_macos_egress_selftest.sh owns — and that is
-# the one thing that can still end the path non-zero, but on a DETECTED leak, never on drift.
+# The two modes are deliberately ASYMMETRIC. Container mode can refuse (`exit 1`) on any drift
+# because it HAS a fingerprint; macOS mode refuses only an egress-mode mismatch against the host-side
+# record written at boot (tests/51_macos_egress_mode_unit.sh owns that), applies what the host owns,
+# and WARNS about what a live VM cannot pick up (gvproxy's DNS allowlist is read once at startup, VM
+# sizing needs the VM stopped, ~/.augur-env is not re-pushed). It does re-run a boot self-test on this
+# path — verify_macos_egress_locked, whose behaviour tests/36_macos_egress_selftest.sh owns — which
+# ends the path non-zero on a DETECTED leak.
 #
 # The last section covers the OTHER half of that story: HOW an operator could end up on the
 # already-running path with a credential-less guest in the first place. Validated only at the
@@ -143,6 +144,9 @@ scp_to_macos()      { :; }
 # assertion rather than a vacuous one.
 vm_cli_rec() { printf '%s\n' "$*" >> "$VMLOG"; return 0; }
 VM_CLI=vm_cli_rec
+# The running VM was booted with egress on, as `up --macos` records it (a mismatch is refused before
+# any of this reconcile; tests/51_macos_egress_mode_unit.sh owns that refusal).
+macos_record_egress_mode
 
 # Negative control for the recorder itself: prove it DOES capture a `run`, so the "never invoked"
 # assertion below cannot pass just because the recorder is broken.
@@ -164,7 +168,7 @@ mk_pinned_state() {   # $1 = "stale" (allowlist newer) | "fresh" (pidfile newer)
 mk_pinned_state stale
 : > "$LOG"; : > "$VMLOG"
 mout="$( cmd_up_macos 2>&1 )"; mrc=$?
-eq "0" "$mrc" "up --macos: returns 0 on a running VM (no fingerprint ⇒ no drift signal to refuse on)"
+eq "0" "$mrc" "up --macos: returns 0 on a running VM booted with the same egress mode"
 if logged gate; then ok "up --macos: runs the project-conf approval gate"
 else fail "up --macos: never ran check_project_conf_approved" "log: $(cat "$LOG")"; fi
 if logged "start_proxy 127.0.0.1"; then ok "up --macos: starts/refreshes the proxy on 127.0.0.1 (gvproxy's SOCKS upstream)"
@@ -315,13 +319,16 @@ else fail "macOS shell does not call warn_if_macos_egress_pinned"; fi
 hasnt "$pinned_fn" 'ssh_macos'   "the pinned-state check never reads the guest"
 hasnt "$pinned_fn" '$VM_CLI'     "the pinned-state check never asks the VM backend"
 has   "$pinned_fn" 'gvproxy_pidfile' "the pinned-state check keys off the gvproxy pidfile (no new state file)"
-# The container half refuses; the macOS half must NOT (no fingerprint ⇒ no reliable drift signal).
+# The container half refuses on any fingerprint drift; the macOS half has no fingerprint and refuses
+# on exactly one drift, the egress mode the VM was booted with (require_macos_egress_mode_current).
 current_body="$(fn_body require_running_container_current)"
 has   "$reconcile_body" 'require_running_container_current' "container up's running path (reconcile_running_container) goes through the drift refusal"
 has   "$current_body"   'exit 1' "container up's running path can refuse on drift (it has container_fingerprint)"
-if printf '%s\n' "$up_macos_body" | sed -n '/already running/,/^    fi$/p' | grep -q 'exit 1'
-then fail "cmd_up_macos refuses on the already-running path" "macOS has no drift signal to refuse on"
-else ok "cmd_up_macos returns 0 on the already-running path (no fingerprint ⇒ no drift refusal)"; fi
+running_branch="$(printf '%s\n' "$up_macos_body" | sed -n '/if macos_vm_running "\$project_vm"; then/,/^    fi$/p')"
+has "$running_branch" 'require_macos_egress_mode_current' "cmd_up_macos's already-running path refuses an egress-mode mismatch"
+if printf '%s\n' "$running_branch" | grep -q 'exit 1'
+then fail "cmd_up_macos refuses on some other drift on the already-running path" "only the egress mode is a refusal"
+else ok "cmd_up_macos refuses on no other drift on the already-running path"; fi
 
 # The credential check's POSITION in the source, not just its effect: a future edit that moves it
 # back below the boot must fail here too, not only behaviourally.

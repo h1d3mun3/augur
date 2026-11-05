@@ -389,6 +389,7 @@ else fail "--no-egress: the clock correction was skipped with the self-test" "lo
 section "Tier 1 — call site: the ALREADY-RUNNING reconcile path"
 
 macos_vm_running() { return 0; }
+macos_record_egress_mode       # booted with egress on (the --no-egress run above recorded "off")
 reset_guest; g_offset -5733
 up_macos
 eq "0" "$rc" "already-running: still returns 0 (a pure host-side reconcile plus this)"
