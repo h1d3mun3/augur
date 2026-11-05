@@ -4486,10 +4486,13 @@ cmd_up_macos() {
     # validate_secret_value failure in there would exit only that subshell, whereas `exit 1` here
     # aborts the whole `up` (fail-closed).
     validate_resolved_credentials || exit 1
+    # Built before the pipe so the writer forks nothing for it.
+    local _path_line
+    _path_line="export PATH=\"\$HOME/$(macos_agent_bindir_rel):\$PATH\"   # $(agent_cli_name) (official installer)"
     {
         echo '# augur (regenerated at VM startup)'
         echo 'eval "$(/opt/homebrew/bin/brew shellenv)" 2>/dev/null || true'
-        echo "export PATH=\"\$HOME/$(macos_agent_bindir_rel):\$PATH\"   # $(agent_cli_name) (official installer)"
+        echo "$_path_line"
         # Also written into the base VM's ~/.zshenv at build time; repeated here because a base VM
         # built by an older augur has it only in ~/.zprofile, which non-login SSH shells never read.
         echo 'export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer'
