@@ -514,6 +514,11 @@ validate_resolved_credentials() {
         _aval="$(resolve_api_key "${!_henv:-}" "$_hfile")"
         [[ -n "$_aval" ]] && { validate_secret_value "$_genv" "$_aval" || return 1; }
     done < <(agent_auth_specs)
+    # The agent's fixed env is written into the same sourced file, so it gets the same check.
+    local _kv
+    for _kv in $(agent_fixed_env); do
+        validate_secret_value "${_kv%%=*}" "${_kv#*=}" || return 1
+    done
     return 0
 }
 
@@ -4454,7 +4459,9 @@ cmd_up_macos() {
         echo 'export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer'
         # The agent's fixed env goes in the file so every guest zsh session (a shell, an ssh
         # one-off, the agent started by hand) sees it, as in Container mode where it is part of
-        # the image environment. Keys and values are agent-declared constants, not operator input.
+        # the image environment. The file is written at boot, so a VM that is already running (or a
+        # clone last booted by an older augur) has it only after `down --macos && up --macos`.
+        # Keys and values are agent-declared constants, checked by validate_resolved_credentials.
         for _kv in $(agent_fixed_env); do echo "export ${_kv%%=*}='${_kv#*=}'"; done
         while IFS='|' read -r _genv _henv _hfile _hvalidator; do
             [[ -z "$_genv" ]] && continue
@@ -5284,7 +5291,7 @@ cmd_update_macos() {
     host_lock_acquire "$MACOS_BASE_WRITER_LOCK" update
     trap 'host_lock_release "$MACOS_BASE_WRITER_LOCK" update' EXIT
     trap 'exit 130' INT TERM HUP
-    info "Updating CLI tools in base VM '${MACOS_BASE_VM}'..."
+    info "Updating $(agent_display_name) in base VM '${MACOS_BASE_VM}'..."
     # Stop a stale base VM from a previous interrupted run: clonefile does not refuse a running source.
     macos_vm_running "$MACOS_BASE_VM" && "$VM_CLI" stop "$MACOS_BASE_VM" 2>/dev/null || true
     # With the lock held no other update runs, so a staging VM that exists now, running or not, was
@@ -5352,7 +5359,7 @@ cmd_update_macos() {
         rm -f "$_installer"
         grep -q "$_agent_bindir" ~/.zprofile 2>/dev/null || echo "export PATH=\"\$HOME/$_agent_bindir:\$PATH\"" >> ~/.zprofile
     '; then
-        error "Failed to update CLI tools (see the error above — often a transient network issue)."
+        error "Failed to update $(agent_display_name) (see the error above — often a transient network issue)."
         error "The base VM was left as-is. Try running 'augur update --macos' again."
         exit 1
     fi
@@ -5396,7 +5403,7 @@ cmd_update_macos() {
     macos_save_scratch_as_base "$MACOS_UPDATE_VM" update
     "$VM_CLI" delete "$MACOS_UPDATE_VM" || warn "Could not delete the staging VM '${MACOS_UPDATE_VM}'; the next update removes it."
     host_lock_release "$MACOS_BASE_WRITER_LOCK" update
-    success "CLI tools updated in '${MACOS_BASE_VM}'."
+    success "$(agent_display_name) updated in '${MACOS_BASE_VM}'."
     warn "Project VMs cloned before this update will not be affected."
     warn "Run ${BOLD}augur destroy --macos && augur up --macos${RESET} to apply to the current project."
 }

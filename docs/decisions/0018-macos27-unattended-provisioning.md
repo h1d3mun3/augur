@@ -196,7 +196,7 @@ The rest of this ADR's text that names `sw_vers`, `guest-os-version`,
 The Consequences bullet that says "an agent inside the guest already has passwordless `sudo`" is
 wrong about project clones: the build-time `NOPASSWD` grant is revoked before the base VM is saved
 (see the 2026-11-06 amendment to ADR-0007). On the fixed-credential path the agent can still reach
-root by typing the guessable `admin` password. On this ADR's path it cannot, because the randomized
+root by typing the guessable `admin` password. On this ADR's path it has no such shortcut, because the randomized
 password is held on the host and is never given to the guest.
 
 ## Context

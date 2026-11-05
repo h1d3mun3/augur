@@ -32,9 +32,7 @@ in time," this **prescribes** "what must never break." It changes rarely.
   with gvproxy and the proxy (`verify_macos_egress_locked`).
 - **Why:** Prevent a misconfiguration or partial failure from "opening up." When it
   fails, it must fail to the closed side.
-- **Enforced by:** `AllowlistTests.testEmptyConfDeniesEverything` / refused on both engines by the `up`, `claude`, `shell` and
-  `setup-token` (container) dispatch cases; `setup-token --macos` is exempt because it never mounts
-  the workspace or merges a project conf, see `verify_egress_locked()`
+- **Enforced by:** `AllowlistTests.testEmptyConfDeniesEverything` / shell `verify_egress_locked()`
   (container) **and `verify_macos_egress_locked()`** (macOS VM, `augur`). Until the latter existed,
   "on every engine" held for the *policy* half on both engines but the boot tripwire was
   container-only: `verify_egress_locked` had exactly one call site (`finish_up`), which macOS mode
@@ -115,8 +113,9 @@ in time," this **prescribes** "what must never break." It changes rarely.
   differs between two same-basename projects while the slug is identical) plus `tests/11_construct_container.sh` and
   `tests/30_macos_vm.sh` (the workspace-containment guard `require_safe_workspace` — a workspace
   that CONTAINS `~/.augur` would put the merged allowlist itself inside the read-write share, which
-  is the same widening this invariant forbids; refused on both engines from the shared dispatch
-  tail's `up|claude|shell|setup-token` case, see
+  is the same widening this invariant forbids; refused on both engines by the dispatch gate for
+  `up`, `claude` and `shell`, and for `setup-token` in Container mode; `setup-token --macos` is
+  exempt because its throwaway VM gets no workspace share and no project conf, see
   `docs/decisions/0014-workspace-must-not-contain-augur.md`). The TOFU approval itself
   (`check_project_conf_approved`) is 🟡 partly tested: `tests/01_egress_allowlist_unit.sh` drives the
   `AUGUR_ACCEPT_PROJECT_CONF=1` accept, the non-interactive fail-closed refusal of a conf changed
@@ -140,7 +139,7 @@ in time," this **prescribes** "what must never break." It changes rarely.
   The same gap covers `start_gvproxy`'s `--socks-upstream` / `--dns-allowlist` / `--deny-direct` and
   the containment argv of `container run` (`--network`, `--cap-drop NET_ADMIN`, `--no-dns`, and the
   `--internal` network created by `ensure_egress_network`). A one-line source guard per call site — the `grep -Eq … "$AUGUR"`
-  shape `tests/30_macos_vm.sh` already uses for the read-only profile share — would close all five
+  shape `tests/30_macos_vm.sh` already uses for the read-only profile share — would close all of them
   cheaply.
 
 ### I9. macOS guest network isolation  🟡 partial

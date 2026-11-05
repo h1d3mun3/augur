@@ -284,7 +284,7 @@ installed earlier: those stay as built until you rebuild the base VM with `augur
 Project VMs cloned before an update are unaffected; to pick it up, `augur destroy --macos && augur up
 --macos` in each project, which discards that clone's state (DerivedData, Simulator devices, SwiftPM
 caches). Container mode's `update` also leaves other projects' containers on the old image until they
-are destroyed and brought up again, but it recreates the current project's container for you.
+are destroyed and brought up again; it removes the current project's container so the next `augur up` recreates it.
 
 `augur install-cert --macos` is additive: each run trusts one more CA in the base VM's System
 keychain, and a CA trusted earlier stays trusted. augur does not remove CAs, because it cannot tell
