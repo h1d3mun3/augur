@@ -545,6 +545,22 @@ grep -q "^vm run .*--net-vfkit=" "$LOG" && ok "--no-egress: still the filtered d
 tail_case="$(sed -n '/^case "\$COMMAND" in$/,/^esac$/p' "$AUGUR" | head -n 4)"
 has "$tail_case" 'setup-token)     $MACOS_MODE || require_safe_workspace' "the workspace gate skips setup-token --macos only"
 
+section "Tier 1 — setup-token --macos: SSH reaches the throwaway VM on its own fixed forward port"
+# The real port resolution (macos_ssh_port → the running gvproxy's --ssh-port), with a stand-in
+# gvproxy started the way start_gvproxy starts it: with whatever AUGUR_SSH_FWD_PORT holds once the
+# throwaway identity is adopted. The current project's port (20111 here) must never be used.
+printf 'sleep 60\n' > "$TMPD/fake-gvproxy"
+resolved="$(
+    AUGUR_SSH_FWD_PORT=20111
+    adopt_setup_token_identity
+    bash "$TMPD/fake-gvproxy" --listen-vfkit "unixgram://$(gvproxy_socket)" --ssh-port "$AUGUR_SSH_FWD_PORT" >/dev/null 2>&1 &
+    echo $! > "$(gvproxy_pidfile)"
+    printf '%s %s %s\n' "$(macos_project_vm)" "$(macos_ssh_host "$(macos_project_vm)")" "$(macos_ssh_port "$(macos_project_vm)")"
+    kill $! 2>/dev/null; rm -f "$(gvproxy_pidfile)"
+)"
+eq "$(TARGET_SLUG=""; TARGET_HASH=""; adopt_setup_token_identity; macos_project_vm) 127.0.0.1 ${AUGUR_SSH_FWD_PORT_SETUP_TOKEN}" "$resolved" \
+   "the throwaway VM resolves to 127.0.0.1:${AUGUR_SSH_FWD_PORT_SETUP_TOKEN} (its fixed port, read back from its gvproxy)"
+eq "20998" "$AUGUR_SSH_FWD_PORT_SETUP_TOKEN" "the throwaway VM's fixed forward port is 20998"
 
 section "Tier 1 — setup-token --macos replaces a stored token that cannot be injected"
 # A stored token that the injection check refuses (a quote, a newline) and a gh token that fails it

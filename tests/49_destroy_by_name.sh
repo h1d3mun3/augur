@@ -153,4 +153,59 @@ done
 eq "1" "$rc" "destroy --macos <bad name>: refused with exit 1"
 eq "" "$(cat "$vmlog")" "destroy --macos <bad name>: no augur-vm call at all"
 
+# ── destroy --macos <name> of a RUNNING VM: the in-guest shutdown goes to THAT VM's forward ──
+# The current directory's own forward port (AUGUR_SSH_FWD_PORT, derived from the cwd) belongs to
+# another project's VM, which must never receive the shutdown. The port must come from the named
+# VM's running gvproxy. `ssh` is a PATH shim that records its argv and "powers the VM off".
+section "Tier 1 — destroy --macos <name> of a running VM SSHes to that VM's own forward"
+shimbin="$work/bin"; mkdir -p "$shimbin"
+sshlog="$work/ssh.argv"; offflag="$work/vm-off"
+cat > "$shimbin/ssh" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$sshlog"
+: > "$offflag"
+exit 0
+EOF
+chmod +x "$shimbin/ssh"
+PATH="$shimbin:$PATH"
+running_rec() {   # augur-vm stand-in: the VM is listed running until ssh "powers it off" or stop runs
+    printf '%s\n' "$*" >> "$vmlog"
+    case "$1" in
+        list) printf 'NAME VM STATE\n- %s %s\n' "$vm" "$([[ -e "$offflag" ]] && echo stopped || echo running)" ;;
+        stop) : > "$offflag" ;;
+    esac
+    return 0
+}
+VM_CLI=running_rec
+mkdir -p "$AUGUR_DIR/vms/$vm"; printf 'admin' > "$AUGUR_DIR/vms/$vm/admin-password"
+printf 'sleep 60\n' > "$work/fake-gvproxy"
+gv_pids=()
+fake_target_gvproxy() {   # fake_target_gvproxy [--ssh-port N]: the named VM's live gvproxy
+    bash "$work/fake-gvproxy" --listen-vfkit "unixgram://x" "$@" >/dev/null 2>&1 &
+    gv_pids+=("$!"); echo "$!" > "$AUGUR_PROXY_DIR/${slug}-${hash}.gvproxy.pid"
+}
+
+TARGET_SLUG=""; TARGET_HASH=""; CONTAINER_NAME=""
+AUGUR_SSH_FWD_PORT=20111                   # the current directory's forward port
+: > "$vmlog"; : > "$sshlog"; rm -f "$offflag"
+fake_target_gvproxy --ssh-port 20777
+( cmd_destroy_macos "$vm" ) >/dev/null 2>&1; rc=$?
+eq "0" "$rc" "running VM: destroy --macos <name> exits 0"
+has   "$(cat "$sshlog")" "-p 20777" "running VM: the in-guest shutdown uses the named VM's forward (20777)"
+hasnt "$(cat "$sshlog")" "20111"    "running VM: never the current directory's forward port (20111)"
+has   "$(cat "$sshlog")" "shutdown -h now" "running VM: the SSH call is the in-guest shutdown"
+has   "$(cat "$vmlog")" "delete ${vm}" "running VM: then deletes THAT VM"
+
+# A live gvproxy whose forward port cannot be read back: no SSH at all, straight to augur-vm stop.
+TARGET_SLUG=""; TARGET_HASH=""; CONTAINER_NAME=""
+: > "$vmlog"; : > "$sshlog"; rm -f "$offflag"
+fake_target_gvproxy
+out="$( cmd_destroy_macos "$vm" 2>&1 )"; rc=$?
+eq "0" "$rc" "unreadable forward port: destroy --macos <name> exits 0"
+eq "" "$(cat "$sshlog")" "unreadable forward port: no SSH call at all (never a guessed port)"
+has "$out" "without an in-guest shutdown" "unreadable forward port: says the shutdown is skipped"
+has "$(cat "$vmlog")" "stop ${vm}"   "unreadable forward port: falls through to augur-vm stop"
+has "$(cat "$vmlog")" "delete ${vm}" "unreadable forward port: and deletes THAT VM"
+for p in "${gv_pids[@]}"; do kill "$p" 2>/dev/null; done
+
 finish

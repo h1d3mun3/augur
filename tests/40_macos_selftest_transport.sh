@@ -71,6 +71,8 @@ teardown_ran() { logged "stop $1" && logged stop_gvproxy && logged stop_proxy; }
 G_GVPROXY=1 G_VMIP="" G_SSH_OK=1
 macos_project_vm() { echo testvm; }                     # so macos_via_gvproxy's name test matches
 gvproxy_running()  { [[ "$G_GVPROXY" == 1 ]]; }
+# The forward port is read back from the running gvproxy (see macos_ssh_port); answer for the stand-in.
+macos_vm_gvproxy_fwd_port() { [[ "$G_GVPROXY" == 1 ]] && echo 20123; }
 
 # Shadow the ssh BINARY, below the real ssh_macos. The remote command is ssh's last argument.
 ssh() {
