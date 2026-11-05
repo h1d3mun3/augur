@@ -56,7 +56,7 @@ ensure_macos_workspace() { :; }; ensure_macos_agent_projects() { :; }; ensure_ma
 ensure_macos_agent_profile() { :; }; ensure_macos_agent_bin() { :; }; ensure_macos_git_credential_helper() { :; }
 macos_poweroff_before_teardown() { :; }
 scp_to_macos() { :; }
-ssh_macos() { echo "ssh $*" >> "$LOG"; [[ "$*" == *" -t "* ]] && echo AGENT_ATTACHED; return 0; }
+ssh_macos() { echo "ssh $*" >> "$LOG"; [[ "$*" == *"cat > "* ]] && cat >/dev/null; [[ "$*" == *" -t "* ]] && echo AGENT_ATTACHED; return 0; }
 egress_on()  { AUGUR_EGRESS=auto; }
 egress_off() { AUGUR_EGRESS=0; }
 record() { mkdir -p "$AUGUR_PROXY_DIR"; printf '%s\n' "$1" > "$(macos_egress_mode_file)"; }
