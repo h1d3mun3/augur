@@ -29,7 +29,7 @@ correcting, or reaffirming. Read docs/security-reviews/INVARIANTS.md for the con
 
 The previous snapshot's commit is ${prevCommit}; today's snapshot is dated ${newDate}. To see what
 changed in the egress core since the baseline, run:
-  git log ${prevCommit}..HEAD -- augur augur-proxy gvproxy augur.conf augur-vm
+  git log ${prevCommit}..HEAD -- augur augur-proxy gvproxy augur.conf augur-vm agents
 
 Ground every claim in the CURRENT code (read the actual files - do not trust the previous
 snapshot's prose blindly) and in real test runs where feasible (swift test in augur-proxy/, bash
@@ -51,7 +51,7 @@ const SECTIONS = [
 Your scope is two things.
 
 1. A section titled "## What changed since the ${prevDate} snapshot" - summarize, by reading the
-   actual commits (git log ${prevCommit}..HEAD -- augur augur-proxy gvproxy augur.conf augur-vm),
+   actual commits (git log ${prevCommit}..HEAD -- augur augur-proxy gvproxy augur.conf augur-vm agents),
    what landed in the egress core since the baseline. Group a related commit series (e.g. one PR's
    worth of commits, or a revert stack) into one paragraph each rather than listing every commit.
    Call out explicitly whether this is a contract change - check with

@@ -6,7 +6,7 @@ description: >-
   green, and report ONLY what diverged or changed since the newest dated snapshot —
   like `git diff`, not a full re-description. Use when the user asks to audit / check /
   survey egress control, look for egress drift, or sanity-check egress before merging a
-  change to the egress core (augur / augur-proxy/ / gvproxy/ / augur.conf / augur-vm/).
+  change to the egress core (augur / augur-proxy/ / gvproxy/ / augur.conf / augur-vm/ / agents/).
   To fully REGENERATE the snapshot instead of auditing it, run the `augur-egress-survey`
   workflow (the heavy path) — this skill does not do that.
 ---
@@ -23,7 +23,7 @@ The two artifacts you audit against:
 - **Newest snapshot:** the highest-dated `docs/security-reviews/YYYY-MM-DD-*.md`.
 
 The egress core (what "changed enough to matter" means): `augur`, `augur-proxy/`, `gvproxy/`,
-`augur.conf`, `augur-vm/`.
+`augur.conf`, `augur-vm/`, `agents/`.
 
 ## Steps
 
@@ -53,7 +53,7 @@ The egress core (what "changed enough to matter" means): `augur`, `augur-proxy/`
      snapshot records; report additions/removals.
 
 4. **Changes since the newest snapshot.** Find the snapshot's commit (or use its date) and run
-   `git log --oneline <since>..HEAD -- augur augur-proxy gvproxy augur.conf augur-vm` to list
+   `git log --oneline <since>..HEAD -- augur augur-proxy gvproxy augur.conf augur-vm agents` to list
    egress-core commits landed since. Summarize what each touched (one line each).
 
 5. **Cross-check the snapshot's claims.** For a handful of load-bearing statements in the newest
