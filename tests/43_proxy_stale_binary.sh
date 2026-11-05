@@ -408,7 +408,7 @@ has "$out" "stale: no record" "status --macos shows the stale gvproxy"
 # With egress on the guest is reached through gvproxy's local forward and has no DHCP lease, so
 # the Toolchain block must key off ssh_macos's host, not a lease lookup.
 out="$(resolve_macos_vm_cpu() { echo 4; }; resolve_macos_vm_memory_mb() { echo 8192; }
-       macos_vm_ip() { return 1; }; macos_ssh_host() { echo 127.0.0.1; }
+       macos_vm_ip() { return 1; }; macos_ssh_host() { echo 127.0.0.1; }; macos_ssh_port() { echo 20777; }
        ssh_macos() { echo "    xcode:  Xcode 27.0"; }; cmd_status_macos 2>&1)"
 has   "$out" "xcode:  Xcode 27.0" "status --macos reads the toolchain over the gvproxy forward (no DHCP lease)"
 hasnt "$out" "VM not running"     "status --macos does not call a running gvproxy-mode VM 'not running'"

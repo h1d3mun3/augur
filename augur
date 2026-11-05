@@ -2177,8 +2177,9 @@ verify_macos_egress_locked() {
     # `eng exec` stops working, because its proxy probe then returns no status either.
     #
     # RESOLVABILITY is checked BEFORE the first probe, and separately, because ssh_macos does not
-    # RETURN when it cannot name a host for the VM — it `exit 1`s the whole script:
+    # RETURN when it cannot name a host or port for the VM — it `exit 1`s the whole script:
     #     host="$(macos_ssh_host "$vm")"; [[ -n "$host" ]] || { error …; exit 1; }
+    #     port="$(macos_ssh_port "$vm")"; [[ -n "$port" ]] || { error …; exit 1; }
     # Every probe below invokes it under `&>/dev/null` or inside `$( … )`, so without this check that
     # exit would be UNOBSERVABLE and, being an exit rather than a non-zero return, it would jump clean
     # over the fail-closed teardown at the bottom of this function — leaving precisely the live VM
@@ -2194,11 +2195,12 @@ verify_macos_egress_locked() {
     #
     # Fixing it HERE rather than in ssh_macos is deliberate: turning that `exit 1` into `return 1`
     # would change the failure mode of all 47 call sites at once, many of which rely on `set -e`
-    # aborting the operation. Checking the same condition first is local and total — once a host
-    # resolves, ssh_macos has no other exit path, so every probe below is covered.
-    if [[ -z "$(macos_ssh_host "$vm")" ]]; then
+    # aborting the operation. Checking the same conditions first is local and total — once a host
+    # and a port resolve, ssh_macos has no other exit path, so every probe below is covered. An empty
+    # port (gvproxy up, forward unreadable; see macos_ssh_port) is the same no-way-in state.
+    if [[ -z "$(macos_ssh_host "$vm")" || -z "$(macos_ssh_port "$vm")" ]]; then
         error "Self-test: no SSH transport to '${vm}' — egress cannot be VERIFIED."
-        error "  The VM is running but gvproxy is not, so nothing on the host can reach the guest."
+        error "  The VM is running but gvproxy is not (or has no readable SSH forward), so nothing can reach it."
         error "  gvproxy cannot be restarted under a live VM (its unixgram socket IS the guest's"
         error "  NIC), so this fails closed and stops the VM below; \`augur up --macos\` then boots a"
         error "  fresh guest with a working datapath."
@@ -4974,7 +4976,7 @@ cmd_status_macos() {
     echo -e "${BOLD}Toolchain:${RESET}"
     # Gate on the address ssh_macos will actually use: with egress on, that is gvproxy's local
     # forward and the guest has no DHCP lease, so a lease-based check would never pass.
-    if macos_vm_running "$project_vm" && [[ -n "$(macos_ssh_host "$project_vm")" ]]; then
+    if macos_vm_running "$project_vm" && [[ -n "$(macos_ssh_host "$project_vm")" && -n "$(macos_ssh_port "$project_vm")" ]]; then
         # DEVELOPER_DIR (full Xcode, not the CLT) comes from ~/.augur-env; see cmd_up_macos.
         # AUGUR_AGENT_SEAM | agent version (macOS, in-VM; runs `claude --version`)
         ssh_macos "$project_vm" '
