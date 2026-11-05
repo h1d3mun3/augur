@@ -46,8 +46,7 @@ in time," this **prescribes** "what must never break." It changes rarely.
   `claude --macos` (`tests/51_macos_egress_mode_unit.sh`). `setup-token --macos` boots its throwaway
   VM through the same datapath and self-test (`tests/52_macos_setup_token_unit.sh`). Both self-tests are inherently live (they need a
   booted guest); the *wiring* — invoked on both paths, and a NOT-locked verdict exits non-zero with
-  the teardown having run — is covered offline by `tests/36_macos_egress_selftest.sh`, and
-  `tests/34_up_reconcile.sh` pins the **already-running** path on both engines (container reaches
+  the teardown having run — is covered offline by `tests/36_macos_egress_selftest.sh`; its transport pre-check fails closed too — with the SSH forward port unreadable, teardown runs and no probe is sent (`tests/40_macos_selftest_transport.sh`). `tests/34_up_reconcile.sh` pins the **already-running** path on both engines (container reaches
   `finish_up`; macOS reaches `verify_macos_egress_locked`). `verify_egress_locked` itself has no
   offline peer at all — its live gate is `tests/22_egress_failclosed.sh`, and mutation testing
   confirms that deleting its fail-closed branch, or its call from `finish_up`, leaves the offline
