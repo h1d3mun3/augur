@@ -2044,14 +2044,21 @@ gvproxy_running() {
 # The pidfile name is the VM name minus its `augur-macos-` prefix — both are `<slug>-<path hash>`
 # (see gvproxy_pidfile, macos_project_vm). The port is read back from gvproxy's own argv because
 # it is derived from the project's full path, which the VM name does not carry.
+# The pid in the pidfile may be stale and reused by an unrelated process, so the process is
+# trusted only if its argv also names THIS VM's own vfkit socket (the path gvproxy_socket gives:
+# the slug cut to 24 characters, then the path hash); otherwise this fails rather than guess.
 # `-ww`: on a terminal, BSD ps cuts args at the terminal width, and gvproxy's long socket and
 # allowlist paths come before --ssh-port.
 macos_vm_gvproxy_fwd_port() {
-    local pf="$AUGUR_PROXY_DIR/${1#augur-macos-}.gvproxy.pid" pid args
+    local stem="${1#augur-macos-}" pf pid args sock slug
+    pf="$AUGUR_PROXY_DIR/${stem}.gvproxy.pid"
+    slug="${stem%-*}"
+    sock="$AUGUR_PROXY_DIR/${slug:0:24}-${stem##*-}.vfkit.sock"
     [[ -f "$pf" ]] || return 1
     pid="$(cat "$pf" 2>/dev/null)"
     [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null || return 1
     args="$(ps -ww -o args= -p "$pid" 2>/dev/null)" || return 1
+    [[ "$args " == *"unixgram://${sock} "* ]] || return 1
     [[ "$args" =~ --ssh-port[[:space:]]+([0-9]+) ]] || return 1
     echo "${BASH_REMATCH[1]}"
 }
@@ -4835,6 +4842,9 @@ macos_poweroff_before_teardown() {
     local vm="$1"
     if macos_vm_exists "$vm" && macos_vm_running "$vm" && gvproxy_running; then
         if [[ -z "$(macos_ssh_port "$vm")" ]]; then
+            # Accepted trade-off: the VM is hard-stopped without a graceful in-guest shutdown, which
+            # risks unflushed guest disk state in the clone augur keeps; that is accepted over
+            # connecting to a guessed port, which could be another project's VM.
             warn "Cannot read the SSH forward port of '${vm}' from its gvproxy; stopping it without an in-guest shutdown."
             return 0
         fi
@@ -4985,6 +4995,8 @@ cmd_status_macos() {
             echo "    xcode:  $(xcodebuild -version 2>/dev/null | head -1 || echo "(unable to fetch)")"
             echo "    claude: $(claude --version 2>/dev/null || echo "(unable to fetch)")"
         ' | sanitize_guest_lines || true
+    elif macos_vm_running "$project_vm"; then
+        echo -e "    ${YELLOW}(VM is running, but its SSH forward port could not be read from gvproxy — run: augur down --macos && augur up --macos)${RESET}"
     else
         echo -e "    ${YELLOW}(VM not running — run: augur up --macos)${RESET}"
     fi
@@ -6294,6 +6306,7 @@ if [[ "${AUGUR_SOURCE_ONLY:-0}" == "1" ]]; then return 0 2>/dev/null || true; fi
 # stops at the first other word, so a flag placed later would otherwise be dropped without a word:
 # `augur down extra --macos` would stop the container, `augur build --ipsw X --xcode-xip Y --macos`
 # would build the container image. Every refusal exits 1 before anything runs.
+# - `-h`/`--help` anywhere in the leftovers: print the usage and exit 0, ahead of every check below.
 # - A global flag anywhere in the leftovers: say where it goes.
 # - `build` without --macos: the macOS base-VM build options mean --macos was left out.
 # - Any other leftover word, for a command that takes none.
@@ -6305,10 +6318,13 @@ reject_extra_args() {
     local cmd="$1" a; shift
     case "$cmd" in
         help|--help|-h) return 0 ;;
-        build) $MACOS_MODE && return 0 ;;
-        up|claude|shell|setup-token|install-cert|down|destroy|status|init-conf|list|__names|update|version) ;;
+        build|up|claude|shell|setup-token|install-cert|down|destroy|status|init-conf|list|__names|update|version) ;;
         *) return 0 ;;
     esac
+    for a in "$@"; do
+        case "$a" in -h|--help) cmd_help; exit 0 ;; esac
+    done
+    [[ "$cmd" == build ]] && $MACOS_MODE && return 0
     for a in "$@"; do
         case "$a" in
             --macos|--gui|--egress|--no-egress|--swift)

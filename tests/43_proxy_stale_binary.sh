@@ -412,6 +412,14 @@ out="$(resolve_macos_vm_cpu() { echo 4; }; resolve_macos_vm_memory_mb() { echo 8
        ssh_macos() { echo "    xcode:  Xcode 27.0"; }; cmd_status_macos 2>&1)"
 has   "$out" "xcode:  Xcode 27.0" "status --macos reads the toolchain over the gvproxy forward (no DHCP lease)"
 hasnt "$out" "VM not running"     "status --macos does not call a running gvproxy-mode VM 'not running'"
+# Running VM, but its forward port cannot be read back: say so, not "not running".
+out="$(resolve_macos_vm_cpu() { echo 4; }; resolve_macos_vm_memory_mb() { echo 8192; }
+       macos_vm_ip() { return 1; }; macos_ssh_host() { echo 127.0.0.1; }; macos_ssh_port() { :; }
+       ssh_macos() { echo "SSH-CALLED"; }; cmd_status_macos 2>&1)"
+has   "$out" "SSH forward port could not be read from gvproxy" "status --macos: running VM with an unreadable port says so"
+has   "$out" "augur down --macos && augur up --macos"           "status --macos: …and names the recovery"
+hasnt "$out" "VM not running"                                   "status --macos: …and does not call it 'not running'"
+hasnt "$out" "SSH-CALLED"                                       "status --macos: …and never connects"
 out="$(cmd_list_macos 2>&1)"; rc=$?
 eq 0 "$rc" "list --macos exits 0"
 out="$(macos_vm_exists() { return 1; }; cmd_down_macos 2>&1)"; rc=$?

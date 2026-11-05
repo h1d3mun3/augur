@@ -181,7 +181,7 @@ mkdir -p "$AUGUR_DIR/vms/$vm"; printf 'admin' > "$AUGUR_DIR/vms/$vm/admin-passwo
 printf 'sleep 60\n' > "$work/fake-gvproxy"
 gv_pids=()
 fake_target_gvproxy() {   # fake_target_gvproxy [--ssh-port N]: the named VM's live gvproxy
-    bash "$work/fake-gvproxy" --listen-vfkit "unixgram://x" "$@" >/dev/null 2>&1 &
+    bash "$work/fake-gvproxy" --listen-vfkit "unixgram://$AUGUR_PROXY_DIR/${slug}-${hash}.vfkit.sock" "$@" >/dev/null 2>&1 &
     gv_pids+=("$!"); echo "$!" > "$AUGUR_PROXY_DIR/${slug}-${hash}.gvproxy.pid"
 }
 
@@ -206,6 +206,16 @@ eq "" "$(cat "$sshlog")" "unreadable forward port: no SSH call at all (never a g
 has "$out" "without an in-guest shutdown" "unreadable forward port: says the shutdown is skipped"
 has "$(cat "$vmlog")" "stop ${vm}"   "unreadable forward port: falls through to augur-vm stop"
 has "$(cat "$vmlog")" "delete ${vm}" "unreadable forward port: and deletes THAT VM"
+
+# A live pid with --ssh-port whose socket path is another VM's: same refusal, no SSH.
+TARGET_SLUG=""; TARGET_HASH=""; CONTAINER_NAME=""
+: > "$vmlog"; : > "$sshlog"; rm -f "$offflag"
+bash "$work/fake-gvproxy" --listen-vfkit "unixgram://$AUGUR_PROXY_DIR/other-ffffffffffff.vfkit.sock" --ssh-port 20888 >/dev/null 2>&1 &
+gv_pids+=("$!"); echo "$!" > "$AUGUR_PROXY_DIR/${slug}-${hash}.gvproxy.pid"
+out="$( cmd_destroy_macos "$vm" 2>&1 )"; rc=$?
+eq "0" "$rc" "foreign socket path: destroy --macos <name> exits 0"
+eq "" "$(cat "$sshlog")" "foreign socket path: no SSH call (the reused pid's port is never trusted)"
+has "$(cat "$vmlog")" "stop ${vm}" "foreign socket path: falls through to augur-vm stop"
 for p in "${gv_pids[@]}"; do kill "$p" 2>/dev/null; done
 
 finish
