@@ -136,18 +136,24 @@ hasnt "$bin_fn" "codesign"   "no signature check at plain claude launch (a proje
 # ── 2. update --macos ────────────────────────────────────────────────────────────────────────
 section "Tier 1 — update --macos: a staging copy, promoted only when everything passed"
 VMS="$TMPD/vms.list"
+RUNNING_VMS=""       # space-separated names the recorder reports as running
+CLONE_FAIL_TO=""     # a clone into this name fails
+ON_DELETE_BASE=""    # evaluated right after the base VM is deleted (to interrupt the swap)
 vm_cli_rec() {
     printf 'vm %s\n' "$*" >> "$LOG"
     case "$1" in
-        clone)  echo "$3" >> "$VMS" ;;
-        delete) grep -vx "$2" "$VMS" > "$VMS.t"; mv "$VMS.t" "$VMS" ;;
+        clone)  [[ "$3" == "$CLONE_FAIL_TO" ]] && return 1; echo "$3" >> "$VMS" ;;
+        delete) grep -vx "$2" "$VMS" > "$VMS.t"; mv "$VMS.t" "$VMS"
+                if [[ "$2" == "$MACOS_BASE_VM" && -n "$ON_DELETE_BASE" ]]; then eval "$ON_DELETE_BASE"; fi ;;
+        list)   echo "ID NAME CPU MEM STATE"
+                for _v in $RUNNING_VMS; do echo "x $_v 4 8192 running"; done ;;
     esac
     return 0
 }
 VM_CLI=vm_cli_rec
-reset_vms() { printf '%s\n' "$MACOS_BASE_VM" > "$VMS"; : > "$LOG"; }
+reset_vms() { printf '%s\n' "$MACOS_BASE_VM" > "$VMS"; : > "$LOG"; RUNNING_VMS=""; CLONE_FAIL_TO=""; ON_DELETE_BASE=""; }
 macos_vm_exists()  { grep -qx "$1" "$VMS" 2>/dev/null; }
-macos_vm_running() { return 1; }
+macos_vm_running() { [[ " $RUNNING_VMS " == *" $1 "* ]]; }
 require_vz() { :; }
 mkdir -p "$AUGUR_DIR/vms/$MACOS_BASE_VM"; macos_store_admin_password "$MACOS_BASE_VM" admin
 wait_for_macos_ssh() { return 0; }
@@ -158,19 +164,19 @@ select_macos_full_xcode()        { echo "xcode $1" >> "$LOG"; }
 SIG_OK=1
 verify_real="$(declare -f agent_verify_integrity_macos)"
 agent_verify_integrity_macos() { echo "verify $1" >> "$LOG"; [[ "$SIG_OK" == 1 ]]; }
-run_update() { out="$( set -e; cmd_update_macos 2>&1 )"; rc=$?; }
+run_update() { out="$( exec 2>&1; set -e; cmd_update_macos )"; rc=$?; }   # exec: the EXIT trap's output too
 
 reset_vms; SIG_OK=0
 run_update
 [[ "$rc" -ne 0 ]] && ok "signature failure: update exits non-zero" || fail "signature failure: update exited 0"
 has "$out" "signature check" "signature failure: says so"
-logged "verify $MACOS_BUILD_VM" && ok "the check runs on the staging copy" || fail "the check never ran on the staging copy"
-logged "vm clone $MACOS_BASE_VM $MACOS_BUILD_VM" && ok "the base VM is cloned to a staging copy first" || fail "no staging clone" "$(cat "$LOG")"
+logged "verify $MACOS_UPDATE_VM" && ok "the check runs on the staging copy" || fail "the check never ran on the staging copy"
+logged "vm clone $MACOS_BASE_VM $MACOS_UPDATE_VM" && ok "the base VM is cloned to a staging copy first" || fail "no staging clone" "$(cat "$LOG")"
 logged "vm delete $MACOS_BASE_VM" && fail "signature failure: the base VM was deleted" || ok "signature failure: the base VM is not deleted"
-logged "vm clone $MACOS_BUILD_VM $MACOS_BASE_VM" && fail "signature failure: the update was saved as the base VM" || ok "signature failure: nothing is saved as the base VM"
-logged "vm delete $MACOS_BUILD_VM" && ok "signature failure: the staging copy is discarded" || fail "signature failure: the staging copy is left behind"
+logged "vm clone $MACOS_UPDATE_VM $MACOS_BASE_VM" && fail "signature failure: the update was saved as the base VM" || ok "signature failure: nothing is saved as the base VM"
+logged "vm delete $MACOS_UPDATE_VM" && ok "signature failure: the staging copy is discarded" || fail "signature failure: the staging copy is left behind"
 grep -q "^ssh $MACOS_BASE_VM$" "$LOG" && fail "update ran a command in the base VM itself" || ok "nothing runs inside the base VM itself"
-logged "provision $MACOS_BUILD_VM" && fail "signature failure: provisioning still ran" || ok "signature failure: stops before provisioning"
+logged "provision $MACOS_UPDATE_VM" && fail "signature failure: provisioning still ran" || ok "signature failure: stops before provisioning"
 
 reset_vms; SIG_OK=1
 ssh_macos() { echo "ssh $1" >> "$LOG"; [[ "$*" == *install.sh* ]] && return 1; return 0; }
@@ -182,16 +188,53 @@ ssh_macos() { echo "ssh $1" >> "$LOG"; return 0; }
 reset_vms; SIG_OK=1
 run_update
 eq 0 "$rc" "all steps pass: update exits 0"
-v_at="$(line_of "verify $MACOS_BUILD_VM")"; d_at="$(line_of "vm delete $MACOS_BASE_VM")"
-c_at="$(line_of "vm clone $MACOS_BUILD_VM $MACOS_BASE_VM")"; x_at="$(line_of "vm delete $MACOS_BUILD_VM")"
+v_at="$(line_of "verify $MACOS_UPDATE_VM")"; d_at="$(line_of "vm delete $MACOS_BASE_VM")"
+c_at="$(line_of "vm clone $MACOS_UPDATE_VM $MACOS_BASE_VM")"; x_at="$(line_of "vm delete $MACOS_UPDATE_VM")"
 if [[ -n "$v_at" && -n "$d_at" && -n "$c_at" && -n "$x_at" && "$v_at" -lt "$d_at" && "$d_at" -lt "$c_at" && "$c_at" -lt "$x_at" ]]; then
   ok "the base VM is replaced only after the check (verify@$v_at < delete@$d_at < save@$c_at < drop staging@$x_at)"
 else fail "the base VM replacement is out of order" "$(cat "$LOG")"; fi
 for s in provision managed xcode; do
-  logged "$s $MACOS_BUILD_VM" && ok "$s runs on the staging copy" || fail "$s did not run on the staging copy"
+  logged "$s $MACOS_UPDATE_VM" && ok "$s runs on the staging copy" || fail "$s did not run on the staging copy"
 done
 macos_vm_exists "$MACOS_BASE_VM" && ok "the base VM exists afterwards" || fail "the base VM is gone"
-macos_vm_exists "$MACOS_BUILD_VM" && fail "the staging copy is left behind" || ok "the staging copy is gone"
+macos_vm_exists "$MACOS_UPDATE_VM" && fail "the staging copy is left behind" || ok "the staging copy is gone"
+
+section "Tier 1 — update --macos: never touches the build VM; refuses while a build runs"
+reset_vms; echo "$MACOS_BUILD_VM" >> "$VMS"   # a kept (stopped) build VM
+run_update
+eq 0 "$rc" "a stopped build VM present: update still runs"
+grep -q "$MACOS_BUILD_VM" "$LOG" && fail "update touched the build VM" "$(cat "$LOG")" || ok "update never touches '$MACOS_BUILD_VM'"
+macos_vm_exists "$MACOS_BUILD_VM" && ok "the kept build VM is still there" || fail "the kept build VM was deleted"
+
+reset_vms; echo "$MACOS_BUILD_VM" >> "$VMS"; RUNNING_VMS="$MACOS_BUILD_VM"
+run_update
+[[ "$rc" -ne 0 ]] && ok "a build in progress: update refuses" || fail "a build in progress: update ran"
+has "$out" "build --macos' is in progress" "a build in progress: says so"
+grep -q "^vm clone\|^vm delete\|^vm stop" "$LOG" && fail "a build in progress: update changed a VM" "$(cat "$LOG")" || ok "a build in progress: no VM is cloned, stopped or deleted"
+
+reset_vms; echo "$MACOS_UPDATE_VM" >> "$VMS"   # left stopped by a crashed update
+run_update
+eq 0 "$rc" "a stale stopped staging VM: update runs"
+d_at="$(line_of "vm delete $MACOS_UPDATE_VM")"; c_at="$(line_of "vm clone $MACOS_BASE_VM $MACOS_UPDATE_VM")"
+[[ -n "$d_at" && -n "$c_at" && "$d_at" -lt "$c_at" ]] && ok "the stale staging VM is removed before the new clone" || fail "stale staging VM not removed first" "$(cat "$LOG")"
+
+reset_vms; echo "$MACOS_UPDATE_VM" >> "$VMS"; RUNNING_VMS="$MACOS_UPDATE_VM"
+run_update
+[[ "$rc" -ne 0 ]] && ok "a running staging VM (another update): refused" || fail "a running staging VM: update ran"
+logged "vm delete $MACOS_UPDATE_VM" && fail "a running staging VM was deleted" || ok "a running staging VM is left alone"
+
+section "Tier 1 — update --macos: the swap always leaves one copy"
+reset_vms; ON_DELETE_BASE='kill -INT "$BASHPID"'
+run_update
+eq 0 "$rc" "Ctrl-C between deleting the old base and saving the new one is ignored: the swap completes"
+macos_vm_exists "$MACOS_BASE_VM" && ok "…and the base VM exists" || fail "…and the base VM is gone" "$(cat "$LOG")"
+
+reset_vms; CLONE_FAIL_TO="$MACOS_BASE_VM"
+run_update
+[[ "$rc" -ne 0 ]] && ok "the save fails after the old base is deleted: exits non-zero" || fail "failed save: exit 0"
+macos_vm_exists "$MACOS_UPDATE_VM" && ok "failed save: the updated staging copy is KEPT (the only copy left)" || fail "failed save: both copies are gone" "$(cat "$LOG")"
+has "$out" "augur-vm clone ${MACOS_UPDATE_VM} ${MACOS_BASE_VM}" "failed save: prints the command that finishes the swap"
+reset_vms
 
 build_fn="$(declare -f cmd_build_macos)"
 has   "$build_fn" "agent_verify_integrity_macos" "build --macos runs the same strict check"
@@ -233,7 +276,8 @@ stop_proxy()    { echo "stop_proxy" >> "$LOG"; }
 sync_macos_guest_clock() { echo "clock $1" >> "$LOG"; }
 SELFTEST_OK=1
 verify_macos_egress_locked() { echo "selftest $1" >> "$LOG"; [[ "$SELFTEST_OK" == 1 ]] || exit 1; }
-macos_poweroff_before_teardown() { :; }
+macos_poweroff_before_teardown() { echo "poweroff $1" >> "$LOG"; }
+macos_guest_poweroff()           { echo "poweroff $1" >> "$LOG"; }
 # `read … < /dev/tty`: with a terminal this stub supplies the paste; without one (CI) the redirect
 # fails first and no token is saved. Both are fine here: every assertion below holds either way.
 read() {
@@ -252,8 +296,9 @@ torn_down() {   # torn_down <label>
   logged "vm delete $TV" && ok "$1: the throwaway VM is deleted" || fail "$1: the throwaway VM is left behind" "$(cat "$LOG")"
   macos_vm_exists "$TV" && fail "$1: the throwaway VM still exists" || ok "$1: nothing of it remains"
   logged stop_gvproxy && logged stop_proxy && ok "$1: its gvproxy and proxy are stopped" || fail "$1: its egress helpers are left running"
-  [[ -e "$(setup_token_lock_dir)" ]] && fail "$1: the lock is left behind" || ok "$1: the lock is released"
-  ( adopt_setup_token_identity; [[ -e "$(macos_egress_mode_file)" ]] ) && fail "$1: the egress-mode record is left behind" || ok "$1: its egress-mode record is removed"
+  [[ -L "$(setup_token_lock_path)" ]] && fail "$1: the lock is left behind" || ok "$1: the lock is released"
+  ( adopt_setup_token_identity; [[ -e "$(macos_egress_mode_file)" ]] ) && fail "$1: an egress-mode record was written (nothing reads it)" || ok "$1: no egress-mode record"
+  grep -q "^poweroff " "$LOG" && fail "$1: the guest was asked to shut down before its disk is deleted" || ok "$1: stopped directly, no in-guest poweroff"
 }
 
 reset_vms; SIG_OK=1; SELFTEST_OK=1
@@ -319,18 +364,85 @@ run_st
 d_at="$(line_of "vm delete $TV")"; c_at="$(line_of "vm clone $MACOS_BASE_VM $TV")"
 [[ -n "$d_at" && -n "$c_at" && "$d_at" -lt "$c_at" ]] && ok "a stale throwaway VM is deleted before the new clone" || fail "stale clone not removed first" "$(cat "$LOG")"
 
-reset_vms; mkdir -p "$(setup_token_lock_dir)"; echo 999999999 > "$(setup_token_lock_dir)/pid"
+LOCK="$(setup_token_lock_path)"
+reset_vms; ln -s 999999999 "$LOCK"
 run_st
 logged "vm clone $MACOS_BASE_VM $TV" && ok "a lock left by a dead process is taken over" || fail "a dead lock blocks setup-token"
+[[ -L "$LOCK" ]] && fail "the taken-over lock is left behind" || ok "the taken-over lock is released at the end"
 
 reset_vms; sleep 300 & live=$!; cleanup_pids+=("$live")
-mkdir -p "$(setup_token_lock_dir)"; echo "$live" > "$(setup_token_lock_dir)/pid"
+ln -s "$live" "$LOCK"
 run_st
 [[ "$rc" -ne 0 ]] && ok "a concurrent run: refused" || fail "a concurrent run was not refused"
 has "$out" "Another 'augur setup-token --macos' is running" "a concurrent run: says why"
 grep -q "^vm " "$LOG" && fail "a concurrent run touched a VM" "$(cat "$LOG")" || ok "a concurrent run touches no VM (the live one is not torn down)"
-eq "$live" "$(cat "$(setup_token_lock_dir)/pid" 2>/dev/null)" "a concurrent run leaves the live lock alone"
-kill "$live" 2>/dev/null; rm -rf "$(setup_token_lock_dir)"
+eq "$live" "$(readlink "$LOCK" 2>/dev/null)" "a concurrent run leaves the live lock alone"
+rm -f "$LOCK"
+
+section "Tier 1 — setup-token lock: atomic, and only a provably stale lock is ever removed"
+# Each acquire runs in a subshell, as a separate augur process would: `$$` there is still this test,
+# so the "holder" is simulated by the lock's content, never by $$.
+acq() { out="$( set -e; setup_token_lock_acquire 2>&1 )"; rc=$?; }
+rm -f "$LOCK"
+acq
+eq 0 "$rc" "no lock: acquired"
+eq "$$" "$(readlink "$LOCK")" "the lock is created already naming its holder (no empty window)"
+ln -s "999" "$LOCK" 2>/dev/null && fail "a second create over a held lock succeeded (not atomic)" || ok "creating over an existing lock fails (symlink is the atomic step)"
+rm -f "$LOCK"
+
+ln -s "not-a-pid" "$LOCK"
+acq
+[[ "$rc" -ne 0 ]] && ok "a lock that names no pid: refused, not treated as stale" || fail "a lock that names no pid was taken over"
+eq "not-a-pid" "$(readlink "$LOCK")" "…and it is left untouched"
+rm -f "$LOCK"
+
+ln -s "" "$LOCK" 2>/dev/null || ln -s " " "$LOCK"
+acq
+[[ "$rc" -ne 0 ]] && ok "an empty lock: refused, not treated as stale" || fail "an empty lock was taken over"
+rm -f "$LOCK"
+
+mkdir -p "$LOCK"
+acq
+[[ "$rc" -ne 0 ]] && ok "a directory at the lock path: refused (ln -s would 'succeed' inside it)" || fail "a directory at the lock path was accepted"
+rmdir "$LOCK"
+
+# The reap step itself: a process that saw a dead holder must not remove a lock another process
+# took over in the meantime.
+sleep 300 & live2=$!; cleanup_pids+=("$live2")
+ln -s "$live2" "$LOCK"
+setup_token_lock_reap 999999999 && fail "reap removed a lock now held by a live process" || ok "reap refuses when the lock no longer names the dead holder"
+eq "$live2" "$(readlink "$LOCK" 2>/dev/null)" "…and puts the live lock back untouched"
+ls "$LOCK".reap.* >/dev/null 2>&1 && fail "reap left a private copy behind" || ok "…leaving no private copy behind"
+rm -f "$LOCK"; ln -s 999999999 "$LOCK"
+setup_token_lock_reap 999999999 && ok "reap removes a lock that still names the dead holder" || fail "reap did not remove a stale lock"
+[[ -L "$LOCK" ]] && fail "the stale lock survived reap" || ok "…and it is gone"
+
+# release only removes our own lock.
+ln -s "$live2" "$LOCK"
+setup_token_lock_release
+eq "$live2" "$(readlink "$LOCK" 2>/dev/null)" "release leaves another process's lock alone"
+rm -f "$LOCK"
+
+section "Tier 1 — setup-token --macos refuses (never stops) a running base VM, and a full VM slot"
+reset_vms; RUNNING_VMS="$MACOS_BASE_VM"
+run_st
+[[ "$rc" -ne 0 ]] && ok "base VM running: refused" || fail "base VM running: setup-token ran"
+has "$out" "is running" "base VM running: says so"
+grep -q "^vm clone\|^vm stop\|^vm delete" "$LOG" && fail "base VM running: a VM was cloned/stopped/deleted" "$(cat "$LOG")" || ok "base VM running: nothing is cloned or stopped"
+
+reset_vms; RUNNING_VMS="augur-macos-a-0123456789ab augur-macos-b-0123456789ab"
+run_st
+[[ "$rc" -ne 0 ]] && ok "two macOS VMs running: refused before cloning" || fail "two macOS VMs running: setup-token ran"
+has "$out" "at most two" "two macOS VMs running: names the limit"
+has "$out" "augur-macos-a-0123456789ab" "two macOS VMs running: lists the running VMs"
+logged "vm clone $MACOS_BASE_VM $TV" && fail "two macOS VMs running: cloned anyway" || ok "two macOS VMs running: nothing is cloned"
+grep -q "$PV" "$LOG" && fail "two macOS VMs running: fell back to the project VM" || ok "two macOS VMs running: no fallback to the project VM"
+[[ -L "$LOCK" ]] && fail "two macOS VMs running: the lock is left behind" || ok "two macOS VMs running: the lock is released"
+
+reset_vms; RUNNING_VMS="augur-macos-a-0123456789ab"
+run_st
+logged "vm clone $MACOS_BASE_VM $TV" && ok "one macOS VM running: the throwaway VM still fits" || fail "one macOS VM running: refused" "$out"
+reset_vms
 
 section "Tier 1 — setup-token --macos ignores --no-egress, and needs no safe workspace"
 reset_vms

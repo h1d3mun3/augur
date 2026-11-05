@@ -62,9 +62,9 @@ egress_off() { AUGUR_EGRESS=0; }
 record() { mkdir -p "$AUGUR_PROXY_DIR"; printf '%s\n' "$1" > "$(macos_egress_mode_file)"; }
 run_cmd() { : > "$LOG"; out="$( set -e; "$@" 2>&1 )"; rc=$?; }
 
-refused() {   # refused <label> <remedy>
+refused() {   # refused <label> <remedy> [<reason the message must give>]
   [[ "$rc" -ne 0 ]] && ok "$1: exits non-zero" || fail "$1: was not refused"
-  has "$out" "was started with a different config" "$1: says the VM was started with a different config"
+  has "$out" "${3:-was started with a different config}" "$1: says why (${3:-different config})"
   has "$out" "$2" "$1: gives the remedy"
   if logged "vm stop $PV" || logged stop_gvproxy || logged stop_proxy; then
     fail "$1: the VM or its egress helpers were stopped" "$(cat "$LOG")"
@@ -104,8 +104,8 @@ refused "up --macos --no-egress on an egress VM" "augur down --macos && augur up
 
 egress_on; rm -f "$(macos_egress_mode_file)"
 run_cmd cmd_up_macos
-refused "up --macos on a VM with no record" "augur down --macos && augur up --macos"
-has "$out" "egress unknown" "no record: says the mode is unknown"
+refused "up --macos on a VM with no record" "augur down --macos && augur up --macos" "unknown egress mode"
+has "$out" "started by an older augur" "no record: names the likely cause"
 
 egress_on; record on
 run_cmd cmd_up_macos
@@ -128,7 +128,7 @@ for c in cmd_claude_macos cmd_shell_macos; do
   refused "$c on a --no-egress VM" "augur down --macos && augur up --macos"
   egress_on; rm -f "$(macos_egress_mode_file)"
   run_cmd "$c"
-  refused "$c on a VM with no record" "augur down --macos && augur up --macos"
+  refused "$c on a VM with no record" "augur down --macos && augur up --macos" "unknown egress mode"
   egress_off; record on
   run_cmd "$c"
   refused "$c --no-egress on an egress VM" "--no-egress"

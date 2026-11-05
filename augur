@@ -30,6 +30,9 @@ RESET=$'\033[0m'
 # macOS VM mode: VM names and SSH key
 MACOS_BASE_VM="augur-macos-base"
 MACOS_BUILD_VM="augur-macos-build"
+# `augur update --macos`'s staging copy of the base VM; never the build VM, which may be a running
+# build or one kept with AUGUR_KEEP_BUILD_VM=1.
+MACOS_UPDATE_VM="augur-macos-update"
 MACOS_SSH_USER="admin"
 MACOS_SSH_KEY="$HOME/.augur/vm_key"
 # The password the operator gives the admin account in the manual Setup Assistant build flow
@@ -122,8 +125,8 @@ AUGUR_PROVISION_HOOK="$AUGUR_PROVISION_DIR/hook.sh"
 AUGUR_PROVISION_HOOK_ALLOWLIST="$AUGUR_PROVISION_DIR/hook.allowlist.conf"
 AUGUR_PROVISION_CONTAINER_PACKAGES="$AUGUR_PROVISION_DIR/container-packages.conf"
 # Fixed (not workspace-derived) ports for the ONE-TIME macOS build-provisioning proxy/gvproxy
-# pair: only ever one build/update runs at a time (MACOS_BUILD_VM/MACOS_BASE_VM are
-# singletons), and these sit just past the per-project offset range (offset ∈ [0,899], so
+# pair: only ever one build/update runs at a time (update refuses while a build runs, and the
+# scratch VMs are singletons), and these sit just past the per-project offset range (offset ∈ [0,899], so
 # per-project ports top out at 13899/14899/20899) so the two can never collide.
 AUGUR_PROXY_HTTP_PORT_PROVISION="${AUGUR_PROXY_HTTP_PORT_PROVISION:-13999}"
 AUGUR_PROXY_SOCKS_PORT_PROVISION="${AUGUR_PROXY_SOCKS_PORT_PROVISION:-14999}"
@@ -641,6 +644,12 @@ agent_verify_integrity_macos() {
     out="$(ssh_macos "$vm" "/usr/bin/codesign --verify --strict -R=$(printf '%q' "$req") '${bin}' && /usr/bin/codesign -dvv '${bin}' 2>&1")" \
         || return 1
     grep -qx "TeamIdentifier=${team}" <<<"$out"
+}
+# What agent_verify_integrity_macos refused, for its callers' error output; $1 says which binary
+# ("installed", "updated", ...). Callers add one line saying what happens because of it.
+agent_signature_check_failed() {
+    error "The $1 $(agent_display_name) binary failed the signature check: codesign --verify --strict"
+    error "  against a Developer ID signature from Team ID $(agent_macos_signing_team)."
 }
 
 # ── macOS VM mode helpers ─────────────────────────────────────────────────────
@@ -1948,7 +1957,12 @@ require_macos_egress_mode_current() {
     have="$(cat "$(macos_egress_mode_file)" 2>/dev/null || true)"
     [[ "$have" == "$want" ]] && return 0
     [[ "$want" == off ]] && remedy+=" --no-egress"
-    error "VM '${vm}' was started with a different config (egress ${have:-unknown}; this command asks for egress ${want})."
+    if [[ -z "$have" ]]; then
+        error "VM '${vm}' is running with an unknown egress mode (e.g. it was started by an older augur)."
+        error "Restart it once: ${BOLD}${remedy}${RESET}"
+        exit 1
+    fi
+    error "VM '${vm}' was started with a different config (egress ${have}; this command asks for egress ${want})."
     error "A running VM cannot switch its network datapath: ${BOLD}${remedy}${RESET}"
     exit 1
 }
@@ -3418,19 +3432,21 @@ macos_first_boot_manual() {
              && defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser ${MACOS_SSH_USER}'"
 }
 
-# EXIT trap of build and update: stop and delete the half-built MACOS_BUILD_VM, so a failure never
-# leaves a running VM behind or turns a half-finished one into the base VM.
+# EXIT trap of build and update: stop and delete their scratch VM $1 (MACOS_BUILD_VM /
+# MACOS_UPDATE_VM), so a failure never leaves a running VM behind or turns a half-finished one into
+# the base VM.
 # AUGUR_KEEP_BUILD_VM=1 keeps it (stopped) instead. Debugging aid only: a fresh build VM costs a
 # 15–30 min IPSW install, so discarding it on every failed attempt makes iterating on a boot-time
 # failure (see macos_build_vm_log) impractical. The VM is still replaced by the next build or
 # update, so this only ever preserves the most recent failure.
-macos_discard_build_vm() {
+macos_discard_scratch_vm() {
+    local vm="$1"
     if [[ "${AUGUR_KEEP_BUILD_VM:-}" == "1" ]]; then
-        macos_vm_running "$MACOS_BUILD_VM" && "$VM_CLI" stop "$MACOS_BUILD_VM" 2>/dev/null || true
-        warn "AUGUR_KEEP_BUILD_VM=1: keeping VM '${MACOS_BUILD_VM}' for inspection."
-    elif macos_vm_exists "$MACOS_BUILD_VM"; then
-        macos_vm_running "$MACOS_BUILD_VM" && "$VM_CLI" stop "$MACOS_BUILD_VM" 2>/dev/null || true
-        "$VM_CLI" delete "$MACOS_BUILD_VM" 2>/dev/null || true
+        macos_vm_running "$vm" && "$VM_CLI" stop "$vm" 2>/dev/null || true
+        warn "AUGUR_KEEP_BUILD_VM=1: keeping VM '${vm}' for inspection."
+    elif macos_vm_exists "$vm"; then
+        macos_vm_running "$vm" && "$VM_CLI" stop "$vm" 2>/dev/null || true
+        "$VM_CLI" delete "$vm" 2>/dev/null || true
     fi
 }
 
@@ -3480,7 +3496,7 @@ cmd_build_macos() {
         "$VM_CLI" delete "$MACOS_BUILD_VM"
     fi
 
-    trap macos_discard_build_vm EXIT
+    trap 'macos_discard_scratch_vm "$MACOS_BUILD_VM"' EXIT
 
     # Step 2: Create VM from IPSW
     info "Creating VM from IPSW — this takes 15–30 minutes..."
@@ -3601,8 +3617,8 @@ cmd_build_macos() {
     '
     # Fail closed on a binary that is not the vendor's: the EXIT trap above discards the build VM.
     agent_verify_integrity_macos "$MACOS_BUILD_VM" || {
-        error "The installed $(agent_display_name) binary failed the signature check (codesign --verify --strict,"
-        error "Developer ID Team ID $(agent_macos_signing_team)). Aborting the build; no base VM was saved."
+        agent_signature_check_failed installed
+        error "Aborting the build; no base VM was saved."
         exit 1
     }
 
@@ -4499,38 +4515,69 @@ adopt_setup_token_identity() {
 }
 
 # One setup-token --macos per host at a time: the throwaway VM's name and ports are fixed.
-setup_token_lock_dir() { echo "$AUGUR_DIR/setup-token-macos.lock"; }
-# Take the lock or exit 1 when a live process holds it. A lock whose holder is gone was left by a
-# crash and is taken over.
-setup_token_lock_acquire() {
-    local dir holder
-    dir="$(setup_token_lock_dir)"
-    mkdir -p "$AUGUR_DIR"
-    if ! mkdir "$dir" 2>/dev/null; then
-        holder="$(cat "$dir/pid" 2>/dev/null || true)"
-        if [[ "$holder" =~ ^[0-9]+$ ]] && kill -0 "$holder" 2>/dev/null; then
-            error "Another 'augur setup-token --macos' is running (pid ${holder}). Wait for it to finish."
-            error "  If none is running, remove the stale lock: ${BOLD}rm -rf ${dir}${RESET}"
-            exit 1
-        fi
-        mkdir -p "$dir"
+# The lock is a symlink whose target is the holder's pid. symlink(2) creates the name and its
+# content in one step and fails if the name exists, so there is never a lock without a holder.
+setup_token_lock_path() { echo "$AUGUR_DIR/setup-token-macos.lock"; }
+
+# Remove the lock only if it still names the dead holder $1, and report whether it did. The lock is
+# first renamed to a name private to this process (rename is atomic, so two processes cannot both
+# take the same lock), then checked: if another process replaced it in the meantime, it is put back
+# untouched and this fails.
+setup_token_lock_reap() {
+    local dead="$1" lock private got
+    lock="$(setup_token_lock_path)"; private="${lock}.reap.$$"
+    mv "$lock" "$private" 2>/dev/null || return 1
+    got="$(readlink "$private" 2>/dev/null || true)"
+    if [[ "$got" == "$dead" ]]; then
+        rm -f "$private"
+        return 0
     fi
-    echo "$$" > "$dir/pid"
+    mv "$private" "$lock" 2>/dev/null || rm -f "$private"
+    return 1
+}
+
+# Take the lock or exit 1. A lock whose holder pid is no longer alive was left by a crash and is
+# taken over (setup_token_lock_reap). Anything else — a live holder, or a lock that does not name a
+# pid at all — refuses: only a lock proven stale is ever removed.
+setup_token_lock_acquire() {
+    local lock holder tries=5
+    lock="$(setup_token_lock_path)"
+    mkdir -p "$AUGUR_DIR"
+    # `ln -s` into an existing directory would create a link inside it and "succeed".
+    if [[ -d "$lock" && ! -L "$lock" ]]; then
+        error "'${lock}' is a directory, not an augur lock. Remove it, then retry."
+        exit 1
+    fi
+    while (( tries-- > 0 )); do
+        ln -s "$$" "$lock" 2>/dev/null && return 0
+        holder="$(readlink "$lock" 2>/dev/null || true)"
+        if [[ "$holder" =~ ^[0-9]+$ ]] && ! kill -0 "$holder" 2>/dev/null; then
+            setup_token_lock_reap "$holder" || true
+            continue
+        fi
+        if [[ -z "$holder" ]] && [[ ! -e "$lock" && ! -L "$lock" ]]; then
+            continue   # released between our create and our read: try again
+        fi
+        break
+    done
+    error "Another 'augur setup-token --macos' is running (lock ${lock} → ${holder:-?}). Wait for it to finish."
+    error "  If none is running, remove the lock: ${BOLD}rm -f ${lock}${RESET}"
+    exit 1
 }
 # Release the lock, only if this process holds it.
 setup_token_lock_release() {
-    local dir; dir="$(setup_token_lock_dir)"
-    if [[ "$(cat "$dir/pid" 2>/dev/null || true)" == "$$" ]]; then rm -rf "$dir"; fi
+    local lock; lock="$(setup_token_lock_path)"
+    if [[ "$(readlink "$lock" 2>/dev/null || true)" == "$$" ]]; then rm -f "$lock"; fi
     return 0
 }
 
 # Remove the throwaway VM and everything that served it: VM, gvproxy, proxy, merged allowlist,
-# egress-mode record, pinned host key. Needs adopt_setup_token_identity first. Idempotent and silent
-# when there is nothing to remove, so it runs both at the start (what a crash left behind) and from
-# the EXIT trap; never fails, so it cannot cut the trap short.
+# pinned host key. Needs adopt_setup_token_identity first. Idempotent and silent when there is
+# nothing to remove, so it runs both at the start (what a crash left behind) and from the EXIT trap;
+# never fails, so it cannot cut the trap short. The VM is stopped without asking the guest to shut
+# down: its disk is about to be deleted, so there is nothing to flush.
 setup_token_vm_teardown() {
     local vm; vm="$(macos_project_vm)"
-    macos_poweroff_before_teardown "$vm" || true
     if macos_vm_running "$vm"; then "$VM_CLI" stop "$vm" 2>/dev/null || true; fi
     stop_gvproxy || true
     stop_proxy || true
@@ -4538,8 +4585,28 @@ setup_token_vm_teardown() {
         "$VM_CLI" delete "$vm" >/dev/null 2>&1 \
             || warn "Could not delete the throwaway VM '${vm}'; the next 'augur setup-token --macos' removes it."
     fi
-    rm -f "$(vm_known_hosts_file "$vm")" "$(macos_egress_mode_file)" "$(proxy_allowlist)" 2>/dev/null || true
+    rm -f "$(vm_known_hosts_file "$vm")" "$(proxy_allowlist)" 2>/dev/null || true
     return 0
+}
+
+# Names of the augur-vm VMs running right now, one per line.
+macos_running_vms() {
+    "$VM_CLI" list 2>/dev/null | awk 'NR>1 && $NF == "running" {print $2}'
+}
+
+# Virtualization.framework runs at most two macOS guests per host (Apple's license limit), so an
+# extra VM would only fail later as an opaque SSH timeout. Exit 1, naming the running VMs, when
+# booting one more is bound to fail. $1 names what the extra VM is for. Counts augur's VMs only;
+# a macOS guest of another tool still surfaces as that boot failure.
+require_macos_vm_slot() {
+    local running n vm
+    running="$(macos_running_vms)"
+    n="$(grep -c . <<<"$running" || true)"
+    (( n < 2 )) && return 0
+    error "Cannot start ${1}: ${n} macOS VMs are already running, and macOS allows at most two at once."
+    while IFS= read -r vm; do [[ -n "$vm" ]] && error "  • ${vm}"; done <<<"$running"
+    error "Stop one first: ${BOLD}augur down --macos${RESET} in its project directory (see ${BOLD}augur list --macos${RESET})."
+    exit 1
 }
 
 # macOS counterpart of cmd_setup_token: run `claude setup-token` in a throwaway clone of the base VM
@@ -4553,6 +4620,13 @@ cmd_setup_token_macos() {
         exit 1
     }
     require_macos_admin_password "$MACOS_BASE_VM"
+    # Refused, not stopped: a running base VM is an install-cert window or one started by hand, and
+    # clonefile does not refuse a running source, so its clone could be inconsistent.
+    if macos_vm_running "$MACOS_BASE_VM"; then
+        error "The base VM '${MACOS_BASE_VM}' is running (an 'augur install-cert --macos' window, or started by hand)."
+        error "  Finish or stop it first (${BOLD}augur-vm stop ${MACOS_BASE_VM}${RESET}), then retry."
+        exit 1
+    fi
     if ! egress_enabled; then
         warn "setup-token --macos always runs with egress filtering on; ignoring --no-egress / AUGUR_EGRESS=0."
         AUGUR_EGRESS=1
@@ -4561,17 +4635,16 @@ cmd_setup_token_macos() {
     local vm; vm="$(macos_project_vm)"
     setup_token_lock_acquire
     # Every exit path removes the throwaway VM: success, failure (including the self-test's and
-    # ssh_macos' own `exit 1`), and Ctrl-C, which INT/TERM turn into a normal exit.
+    # ssh_macos' own `exit 1`), and Ctrl-C, which INT/TERM/HUP turn into a normal exit.
     trap 'setup_token_vm_teardown; setup_token_lock_release' EXIT
+    trap 'exit 130' INT TERM HUP
     setup_token_vm_teardown
-    # Armed after the teardown above: a guest poweroff inside it resets INT/TERM on its way out.
-    trap 'exit 130' INT TERM
+    require_macos_vm_slot "the throwaway VM for setup-token"
 
     info "Cloning base VM '${MACOS_BASE_VM}' to the throwaway VM '${vm}' (deleted afterwards)..."
     "$VM_CLI" clone "$MACOS_BASE_VM" "$vm"
     start_proxy "127.0.0.1"
     start_gvproxy
-    macos_record_egress_mode
     info "Starting '${vm}' with no workspace and no credentials, egress restricted to the baseline + global allowlist..."
     "$VM_CLI" run --no-graphics --net-vfkit="$(gvproxy_socket)" "$vm" &>"$(macos_vm_log)" &
     disown
@@ -4582,9 +4655,8 @@ cmd_setup_token_macos() {
     sync_macos_guest_clock "$vm"
     verify_macos_egress_locked "$vm"
     if ! agent_verify_integrity_macos "$vm"; then
-        error "The $(agent_display_name) binary in the base VM failed the signature check (codesign --verify --strict,"
-        error "Developer ID Team ID $(agent_macos_signing_team)) — refusing to run setup-token."
-        error "Reinstall it in the base VM: ${BOLD}augur update --macos${RESET} (or rebuild: ${BOLD}augur build --macos${RESET})."
+        agent_signature_check_failed "base VM's"
+        error "Refusing to run setup-token. Reinstall it in the base VM: ${BOLD}augur update --macos${RESET} (or rebuild: ${BOLD}augur build --macos${RESET})."
         exit 1
     fi
     macos_seed_claude_json "$vm"
@@ -4615,7 +4687,7 @@ cmd_setup_token_macos() {
     info "Removing the throwaway VM '${vm}'..."
     setup_token_vm_teardown
     setup_token_lock_release
-    trap - EXIT INT TERM
+    trap - EXIT INT TERM HUP
     return $rc
 }
 
@@ -5063,6 +5135,15 @@ cmd_install_cert_macos() {
     trap - EXIT INT TERM
 }
 
+# EXIT trap of update's swap (staging copy → base VM): the staging copy is never deleted here. If the
+# old base VM is gone and the new one was not saved, the staging copy is the only copy, so say how
+# to finish the swap by hand.
+macos_update_swap_exit() {
+    macos_vm_exists "$MACOS_BASE_VM" && return 0
+    error "The base VM was not saved. The updated VM is kept as '${MACOS_UPDATE_VM}'; save it with:"
+    error "  ${BOLD}augur-vm clone ${MACOS_UPDATE_VM} ${MACOS_BASE_VM} && augur-vm delete ${MACOS_UPDATE_VM}${RESET}"
+}
+
 cmd_update_macos() {
     require_vz
     macos_vm_exists "$MACOS_BASE_VM" || {
@@ -5074,49 +5155,60 @@ cmd_update_macos() {
     info "Updating CLI tools in base VM '${MACOS_BASE_VM}'..."
     # Stop a stale base VM from a previous interrupted run: clonefile does not refuse a running source.
     macos_vm_running "$MACOS_BASE_VM" && "$VM_CLI" stop "$MACOS_BASE_VM" 2>/dev/null || true
-    # Every step runs on a staging copy (MACOS_BUILD_VM, the same scratch name build uses), and the
-    # base VM is replaced only once all of them, the signature check included, have passed. Any
-    # failure or Ctrl-C leaves the base VM exactly as it was and discards the copy.
-    if macos_vm_exists "$MACOS_BUILD_VM"; then
-        macos_vm_running "$MACOS_BUILD_VM" && "$VM_CLI" stop "$MACOS_BUILD_VM" 2>/dev/null || true
-        "$VM_CLI" delete "$MACOS_BUILD_VM"
+    # A running build replaces the base VM this update is about to replace, and both use the same
+    # fixed provisioning proxy/gvproxy ports, so the two cannot run at once. A stopped build VM (one
+    # kept with AUGUR_KEEP_BUILD_VM=1) is left alone.
+    if macos_vm_running "$MACOS_BUILD_VM"; then
+        error "'${MACOS_BUILD_VM}' is running: an 'augur build --macos' is in progress. Let it finish, then retry."
+        exit 1
     fi
-    trap macos_discard_build_vm EXIT
-    trap 'exit 130' INT TERM
-    info "Cloning '${MACOS_BASE_VM}' to the staging VM '${MACOS_BUILD_VM}'..."
-    "$VM_CLI" clone "$MACOS_BASE_VM" "$MACOS_BUILD_VM"
-    rm -f "$(vm_known_hosts_file "$MACOS_BUILD_VM")"
+    # A running staging VM is another update in progress; a stopped one was left by a crash.
+    if macos_vm_running "$MACOS_UPDATE_VM"; then
+        error "'${MACOS_UPDATE_VM}' is running: another 'augur update --macos' is in progress (or was killed;"
+        error "  stop it with ${BOLD}augur-vm stop ${MACOS_UPDATE_VM}${RESET})."
+        exit 1
+    fi
+    if macos_vm_exists "$MACOS_UPDATE_VM"; then "$VM_CLI" delete "$MACOS_UPDATE_VM"; fi
+    # Every step runs on a staging copy (MACOS_UPDATE_VM), and the base VM is replaced only once all
+    # of them, the signature check included, have passed. Until then any failure or Ctrl-C leaves
+    # the base VM as it was and discards the copy. The replacement itself is guarded below so that
+    # at least one of the two always survives.
+    trap 'macos_discard_scratch_vm "$MACOS_UPDATE_VM"' EXIT
+    trap 'exit 130' INT TERM HUP
+    info "Cloning '${MACOS_BASE_VM}' to the staging VM '${MACOS_UPDATE_VM}'..."
+    "$VM_CLI" clone "$MACOS_BASE_VM" "$MACOS_UPDATE_VM"
+    rm -f "$(vm_known_hosts_file "$MACOS_UPDATE_VM")"
     # Base-VM maintenance runs over NAT (no gvproxy/agent); opt into it explicitly
     # because egress-filtered networking is the fail-closed default. Keep the boot
     # stderr on disk (not /dev/null) so a reachability failure below can show the cause.
-    "$VM_CLI" run --no-graphics --net-nat "$MACOS_BUILD_VM" &>"$(macos_base_vm_log)" &
+    "$VM_CLI" run --no-graphics --net-nat "$MACOS_UPDATE_VM" &>"$(macos_base_vm_log)" &
     local vm_pid=$!
     # A cold first boot of the base VM (full macOS boot + fresh DHCP lease + sshd up) can take
     # well over the 2 min a warm project VM needs, so give it a generous wall-clock budget.
-    if ! wait_for_macos_ssh "$MACOS_BUILD_VM" 300 &>/dev/null; then
-        error "VM '${MACOS_BUILD_VM}' did not become reachable over SSH in time."
+    if ! wait_for_macos_ssh "$MACOS_UPDATE_VM" 300 &>/dev/null; then
+        error "VM '${MACOS_UPDATE_VM}' did not become reachable over SSH in time."
         # Surface the otherwise-discarded cause (mirrors cmd_up_macos). The VM boots over NAT; the
         # usual reasons it stays unreachable are a boot failure or a missing/stale DHCP lease —
         # augur-vm resolves its IP from /var/db/dhcpd_leases by MAC, so an empty host means it
         # never booted far enough to lease an address.
         local _bhost
-        _bhost="$(macos_ssh_host "$MACOS_BUILD_VM" 2>/dev/null || true)"
+        _bhost="$(macos_ssh_host "$MACOS_UPDATE_VM" 2>/dev/null || true)"
         error "Diagnostics (kept on disk):"
         error "  staging VM SSH host (from DHCP lease): ${_bhost:-<none — VM did not boot or never got an IP>}"
         if [[ -n "$_bhost" ]]; then
             error "  ---- ssh probe (stderr) ----"
-            ssh_macos "$MACOS_BUILD_VM" true 2>&1 | head -n 6 | sanitize_guest_lines | while IFS= read -r _l; do error "  | $_l"; done || true
+            ssh_macos "$MACOS_UPDATE_VM" true 2>&1 | head -n 6 | sanitize_guest_lines | while IFS= read -r _l; do error "  | $_l"; done || true
         fi
         error "  VM log:      $(macos_base_vm_log)"
         if [[ -s "$(macos_base_vm_log)" ]]; then
             error "  ---- last VM lines ----"
             tail -n 15 "$(macos_base_vm_log)" 2>/dev/null | sanitize_guest_lines | while IFS= read -r _l; do error "  | $_l"; done
         fi
-        stop_and_reap_macos_vm "$MACOS_BUILD_VM" "$vm_pid"
+        stop_and_reap_macos_vm "$MACOS_UPDATE_VM" "$vm_pid"
         error "The base VM was left as-is; it may just be slow to boot — re-run ${BOLD}augur update --macos${RESET}."
         exit 1
     fi
-    if ! ssh_macos "$MACOS_BUILD_VM" '
+    if ! ssh_macos "$MACOS_UPDATE_VM" '
         # Claude Code via the official installer (see cmd_build_macos for why npm is avoided).
         # The VM has no virtiofs mounts here, so ~/.claude is local and writable.
         # Download to a temp file before executing — avoids piping untrusted content to a shell.
@@ -5144,46 +5236,46 @@ cmd_update_macos() {
         error "The base VM was left as-is. Try running 'augur update --macos' again."
         exit 1
     fi
-    agent_verify_integrity_macos "$MACOS_BUILD_VM" || {
-        error "The updated $(agent_display_name) binary failed the signature check (codesign --verify --strict,"
-        error "Developer ID Team ID $(agent_macos_signing_team)). The base VM was left as-is."
+    agent_verify_integrity_macos "$MACOS_UPDATE_VM" || {
+        agent_signature_check_failed updated
+        error "The base VM was left as-is."
         exit 1
     }
 
     # Optional custom provisioning (~/.augur/provision/manifest.conf and/or hook.sh) — kept
     # in sync with the base VM on every update too, not just at first build. No-op unless
     # the operator created those files. See run_base_provisioning.
-    run_base_provisioning "$MACOS_BUILD_VM" "$vm_pid"
+    run_base_provisioning "$MACOS_UPDATE_VM" "$vm_pid"
 
     # Same scrub as cmd_build_macos: re-assert the no-account-state invariant on every
     # update too, not just at build. The base VM is long-lived and mutable, so a human can log
     # into `claude` by hand between updates (the actual leak vector — neither build's provisioning
     # nor this update step ever runs `claude` interactively); running this on every update makes
     # that self-healing instead of requiring a full rebuild to notice and fix.
-    ssh_macos "$MACOS_BUILD_VM" "rm -f ~/.claude.json"
+    ssh_macos "$MACOS_UPDATE_VM" "rm -f ~/.claude.json"
 
     # Same reasoning as the scrub above: re-assert augur's managed policy on every update, so a base
     # VM built before this existed self-heals on routine maintenance instead of needing a full
     # rebuild. Idempotent (it overwrites the same file with the same bytes).
-    install_macos_managed_settings "$MACOS_BUILD_VM"
+    install_macos_managed_settings "$MACOS_UPDATE_VM"
 
     # Same as the end of cmd_build_macos, re-run here so a base VM built with the Command Line
     # Tools left selected self-heals without a rebuild, and provisioning above cannot undo it.
-    select_macos_full_xcode "$MACOS_BUILD_VM" \
+    select_macos_full_xcode "$MACOS_UPDATE_VM" \
         || warn "Could not select the full Xcode install; xcodebuild over plain SSH may hit the Command Line Tools."
 
     info "Saving base VM '${MACOS_BASE_VM}'..."
-    stop_and_reap_macos_vm "$MACOS_BUILD_VM" "$vm_pid"
+    stop_and_reap_macos_vm "$MACOS_UPDATE_VM" "$vm_pid"
+    # The swap. From here on the EXIT trap never deletes the staging copy: once the old base VM is
+    # deleted it is the only copy, and macos_update_swap_exit keeps it and prints how to finish the
+    # swap. INT/TERM/HUP are ignored for the two quick steps so an interrupt cannot land between
+    # them; a SIGKILL there still leaves the staging copy on disk.
+    trap '' INT TERM HUP
+    trap macos_update_swap_exit EXIT
     "$VM_CLI" delete "$MACOS_BASE_VM"
-    if ! "$VM_CLI" clone "$MACOS_BUILD_VM" "$MACOS_BASE_VM"; then
-        # The old base VM is already gone, so the updated copy is now the only one: keep it.
-        trap - EXIT INT TERM
-        error "Could not save the updated VM as '${MACOS_BASE_VM}'. It is kept as '${MACOS_BUILD_VM}'; save it with:"
-        error "  ${BOLD}augur-vm clone ${MACOS_BUILD_VM} ${MACOS_BASE_VM} && augur-vm delete ${MACOS_BUILD_VM}${RESET}"
-        exit 1
-    fi
-    "$VM_CLI" delete "$MACOS_BUILD_VM"
-    trap - EXIT INT TERM
+    "$VM_CLI" clone "$MACOS_UPDATE_VM" "$MACOS_BASE_VM"
+    trap - EXIT INT TERM HUP
+    "$VM_CLI" delete "$MACOS_UPDATE_VM" || warn "Could not delete the staging VM '${MACOS_UPDATE_VM}'; the next update removes it."
     success "CLI tools updated in '${MACOS_BASE_VM}'."
     warn "Project VMs cloned before this update will not be affected."
     warn "Run ${BOLD}augur destroy --macos && augur up --macos${RESET} to apply to the current project."
@@ -5712,7 +5804,7 @@ provision_fail() {
 # No-op if none of those files exist — cmd_build_macos/cmd_update_macos are unaffected.
 # TOFU-gated (check_provision_approved) and executed over the dedicated, egress-filtered
 # provision proxy/gvproxy pair — not the open NAT the rest of the build uses. $1 = VM name
-# (MACOS_BUILD_VM, the scratch VM both build and update work in), $2 = the caller's current backgrounded `run` pid (so
+# (MACOS_BUILD_VM or MACOS_UPDATE_VM, the scratch VM build or update works in), $2 = the caller's current backgrounded `run` pid (so
 # this can stop that NAT session before switching network modes).
 run_base_provisioning() {
     local vm="$1" outer_pid="${2:-}"
