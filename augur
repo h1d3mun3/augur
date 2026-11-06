@@ -6355,8 +6355,10 @@ cmd_help() {
     echo -e "      ${CYAN}docs/decisions/0005-no-prune-command.md${RESET}."
     echo -e "    • ${BOLD}install-cert${RESET}: trust a private/self-signed CA in the guest (edge case). Pass ONE PEM"
     echo -e "      X.509 cert (${CYAN}.crt${RESET}). Container bakes it into the image (dropped by ${BOLD}build${RESET}/${BOLD}update${RESET} — re-run);"
-    echo -e "      macOS adds it to the base VM's System keychain (approve the prompt in the VM window; new"
-    echo -e "      clones inherit it; earlier CAs stay trusted, only a full build --macos drops them; a cert already in the keychain is skipped, its trust setting not re-checked). A trusted CA can MITM the guest's TLS — install only CAs you trust."
+    echo -e "      macOS adds it to the base VM's System keychain (approve the prompt in the VM window); new"
+    echo -e "      clones inherit it; earlier CAs stay trusted, only a full build --macos drops them; a cert already"
+    echo -e "      in the keychain is skipped, and its trust setting is not re-checked. A trusted CA can MITM the"
+    echo -e "      guest's TLS — install only CAs you trust."
     echo ""
 }
 
