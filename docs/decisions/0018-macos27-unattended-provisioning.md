@@ -191,6 +191,22 @@ re-encoding them.
 The rest of this ADR's text that names `sw_vers`, `guest-os-version`,
 `host_macos_major_version` or `vm_cli_supports_provisioning` describes the superseded mechanism.
 
+## Amendment (2026-11-06, the agent has no passwordless sudo)
+
+The Consequences bullet that says "an agent inside the guest already has passwordless `sudo`" is
+wrong about project clones: the build-time `NOPASSWD` grant is revoked before the base VM is saved
+(see the 2026-11-06 amendment to ADR-0007). On the fixed-credential path the agent can still reach
+root by typing the guessable `admin` password. On this ADR's path it has no such shortcut, because the randomized
+password is held on the host and is never given to the guest.
+
+Checked live on 2026-11-06, on a macOS 27.2 host with a macOS 27.2 guest, in a project VM cloned from a
+base VM built through this ADR's randomized-password path: `/etc/sudoers.d/augur` is absent; `sudo -n true`
+fails with "a password is required"; no admin-password file is visible under the guest's shared
+directories; and `sudo` with the guesses `admin`, `password`, `1234`, `12345678` and `root` all failed.
+The guest user is a member of the `admin` group, so what protects root is that the randomized password
+never reaches the guest. The fixed-credential path of ADR-0007 was not exercised in this check; its
+description above rests on reading the code.
+
 ## Context
 
 ADR-0007 removed the operator-typed SSH password prompt but explicitly kept the base VM's

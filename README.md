@@ -266,15 +266,43 @@ cd ~/projects/my-app
 augur up --macos        # clone base VM and start (first run clones automatically)
 augur up --macos --gui  # same, but also open a VM window (display + keyboard + pointer)
 augur claude --macos    # launch Claude Code  (starts VM if not running)
-augur shell --macos     # open a bash shell   (starts VM if not running)
+augur shell --macos     # open a zsh shell    (starts VM if not running)
 augur setup-token --macos  # get a Claude subscription token (runs in a throwaway clone of the base VM, saves on the host)
 augur down --macos      # stop the VM (keeps the clone — next up is fast)
 augur destroy --macos   # stop and remove the project VM clone (or: augur destroy --macos <name>)
 augur status --macos    # show VM status, toolchain, and auth info
 augur list --macos      # list all VMs and their state
-augur update --macos    # update CLI tools in the base VM (on a staging copy; the base is replaced only if every step passes)
+augur update --macos    # update Claude Code, gh and Homebrew formulae (+ custom provisioning) in the base VM (see below)
 augur version --macos   # show augur version (macOS mode)
 ```
+
+`augur update --macos` works on a staging copy that replaces the base VM only if every step passes
+(a failure leaves the base VM as it was). It reinstalls Claude Code with the official installer and
+runs `brew update` and `brew upgrade --formula`, which upgrades `gh` and every other installed
+Homebrew formula, including the ones your manifest installed. Casks are left alone, because an
+upgrade can need `sudo`. Both run over the staging VM's plain NAT, as the Homebrew and `gh` installs
+of `augur build --macos` do: the staging VM is a credential-less copy of the base VM, and its network
+is not egress-filtered. That includes formulae and third-party taps your manifest installed earlier
+(the build installs those through the egress-filtered session instead), so their upgrades are fetched
+unfiltered. A single formula that fails to upgrade fails the whole update, leaving the base VM as it
+was. Your custom provisioning is then re-run over the usual egress-filtered session, and augur's own
+base-VM settings are re-asserted. Xcode is not updated: rebuild the base VM with `augur build --macos`
+for that.
+Project VMs cloned before an update are unaffected; to pick it up, `augur destroy --macos && augur up
+--macos` in each project, which discards that clone's state (DerivedData, Simulator devices, SwiftPM
+caches). Container mode's `update` also leaves other projects' containers on the old image until they
+are destroyed and brought up again; it removes the current project's container so the next `augur up` recreates it.
+
+`augur install-cert --macos` is additive: each run trusts one more CA in the base VM's System
+keychain, and a CA trusted earlier stays trusted. augur does not remove CAs, because it cannot tell
+which ones in that keychain you put there; delete one by hand in the base VM if you need to. Container
+mode's `install-cert` replaces its single custom CA instead. A full `augur build --macos` drops
+every CA installed this way. Re-running it for a certificate that is already in the keychain is a
+no-op: augur boots the base VM headless, finds the certificate by its SHA-256 fingerprint, prints its
+subject and expiry, and stops without opening a window. It does not check the certificate's trust
+setting, only that it is present, and nothing forces the window flow again; the notice it prints gives
+the manual commands (`sudo security add-trusted-cert …` in the VM's Terminal, or delete the certificate
+and re-run).
 
 A VM keeps the egress mode it was started with. If it is running and you ask for the other one
 (e.g. `augur up --macos --no-egress`, then a plain `augur claude --macos`), augur refuses rather than
@@ -298,8 +326,8 @@ start it unfiltered).
 ### Authentication
 
 On macOS, Claude Code stores its OAuth login in the Keychain, which is unreadable over SSH and
-absent from a freshly cloned VM. So macOS mode injects a credential through the environment on
-every `up` (the same way it does for the GitHub token):
+absent from a freshly cloned VM. So macOS mode injects a credential through the environment
+each time the VM boots (the same way it does for the GitHub token; a VM that is already running keeps what it booted with until `augur down --macos && augur up --macos`):
 
 - `CLAUDE_CODE_OAUTH_TOKEN` — subscription token; either set the env var / save it to
   `~/.claude_code_oauth_token`, or run **`augur setup-token --macos`**: it runs `claude setup-token`

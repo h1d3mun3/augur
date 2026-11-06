@@ -97,6 +97,7 @@ _devdir="export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer"
 has   "$build_macos_body" "${_devdir}'\\'' >> ~/.zshenv"   "macOS build pins DEVELOPER_DIR in ~/.zshenv (read by non-login SSH shells)"
 hasnt "$build_macos_body" "${_devdir}'\\'' >> ~/.zprofile" "macOS build does not pin DEVELOPER_DIR in ~/.zprofile (login shells only)"
 has   "$up_macos"         "echo '${_devdir}'"               "macOS up writes DEVELOPER_DIR into ~/.augur-env (heals clones of an older base VM)"
+has   "$up_macos"         'for _kv in $(agent_fixed_env)'   "macOS up writes the agent's fixed env into ~/.augur-env (every guest session, not just the launch)"
 has "$up_macos" 'if $_fresh_clone; then'         "macOS .claude.json seed overwrites unconditionally on a fresh clone"
 
 # Base-VM account-state scrub: the base VM is long-lived and mutable, so a human can
@@ -284,6 +285,15 @@ if [[ "$(uname -s)" != "Darwin" ]]
 then has "$g_out" "requires macOS" "up --macos from \$HOME/sub falls through to require_vz (OS check)"
 else has "$g_out" "was not found"  "up --macos from \$HOME/sub falls through to require_vz (backend check)"; fi
 rm -rf "$guard_td"
+
+section "Help text matches what each mode does"
+helptxt="$(bash "$AUGUR" help 2>&1 </dev/null)"
+has   "$helptxt" "Update Claude Code, gh and Homebrew formulae in the base VM" "help: update --macos names its real scope"
+hasnt "$helptxt" "Update CLI tools in base VM"                          "help: no stale 'CLI tools' wording for update --macos"
+has   "$helptxt" "Open a zsh shell"                                     "help: macOS shell is zsh"
+has   "$helptxt" "earlier CAs stay trusted"                             "help: macOS install-cert says it is additive"
+has   "$up_macos" "→ Open a zsh shell"                                  "up --macos hint: macOS shell is zsh"
+has   "$up_macos" "Stop the VM (keeps the clone)"                       "up --macos hint: down keeps the clone"
 
 section "Tier 2 — macOS live smoke (gated)"
 if [[ "$(uname -s)" != "Darwin" ]]; then skip "live macOS checks" "not a macOS host"; finish; exit $?; fi

@@ -7,7 +7,7 @@ _augur() {
     cmds=(
         'up:Start the container / VM'
         'claude:Launch Claude Code'
-        'shell:Open a bash shell'
+        'shell:Open a shell (bash in a container, zsh in a macOS VM)'
         'setup-token:Get a Claude token in the guest'
         'install-cert:Trust a custom CA in the guest'
         'down:Stop the container / VM (kept)'

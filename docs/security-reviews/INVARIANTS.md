@@ -47,8 +47,10 @@ in time," this **prescribes** "what must never break." It changes rarely.
   VM through the same datapath and self-test (`tests/52_macos_setup_token_unit.sh`). Both self-tests are inherently live (they need a
   booted guest); the *wiring* — invoked on both paths, and a NOT-locked verdict exits non-zero with
   the teardown having run — is covered offline by `tests/36_macos_egress_selftest.sh`; its transport pre-check fails closed too — with the SSH forward port unreadable, teardown runs and no probe is sent (`tests/40_macos_selftest_transport.sh`). `tests/34_up_reconcile.sh` pins the **already-running** path on both engines (container reaches
-  `finish_up`; macOS reaches `verify_macos_egress_locked`). `verify_egress_locked` itself has no
-  offline peer at all — its live gate is `tests/22_egress_failclosed.sh`, and mutation testing
+  `finish_up`; macOS reaches `verify_macos_egress_locked`). `verify_egress_locked` has no offline
+  test of its verdict: `tests/11_construct_container.sh` pins only its probe transport (the execs it
+  issues, `/bin/sh` by absolute path, a pinned `PATH`), not the leak verdict, the teardown or the
+  through-proxy requirement. Its live gate is `tests/22_egress_failclosed.sh`, and mutation testing
   confirms that deleting its fail-closed branch, or its call from `finish_up`, leaves the offline
   suite green. The two engines' halves of this invariant therefore rest on very unequal evidence.
 
@@ -73,7 +75,7 @@ in time," this **prescribes** "what must never break." It changes rarely.
 ### I5. DNS fails closed (no DNS tunnel)  ✅ test
 - **Rule:** Keep "resolvable == connectable." Apple Container uses `--no-dns` (no
   resolver in the guest), and the macOS VM uses gvproxy's `--dns-allowlist` (NXDOMAIN
-  for non-allowlisted; rejects record types other than A/AAAA).
+  for non-allowlisted; answers only A/AAAA/CNAME queries for an allowlisted name and refuses every other record type).
 - **Why:** Prevent exfiltration by smuggling data in DNS queries.
 - **Enforced by:** the DNS probe in shell `verify_egress_locked()` (container, `augur`) **and the two
   DNS probes in `verify_macos_egress_locked()`** (macOS, on both `up --macos` paths): a
@@ -111,8 +113,9 @@ in time," this **prescribes** "what must never break." It changes rarely.
   differs between two same-basename projects while the slug is identical) plus `tests/11_construct_container.sh` and
   `tests/30_macos_vm.sh` (the workspace-containment guard `require_safe_workspace` — a workspace
   that CONTAINS `~/.augur` would put the merged allowlist itself inside the read-write share, which
-  is the same widening this invariant forbids; refused on both engines from the shared dispatch
-  tail's `up|claude|shell|setup-token` case, see
+  is the same widening this invariant forbids; refused on both engines by the dispatch gate for
+  `up`, `claude` and `shell`, and for `setup-token` in Container mode; `setup-token --macos` is
+  exempt because its throwaway VM gets no workspace share and no project conf, see
   `docs/decisions/0014-workspace-must-not-contain-augur.md`). The TOFU approval itself
   (`check_project_conf_approved`) is 🟡 partly tested: `tests/01_egress_allowlist_unit.sh` drives the
   `AUGUR_ACCEPT_PROJECT_CONF=1` accept, the non-interactive fail-closed refusal of a conf changed
@@ -134,8 +137,9 @@ in time," this **prescribes** "what must never break." It changes rarely.
   structural guarantee (addendum A6) — ⚠ **grep-only**: no test asserts `start_proxy`'s argv, and
   inserting the flag into `start_proxy`'s `augur-proxy` argv leaves the entire offline suite green.
   The same gap covers `start_gvproxy`'s `--socks-upstream` / `--dns-allowlist` / `--deny-direct` and
-  `container run`'s `--no-dns`. A one-line source guard per call site — the `grep -Eq … "$AUGUR"`
-  shape `tests/30_macos_vm.sh` already uses for the read-only profile share — would close all five
+  the containment argv of `container run` (`--network`, `--cap-drop NET_ADMIN`, `--no-dns`, and the
+  `--internal` network created by `ensure_egress_network`). A one-line source guard per call site — the `grep -Eq … "$AUGUR"`
+  shape `tests/30_macos_vm.sh` already uses for the read-only profile share — would close all of them
   cheaply.
 
 ### I9. macOS guest network isolation  🟡 partial
@@ -187,9 +191,9 @@ in time," this **prescribes** "what must never break." It changes rarely.
 ---
 
 > Of the 10, I1–I8 are enforced by tests/self-tests; I9 is partial (entitlement only); I10 is
-> partial (Container mode test-enforced). The remaining review-only surface is the macOS half of
-> I10 (credentials not on argv: macOS goes through a file written over SSH stdin, which no test
-> asserts), the hardware-dependent part of I9 (the live NIC count — the gvproxy UDP/ICMP drop is now probed
+> partial (Container mode test-enforced, plus `setup-token --macos`'s credential-free throwaway VM).
+> The remaining review-only surface is the rest of the macOS half of I10 (credentials not on argv:
+> a project VM's `~/.augur-env` goes through a file written over SSH stdin, which no test asserts), the hardware-dependent part of I9 (the live NIC count — the gvproxy UDP/ICMP drop is now probed
 > live on every `up --macos`), and two gaps inside I7 (the TOFU gate's interactive and no-sha256
 > branches, and the approval record's full-path keying). Note that "enforced by tests" does not extend to augur's own
 > argv for I5 and I8: see their notes. For background on each item, see the newest

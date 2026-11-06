@@ -514,6 +514,11 @@ validate_resolved_credentials() {
         _aval="$(resolve_api_key "${!_henv:-}" "$_hfile")"
         [[ -n "$_aval" ]] && { validate_secret_value "$_genv" "$_aval" || return 1; }
     done < <(agent_auth_specs)
+    # The agent's fixed env is written into the same sourced file, so it gets the same check.
+    local _kv
+    for _kv in $(agent_fixed_env); do
+        validate_secret_value "${_kv%%=*}" "${_kv#*=}" || return 1
+    done
     return 0
 }
 
@@ -528,6 +533,7 @@ read_agent_token_from_tty() {
 # Persist a captured Claude subscription token to the host token file augur reads whenever it
 # injects credentials (resolve_api_key picks it up as CLAUDE_CODE_OAUTH_TOKEN). Validates the
 # shape and writes it 0600. The host never needs claude installed for this.
+# $2 is "macos" when the token was minted for macOS VM mode; it only selects the "next up" wording.
 # AUGUR_AGENT_SEAM | token persistence — Claude-specific shape (sk-ant-*) + dest file.
 # CONTRACT (credentials): this charset/length check is the only credential validator today;
 # generalize it to every agent's resolved credential value before broadening agent_auth_specs.
@@ -548,7 +554,11 @@ save_oauth_token() {
     ( umask 077; printf '%s\n' "$token" > "$dest" )
     chmod 600 "$dest"
     success "Saved subscription token to ${BOLD}${dest}${RESET} (chmod 600)."
-    info "augur injects it as CLAUDE_CODE_OAUTH_TOKEN from the next session (macOS VM mode: the next 'up') — no host claude needed."
+    if [[ "${2:-}" == macos ]]; then
+        info "augur writes it into the guest as CLAUDE_CODE_OAUTH_TOKEN each time a VM boots, so a VM that is already running keeps its old credentials until: ${BOLD}augur down --macos && augur up --macos${RESET}"
+    else
+        info "augur injects it as CLAUDE_CODE_OAUTH_TOKEN into every new session (claude, shell) — no host claude needed."
+    fi
     # resolve_api_key prefers the host env var over this file, so a set variable hides the new token.
     if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
         warn "CLAUDE_CODE_OAUTH_TOKEN is set in this shell, and augur injects that value instead of ${dest}."
@@ -4425,7 +4435,7 @@ cmd_up_macos() {
     # host sources (agent_auth_specs). CONTRACT (credentials): these values are interpolated into a
     # SOURCED shell file; a future multi-agent build must validate each value (reject quotes/control
     # bytes) before this point.
-    local gh_token _genv _henv _hfile _hvalidator _aval
+    local gh_token _genv _henv _hfile _hvalidator _aval _kv
     gh_token="$(gh auth token 2>/dev/null || true)"
     # Re-run the SAME check immediately before the write — one helper, no second validator to drift.
     # The early call (above the clone) is what keeps a bad credential from booting a VM; this one
@@ -4447,6 +4457,12 @@ cmd_up_macos() {
         # Also written into the base VM's ~/.zshenv at build time; repeated here because a base VM
         # built by an older augur has it only in ~/.zprofile, which non-login SSH shells never read.
         echo 'export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer'
+        # The agent's fixed env goes in the file so every guest zsh session (a shell, an ssh
+        # one-off, the agent started by hand) sees it, as in Container mode where it is part of
+        # the image environment. The file is written at boot, so a VM that is already running (or a
+        # clone last booted by an older augur) has it only after `down --macos && up --macos`.
+        # Keys and values are agent-declared constants, checked by validate_resolved_credentials.
+        for _kv in $(agent_fixed_env); do echo "export ${_kv%%=*}='${_kv#*=}'"; done
         while IFS='|' read -r _genv _henv _hfile _hvalidator; do
             [[ -z "$_genv" ]] && continue
             _aval="$(resolve_api_key "${!_henv:-}" "$_hfile")"
@@ -4468,8 +4484,8 @@ cmd_up_macos() {
     success "VM '${project_vm}' is up."
     echo ""
     echo -e "  ${BOLD}augur claude --macos${RESET} → Launch $(agent_display_name)"
-    echo -e "  ${BOLD}augur shell --macos${RESET}  → Open bash shell"
-    echo -e "  ${BOLD}augur down --macos${RESET}   → Stop and remove"
+    echo -e "  ${BOLD}augur shell --macos${RESET}  → Open a zsh shell"
+    echo -e "  ${BOLD}augur down --macos${RESET}   → Stop the VM (keeps the clone)"
 }
 
 cmd_claude_macos() {
@@ -4757,7 +4773,7 @@ cmd_setup_token_macos() {
     local token
     token="$(read_agent_token_from_tty)"
     local rc=0
-    save_oauth_token "$token" || rc=1
+    save_oauth_token "$token" macos || rc=1
     info "Removing the throwaway VM '${vm}'..."
     setup_token_vm_teardown
     host_lock_release "$MACOS_SETUP_TOKEN_LOCK" setup-token
@@ -5134,12 +5150,33 @@ _cert_present_in_base_vm() {
         | tr -d ':' | tr 'a-f' 'A-F' | grep -q "$want"
 }
 
+# Notice for install-cert --macos when certificate $1 is already in the base VM's System keychain.
+# Presence is checked by fingerprint only; the trust setting is not read, so say so plainly and
+# give the manual way to (re)apply it.
+report_cert_already_installed() {
+    local cert="$1" subject enddate sha1
+    subject="$(openssl x509 -in "$cert" -noout -subject 2>/dev/null | sed 's/^subject=[[:space:]]*//')"
+    enddate="$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null | sed 's/^notAfter=//')"
+    sha1="$(openssl x509 -in "$cert" -noout -fingerprint -sha1 2>/dev/null | sed 's/^.*=//; s/://g')"
+    success "This certificate is already in the System keychain of base VM '${MACOS_BASE_VM}'; nothing was changed."
+    echo -e "    Subject:  ${subject:-<unknown>}"
+    echo -e "    Expires:  ${enddate:-<unknown>}"
+    warn "Its TRUST SETTING was NOT verified (augur checks only that the certificate is present). It is"
+    warn "assumed trusted, because trusting it is part of the normal install."
+    warn "No option forces the GUI flow again. To re-apply the trust by hand: boot the base VM with a"
+    warn "window (${BOLD}augur-vm run --net-nat ${MACOS_BASE_VM}${RESET}), put the certificate file in the VM, and run in the"
+    warn "VM's own Terminal:"
+    echo -e "    ${BOLD}sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain <cert>${RESET}"
+    warn "Or remove the certificate there (${BOLD}sudo security delete-certificate -Z ${sha1:-<sha1>} /Library/Keychains/System.keychain${RESET})"
+    warn "and re-run ${BOLD}augur install-cert --macos${RESET}. Shut the VM down afterwards, before any ${BOLD}augur up --macos${RESET}."
+}
+
 # macOS mode: install the CA into the base VM's System keychain, so every cloned project VM
 # inherits it (keychain-consulting clients — curl, git, gh (Go uses Security.framework on
 # darwin), and native Claude Code — then trust it). Modifying System-keychain trust settings
 # needs an interactive GUI authorization that a non-console SSH session cannot obtain (an
 # SSH-invoked `security add-trusted-cert` fails "authorization denied, no user interaction
-# possible" — confirmed on macOS 26). So we boot the base VM WITH a GUI window, copy the cert in,
+# possible" — confirmed on macOS 26). So we first boot the base VM headless and stop if the cert is already in the keychain; otherwise we boot it WITH a GUI window, copy the cert in,
 # and have the OPERATOR run `security add-trusted-cert` in the VM's own Terminal; augur then
 # verifies it landed. Mirrors cmd_update_macos's boot-base-VM/stop-and-reap shape.
 cmd_install_cert_macos() {
@@ -5165,9 +5202,10 @@ cmd_install_cert_macos() {
     trap 'host_lock_release "$MACOS_BASE_WRITER_LOCK" install-cert' EXIT
     # Stop a stale base VM from a previous interrupted run before booting a fresh one.
     macos_vm_running "$MACOS_BASE_VM" && "$VM_CLI" stop "$MACOS_BASE_VM" 2>/dev/null || true
-    info "Booting base VM '${MACOS_BASE_VM}' with a GUI window (for the trust prompt)..."
-    # GUI (no --no-graphics) + NAT, backgrounded so we can drive it over SSH.
-    "$VM_CLI" run --net-nat "$MACOS_BASE_VM" &>"$(macos_base_vm_log)" &
+    info "Booting base VM '${MACOS_BASE_VM}' headless to check whether the certificate is already installed..."
+    # Headless + NAT, backgrounded so we can drive it over SSH. A window is opened (second boot
+    # below) only when the certificate is missing and the operator has to approve the trust.
+    "$VM_CLI" run --no-graphics --net-nat "$MACOS_BASE_VM" &>"$(macos_base_vm_log)" &
     local vm_pid=$!
     # CRITICAL: the base VM is now running. Guarantee it is stopped on EVERY exit — including
     # Ctrl-C at the interactive prompts below. A base VM left running would be cloned in a live,
@@ -5184,6 +5222,23 @@ cmd_install_cert_macos() {
     trap 'exit 130' INT TERM
     if ! wait_for_macos_ssh "$MACOS_BASE_VM" 300 &>/dev/null; then
         error "Base VM '${MACOS_BASE_VM}' did not become reachable over SSH in time."
+        error "  VM log: $(macos_base_vm_log)"
+        exit 1
+    fi
+    if _cert_present_in_base_vm "$cert"; then
+        report_cert_already_installed "$cert"
+        stop_and_reap_macos_vm "$MACOS_BASE_VM" "$vm_pid"
+        trap - EXIT INT TERM
+        host_lock_release "$MACOS_BASE_WRITER_LOCK" install-cert
+        return 0
+    fi
+    info "Not installed yet. Restarting base VM '${MACOS_BASE_VM}' with a GUI window (for the trust prompt)..."
+    stop_and_reap_macos_vm "$MACOS_BASE_VM" "$vm_pid"
+    # GUI (no --no-graphics) + NAT. augur-vm waits out the previous boot's still-held auxiliary-storage lock itself, within the SSH budget below.
+    "$VM_CLI" run --net-nat "$MACOS_BASE_VM" &>"$(macos_base_vm_log)" &
+    vm_pid=$!
+    if ! wait_for_macos_ssh "$MACOS_BASE_VM" 300 &>/dev/null; then
+        error "Base VM '${MACOS_BASE_VM}' did not become reachable over SSH after the restart with a window."
         error "  VM log: $(macos_base_vm_log)"
         exit 1
     fi
@@ -5222,6 +5277,7 @@ cmd_install_cert_macos() {
     success "Custom CA trusted in base VM '${MACOS_BASE_VM}'."
     warn "Newly cloned project VMs will trust it. ${BOLD}Existing${RESET} project VMs are NOT updated —"
     warn "re-clone a project with: ${BOLD}augur destroy --macos && augur up --macos${RESET}."
+    warn "Additive: CAs installed earlier stay trusted too (augur never removes one; delete it in the base VM by hand)."
     warn "A full ${BOLD}augur build --macos${RESET} (base VM rebuild) drops the CA — re-run install-cert."
     # Clean success: stop the VM ourselves and disarm the trap so the normal exit doesn't re-stop it.
     stop_and_reap_macos_vm "$MACOS_BASE_VM" "$vm_pid"
@@ -5274,7 +5330,7 @@ cmd_update_macos() {
     host_lock_acquire "$MACOS_BASE_WRITER_LOCK" update
     trap 'host_lock_release "$MACOS_BASE_WRITER_LOCK" update' EXIT
     trap 'exit 130' INT TERM HUP
-    info "Updating CLI tools in base VM '${MACOS_BASE_VM}'..."
+    info "Updating base VM '${MACOS_BASE_VM}': $(agent_display_name) and the Homebrew formulae (gh included), then any custom provisioning..."
     # Stop a stale base VM from a previous interrupted run: clonefile does not refuse a running source.
     macos_vm_running "$MACOS_BASE_VM" && "$VM_CLI" stop "$MACOS_BASE_VM" 2>/dev/null || true
     # With the lock held no other update runs, so a staging VM that exists now, running or not, was
@@ -5316,6 +5372,14 @@ cmd_update_macos() {
         error "The base VM was left as-is; it may just be slow to boot — re-run ${BOLD}augur update --macos${RESET}."
         exit 1
     fi
+    # Before the Homebrew upgrade below: a base VM built with the Command Line Tools selected needs
+    # the full Xcode selected for a formula that builds from source. It is selected again after
+    # provisioning, which can leave the Command Line Tools selected.
+    select_macos_full_xcode "$MACOS_UPDATE_VM" || {
+        error "Could not select the full Xcode install in '${MACOS_UPDATE_VM}'."
+        error "The base VM was left as-is."
+        exit 1
+    }
     # Seam constants set as variables ahead of the single-quoted script, as in cmd_build_macos.
     if ! ssh_macos "$MACOS_UPDATE_VM" "_agent_url='$(agent_installer_url)'; _agent_args='$(agent_installer_args)'; _agent_bindir='$(macos_agent_bindir_rel)'; _agent_name='$(agent_display_name)'
 "'
@@ -5329,7 +5393,7 @@ cmd_update_macos() {
         _with_timeout() {
             local _secs="$1"; shift
             "$@" & local _cpid=$!
-            ( sleep "$_secs"; kill -TERM "$_cpid" 2>/dev/null ) & local _wpid=$!
+            ( sleep "$_secs"; pkill -TERM -P "$_cpid" 2>/dev/null; kill -TERM "$_cpid" 2>/dev/null ) & local _wpid=$!
             wait "$_cpid" 2>/dev/null; local _rc=$?
             kill "$_wpid" 2>/dev/null; wait "$_wpid" 2>/dev/null
             return $_rc
@@ -5341,8 +5405,16 @@ cmd_update_macos() {
             || { echo "augur: ERROR $_agent_name installer failed or timed out" >&2; rm -f "$_installer"; exit 1; }
         rm -f "$_installer"
         grep -q "$_agent_bindir" ~/.zprofile 2>/dev/null || echo "export PATH=\"\$HOME/$_agent_bindir:\$PATH\"" >> ~/.zprofile
+        # Homebrew formulae (gh included), over the same plain NAT as the installer above. Formulae
+        # only: a cask upgrade can need root, which this unprivileged call does not have.
+        [ -x /opt/homebrew/bin/brew ] || { echo "augur: ERROR Homebrew is missing from the base VM (/opt/homebrew/bin/brew)" >&2; exit 1; }
+        eval "$(/opt/homebrew/bin/brew shellenv)"
+        _with_timeout 900 brew update \
+            || { echo "augur: ERROR brew update failed or timed out" >&2; exit 1; }
+        _with_timeout 1800 brew upgrade --formula \
+            || { echo "augur: ERROR brew upgrade failed or timed out" >&2; exit 1; }
     '; then
-        error "Failed to update CLI tools (see the error above — often a transient network issue)."
+        error "Failed to update the base VM's tools (see the error above; a network problem or a single broken Homebrew formula both land here)."
         error "The base VM was left as-is. Try running 'augur update --macos' again."
         exit 1
     fi
@@ -5386,7 +5458,7 @@ cmd_update_macos() {
     macos_save_scratch_as_base "$MACOS_UPDATE_VM" update
     "$VM_CLI" delete "$MACOS_UPDATE_VM" || warn "Could not delete the staging VM '${MACOS_UPDATE_VM}'; the next update removes it."
     host_lock_release "$MACOS_BASE_WRITER_LOCK" update
-    success "CLI tools updated in '${MACOS_BASE_VM}'."
+    success "Base VM '${MACOS_BASE_VM}' updated."
     warn "Project VMs cloned before this update will not be affected."
     warn "Run ${BOLD}augur destroy --macos && augur up --macos${RESET} to apply to the current project."
 }
@@ -6205,14 +6277,14 @@ cmd_help() {
     echo -e "    augur ${CYAN}build${RESET}  --macos --ipsw <path> --xcode-xip <path> [--platforms <list>] [--manual-setup]  Build base VM (one-time)"
     echo -e "    augur ${CYAN}up${RESET}     --macos [--gui]                           Start project VM (--gui opens a window)"
     echo -e "    augur ${CYAN}claude${RESET} --macos                                   Launch Claude Code"
-    echo -e "    augur ${CYAN}shell${RESET}  --macos                                   Open bash shell"
+    echo -e "    augur ${CYAN}shell${RESET}  --macos                                   Open a zsh shell"
     echo -e "    augur ${CYAN}setup-token${RESET} --macos                              Get a Claude token in a throwaway clone of the base VM, save it on the host"
     echo -e "    augur ${CYAN}install-cert${RESET} --macos <cert.crt>                   Trust a custom CA (PEM X.509) in the base VM"
     echo -e "    augur ${CYAN}down${RESET}    --macos                                   Stop the VM (keep the clone)"
     echo -e "    augur ${CYAN}destroy${RESET} --macos [name]                             Stop and remove the VM clone (name: from augur list --macos)"
     echo -e "    augur ${CYAN}status${RESET}  --macos                                   Check VM status and toolchain"
     echo -e "    augur ${CYAN}list${RESET}    --macos                                   List all VMs and their state"
-    echo -e "    augur ${CYAN}update${RESET}  --macos                                   Update CLI tools in base VM"
+    echo -e "    augur ${CYAN}update${RESET}  --macos                                   Update Claude Code, gh and Homebrew formulae in the base VM"
     echo -e "    augur ${CYAN}version${RESET} --macos                                   Show augur version (macOS mode)"
     echo ""
     echo -e "  ${BOLD}OPTIONS${RESET}  (put them right after the command: ${CYAN}augur up --macos --gui${RESET}; a misplaced one is refused)"
@@ -6283,8 +6355,10 @@ cmd_help() {
     echo -e "      ${CYAN}docs/decisions/0005-no-prune-command.md${RESET}."
     echo -e "    • ${BOLD}install-cert${RESET}: trust a private/self-signed CA in the guest (edge case). Pass ONE PEM"
     echo -e "      X.509 cert (${CYAN}.crt${RESET}). Container bakes it into the image (dropped by ${BOLD}build${RESET}/${BOLD}update${RESET} — re-run);"
-    echo -e "      macOS adds it to the base VM's System keychain (approve the prompt in the VM window; new"
-    echo -e "      clones inherit it). A trusted CA can MITM the guest's TLS — install only CAs you trust."
+    echo -e "      macOS adds it to the base VM's System keychain (approve the prompt in the VM window); new"
+    echo -e "      clones inherit it; earlier CAs stay trusted, only a full build --macos drops them; a cert already"
+    echo -e "      in the keychain is skipped, and its trust setting is not re-checked. A trusted CA can MITM the"
+    echo -e "      guest's TLS — install only CAs you trust."
     echo ""
 }
 

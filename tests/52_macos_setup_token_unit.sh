@@ -207,6 +207,41 @@ run_update
 logged "vm delete $MACOS_BASE_VM" && fail "installer failure: the base VM was deleted" || ok "installer failure: the base VM is untouched"
 ssh_macos() { echo "ssh $1" >> "$LOG"; return 0; }
 
+# The update script upgrades Homebrew formulae (gh included) over the same plain-NAT ssh call as the
+# agent installer: after it, bounded by a timeout, formulae only, and no sudo.
+reset_vms; SIG_OK=1
+ssh_macos() { echo "ssh $1" >> "$LOG"; [[ "$*" == *install.sh* || "$*" == *_agent_url* ]] && printf '%s\n' "$*" > "$TMPD/update-script"; return 0; }
+run_update
+script="$(cat "$TMPD/update-script")"
+has   "$script" "brew update"             "update script: runs brew update"
+has   "$script" "brew upgrade --formula"  "update script: upgrades formulae only"
+hasnt "$script" "brew upgrade --cask"     "update script: no cask upgrade"
+hasnt "$script" "sudo"                    "update script: no sudo"
+has   "$script" "_with_timeout 900 brew update" "update script: brew update is time-bounded"
+has   "$script" "brew update failed or timed out" "update script: a failed brew update aborts (exit 1)"
+has   "$script" "brew upgrade failed or timed out" "update script: a failed brew upgrade aborts (exit 1)"
+has   "$script" "Homebrew is missing from the base VM" "update script: a missing Homebrew is reported as such"
+i_at="$(grep -bo '_with_timeout 180 bash' <<<"$script" | head -n1 | cut -d: -f1)"; b_at="$(grep -bo 'brew update' <<<"$script" | head -n1 | cut -d: -f1)"
+[[ -n "$i_at" && -n "$b_at" && "$i_at" -lt "$b_at" ]] && ok "update script: brew runs after the agent installer, in the same call" || fail "update script: brew is not after the installer" "installer@$i_at brew@$b_at"
+ssh_macos() { echo "ssh $1" >> "$LOG"; return 0; }
+
+# Full Xcode is selected BEFORE the update script (which includes the Homebrew upgrade) and again after
+# provisioning. A failure of the early selection aborts before the script runs.
+reset_vms; SIG_OK=1
+run_update
+x1="$(grep -nx "xcode $MACOS_UPDATE_VM" "$LOG" | head -n1 | cut -d: -f1)"; x2="$(grep -nx "xcode $MACOS_UPDATE_VM" "$LOG" | tail -n1 | cut -d: -f1)"
+s1="$(grep -nx "ssh $MACOS_UPDATE_VM" "$LOG" | head -n1 | cut -d: -f1)"; p1="$(line_of "provision $MACOS_UPDATE_VM")"
+if [[ -n "$x1" && -n "$s1" && -n "$p1" && "$x1" -lt "$s1" && "$s1" -lt "$p1" && "$p1" -lt "$x2" ]]; then
+  ok "update: Xcode is selected before the update script, and again after provisioning (xcode@$x1 script@$s1 provision@$p1 xcode@$x2)"
+else fail "update: Xcode selection is misplaced" "xcode@$x1 script@$s1 provision@$p1 xcode@$x2"; fi
+reset_vms; SIG_OK=1
+select_macos_full_xcode() { echo "xcode $1" >> "$LOG"; return 1; }
+run_update
+[[ "$rc" -ne 0 ]] && ok "update: a failing early Xcode selection aborts" || fail "update: a failing early Xcode selection was ignored"
+logged "ssh $MACOS_UPDATE_VM" && fail "…but the update script still ran" || ok "…before the update script runs"
+logged "vm delete $MACOS_BASE_VM" && fail "…and the base VM was deleted" || ok "…and the base VM is untouched"
+select_macos_full_xcode() { echo "xcode $1" >> "$LOG"; }
+
 reset_vms; SIG_OK=1
 run_update
 eq 0 "$rc" "all steps pass: update exits 0"
@@ -568,7 +603,7 @@ section "Tier 1 — setup-token --macos replaces a stored token that cannot be i
 # The save is wrapped to supply the paste, so this holds with or without a terminal for /dev/tty.
 eval "$(declare -f save_oauth_token | sed '1s/^save_oauth_token/real_save_oauth_token/')"
 NEW_TOKEN="sk-ant-oat01-replacement_token-0123456789"
-save_oauth_token() { echo "save" >> "$LOG"; real_save_oauth_token "$NEW_TOKEN"; }
+save_oauth_token() { echo "save" >> "$LOG"; real_save_oauth_token "$NEW_TOKEN" "${2:-}"; }
 gh() { [[ "$*" == "auth token" ]] && printf '%s\n' $'ghp_bad\nEVIL=1'; }
 unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN
 for bad in "sk-ant-oat01-it's-bad-0123456789" $'sk-ant-oat01-bad\nEVIL=1'; do
@@ -661,7 +696,7 @@ no_stopped_steps() {   # no_stopped_steps <label>
 }
 after_hook() {   # after_hook <label> <vm>: managed, xcode, verify all after the hook, verify last
   local h m x v
-  h="$(line_of "hook $2")"; m="$(line_of "managed $2")"; x="$(line_of "xcode $2")"; v="$(line_of "verify $2")"
+  h="$(line_of "hook $2")"; m="$(line_of "managed $2")"; x="$(grep -nx "xcode $2" "$LOG" | tail -n1 | cut -d: -f1)"; v="$(line_of "verify $2")"
   if [[ -n "$h" && -n "$m" && -n "$x" && -n "$v" && "$h" -lt "$m" && "$m" -lt "$v" && "$x" -lt "$v" ]]; then
     ok "$1: managed policy, Xcode selection and then the signer check run after the hook (hook@$h verify@$v)"
   else fail "$1: post-provisioning steps out of order" "hook@$h managed@$m xcode@$x verify@$v"; fi
@@ -742,5 +777,48 @@ rm -f "$WLOCK"
 cert_fn="$(declare -f cmd_install_cert_macos)"
 has "$cert_fn" 'host_lock_acquire "$MACOS_BASE_WRITER_LOCK" install-cert' "install-cert --macos (which writes into the base VM) takes the base-writer lock"
 has "$cert_fn" 'host_lock_release "$MACOS_BASE_WRITER_LOCK" install-cert' "…and releases it"
+
+section "Tier 1 — install-cert --macos skips a certificate that is already in the keychain"
+if command -v openssl >/dev/null; then
+  CRT="$TMPD/ca.crt"
+  openssl req -x509 -newkey rsa:2048 -nodes -keyout /dev/null -out "$CRT" -days 30 -subj "/CN=augur-skip-test" 2>/dev/null
+  eval "$(declare -f vm_cli_rec | sed '1s/vm_cli_rec/vm_cli_cert/')"
+  VM_CLI=vm_cli_cert
+  require_macos_admin_password() { :; }
+  confirm_cert_install() { return 0; }
+  wait_for_macos_ssh() { echo "$MACOS_BASE_VM" >> "$RUNF"; echo "ssh-up" >> "$LOG"; return 0; }
+  scp_to_macos() { echo "scp" >> "$LOG"; return 0; }
+  ssh_macos() { cat >/dev/null 2>&1 </dev/null; echo "ssh" >> "$LOG"; return 0; }
+  CERT_PRESENT=1
+  _cert_present_in_base_vm() { [[ "$CERT_PRESENT" == 1 ]]; }
+  run_cert() { out="$( exec 2>&1 </dev/null; set -e; cmd_install_cert_macos "$CRT"; echo "done" )"; rc=$?; }
+
+  reset_vms; : > "$RUNF"; CERT_PRESENT=1
+  run_cert
+  eq 0 "$rc" "already present: exits 0"
+  has "$out" "already in the System keychain" "already present: says so"
+  has "$out" "augur-skip-test" "already present: shows the subject"
+  has "$out" "Expires:" "already present: shows the expiry"
+  has "$out" "TRUST SETTING was NOT verified" "already present: says the trust setting was not verified"
+  has "$out" "sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain" "already present: gives the manual trust command"
+  hasnt "$out" "Existing project VMs are NOT updated" "already present: no project-VM reminder"
+  logged "vm run --no-graphics --net-nat $MACOS_BASE_VM" && ok "already present: the base VM boots headless" || fail "already present: no headless boot" "$(cat "$LOG")"
+  logged "vm run --net-nat $MACOS_BASE_VM" && fail "already present: a GUI window was opened" || ok "already present: no GUI window"
+  logged scp && fail "already present: the certificate was copied into the VM" || ok "already present: nothing is copied into the VM"
+  logged "vm stop $MACOS_BASE_VM" && ok "already present: the base VM is stopped" || fail "already present: the base VM is left running"
+  grep -qx "$MACOS_BASE_VM" "$RUNF" && fail "already present: the base VM is still marked running" || ok "already present: the base VM is not running afterwards"
+  [[ -L "$WLOCK" ]] && fail "already present: the base-writer lock is left behind" || ok "already present: the base-writer lock is released"
+
+  reset_vms; : > "$RUNF"; CERT_PRESENT=0
+  run_cert
+  [[ "$rc" -ne 0 ]] && ok "absent: proceeds to the interactive step (refused without a terminal)" || fail "absent: did not reach the interactive step"
+  hasnt "$out" "already in the System keychain" "absent: no skip notice"
+  logged "vm run --no-graphics --net-nat $MACOS_BASE_VM" && logged "vm run --net-nat $MACOS_BASE_VM" && ok "absent: headless check, then a GUI boot" || fail "absent: boots are wrong" "$(cat "$LOG")"
+  b1="$(grep -n '^vm run --no-graphics' "$LOG" | head -n1 | cut -d: -f1)"; s1="$(grep -n "^vm stop $MACOS_BASE_VM" "$LOG" | cut -d: -f1 | awk -v b="$b1" '$1>b{print;exit}')"; g1="$(grep -n '^vm run --net-nat' "$LOG" | head -n1 | cut -d: -f1)"
+  [[ -n "$b1" && -n "$s1" && -n "$g1" && "$b1" -lt "$s1" && "$s1" -lt "$g1" ]] && ok "absent: the headless VM is stopped before the GUI boot" || fail "absent: boot order" "headless@$b1 stop@$s1 gui@$g1"
+  logged scp && ok "absent: the certificate is staged in the VM" || fail "absent: certificate never staged"
+  grep -qx "$MACOS_BASE_VM" "$RUNF" && fail "absent: the base VM is left running after the abort" || ok "absent: the base VM is stopped on the abort path"
+  [[ -L "$WLOCK" ]] && fail "absent: the base-writer lock is left behind" || ok "absent: the base-writer lock is released"
+else skip "install-cert skip branch" "openssl not available"; fi
 
 finish
