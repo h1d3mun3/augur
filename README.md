@@ -267,22 +267,31 @@ augur up --macos        # clone base VM and start (first run clones automaticall
 augur up --macos --gui  # same, but also open a VM window (display + keyboard + pointer)
 augur claude --macos    # launch Claude Code  (starts VM if not running)
 augur shell --macos     # open a bash shell   (starts VM if not running)
-augur setup-token --macos  # get a Claude subscription token (runs in the VM, saves on the host)
+augur setup-token --macos  # get a Claude subscription token (runs in a throwaway clone of the base VM, saves on the host)
 augur down --macos      # stop the VM (keeps the clone — next up is fast)
 augur destroy --macos   # stop and remove the project VM clone (or: augur destroy --macos <name>)
 augur status --macos    # show VM status, toolchain, and auth info
 augur list --macos      # list all VMs and their state
-augur update --macos    # update CLI tools in the base VM
+augur update --macos    # update CLI tools in the base VM (on a staging copy; the base is replaced only if every step passes)
 augur version --macos   # show augur version (macOS mode)
 ```
+
+A VM keeps the egress mode it was started with. If it is running and you ask for the other one
+(e.g. `augur up --macos --no-egress`, then a plain `augur claude --macos`), augur refuses rather than
+attach, and leaves the VM running: `augur down --macos && augur up --macos` (add `--no-egress` to
+start it unfiltered).
 
 ### Concurrent VM limit
 
 > **At most two macOS VMs can run at once.** Apple's macOS license permits up to two virtualized
 > macOS instances per Mac, and Virtualization.framework enforces that limit: starting a third
 > running macOS guest fails. That covers every macOS guest on the host, not just augur's. Each
-> project clone counts while it is running, and so does the build VM during `augur build --macos` /
-> `augur update --macos`. Stopped clones don't count, so you can keep as many as your disk allows.
+> project clone counts while it is running, and so do augur's short-lived VMs: the build VM during
+> `augur build --macos`, the staging VM (`augur-macos-update`) during `augur update --macos`, and the
+> throwaway VM (`augur-macos-_setup-token-throwaway`) during `augur setup-token --macos`.
+> `setup-token --macos` checks first and refuses, naming the running VMs, when two augur VMs are
+> already up (a macOS guest of another tool still surfaces as a boot failure).
+> Stopped clones don't count, so you can keep as many as your disk allows.
 > Run `augur down --macos` in a project you're not using (or check `augur list --macos`) to free a
 > slot. Container mode runs Linux guests and isn't affected.
 
@@ -294,8 +303,20 @@ every `up` (the same way it does for the GitHub token):
 
 - `CLAUDE_CODE_OAUTH_TOKEN` — subscription token; either set the env var / save it to
   `~/.claude_code_oauth_token`, or run **`augur setup-token --macos`**: it runs `claude setup-token`
-  inside the guest (so you don't install Claude Code on the host), then you paste the token
-  back once and augur saves it to `~/.claude_code_oauth_token`.
+  in a throwaway clone of the base VM (so you don't install Claude Code on the host), then you
+  paste the token back once and augur saves it to `~/.claude_code_oauth_token`. It never starts,
+  stops or uses this project's VM, so it works from any directory and whether or not a project VM
+  is running. The clone gets no credentials, no workspace and no project allowlist (only the
+  baseline + `~/.augur/augur.conf` domains, egress-filtered and self-tested like a normal `up`),
+  `claude` must pass `codesign --verify --strict` against Anthropic's Developer ID team before it
+  is attached to your terminal, and the clone is deleted when the command ends (or on the next run
+  if it was interrupted). It refuses while the base VM itself is running (e.g. an `install-cert`
+  window), while an `augur build --macos` or `augur update --macos` is replacing the base VM, and
+  when two macOS VMs are already running (see
+  [Concurrent VM limit](#concurrent-vm-limit)). `augur build --macos` and `augur update --macos` apply the same signature
+  check, as their last step after any custom provisioning, and refuse to save a base VM that fails
+  it. Only one of them runs at a time: a second `build`/`update --macos` refuses, naming the one in
+  progress.
 - `ANTHROPIC_API_KEY` — Console API key (env or `~/.anthropic_api_key`). Takes priority if both are set.
 
 ### Guest clock

@@ -25,7 +25,10 @@ has "$up_macos" 'ensure_macos_claude_agents'     "macOS up wires ~/.claude/agent
 # No folder-trust seed: augur does not pre-trust the mounted workspace on macOS either — a
 # regression guard against re-introducing the per-workspace key.
 hasnt "$up_macos" 'hasTrustDialogAccepted'       "macOS up does NOT pre-trust the workspace in the .claude.json stub"
-has "$up_macos" 'hasCompletedOnboarding'         "macOS up still seeds the onboarding-only stub"
+seed_fn="$(awk '/^macos_seed_claude_json\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
+has "$up_macos" 'macos_seed_claude_json'         "macOS up still seeds the onboarding-only stub"
+has "$seed_fn"  'hasCompletedOnboarding'         "the macOS stub carries onboarding state"
+hasnt "$seed_fn" 'hasTrustDialogAccepted'        "the macOS stub does NOT pre-trust a folder"
 # Write-once, gated on "did we just clone this VM" — NOT the file's absence.
 # `down --macos` keeps the clone, so an unconditional scp on every `up`
 # would destroy accumulated guest state on every restart of a REUSED VM. Keying off "just

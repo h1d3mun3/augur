@@ -335,10 +335,11 @@ has "$out" "Egress filtering OFF" "--no-egress: still says what it turned off (c
 section "Tier 1 — call site: the ALREADY-RUNNING reconcile path (container's finish_up runs there too)"
 
 macos_vm_running() { return 0; }
+macos_record_egress_mode       # booted with egress on (the --no-egress run above recorded "off")
 
 reset_guest
 up_macos
-eq "0" "$rc" "already-running + locked: still returns 0 (no fingerprint ⇒ still no drift refusal)"
+eq "0" "$rc" "already-running + locked: still returns 0 (same egress mode ⇒ no refusal)"
 has "$out" "reconciling host-side state only" "already-running: the reconcile branch was taken (control)"
 has "$out" "Egress self-test passed"          "already-running: I1's tripwire fires on this path too"
 if logged "start_proxy 127.0.0.1"; then ok "already-running: the proxy is still revived first (the self-test verifies THAT)"
