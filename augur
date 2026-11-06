@@ -5234,11 +5234,11 @@ cmd_install_cert_macos() {
     fi
     info "Not installed yet. Restarting base VM '${MACOS_BASE_VM}' with a GUI window (for the trust prompt)..."
     stop_and_reap_macos_vm "$MACOS_BASE_VM" "$vm_pid"
-    # GUI (no --no-graphics) + NAT.
+    # GUI (no --no-graphics) + NAT. augur-vm waits out the previous boot's still-held auxiliary-storage lock itself, within the SSH budget below.
     "$VM_CLI" run --net-nat "$MACOS_BASE_VM" &>"$(macos_base_vm_log)" &
     vm_pid=$!
     if ! wait_for_macos_ssh "$MACOS_BASE_VM" 300 &>/dev/null; then
-        error "Base VM '${MACOS_BASE_VM}' did not become reachable over SSH in time."
+        error "Base VM '${MACOS_BASE_VM}' did not become reachable over SSH after the restart with a window."
         error "  VM log: $(macos_base_vm_log)"
         exit 1
     fi
