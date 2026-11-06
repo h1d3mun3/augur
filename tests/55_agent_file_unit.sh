@@ -93,11 +93,11 @@ has "$out" "REACHED" "the complete agent file loads"
 
 # ── (b) every accessor augur calls is defined by the file ─────────────────────
 section "Tier 0 — agents/claude.sh defines every agent_* accessor augur calls"
-# Every agent_* word on a non-comment line of augur outside the loader's own required-accessor list,
-# minus the ones augur defines itself and the plain variables (assigned or declared local) that
-# merely share the prefix.
-code="$(grep -v '^[[:space:]]*#' "$AUGUR" | awk '/^AGENT_REQUIRED_ACCESSORS=\(/{skip=1} !skip{print} skip&&/^\)/{skip=0}')"
-mapfile -t called < <(printf '%s\n' "$code" | grep -oE '\bagent_[a-z0-9_]*[a-z0-9]' | sort -u)
+# Every agent_* word on a non-comment line of augur outside the loader's own accessor lists (required and
+# may-be-empty), minus the ones augur defines itself and the plain variables (assigned or declared
+# local) that merely share the prefix.
+code="$(grep -v '^[[:space:]]*#' "$AUGUR" | awk '/^AGENT_(REQUIRED|EMPTY_OK)_ACCESSORS=\(/{skip=1} !skip{print} skip&&/\)[[:space:]]*$/{skip=0}')"
+called=(); while IFS= read -r _l; do called+=("$_l"); done < <(printf '%s\n' "$code" | grep -oE '\bagent_[a-z0-9_]*[a-z0-9]' | sort -u)
 missing=0; n=0; derived=()
 for name in "${called[@]}"; do
   grep -qE "^${name}\(\)" <<<"$code" && continue
@@ -110,10 +110,10 @@ done
 (( missing )) || ok "all $n accessors augur calls are defined by agents/claude.sh"
 # The loader's required list is exactly the called set, so it cannot drift from the call sites: a new
 # call without a list entry, or a list entry nothing calls, both fail here.
-mapfile -t required < <(AUGUR_SOURCE_ONLY=1 bash -c 'source "$1" && printf "%s\n" "${AGENT_REQUIRED_ACCESSORS[@]}"' _ "$AUGUR" | sort -u)
+required=(); while IFS= read -r _l; do required+=("$_l"); done < <(AUGUR_SOURCE_ONLY=1 bash -c 'source "$1" && printf "%s\n" "${AGENT_REQUIRED_ACCESSORS[@]}"' _ "$AUGUR" | sort -u)
 eq "$(printf '%s\n' "${derived[@]}")" "$(printf '%s\n' "${required[@]}")" "the loader's AGENT_REQUIRED_ACCESSORS equals the accessors augur calls"
 # Every accessor the file defines is one augur requires (no dead or unchecked ones).
-mapfile -t defined < <(grep -oE '^agent_[a-z0-9_]+\(\)' "$AGENT_FILE" | tr -d '()' | sort -u)
+defined=(); while IFS= read -r _l; do defined+=("$_l"); done < <(grep -oE '^agent_[a-z0-9_]+\(\)' "$AGENT_FILE" | tr -d '()' | sort -u)
 eq "$(printf '%s\n' "${defined[@]}")" "$(printf '%s\n' "${required[@]}")" "the agent file defines exactly the required accessors"
 
 # The file declares data only: it defines nothing but agent_* functions, and loads nothing else.

@@ -601,12 +601,13 @@ macos_agent_bindir_rel() { dirname "$(agent_macos_cli_relpath)"; }
 # A container-side absolute path $1 (an agent_state_* / agent_profile_* value under the container
 # user's home), as a path relative to the macOS guest user's home.
 #
-# Fails (with a message, returning 1) unless $1 is a plain path strictly under /home/dev/: the value
+# Fails (with a message, returning 1) unless $1 is a plain path strictly under /home/dev/ (no empty,
+# "." or ".." components): the value
 # lands inside remote scripts that rm -rf and ln -sfn it, so anything else must never get that far.
 # Callers propagate the failure.
 guest_home_relpath() {
     local p="$1"
-    if [[ "$p" != /home/dev/?* || "$p" == *..* || "$p" == *//* || "$p" == *[!A-Za-z0-9._/-]* ]]; then
+    if [[ "$p" != /home/dev/?* || "$p" == *..* || "$p" == *//* || "$p" == */./* || "$p" == */. || "$p" == *[!A-Za-z0-9._/-]* ]]; then
         echo "augur: the agent definition gives a guest path that is not a plain path under /home/dev/: $p" >&2
         return 1
     fi

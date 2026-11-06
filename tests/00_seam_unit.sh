@@ -184,7 +184,7 @@ eq ".claude"          "$(guest_home_relpath "$(agent_profile_guest_dir)")"      
 eq ".local/bin"       "$(macos_agent_bindir_rel)"                                  "macos_agent_bindir_rel"
 # guest_home_relpath fails closed on anything that is not a plain path strictly under /home/dev/.
 for _bad in "/abs/path" "/home/dev" "/home/dev/" "/home/devx/a" "relative/path" "/home/dev/../etc" "/home/dev/a/../b" \
-            "/home/dev//a" '/home/dev/a b' '/home/dev/a;b' '/home/dev/$x' '/home/dev/`x`' "/home/dev/a'b" '/home/dev/a"b' \
+            "/home/dev//a" "/home/dev/." "/home/dev/./a" "/home/dev/a/." "/home/dev/a/./b" '/home/dev/a b' '/home/dev/a;b' '/home/dev/$x' '/home/dev/`x`' "/home/dev/a'b" '/home/dev/a"b' \
             $'/home/dev/a\nb' ""; do
   if _out="$(guest_home_relpath "$_bad" 2>/dev/null)"; then fail "guest_home_relpath refuses $(printf %q "$_bad")" "accepted: $_out"
   else ok "guest_home_relpath refuses $(printf %q "$_bad")"; fi
