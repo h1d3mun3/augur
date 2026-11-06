@@ -295,6 +295,14 @@ eq 0 "$rc" "a running staging VM with no lock holder (a killed update's): update
 s_at="$(line_of "vm stop $MACOS_UPDATE_VM")"; d_at="$(line_of "vm delete $MACOS_UPDATE_VM")"; c_at="$(line_of "vm clone $MACOS_BASE_VM $MACOS_UPDATE_VM")"
 [[ -n "$s_at" && -n "$d_at" && -n "$c_at" && "$s_at" -lt "$d_at" && "$d_at" -lt "$c_at" ]] && ok "…it is stopped and removed before the new clone" || fail "…it was not stopped and removed first" "$(cat "$LOG")"
 
+reset_vms; RUNNING_VMS="$MACOS_BASE_VM"   # a hand-started base VM, or an install-cert window
+run_update
+eq 1 "$rc" "base VM running: update refuses with exit 1"
+has "$out" "augur-vm stop $MACOS_BASE_VM" "base VM running: names the stop command"
+has "$out" "is running" "base VM running: says so"
+grep -q "^vm " "$LOG" && fail "base VM running: a VM was cloned, stopped or deleted" "$(cat "$LOG")" || ok "base VM running: nothing is cloned, stopped or deleted"
+[[ -L "$WLOCK" ]] && fail "base VM running: the base-writer lock is left behind" || ok "base VM running: the base-writer lock is released"
+
 reset_vms; CLONE_FAIL_TO="$MACOS_UPDATE_VM"
 run_update
 [[ "$rc" -ne 0 ]] && ok "the staging clone fails: update exits non-zero" || fail "failed staging clone: exit 0"
@@ -819,6 +827,15 @@ if command -v openssl >/dev/null; then
   logged scp && ok "absent: the certificate is staged in the VM" || fail "absent: certificate never staged"
   grep -qx "$MACOS_BASE_VM" "$RUNF" && fail "absent: the base VM is left running after the abort" || ok "absent: the base VM is stopped on the abort path"
   [[ -L "$WLOCK" ]] && fail "absent: the base-writer lock is left behind" || ok "absent: the base-writer lock is released"
+
+  reset_vms; echo "$MACOS_BASE_VM" > "$RUNF"   # running before install-cert starts
+  run_cert
+  eq 1 "$rc" "base VM running: install-cert refuses with exit 1"
+  has "$out" "augur-vm stop $MACOS_BASE_VM" "base VM running: names the stop command"
+  hasnt "$out" "done" "base VM running: install-cert does not carry on"
+  grep -q "^vm " "$LOG" && fail "base VM running: a VM was run, stopped or deleted" "$(cat "$LOG")" || ok "base VM running: nothing is booted, stopped or deleted"
+  grep -qx "$MACOS_BASE_VM" "$RUNF" && ok "base VM running: it is left running" || fail "base VM running: it was stopped"
+  [[ -L "$WLOCK" ]] && fail "base VM running: the base-writer lock is left behind" || ok "base VM running: the base-writer lock is released"
 else skip "install-cert skip branch" "openssl not available"; fi
 
 finish

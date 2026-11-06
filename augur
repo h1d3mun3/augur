@@ -4690,6 +4690,19 @@ macos_scrub_augur_credentials() {
     fi"
 }
 
+# Refuse to go on while the base VM is running. A running base VM is a hand-started session, an
+# 'augur install-cert --macos' window, or a leftover from an interrupted run; stopping it for the
+# caller could kill someone's live session, and clonefile does not refuse a running source, so a
+# clone or replacement of it would be inconsistent. The operator stops it deliberately. (`build
+# --macos` is the one command that stops it itself, after asking.) $1 is the command name shown in
+# the message. Callers holding the base-writer lock release it through their EXIT trap.
+require_base_vm_stopped() {
+    macos_vm_running "$MACOS_BASE_VM" || return 0
+    error "Cannot run ${1} --macos: the base VM '${MACOS_BASE_VM}' is running (started by hand, an 'augur install-cert --macos' window, or left over from an interrupted run)."
+    error "  Finish or stop it first (${BOLD}augur-vm stop ${MACOS_BASE_VM}${RESET}), then retry."
+    exit 1
+}
+
 # macOS counterpart of cmd_setup_token: run `claude setup-token` in a throwaway clone of the base VM
 # (see the section header) and save the resulting token on the host. Same copy-the-code flow (no host
 # claude needed). Works whether or not this project's VM exists or runs; it is never touched.
@@ -4701,13 +4714,7 @@ cmd_setup_token_macos() {
         exit 1
     }
     require_macos_admin_password "$MACOS_BASE_VM"
-    # Refused, not stopped: a running base VM is an install-cert window or one started by hand, and
-    # clonefile does not refuse a running source, so its clone could be inconsistent.
-    if macos_vm_running "$MACOS_BASE_VM"; then
-        error "The base VM '${MACOS_BASE_VM}' is running (an 'augur install-cert --macos' window, or started by hand)."
-        error "  Finish or stop it first (${BOLD}augur-vm stop ${MACOS_BASE_VM}${RESET}), then retry."
-        exit 1
-    fi
+    require_base_vm_stopped setup-token
     if ! egress_enabled; then
         warn "setup-token --macos always runs with egress filtering on; ignoring --no-egress / AUGUR_EGRESS=0."
         AUGUR_EGRESS=1
@@ -5200,8 +5207,7 @@ cmd_install_cert_macos() {
     # neither can stop or replace the base VM under the operator's trust window.
     host_lock_acquire "$MACOS_BASE_WRITER_LOCK" install-cert
     trap 'host_lock_release "$MACOS_BASE_WRITER_LOCK" install-cert' EXIT
-    # Stop a stale base VM from a previous interrupted run before booting a fresh one.
-    macos_vm_running "$MACOS_BASE_VM" && "$VM_CLI" stop "$MACOS_BASE_VM" 2>/dev/null || true
+    require_base_vm_stopped install-cert
     info "Booting base VM '${MACOS_BASE_VM}' headless to check whether the certificate is already installed..."
     # Headless + NAT, backgrounded so we can drive it over SSH. A window is opened (second boot
     # below) only when the certificate is missing and the operator has to approve the trust.
@@ -5330,9 +5336,8 @@ cmd_update_macos() {
     host_lock_acquire "$MACOS_BASE_WRITER_LOCK" update
     trap 'host_lock_release "$MACOS_BASE_WRITER_LOCK" update' EXIT
     trap 'exit 130' INT TERM HUP
+    require_base_vm_stopped update
     info "Updating base VM '${MACOS_BASE_VM}': $(agent_display_name) and the Homebrew formulae (gh included), then any custom provisioning..."
-    # Stop a stale base VM from a previous interrupted run: clonefile does not refuse a running source.
-    macos_vm_running "$MACOS_BASE_VM" && "$VM_CLI" stop "$MACOS_BASE_VM" 2>/dev/null || true
     # With the lock held no other update runs, so a staging VM that exists now, running or not, was
     # left by one that was killed. The build VM is never touched (it may be one kept with
     # AUGUR_KEEP_BUILD_VM=1).
