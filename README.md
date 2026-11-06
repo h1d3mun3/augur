@@ -280,11 +280,14 @@ augur version --macos   # show augur version (macOS mode)
 (a failure leaves the base VM as it was). It reinstalls Claude Code with the official installer and
 runs `brew update` and `brew upgrade --formula`, which upgrades `gh` and every other installed
 Homebrew formula, including the ones your manifest installed. Casks are left alone, because an
-upgrade can need `sudo`. Both run, like the same steps of `augur build --macos`, over the staging VM's
-plain NAT: it is a credential-less copy of the base VM, and its network is not egress-filtered. Your
-custom provisioning is then re-run over the usual egress-filtered session, and augur's own base-VM
-settings are re-asserted. Xcode is not updated: rebuild the base VM with `augur build --macos` for
-that.
+upgrade can need `sudo`. Both run over the staging VM's plain NAT, as the Homebrew and `gh` installs
+of `augur build --macos` do: the staging VM is a credential-less copy of the base VM, and its network
+is not egress-filtered. That includes formulae and third-party taps your manifest installed earlier
+(the build installs those through the egress-filtered session instead), so their upgrades are fetched
+unfiltered. A single formula that fails to upgrade fails the whole update, leaving the base VM as it
+was. Your custom provisioning is then re-run over the usual egress-filtered session, and augur's own
+base-VM settings are re-asserted. Xcode is not updated: rebuild the base VM with `augur build --macos`
+for that.
 Project VMs cloned before an update are unaffected; to pick it up, `augur destroy --macos && augur up
 --macos` in each project, which discards that clone's state (DerivedData, Simulator devices, SwiftPM
 caches). Container mode's `update` also leaves other projects' containers on the old image until they

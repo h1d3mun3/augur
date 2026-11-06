@@ -218,6 +218,9 @@ has   "$script" "brew upgrade --formula"  "update script: upgrades formulae only
 hasnt "$script" "brew upgrade --cask"     "update script: no cask upgrade"
 hasnt "$script" "sudo"                    "update script: no sudo"
 has   "$script" "_with_timeout 900 brew update" "update script: brew update is time-bounded"
+has   "$script" "brew update failed or timed out" "update script: a failed brew update aborts (exit 1)"
+has   "$script" "brew upgrade failed or timed out" "update script: a failed brew upgrade aborts (exit 1)"
+has   "$script" "Homebrew is missing from the base VM" "update script: a missing Homebrew is reported as such"
 i_at="$(grep -bo '_with_timeout 180 bash' <<<"$script" | head -n1 | cut -d: -f1)"; b_at="$(grep -bo 'brew update' <<<"$script" | head -n1 | cut -d: -f1)"
 [[ -n "$i_at" && -n "$b_at" && "$i_at" -lt "$b_at" ]] && ok "update script: brew runs after the agent installer, in the same call" || fail "update script: brew is not after the installer" "installer@$i_at brew@$b_at"
 ssh_macos() { echo "ssh $1" >> "$LOG"; return 0; }

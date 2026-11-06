@@ -5346,7 +5346,7 @@ cmd_update_macos() {
         _with_timeout() {
             local _secs="$1"; shift
             "$@" & local _cpid=$!
-            ( sleep "$_secs"; kill -TERM "$_cpid" 2>/dev/null ) & local _wpid=$!
+            ( sleep "$_secs"; pkill -TERM -P "$_cpid" 2>/dev/null; kill -TERM "$_cpid" 2>/dev/null ) & local _wpid=$!
             wait "$_cpid" 2>/dev/null; local _rc=$?
             kill "$_wpid" 2>/dev/null; wait "$_wpid" 2>/dev/null
             return $_rc
@@ -5360,13 +5360,14 @@ cmd_update_macos() {
         grep -q "$_agent_bindir" ~/.zprofile 2>/dev/null || echo "export PATH=\"\$HOME/$_agent_bindir:\$PATH\"" >> ~/.zprofile
         # Homebrew formulae (gh included), over the same plain NAT as the installer above. Formulae
         # only: a cask upgrade can need root, which this unprivileged call does not have.
-        eval "$(/opt/homebrew/bin/brew shellenv)" 2>/dev/null
+        [ -x /opt/homebrew/bin/brew ] || { echo "augur: ERROR Homebrew is missing from the base VM (/opt/homebrew/bin/brew)" >&2; exit 1; }
+        eval "$(/opt/homebrew/bin/brew shellenv)"
         _with_timeout 900 brew update \
             || { echo "augur: ERROR brew update failed or timed out" >&2; exit 1; }
         _with_timeout 1800 brew upgrade --formula \
             || { echo "augur: ERROR brew upgrade failed or timed out" >&2; exit 1; }
     '; then
-        error "Failed to update the base VM's tools (see the error above — often a transient network issue)."
+        error "Failed to update the base VM's tools (see the error above; a network problem or a single broken Homebrew formula both land here)."
         error "The base VM was left as-is. Try running 'augur update --macos' again."
         exit 1
     fi
