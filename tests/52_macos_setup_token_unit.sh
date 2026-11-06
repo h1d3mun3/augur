@@ -225,6 +225,23 @@ i_at="$(grep -bo '_with_timeout 180 bash' <<<"$script" | head -n1 | cut -d: -f1)
 [[ -n "$i_at" && -n "$b_at" && "$i_at" -lt "$b_at" ]] && ok "update script: brew runs after the agent installer, in the same call" || fail "update script: brew is not after the installer" "installer@$i_at brew@$b_at"
 ssh_macos() { echo "ssh $1" >> "$LOG"; return 0; }
 
+# Full Xcode is selected BEFORE the update script (which includes the Homebrew upgrade) and again after
+# provisioning. A failure of the early selection aborts before the script runs.
+reset_vms; SIG_OK=1
+run_update
+x1="$(grep -nx "xcode $MACOS_UPDATE_VM" "$LOG" | head -n1 | cut -d: -f1)"; x2="$(grep -nx "xcode $MACOS_UPDATE_VM" "$LOG" | tail -n1 | cut -d: -f1)"
+s1="$(grep -nx "ssh $MACOS_UPDATE_VM" "$LOG" | head -n1 | cut -d: -f1)"; p1="$(line_of "provision $MACOS_UPDATE_VM")"
+if [[ -n "$x1" && -n "$s1" && -n "$p1" && "$x1" -lt "$s1" && "$s1" -lt "$p1" && "$p1" -lt "$x2" ]]; then
+  ok "update: Xcode is selected before the update script, and again after provisioning (xcode@$x1 script@$s1 provision@$p1 xcode@$x2)"
+else fail "update: Xcode selection is misplaced" "xcode@$x1 script@$s1 provision@$p1 xcode@$x2"; fi
+reset_vms; SIG_OK=1
+select_macos_full_xcode() { echo "xcode $1" >> "$LOG"; return 1; }
+run_update
+[[ "$rc" -ne 0 ]] && ok "update: a failing early Xcode selection aborts" || fail "update: a failing early Xcode selection was ignored"
+logged "ssh $MACOS_UPDATE_VM" && fail "…but the update script still ran" || ok "…before the update script runs"
+logged "vm delete $MACOS_BASE_VM" && fail "…and the base VM was deleted" || ok "…and the base VM is untouched"
+select_macos_full_xcode() { echo "xcode $1" >> "$LOG"; }
+
 reset_vms; SIG_OK=1
 run_update
 eq 0 "$rc" "all steps pass: update exits 0"
@@ -679,7 +696,7 @@ no_stopped_steps() {   # no_stopped_steps <label>
 }
 after_hook() {   # after_hook <label> <vm>: managed, xcode, verify all after the hook, verify last
   local h m x v
-  h="$(line_of "hook $2")"; m="$(line_of "managed $2")"; x="$(line_of "xcode $2")"; v="$(line_of "verify $2")"
+  h="$(line_of "hook $2")"; m="$(line_of "managed $2")"; x="$(grep -nx "xcode $2" "$LOG" | tail -n1 | cut -d: -f1)"; v="$(line_of "verify $2")"
   if [[ -n "$h" && -n "$m" && -n "$x" && -n "$v" && "$h" -lt "$m" && "$m" -lt "$v" && "$x" -lt "$v" ]]; then
     ok "$1: managed policy, Xcode selection and then the signer check run after the hook (hook@$h verify@$v)"
   else fail "$1: post-provisioning steps out of order" "hook@$h managed@$m xcode@$x verify@$v"; fi
