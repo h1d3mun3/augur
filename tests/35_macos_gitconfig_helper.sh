@@ -53,23 +53,29 @@ AUGUR_DIR="$TMPD/augur"
 export GIT_CONFIG_NOSYSTEM=1
 unset GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_COUNT
 
-# The exact value cmd_up_macos means to install. Pinned as a literal on purpose: it is the contract
+# The exact value augur means to install. Pinned as a literal on purpose: it is the contract
 # with the guest (`$GH_TOKEN` stays a REFERENCE, expanded at push time, never the token itself), and
 # a silent edit to the helper body should have to be re-affirmed here.
 WANT='!f() { test "$1" = get && echo username=x-access-token && echo password=$GH_TOKEN; }; f'
 KEY='credential.https://github.com.helper'
 
 # Stand-in for the guest. ssh runs its argv joined-and-parsed by the remote shell, so `bash -c` with
-# $HOME redirected at a throwaway "guest home" is a faithful stand-in — and it means the assertions
-# below are made against REAL `git config` behaviour, not a model of it.
+# $HOME redirected at a throwaway "guest home" (and the guest's /Users/<user> mapped onto it) is a
+# faithful stand-in — and it means the assertions below are made against REAL `git config`
+# behaviour, not a model of it.
 GUEST_HOME=""
 SSHLOG="$TMPD/sshlog"
 : > "$SSHLOG"
 ssh_macos() {
     local vm="$1"; shift
-    printf '%s\n' "$vm" >> "$SSHLOG"
-    HOME="$GUEST_HOME" XDG_CONFIG_HOME="$GUEST_HOME/.config" bash -c "$*"
+    local cmd="$*"
+    printf '%s\n' "$cmd" >> "$SSHLOG"
+    cmd="${cmd//\/Users\/${MACOS_SSH_USER}/$GUEST_HOME}"
+    HOME="$GUEST_HOME" XDG_CONFIG_HOME="$GUEST_HOME/.config" bash -c "$cmd"
 }
+unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN
+GH_HOST_TOKEN=""
+gh() { [[ -n "$GH_HOST_TOKEN" ]] || return 1; printf '%s\n' "$GH_HOST_TOKEN"; }
 
 # mk_guest <name> <heredoc-on-stdin> — a fresh guest home holding the scp'd ~/.gitconfig
 mk_guest() {
@@ -82,12 +88,12 @@ guest_values() {   # every value the guest's global config holds for KEY, newlin
     HOME="$GUEST_HOME" XDG_CONFIG_HOME="$GUEST_HOME/.config" \
         git config --global --get-all "$KEY" 2>/dev/null
 }
-# Run the REAL function the way cmd_up_macos runs it: inside `set -e`. Without that the `|| warn`
-# is unobservable (a bare failing ssh_macos would just return non-zero and be ignored), and the
-# abort this PR prevents is precisely a `set -e` abort.
-wire() {   # wire <token> — sets $out / $rc
-    : > "$SSHLOG"
-    out="$( set -e; ensure_macos_git_credential_helper testvm "$1" 2>&1 )"; rc=$?
+# Run the REAL push (push_macos_guest_env writes the helper in the same ssh session as
+# ~/.augur-env) the way its callers run it: inside `set -e`. Without that a helper failure that
+# aborts would be indistinguishable from one that only warns.
+wire() {   # wire <host gh token> — sets $out / $rc
+    : > "$SSHLOG"; GH_HOST_TOKEN="$1"
+    out="$( set -e; push_macos_guest_env testvm 2>&1 )"; rc=$?
 }
 
 section "Tier 1 — a DUPLICATED credential.helper (what \`gh auth setup-git\` leaves) must not break up"
@@ -160,10 +166,10 @@ mk_guest notoken <<'EOF'
 EOF
 wire ""
 eq "0" "$rc" "no gh token: the wiring returns 0"
-if [[ -s "$SSHLOG" ]]; then
-  fail "no gh token: the guest WAS contacted" "sshlog: [$(cat "$SSHLOG")]"
+if grep -q "git config" "$SSHLOG"; then
+  fail "no gh token: a git config command WAS sent" "sshlog: [$(cat "$SSHLOG")]"
 else
-  ok "no gh token: no guest round-trip at all (a helper referencing an unset \$GH_TOKEN is worse than none)"
+  ok "no gh token: no helper is written (a helper referencing an unset \$GH_TOKEN is worse than none)"
 fi
 if cmp -s "$GUEST_HOME/.gitconfig" "$TMPD/guest-notoken.orig"; then
   ok "no gh token: the copied ~/.gitconfig is left byte-identical"
@@ -186,6 +192,7 @@ wire "ghp_hosttoken0123456789"
 eq "0" "$rc" "malformed ~/.gitconfig: the wiring still returns 0 under \`set -e\` (\`up\` is not aborted)"
 has "$out" "Could not configure git's credential helper" "malformed ~/.gitconfig: warns, so the missing push credential is not silent"
 has "$out" "git push"                                    "malformed ~/.gitconfig: the warning names the capability that is lost"
+has "$(cat "$GUEST_HOME/.augur-env" 2>/dev/null)" "export GH_TOKEN='ghp_hosttoken0123456789'" "malformed ~/.gitconfig: ~/.augur-env is still installed (the helper failure undoes nothing)"
 
 section "Tier 1 — source guards: ordering, and container mode's immunity"
 
@@ -212,8 +219,8 @@ scp_at="$(printf  '%s\n' "$up_macos_body" | grep -n 'scp_to_macos .* "\$HOME/\.g
 # The helper is written by push_macos_guest_env, so its call site in cmd_up_macos is what must follow
 # the scp.
 push_fn_body="$(fn_body push_macos_guest_env)"
-has "$push_fn_body" 'ensure_macos_git_credential_helper "$vm"' "the ~/.augur-env push writes the git credential helper"
-wire_at="$(printf '%s\n' "$up_macos_body" | grep -n '^ *push_macos_guest_env '   | head -n1 | cut -d: -f1)"
+has "$push_fn_body" '$(macos_git_credential_helper_cmd) || exit 3' "the ~/.augur-env push writes the git credential helper, best-effort"
+wire_at="$(printf '%s\n' "$up_macos_body" | grep -n '^ *push_macos_guest_env '   | tail -n1 | cut -d: -f1)"
 if [[ -n "$scp_at" && -n "$wire_at" && "$scp_at" -lt "$wire_at" ]]; then
   ok "macOS up copies ~/.gitconfig BEFORE writing the helper into it (scp@$scp_at < helper@$wire_at)"
 else

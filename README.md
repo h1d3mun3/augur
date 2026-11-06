@@ -327,7 +327,7 @@ start it unfiltered).
 
 On macOS, Claude Code stores its OAuth login in the Keychain, which is unreadable over SSH and
 absent from a freshly cloned VM. So macOS mode injects a credential through the environment
-each time the VM boots and at the start of every `augur claude --macos` / `augur shell --macos` session (the same way it does for the GitHub token), so a changed credential reaches the next session without a VM restart:
+on every `augur up --macos`, `augur claude --macos` and `augur shell --macos`, whether it boots the VM or finds it running (the same way it does for the GitHub token), so a changed credential reaches the next session without a VM restart:
 
 - `CLAUDE_CODE_OAUTH_TOKEN` — subscription token; either set the env var / save it to
   `~/.claude_code_oauth_token`, or run **`augur setup-token --macos`**: it runs `claude setup-token`
@@ -680,9 +680,9 @@ resolves them afresh, so a rotated key or token takes effect on the next session
 container recreate. A session already running keeps the value it started with. `augur
 setup-token` runs with **no** credentials injected (it exists to mint one), and neither does a
 `container exec` you run by hand outside augur. In macOS VM mode they are rewritten into the
-guest's `~/.augur-env` when the VM boots and again at the start of every `augur claude --macos` /
-`augur shell --macos` session, so a rotated key or token likewise reaches the next session with no
-VM restart; a guest shell already open keeps the values it started with.
+guest's `~/.augur-env` by every `augur up --macos`, `augur claude --macos` and `augur shell --macos`,
+whether it boots the VM or finds it running, so a rotated key or token likewise reaches the next
+session with no VM restart; a guest shell already open keeps the values it started with.
 
 **GitHub CLI:**
 

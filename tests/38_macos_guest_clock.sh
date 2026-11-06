@@ -393,7 +393,7 @@ macos_record_egress_mode       # booted with egress on (the --no-egress run abov
 reset_guest; g_offset -5733
 up_macos
 eq "0" "$rc" "already-running: still returns 0 (a pure host-side reconcile plus this)"
-has "$out" "reconciling host-side state only" "already-running: the reconcile branch was taken (control)"
+has "$out" "reconciling host-side state and refreshing credentials" "already-running: the reconcile branch was taken (control)"
 if did_set; then ok "already-running: a long-lived guest's clock is re-corrected here too"
 else fail "already-running: the clock is never corrected on the reconcile path" \
           "a VM kept across \`down --macos\` would never be fixed; log: [$(tr '\n' ' ' < "$SSHLOG")]"; fi
@@ -442,6 +442,7 @@ section "Tier 1 — source guards: the wiring's POSITION, and the NTP door stays
 up_macos_body="$(awk '/^cmd_up_macos\(\)/{f=1} f{print} f&&/^}/{exit}'      "$AUGUR")"
 claude_body="$(awk  '/^cmd_claude_macos\(\)/{f=1} f{print} f&&/^}/{exit}'   "$AUGUR")"
 shell_body="$(awk   '/^cmd_shell_macos\(\)/{f=1} f{print} f&&/^}/{exit}'    "$AUGUR")"
+prep_body="$(awk    '/^prepare_macos_session\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
 
 # Position in the source, not just its effect: an edit that moves the call below the self-test, the
 # credential writer or the banner must fail here too. (grep -n indexes within the extracted body.)
@@ -452,7 +453,7 @@ shell_body="$(awk   '/^cmd_shell_macos\(\)/{f=1} f{print} f&&/^}/{exit}'    "$AU
 c_at="$(printf   '%s\n' "$up_macos_body" | grep -n '^    sync_macos_guest_clock '          | head -n1 | cut -d: -f1)"
 ssh_at="$(printf '%s\n' "$up_macos_body" | grep -n '^ *wait_for_macos_ssh '                | head -n1 | cut -d: -f1)"
 v_at="$(printf   '%s\n' "$up_macos_body" | grep -n 'verify_macos_egress_locked "\$project_vm"' | tail -n1 | cut -d: -f1)"
-env_at="$(printf '%s\n' "$up_macos_body" | grep -n 'push_macos_guest_env "\$project_vm"'   | head -n1 | cut -d: -f1)"
+env_at="$(printf '%s\n' "$up_macos_body" | grep -n 'push_macos_guest_env "\$project_vm"'   | tail -n1 | cut -d: -f1)"
 ban_at="$(printf '%s\n' "$up_macos_body" | grep -n "success \"VM '"                        | head -n1 | cut -d: -f1)"
 if [[ -n "$c_at" && -n "$ssh_at" && -n "$v_at" && -n "$env_at" && -n "$ban_at" \
       && "$ssh_at" -lt "$c_at" && "$c_at" -lt "$v_at" && "$c_at" -lt "$env_at" && "$c_at" -lt "$ban_at" ]]; then
@@ -464,12 +465,11 @@ fi
 if printf '%s\n' "$up_macos_body" | sed -n '/already running/,/^    fi$/p' | grep -q '^ *sync_macos_guest_clock '
 then ok "the already-running branch syncs the clock (the only place a long-lived guest is re-corrected)"
 else fail "the already-running branch skips the clock sync" "a VM kept across \`down --macos\` would drift forever"; fi
-printf '%s\n' "$claude_body" | grep -q '^ *sync_macos_guest_clock ' \
-  && ok "cmd_claude_macos syncs the clock (it attaches without going through up)" \
-  || fail "cmd_claude_macos does not sync the clock"
-printf '%s\n' "$shell_body" | grep -q '^ *sync_macos_guest_clock ' \
-  && ok "cmd_shell_macos syncs the clock" \
-  || fail "cmd_shell_macos does not sync the clock"
+printf '%s\n' "$prep_body" | grep -q '^ *sync_macos_guest_clock ' \
+  && ok "prepare_macos_session syncs the clock (claude/shell attach without going through up)" \
+  || fail "prepare_macos_session does not sync the clock"
+has "$claude_body" 'prepare_macos_session "$project_vm"' "cmd_claude_macos goes through prepare_macos_session"
+has "$shell_body"  'prepare_macos_session "$project_vm"' "cmd_shell_macos goes through prepare_macos_session"
 
 # The rejected alternative, pinned so it cannot be quietly attempted. NTP is UDP/123; the allowlist
 # is SOCKS5/TCP names, and the patch does not register the UDP forwarder under --deny-direct at all.

@@ -339,8 +339,8 @@ gate_before cmd_claude ensure_session_container   # container mode's claude/shel
 gate_before cmd_shell ensure_session_container
 gate_before cmd_setup_token container_running
 gate_before cmd_up_macos macos_vm_running
-gate_before cmd_claude_macos macos_vm_running
-gate_before cmd_shell_macos macos_vm_running
+gate_before cmd_claude_macos prepare_macos_session   # its running-vs-up branch lives there
+gate_before cmd_shell_macos prepare_macos_session
 # setup-token --macos never attaches to the project VM: it boots its own throwaway clone and helpers
 # (tests/52_macos_setup_token_unit.sh), so the project's helpers have nothing to gate there.
 hasnt "$(declare -f cmd_setup_token_macos)" "require_fresh_egress_helpers" "cmd_setup_token_macos is not gated by the project's helpers"

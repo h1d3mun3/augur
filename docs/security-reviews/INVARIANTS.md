@@ -160,11 +160,11 @@ in time," this **prescribes** "what must never break." It changes rarely.
 ### I10. Do not expose credentials on argv  🟡 partial
 - **Rule:** No injected agent or gh credential (`agent_auth_specs` values, `GH_TOKEN`) is ever
   placed on a command line. On macOS the credentials are written to
-  `~/.augur-env` via SSH stdin (`push_macos_guest_env`: a temp file created under `umask 077`, then
-  renamed over it), on every boot and at the start of every `augur claude --macos` /
-  `augur shell --macos` session on a running VM. In Container mode credentials are never passed to
-  `container run` at all; they reach only the `container exec` that starts `augur claude` /
-  `augur shell`, through `--env-file <(…)` written by the bash builtin `printf`
+  `~/.augur-env` via SSH stdin (`push_macos_guest_env`: the content is built host-side and piped
+  in by the bash builtin `printf`, into a temp file created under `umask 077` and renamed over
+  it), by every `augur up --macos`, `augur claude --macos` and `augur shell --macos`. In Container
+  mode credentials are never passed to `container run` at all; they reach only the `container exec`
+  that starts `augur claude` / `augur shell`, through `--env-file <(…)` written by the bash builtin `printf`
   (`session_credential_env`). `augur setup-token` and augur's own execs get none. In macOS VM mode
   `augur setup-token --macos` never uses the project VM: it runs in a throwaway clone of the base VM
   that receives no `~/.augur-env`, no `GH_TOKEN`, no git config and no share, and is deleted on every
@@ -178,8 +178,8 @@ in time," this **prescribes** "what must never break." It changes rarely.
   no engine argv holds a value; `setup-token` and the profile/history execs carry no `--env-file`.
   `tests/21_container_live.sh` (live, `AUGUR_TEST_LIVE=1`) additionally checks `container inspect`
   shows no credential. macOS mode: `tests/56_macos_session_credentials.sh` asserts, through a
-  recording `ssh_macos`, that the `~/.augur-env` push (`push_macos_guest_env`, both on a running
-  VM's `claude --macos` / `shell --macos` and inside the boot of `cmd_up_macos`) carries the
+  recording `ssh_macos`, that the `~/.augur-env` push (`push_macos_guest_env`, on a running
+  VM's `up` / `claude` / `shell --macos` and inside the boot of `cmd_up_macos`) carries the
   credential values only on stdin and none on any ssh argv; the guest-side process list on a real
   VM stays ⚠ review-only. `tests/52_macos_setup_token_unit.sh` asserts that no credential value (API
   key, OAuth token file, gh token) and no `~/.augur-env` / `~/.gitconfig` reaches the throwaway VM

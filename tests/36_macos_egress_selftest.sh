@@ -340,7 +340,7 @@ macos_record_egress_mode       # booted with egress on (the --no-egress run abov
 reset_guest
 up_macos
 eq "0" "$rc" "already-running + locked: still returns 0 (same egress mode ⇒ no refusal)"
-has "$out" "reconciling host-side state only" "already-running: the reconcile branch was taken (control)"
+has "$out" "reconciling host-side state and refreshing credentials" "already-running: the reconcile branch was taken (control)"
 has "$out" "Egress self-test passed"          "already-running: I1's tripwire fires on this path too"
 if logged "start_proxy 127.0.0.1"; then ok "already-running: the proxy is still revived first (the self-test verifies THAT)"
 else fail "already-running: start_proxy was not called" "log: [$(tr '\n' ' ' < "$LOG")]"; fi
@@ -365,7 +365,7 @@ selftest_fn="$(awk '/^verify_macos_egress_locked\(\)/{f=1} f{print} f&&/^}/{exit
 # Position in the source, not just its effect: an edit that moves the call below the credential
 # writer or the banner must fail here too. (grep -n indexes within the extracted function body.)
 v_at="$(printf  '%s\n' "$up_macos_body" | grep -n 'verify_macos_egress_locked "\$project_vm"' | tail -n1 | cut -d: -f1)"
-env_at="$(printf '%s\n' "$up_macos_body" | grep -n 'push_macos_guest_env "\$project_vm"' | head -n1 | cut -d: -f1)"
+env_at="$(printf '%s\n' "$up_macos_body" | grep -n 'push_macos_guest_env "\$project_vm"' | tail -n1 | cut -d: -f1)"
 ban_at="$(printf '%s\n' "$up_macos_body" | grep -n "success \"VM '"           | head -n1 | cut -d: -f1)"
 ssh_at="$(printf '%s\n' "$up_macos_body" | grep -n '^ *wait_for_macos_ssh '   | head -n1 | cut -d: -f1)"
 if [[ -n "$v_at" && -n "$env_at" && -n "$ban_at" && -n "$ssh_at" \
