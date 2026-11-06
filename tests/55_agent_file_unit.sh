@@ -2,7 +2,8 @@
 # Tier 0/1 (offline) — the agent definition file (agents/claude.sh) that `augur` sources.
 #   (a) augur fails closed, in every entry path, when the file is missing or unreadable;
 #   (b) the file defines every agent_* accessor augur calls;
-#   (c) `bash install` / `bash install --here` ship the file and refuse a source tree without it;
+#   (c) `bash install` / `bash install --here` ship the file and refuse a source tree without it, and
+#       write PATH and the completion hook to the login shell's rc file;
 #   (d) the file's directory is not under anything cmd_up / cmd_up_macos mounts or shares into a guest.
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/.." && pwd)"
 source "$HERE/lib.sh"
@@ -143,7 +144,7 @@ cp "$REPO/completions/augur.bash" "$REPO/completions/augur.zsh" "$src/completion
 mkdir -p "$src/agents"; cp "$AGENT_FILE" "$src/agents/claude.sh"
 
 export HOME="$work/ihome"; mkdir -p "$HOME"
-out="$( PATH="$bin" bash "$src/install" --here 2>&1 </dev/null )"; rc=$?
+out="$( SHELL=/bin/bash PATH="$bin" bash "$src/install" --here 2>&1 </dev/null )"; rc=$?
 eq "0" "$rc" "install --here from a source tree exits 0"
 if [[ -f "$HOME/.augur/agents/claude.sh" ]] && cmp -s "$AGENT_FILE" "$HOME/.augur/agents/claude.sh"
 then ok "install --here copies agents/claude.sh into ~/.augur/agents/"
@@ -190,16 +191,75 @@ if [[ "$rc" -ne 0 && "$rc" -ne 124 ]]; then ok "a symlink loop fails fast"; else
 
 # Always refreshed: a stale or hand-edited installed copy is overwritten.
 echo '# stale' > "$HOME/.augur/agents/claude.sh"
-PATH="$bin" bash "$src/install" --here >/dev/null 2>&1 </dev/null
+SHELL=/bin/bash PATH="$bin" bash "$src/install" --here >/dev/null 2>&1 </dev/null
 if cmp -s "$AGENT_FILE" "$HOME/.augur/agents/claude.sh"; then ok "a re-install overwrites an edited agent file"
 else fail "a re-install overwrites an edited agent file" "installed copy still differs"; fi
 # The installed pair works together.
 out="$( cd "$work" && PATH="$HERE/shims:$PATH" bash "$HOME/.augur/augur" version 2>&1 </dev/null )"; rc=$?
 eq "0" "$rc" "the installed augur runs with the installed agent file"
 
+# ── the rc file install writes follows the login shell ───────────────────────
+section "Tier 1 — install writes PATH and completion to the login shell's rc file"
+# rc_install HOME SHELL: run install --here with that HOME and login shell; prints its output with
+# the colour codes stripped.
+rc_install() {
+  ( export HOME="$1" SHELL="$2"; PATH="$bin" bash "$src/install" --here 2>&1 </dev/null ) | sed $'s/\e\\[[0-9;]*m//g'
+}
+# rc_count FILE PATTERN: how many lines of FILE match PATTERN (0 for a missing file).
+rc_count() { if [[ -f "$1" ]]; then grep -c -- "$2" "$1"; else echo 0; fi; }
+PATH_LINE='^export PATH=.*\.augur'
+
+# zsh, no rc files: ~/.zshrc is created with one PATH line and one zsh hook.
+h="$work/rc-zsh"; mkdir -p "$h"
+out="$(rc_install "$h" /bin/zsh)"
+if [[ -f "$h/.zshrc" ]]; then ok "zsh: ~/.zshrc is created when missing"; else fail "zsh: ~/.zshrc is created when missing" "$out"; fi
+eq "1" "$(rc_count "$h/.zshrc" "$PATH_LINE")" "zsh: ~/.zshrc has exactly one PATH line"
+eq "1" "$(rc_count "$h/.zshrc" 'augur\.zsh')" "zsh: ~/.zshrc has exactly one augur.zsh completion hook"
+eq "0" "$(rc_count "$h/.zshrc" 'augur\.bash')" "zsh: ~/.zshrc has no bash completion hook"
+if [[ ! -e "$h/.bashrc" ]]; then ok "zsh: no ~/.bashrc is created"; else fail "zsh: no ~/.bashrc is created" "$(cat "$h/.bashrc")"; fi
+has "$out" "source $h/.zshrc" "zsh: next steps say to source ~/.zshrc"
+
+# zsh with only a leftover ~/.bashrc: ~/.zshrc still gets the lines and ~/.bashrc is untouched.
+h="$work/rc-zsh-bashrc"; mkdir -p "$h"
+printf '# my bashrc\nalias ll="ls -l"' > "$h/.bashrc"; cp "$h/.bashrc" "$work/rc-bashrc.orig"
+out="$(rc_install "$h" /bin/zsh)"
+eq "1" "$(rc_count "$h/.zshrc" "$PATH_LINE")" "zsh + leftover ~/.bashrc: ~/.zshrc gets the PATH line"
+eq "1" "$(rc_count "$h/.zshrc" 'augur\.zsh')" "zsh + leftover ~/.bashrc: ~/.zshrc gets the zsh hook"
+if cmp -s "$work/rc-bashrc.orig" "$h/.bashrc"; then ok "zsh + leftover ~/.bashrc: ~/.bashrc is byte-identical"
+else fail "zsh + leftover ~/.bashrc: ~/.bashrc is byte-identical" "$(cat "$h/.bashrc")"; fi
+has "$out" "source $h/.zshrc" "zsh + leftover ~/.bashrc: next steps say to source ~/.zshrc"
+
+# bash, no rc files: ~/.bashrc is created with the PATH line and a bash hook.
+h="$work/rc-bash"; mkdir -p "$h"
+out="$(rc_install "$h" /bin/bash)"
+eq "1" "$(rc_count "$h/.bashrc" "$PATH_LINE")" "bash: ~/.bashrc is created with one PATH line"
+eq "1" "$(rc_count "$h/.bashrc" 'augur\.bash')" "bash: ~/.bashrc has exactly one augur.bash completion hook"
+eq "0" "$(rc_count "$h/.bashrc" 'augur\.zsh')" "bash: ~/.bashrc has no zsh completion hook"
+if [[ ! -e "$h/.zshrc" ]]; then ok "bash: no ~/.zshrc is created"; else fail "bash: no ~/.zshrc is created" "$(cat "$h/.zshrc")"; fi
+has "$out" "source $h/.bashrc" "bash: next steps say to source ~/.bashrc"
+
+# An unsupported shell gets a warning and a manual-PATH step, and no rc file is written.
+h="$work/rc-fish"; mkdir -p "$h"
+out="$(rc_install "$h" /usr/bin/fish)"
+if [[ ! -e "$h/.zshrc" && ! -e "$h/.bashrc" ]]; then ok "fish: neither ~/.zshrc nor ~/.bashrc is created"
+else fail "fish: neither ~/.zshrc nor ~/.bashrc is created" "$(ls -A "$h")"; fi
+has "$out" "Login shell 'fish' is not supported for automatic setup" "fish: install warns the shell is not supported"
+has "$out" "Add $h/.augur to PATH manually" "fish: next steps say to add the install dir to PATH manually"
+hasnt "$out" "source ~/.zshrc" "fish: next steps do not say to source ~/.zshrc"
+hasnt "$out" "source $h/" "fish: next steps do not say to source any rc file"
+
+# Re-running install adds neither line a second time.
+h="$work/rc-twice"; mkdir -p "$h"
+rc_install "$h" /bin/zsh >/dev/null
+out="$(rc_install "$h" /bin/zsh)"
+eq "1" "$(rc_count "$h/.zshrc" "$PATH_LINE")" "re-install: ~/.zshrc still has exactly one PATH line"
+eq "1" "$(rc_count "$h/.zshrc" 'augur\.zsh')" "re-install: ~/.zshrc still has exactly one completion hook"
+has "$out" "PATH already configured in $h/.zshrc" "re-install: install says PATH is already configured"
+unset h PATH_LINE
+
 # A source tree without the file is refused before anything is copied.
 rm -rf "$src/agents"; export HOME="$work/ihome2"; mkdir -p "$HOME"
-out="$( PATH="$bin" bash "$src/install" --here 2>&1 </dev/null )"; rc=$?
+out="$( SHELL=/bin/bash PATH="$bin" bash "$src/install" --here 2>&1 </dev/null )"; rc=$?
 if [[ "$rc" -ne 0 ]]; then ok "install refuses a source tree without agents/claude.sh"
 else fail "install refuses a source tree without agents/claude.sh" "exited 0"; fi
 has "$out" "agents/claude.sh not found" "install names the missing agent file"
