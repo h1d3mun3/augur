@@ -168,7 +168,6 @@ mkdir -p "$AUGUR_DIR/vms/$MACOS_BASE_VM"; macos_store_admin_password "$MACOS_BAS
 wait_for_macos_ssh() { return 0; }
 ssh_macos() { echo "ssh $1" >> "$LOG"; return 0; }
 prov_real="$(declare -f run_base_provisioning)"
-brew_real="$(declare -f run_brew_upgrade)"
 run_base_provisioning()          { echo "provision $1" >> "$LOG"; }
 install_macos_managed_settings() { echo "managed $1" >> "$LOG"; }
 select_macos_full_xcode()        { echo "xcode $1" >> "$LOG"; }
@@ -206,6 +205,21 @@ ssh_macos() { echo "ssh $1" >> "$LOG"; [[ "$*" == *install.sh* ]] && return 1; r
 run_update
 [[ "$rc" -ne 0 ]] && ok "installer failure: update exits non-zero" || fail "installer failure: exit 0"
 logged "vm delete $MACOS_BASE_VM" && fail "installer failure: the base VM was deleted" || ok "installer failure: the base VM is untouched"
+ssh_macos() { echo "ssh $1" >> "$LOG"; return 0; }
+
+# The update script upgrades Homebrew formulae (gh included) over the same plain-NAT ssh call as the
+# agent installer: after it, bounded by a timeout, formulae only, and no sudo.
+reset_vms; SIG_OK=1
+ssh_macos() { echo "ssh $1" >> "$LOG"; [[ "$*" == *install.sh* || "$*" == *_agent_url* ]] && printf '%s\n' "$*" > "$TMPD/update-script"; return 0; }
+run_update
+script="$(cat "$TMPD/update-script")"
+has   "$script" "brew update"             "update script: runs brew update"
+has   "$script" "brew upgrade --formula"  "update script: upgrades formulae only"
+hasnt "$script" "brew upgrade --cask"     "update script: no cask upgrade"
+hasnt "$script" "sudo"                    "update script: no sudo"
+has   "$script" "_with_timeout 900 brew update" "update script: brew update is time-bounded"
+i_at="$(grep -bo '_with_timeout 180 bash' <<<"$script" | head -n1 | cut -d: -f1)"; b_at="$(grep -bo 'brew update' <<<"$script" | head -n1 | cut -d: -f1)"
+[[ -n "$i_at" && -n "$b_at" && "$i_at" -lt "$b_at" ]] && ok "update script: brew runs after the agent installer, in the same call" || fail "update script: brew is not after the installer" "installer@$i_at brew@$b_at"
 ssh_macos() { echo "ssh $1" >> "$LOG"; return 0; }
 
 reset_vms; SIG_OK=1
@@ -647,10 +661,7 @@ macos_admin_password_stdin()     { echo pw; }
 install_macos_managed_settings() { guest "$1" managed; }
 select_macos_full_xcode()        { guest "$1" xcode; }
 agent_verify_integrity_macos()   { guest "$1" verify && [[ "$SIG_OK" == 1 ]]; }
-FILES=1
-provision_files_present()        { [[ "$FILES" == 1 ]]; }
-UPGRADE_OK=1
-run_brew_upgrade()               { guest "$1" brew-upgrade && [[ "$UPGRADE_OK" == 1 ]]; }
+provision_files_present()        { return 0; }
 provision_manifest_validate()    { return 0; }
 check_provision_approved()       { return 0; }
 start_provision_proxy()          { echo "start_provision_proxy" >> "$LOG"; }
@@ -696,56 +707,6 @@ logged "vm delete $MACOS_BASE_VM" && fail "…but the base VM was deleted" || ok
 logged stop_provision_gvproxy && ok "…and the provisioning helpers are stopped" || fail "…but the provisioning helpers are left running"
 HOOK_OK=1
 [[ -L "$WLOCK" ]] && fail "update: the base-writer lock is left behind" || ok "update: the base-writer lock is released on failure"
-
-section "Tier 1 — update upgrades the Homebrew packages inside the filtered session"
-reset_vms; : > "$RUNF"
-run_update
-eq 0 "$rc" "update: exits 0"
-u_at="$(line_of "brew-upgrade $MACOS_UPDATE_VM")"; g_at="$(line_of start_provision_gvproxy)"
-m_at="$(line_of "manifest $MACOS_UPDATE_VM")"; h_at="$(line_of "hook $MACOS_UPDATE_VM")"; s_at="$(line_of "stop_provision_gvproxy")"
-if [[ -n "$u_at" && -n "$g_at" && -n "$m_at" && -n "$s_at" && "$g_at" -lt "$u_at" && "$u_at" -lt "$m_at" && "$u_at" -lt "$h_at" && "$u_at" -lt "$s_at" ]]; then
-  ok "update: brew upgrade runs after the filtered datapath is up, before the manifest and hook (gvproxy@$g_at upgrade@$u_at manifest@$m_at)"
-else fail "update: brew upgrade is not inside the filtered session" "gvproxy@$g_at upgrade@$u_at manifest@$m_at hook@$h_at stop@$s_at"; fi
-
-reset_vms; : > "$RUNF"; UPGRADE_OK=0
-run_update
-[[ "$rc" -ne 0 ]] && ok "update: a failing brew upgrade aborts" || fail "update: a failing brew upgrade was ignored"
-has "$out" "not in the provisioning allowlist" "update: the failure says an unallowlisted domain is a possible cause"
-logged "vm delete $MACOS_BASE_VM" && fail "…but the base VM was deleted" || ok "…and the base VM is untouched"
-logged "vm clone $MACOS_UPDATE_VM $MACOS_BASE_VM" && fail "…but the update was saved as the base VM" || ok "…and nothing is saved as the base VM"
-macos_vm_exists "$MACOS_UPDATE_VM" && fail "…but the staging copy is left behind" || ok "…and the staging copy is discarded"
-logged stop_provision_gvproxy && ok "…and the provisioning helpers are stopped" || fail "…but the provisioning helpers are left running"
-logged "manifest $MACOS_UPDATE_VM" && fail "…but the manifest still ran" || ok "…and the manifest never ran"
-UPGRADE_OK=1
-
-# No provisioning files: the filtered session still runs for the upgrade, but needs no sudo grant.
-reset_vms; : > "$RUNF"; FILES=0
-run_update
-eq 0 "$rc" "update without provisioning files: exits 0"
-logged "brew-upgrade $MACOS_UPDATE_VM" && ok "update without provisioning files: brew upgrade still runs" || fail "update without provisioning files: no brew upgrade" "$(cat "$LOG")"
-logged "pssh $MACOS_UPDATE_VM" && fail "update without provisioning files: a sudo grant was made" || ok "update without provisioning files: no sudo grant, manifest or hook"
-logged "manifest $MACOS_UPDATE_VM" && fail "update without provisioning files: the manifest ran" || ok "update without provisioning files: the manifest does not run"
-FILES=1
-
-# An unapproved hook.allowlist.conf never reaches an upgrade-only session (nothing prompts for it).
-AUGUR_PROVISION_HOOK_ALLOWLIST="$TMPD/hook.allowlist.conf"; printf 'evil.example.com\n' > "$AUGUR_PROVISION_HOOK_ALLOWLIST"
-FILES=0; eq "" "$(provision_hook_allowlist_domains)" "no manifest or hook: hook.allowlist.conf contributes nothing"
-FILES=1; eq "evil.example.com" "$(provision_hook_allowlist_domains)" "with a manifest or hook: it is merged (and was approved with them)"
-rm -f "$AUGUR_PROVISION_HOOK_ALLOWLIST"
-
-# The command itself: update, then upgrade, no sudo, and a failure of either stops it.
-eval "$brew_real"
-BREW_LOG="$TMPD/brew.log"; : > "$BREW_LOG"; BREW_FAIL=""
-ssh_macos_provision() { echo "$2" >> "$BREW_LOG"; [[ "$2" == "$BREW_FAIL" ]] && return 1; return 0; }
-run_brew_upgrade testvm >/dev/null 2>&1; rc=$?
-eq 0 "$rc" "run_brew_upgrade: succeeds"
-eq $'brew update\nbrew upgrade --formula' "$(cat "$BREW_LOG")" "run_brew_upgrade: brew update, then a formula-only brew upgrade, without sudo"
-: > "$BREW_LOG"; BREW_FAIL="brew update"
-run_brew_upgrade testvm >/dev/null 2>&1; rc=$?
-[[ "$rc" -ne 0 ]] && ok "run_brew_upgrade: a failing brew update fails" || fail "run_brew_upgrade: brew update failure ignored"
-eq "brew update" "$(cat "$BREW_LOG")" "run_brew_upgrade: nothing is upgraded after a failed update"
-ssh_macos_provision() { local vm="$1"; shift; guest "$vm" "pssh"; }
-run_brew_upgrade() { guest "$1" brew-upgrade && [[ "$UPGRADE_OK" == 1 ]]; }
 
 # build: everything before Step 6.5 stubbed down to its recorded effect.
 IPSW="$TMPD/r.ipsw"; XIP="$TMPD/x.xip"; : > "$IPSW"; : > "$XIP"

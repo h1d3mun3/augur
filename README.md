@@ -277,15 +277,14 @@ augur version --macos   # show augur version (macOS mode)
 ```
 
 `augur update --macos` works on a staging copy that replaces the base VM only if every step passes
-(a failure leaves the base VM as it was). It reinstalls Claude Code with the official installer,
-runs `brew update` and `brew upgrade --formula` (which upgrades `gh` and every other Homebrew formula,
-including the ones your manifest installed; casks are left alone, since an upgrade can need sudo), re-runs your custom provisioning, and re-asserts
-augur's own base-VM settings. The Homebrew step runs over the same egress-filtered session as custom
-provisioning, so it reaches only the provisioning allowlist (`formulae.brew.sh`, `ghcr.io`,
-`github.com`, `*.githubusercontent.com`, plus your `hook.allowlist.conf` when you also have a manifest or hook); a package that needs
-another domain makes the update fail rather than widen the list. That session needs Go
-(`augur-gvproxy`), as egress filtering does everywhere in macOS mode. Xcode is not updated: rebuild
-the base VM with `augur build --macos` for that.
+(a failure leaves the base VM as it was). It reinstalls Claude Code with the official installer and
+runs `brew update` and `brew upgrade --formula`, which upgrades `gh` and every other installed
+Homebrew formula, including the ones your manifest installed. Casks are left alone, because an
+upgrade can need `sudo`. Both run, like the same steps of `augur build --macos`, over the staging VM's
+plain NAT: it is a credential-less copy of the base VM, and its network is not egress-filtered. Your
+custom provisioning is then re-run over the usual egress-filtered session, and augur's own base-VM
+settings are re-asserted. Xcode is not updated: rebuild the base VM with `augur build --macos` for
+that.
 Project VMs cloned before an update are unaffected; to pick it up, `augur destroy --macos && augur up
 --macos` in each project, which discards that clone's state (DerivedData, Simulator devices, SwiftPM
 caches). Container mode's `update` also leaves other projects' containers on the old image until they
