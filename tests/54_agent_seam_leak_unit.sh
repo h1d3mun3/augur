@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Tier 0 — the agent seam does not leak. No container, no VM; runs anywhere.
 # Fails when a Claude / Anthropic / sk-ant literal shows up in a non-comment line of `augur`
-# outside the agent seam block, the lines tagged AUGUR_AGENT_SEAM, and the short allowlist below.
+# outside the agent seam (the whole of agents/claude.sh, which is not scanned), the lines tagged AUGUR_AGENT_SEAM, and the short allowlist below.
 # A new agent-specific value belongs behind an agent_* accessor; only user-facing text and the
 # `augur claude` subcommand surface are allowed to name the agent directly.
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/.." && pwd)"
@@ -24,14 +24,9 @@ ALLOW_LINES=(
   'api\.anthropic\.com::names a default allowlisted egress domain in a warning, not agent code'
 )
 
-in_seam=0; fn=""; n=0; leaks=()
+fn=""; n=0; leaks=()
 while IFS= read -r line; do
   n=$((n+1))
-  case "$line" in
-    "# ══ AGENT SEAM"*) in_seam=1; continue;;
-    "# ══ end AGENT SEAM"*) in_seam=0; continue;;
-  esac
-  (( in_seam )) && continue
   [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)\(\)[[:space:]]*\{ ]] && fn="${BASH_REMATCH[1]}"
   [[ "$line" =~ ^[[:space:]]*# ]] && continue
   shopt -s nocasematch

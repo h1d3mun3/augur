@@ -27,7 +27,7 @@ has "$up_macos" 'ensure_macos_agent_agents'     "macOS up wires ~/.claude/agents
 hasnt "$up_macos" 'hasTrustDialogAccepted'       "macOS up does NOT pre-trust the workspace in the .claude.json stub"
 seed_fn="$(awk '/^macos_seed_agent_config\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
 has "$up_macos" 'macos_seed_agent_config'         "macOS up still seeds the onboarding-only stub"
-has "$(grep "^agent_config_seed_json()" "$AUGUR")" 'hasCompletedOnboarding' "the macOS stub carries onboarding state"
+has "$(grep "^agent_config_seed_json()" "$REPO/agents/claude.sh")" 'hasCompletedOnboarding' "the macOS stub carries onboarding state"
 hasnt "$seed_fn" 'hasTrustDialogAccepted'        "the macOS stub does NOT pre-trust a folder"
 # Write-once, gated on "did we just clone this VM" — NOT the file's absence.
 # `down --macos` keeps the clone, so an unconditional scp on every `up`
