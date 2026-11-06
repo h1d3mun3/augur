@@ -493,15 +493,16 @@ validate_secret_value() {
 # `|| exit 1`. Must not run inside a subshell or process substitution: `_creds` would not reach the
 # caller there.
 #
-# Resolution reads only host env vars, host files and `gh auth token`, so it runs before anything
-# touches a guest. Each caller runs it at the latest point that still precedes that:
+# Resolution reads only host env vars, host files and `gh auth token`, so it can run before a guest
+# exists. Callers place it as follows:
 #   • Container mode: cmd_claude / cmd_shell, before bringing the container up (cmd_up injects
 #     nothing and does not call it).
 #   • macOS mode, boot: cmd_up_macos, before the clone. Checked only after `augur-vm clone`,
 #     `augur-vm set`, `augur-vm run` and the SSH wait, a bad value would abort `up` with a VM cloned,
 #     sized and BOOTED and nothing torn down.
-#   • macOS mode, running VM: cmd_up_macos's already-running branch and prepare_macos_session, just
-#     before their first guest step.
+#   • macOS mode, running VM: prepare_macos_session, before its first guest step; cmd_up_macos's
+#     already-running branch, just before its push, so a bad credential never cancels that branch's
+#     reconcile, clock fix or egress self-test.
 # Deliberately NOT called by setup-token in either mode: it injects no credentials (container mode
 # runs the login in the project container with no --env-file, macOS mode in a throwaway clone of the
 # base VM), so a stored token that fails the check can still be replaced by `augur setup-token`.
@@ -2886,7 +2887,7 @@ _add_session_exec_env() {
 # egress bring-up + boot self-test), never a bare `container start`: with a persisted container,
 # `down`(stop) then `claude` is a normal reuse path, and a bare start would re-attach the guest with
 # NO proxy re-established and NO self-test — silently bypassing egress. Mirrors macOS
-# `cmd_claude_macos` (running || up). Already running → cmd_up is skipped, so check the fingerprint
+# prepare_macos_session (running || up). Already running → cmd_up is skipped, so check the fingerprint
 # here with the same refusal `augur up` gives (see require_running_container_current).
 ensure_session_container() {
     if container_running; then
@@ -4050,8 +4051,8 @@ MACOS_AUGUR_ENV_END_LINE='# augur-env: end'
 # SOURCED shell file as `export VAR='<value>'`, which is why only values resolve_session_credentials
 # has validated may be written here; nothing is resolved again.
 #
-# Returns non-zero, after saying what failed, when the guest could not install the file (ssh
-# failure, a full disk, an unwritable ~/.zshenv). Callers decide whether that is fatal. A failing
+# Returns non-zero, after saying what happened, when the install failed or its outcome is unknown
+# (ssh failure, a full disk, an unwritable ~/.zshenv). Callers decide whether that is fatal. A failing
 # git helper write only warns.
 push_macos_guest_env() {
     local vm="$1" _kv _content _cmd _rc=0
@@ -4071,8 +4072,9 @@ push_macos_guest_env() {
 
     # Guest side, in one ssh session:
     #   1. Remove temp files left by an earlier push whose ssh was killed mid-write: they may hold
-    #      revoked secrets. The temp name ends in the writing shell's PID, so a file whose PID is
-    #      still alive belongs to a concurrent push and is left alone.
+    #      revoked secrets. Only files older than a minute go; a live push finishes well within
+    #      that, so a concurrent push keeps its own. Best-effort: a failed cleanup does not stop the
+    #      install.
     #   2. ~/.augur-env, atomically: the content goes to this session's temp file, created under
     #      umask 077 (mode 600 before the first secret byte lands), and is renamed over ~/.augur-env
     #      only if its last line is the end marker. A zsh starting at the same moment (a second
@@ -4084,7 +4086,9 @@ push_macos_guest_env() {
     #   4. git's credential helper (only with a gh token), best-effort: exit 3 tells the host to
     #      warn, with ~/.augur-env already installed. On the boot path cmd_up_macos calls this
     #      after its ~/.gitconfig scp, which replaces the file the helper is written into.
-    _cmd="find /Users/${MACOS_SSH_USER} -maxdepth 1 -name '.augur-env.tmp.*' 2>/dev/null | while read -r f; do kill -0 \"\${f##*.}\" 2>/dev/null || rm -f \"\$f\"; done"
+    # Any other status (ssh's own 255 when the connection drops) leaves the outcome unknown: the
+    # drop may have come before or after the rename.
+    _cmd="find /Users/${MACOS_SSH_USER} -maxdepth 1 -name '.augur-env.tmp.*' -mmin +1 -exec rm -f {} + 2>/dev/null"
     _cmd+="; rm -f ${_tmp} && ( umask 077 && cat > ${_tmp} ) && [ \"\$(tail -n 1 ${_tmp})\" = '${MACOS_AUGUR_ENV_END_LINE}' ] && mv -f ${_tmp} ${_env} || { rm -f ${_tmp}; exit 1; }"
     _cmd+="; { grep -q '.augur-env' ~/.zshenv 2>/dev/null || echo '${MACOS_AUGUR_ENV_SOURCE_LINE}' >> ~/.zshenv; } || exit 4"
     if creds_have_gh_token; then _cmd+="; $(macos_git_credential_helper_cmd) || exit 3"; fi
@@ -4098,7 +4102,9 @@ push_macos_guest_env() {
            return 0 ;;
         4) warn "VM '${vm}' got its new ~/.augur-env, but ~/.zshenv could not be updated to source it."
            return 1 ;;
-        *) warn "Could not write ~/.augur-env in VM '${vm}' (ssh exit ${_rc}); the guest's ~/.augur-env is unchanged."
+        1) warn "Could not write ~/.augur-env in VM '${vm}'; the guest's ~/.augur-env is unchanged."
+           return 1 ;;
+        *) warn "The ~/.augur-env push to VM '${vm}' has an unknown outcome (ssh exit ${_rc}); the guest may hold the old or the new credentials."
            return 1 ;;
     esac
 }
@@ -4351,9 +4357,6 @@ cmd_up_macos() {
         fi
         # …and the half a live VM genuinely cannot pick up. Warn; do not pretend to have applied it.
         warn_if_macos_egress_pinned "$project_vm"
-        # Resolved and checked here, after the host-side reconcile above (a bad credential must not
-        # block a revocation or a proxy revival) and before the first guest step below.
-        resolve_session_credentials || exit 1
         # The guest clock, corrected here too. The measured offset is a
         # boot-invariant constant, so a single correction per boot is enough for the defect as
         # observed — but a VM this branch exists to serve is by definition long-lived (`down --macos`
@@ -4374,7 +4377,10 @@ cmd_up_macos() {
         # booted that way.
         if egress_enabled; then verify_macos_egress_locked "$project_vm"; fi
         # After the self-test, as on the boot path: credentials go only to a guest just proven
-        # contained. A failed push is fatal here as on the boot path (see push_macos_guest_env).
+        # contained. Resolved only now, so a bad or unreadable credential cannot cancel the
+        # reconcile, the clock fix or the self-test above; it still stops the push (fail closed).
+        # A failed push is fatal here as on the boot path (see push_macos_guest_env).
+        resolve_session_credentials || exit 1
         push_macos_guest_env "$project_vm" || exit 1
         return 0
     fi
@@ -4540,6 +4546,11 @@ cmd_up_macos() {
 # running gets the full cmd_up_macos, which boots it, wires it and pushes the credentials. A running
 # VM is attached to without going through `up`, so the per-run guest work an `up` does is done here
 # instead. One function so the two commands cannot drift.
+#
+# Accepted trade-off: two gaps that need a second augur command on the same project at once, which
+# augur does not support (see restart_egress_network_helper). A session can push to a VM whose
+# concurrent `up` has not finished its self-test yet, and a VM that comes up between the running
+# check and cmd_up_macos goes through its already-running branch, which skips the ensure_* wiring.
 prepare_macos_session() {
     local vm="$1" _creds=()
     if ! macos_vm_running "$vm"; then
@@ -4735,14 +4746,15 @@ require_macos_vm_slot() {
     exit 1
 }
 
-# Remove from VM $1 the credential-bearing files augur itself writes into a guest: ~/.augur-env, the
-# ~/.zshenv line that sources it (push_macos_guest_env), and ~/.gitconfig, which carries the GH_TOKEN
+# Remove from VM $1 the credential-bearing files augur itself writes into a guest: ~/.augur-env (and
+# any ~/.augur-env.tmp.* a killed push left behind), the ~/.zshenv line that sources it
+# (push_macos_guest_env), and ~/.gitconfig, which carries the GH_TOKEN
 # credential helper (macos_git_credential_helper_cmd). augur writes these into project VMs only,
 # never into the base VM, so in setup-token's fresh clone this is defense in depth. Deliberately
 # limited to augur's own files: the Keychain and whatever a human may have left in the base VM by
 # hand are out of its scope.
 macos_scrub_augur_credentials() {
-    ssh_macos "$1" "rm -f ~/.augur-env ~/.gitconfig && if [ -f ~/.zshenv ]; then
+    ssh_macos "$1" "rm -f ~/.augur-env ~/.gitconfig && find ~ -maxdepth 1 -name '.augur-env.tmp.*' -exec rm -f {} + && if [ -f ~/.zshenv ]; then
         grep -vxF '${MACOS_AUGUR_ENV_SOURCE_LINE}' ~/.zshenv > ~/.zshenv.augur-scrub
         [ \$? -le 1 ] && mv ~/.zshenv.augur-scrub ~/.zshenv
     fi"
@@ -6525,7 +6537,7 @@ MACOS_SHARE="workspace-$(workspace_slug)"
 # than inside cmd_up/cmd_up_macos. Two reasons:
 #   • Structural: a single site makes it impossible to fix one mode and forget the other.
 #   • Correctness: cmd_claude/cmd_shell only call cmd_up when the guest is NOT already
-#     running (ensure_session_container, `macos_vm_running … || cmd_up_macos`), so a
+#     running (ensure_session_container, prepare_macos_session), so a
 #     check inside `up` would be skipped entirely when attaching to a guest a pre-fix augur
 #     had already created from $HOME — exactly the case that needs refusing.
 # It also runs BEFORE require_vz (called from inside the macOS cmd_* functions), so the

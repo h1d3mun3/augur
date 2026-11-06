@@ -639,10 +639,12 @@ printf 'export GH_TOKEN=x\n' > "$GHOME/.augur-env"
 printf '[credential "https://github.com"]\n  helper = x\n' > "$GHOME/.gitconfig"
 printf 'export DEVELOPER_DIR=/x\n%s\nexport KEEP=1\n' "$MACOS_AUGUR_ENV_SOURCE_LINE" > "$GHOME/.zshenv"
 printf 'keep-me\n' > "$GHOME/.zprofile"
+printf 'export GH_TOKEN=x\n' > "$GHOME/.augur-env.tmp.4242"   # left by a killed push
 macos_scrub_augur_credentials testvm; rc=$?
 eq 0 "$rc" "scrub: succeeds"
 [[ -e "$GHOME/.augur-env" ]] && fail "scrub: ~/.augur-env survives" || ok "scrub: ~/.augur-env is removed"
 [[ -e "$GHOME/.gitconfig" ]] && fail "scrub: ~/.gitconfig (credential helper) survives" || ok "scrub: ~/.gitconfig is removed"
+[[ -e "$GHOME/.augur-env.tmp.4242" ]] && fail "scrub: a leftover ~/.augur-env.tmp.* survives" || ok "scrub: leftover ~/.augur-env.tmp.* files are removed"
 eq $'export DEVELOPER_DIR=/x\nexport KEEP=1' "$(cat "$GHOME/.zshenv")" "scrub: only the line sourcing ~/.augur-env leaves ~/.zshenv"
 eq "keep-me" "$(cat "$GHOME/.zprofile")" "scrub: nothing else is touched"
 printf '%s\n' "$MACOS_AUGUR_ENV_SOURCE_LINE" > "$GHOME/.zshenv"

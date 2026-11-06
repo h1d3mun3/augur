@@ -10,11 +10,12 @@
 #   • one ssh connection per push, carrying ~/.augur-env, the ~/.zshenv line and the git helper,
 #     and one `gh auth token` per invocation;
 #   • the write is atomic and mode 600, the guest installs only content ending in the end marker,
-#     and stale temp files of earlier pushes are removed while a live push's is left alone;
+#     and temp files older than a minute (left by a killed push) are removed while a fresh one stays;
 #   • each credential is read once per invocation and the bytes written are the bytes validated;
 #   • a credential that cannot be injected, or a credential file that cannot be read, aborts before
 #     anything reaches the guest (on a boot: before the VM backend is called at all), while
-#     `up --macos` on a running VM still rewrites the allowlist and revives the proxy first;
+#     `up --macos` on a running VM still rewrites the allowlist, revives the proxy, fixes the clock
+#     and runs the self-test first;
 #   • a push that fails in transport is a warning on claude/shell and fatal on `up`;
 #   • no credential value is ever on an ssh argv;
 #   • every path pushes exactly once: running VM, boot, a VM that came up in the meantime, and
@@ -67,7 +68,8 @@ gh() {
 
 # The guest. The commands that write credential state run for real under `bash -c` in GUEST_HOME,
 # with the guest's /Users/<user> mapped onto it, so the assertions are about the resulting files.
-# FAIL_PUSH=1 makes the push connection fail the way ssh does when it cannot connect.
+# FAIL_PUSH=1 makes the push connection drop the way ssh reports it (255, outcome unknown);
+# FAIL_PUSH=2 makes the guest report a failed install (exit 1, old file kept).
 GUEST_HOME="$TMPD/guest"; mkdir -p "$GUEST_HOME"
 FAIL_PUSH=0
 guest_run() { HOME="$GUEST_HOME" bash -c "${1//\/Users\/${MACOS_SSH_USER}/$GUEST_HOME}"; }
@@ -78,6 +80,7 @@ ssh_macos() {
         -t*) return 0 ;;                                   # the interactive launch
         *".augur-env"*)
             if [[ "$FAIL_PUSH" == 1 ]]; then cat >/dev/null; return 255; fi
+            if [[ "$FAIL_PUSH" == 2 ]]; then cat >/dev/null; return 1; fi
             guest_run "$*" ;;
         *) echo "UNEXPECTED GUEST COMMAND: $*" >&2; return 1 ;;
     esac
@@ -201,23 +204,20 @@ else fail "truncated content: the guest command succeeded"; fi
 eq "$before" "$(cat "$ENV_FILE")" "truncated content: the previous ~/.augur-env is kept"
 eq "" "$(find "$GUEST_HOME" -maxdepth 1 -name '.augur-env.*' -print)" "truncated content: no temp file is left behind"
 
-# A temp file whose writer died (an ssh killed mid-write), one whose writer is still alive (a
-# concurrent push), and a file that is not augur's at all.
-sleep 300 & live_pid=$!
-dead_pid=999999; while kill -0 "$dead_pid" 2>/dev/null; do dead_pid=$((dead_pid - 1)); done
-printf "export GH_TOKEN='ghp_revoked'\n" > "$GUEST_HOME/.augur-env.tmp.$dead_pid"
-printf 'in progress\n'                   > "$GUEST_HOME/.augur-env.tmp.$live_pid"
-printf 'mine\n'                          > "$GUEST_HOME/.augur-env.bak"
+# A temp file left by a push killed mid-write long ago, a fresh one (a concurrent push still
+# writing), and a file that is not augur's at all.
+printf "export GH_TOKEN='ghp_revoked'\n" > "$GUEST_HOME/.augur-env.tmp.4242"; touch -t 202001010000 "$GUEST_HOME/.augur-env.tmp.4242"
+printf 'in progress\n'                   > "$GUEST_HOME/.augur-env.tmp.4343"
+printf 'mine\n'                          > "$GUEST_HOME/.augur-env.bak"; touch -t 202001010000 "$GUEST_HOME/.augur-env.bak"
 run_cmd shell
-kill "$live_pid" 2>/dev/null; wait "$live_pid" 2>/dev/null
 eq "0" "$rc" "stale temp files: shell --macos completes"
-[[ -e "$GUEST_HOME/.augur-env.tmp.$dead_pid" ]] && fail "stale temp file of a dead push survives (it may hold revoked secrets)" \
-    || ok "a temp file left by a dead push is removed"
-[[ -e "$GUEST_HOME/.augur-env.tmp.$live_pid" ]] && ok "a temp file of a push still running is left alone" \
+[[ -e "$GUEST_HOME/.augur-env.tmp.4242" ]] && fail "an old temp file survives (it may hold revoked secrets)" \
+    || ok "a temp file older than a minute is removed"
+[[ -e "$GUEST_HOME/.augur-env.tmp.4343" ]] && ok "a fresh temp file (a concurrent push) is left alone" \
     || fail "a concurrent push's temp file was removed (its mv would then fail)"
 [[ -e "$GUEST_HOME/.augur-env.bak" ]] && ok "a file outside augur's temp-name pattern is left alone" \
     || fail "cleanup removed a file that is not augur's"
-rm -f "$GUEST_HOME/.augur-env.tmp.$live_pid" "$GUEST_HOME/.augur-env.bak"
+rm -f "$GUEST_HOME/.augur-env.tmp.4343" "$GUEST_HOME/.augur-env.bak"
 
 section "Tier 1 — a credential that cannot be injected aborts before the guest is touched"
 
@@ -227,13 +227,17 @@ for _cmd in shell claude up; do
     run_cmd "$_cmd"
     nonzero "bad ANTHROPIC_API_KEY: $_cmd --macos"
     has "$out" "Refusing to inject ANTHROPIC_API_KEY" "bad ANTHROPIC_API_KEY: $_cmd --macos names the variable"
+    eq "0" "$(pushes)" "bad ANTHROPIC_API_KEY: $_cmd --macos sends no push"
+    [[ "$_cmd" == up ]] && break
     eq "" "$(cat "$SSHLOG")" "bad ANTHROPIC_API_KEY: $_cmd --macos sends nothing over ssh"
     eq "" "$(cat "$STEPS")" "bad ANTHROPIC_API_KEY: $_cmd --macos runs no guest step (clock, workspace, …)"
 done
-# `up` on a running VM refused only AFTER its host-side reconcile: a bad credential must not block a
-# revocation landing or a dead proxy being revived.
+# `up` on a running VM refuses only at the push: a bad credential must not block a revocation
+# landing, a dead proxy being revived, the clock fix or the self-test that proves enforcement.
 has "$(cat "$HOSTLOG")" "gate"        "bad ANTHROPIC_API_KEY: up --macos on a running VM still runs the approval gate (allowlist rewrite)"
 has "$(cat "$HOSTLOG")" "start_proxy" "bad ANTHROPIC_API_KEY: up --macos on a running VM still revives the proxy"
+has "$(cat "$STEPS")" "sync_macos_guest_clock"     "bad ANTHROPIC_API_KEY: up --macos on a running VM still fixes the guest clock"
+has "$(cat "$STEPS")" "verify_macos_egress_locked" "bad ANTHROPIC_API_KEY: up --macos on a running VM still runs the egress self-test"
 eq "$before" "$(cat "$ENV_FILE")" "bad ANTHROPIC_API_KEY: the guest's ~/.augur-env is unchanged"
 # On a boot it refuses before the VM backend is called at all.
 RUNNING=0
@@ -264,7 +268,11 @@ else
         nonzero "unreadable token file, running VM: $_cmd --macos"
         has "$out" "Could not read" "unreadable token file, running VM: $_cmd --macos says the file could not be read"
         eq "0" "$(pushes)" "unreadable token file, running VM: $_cmd --macos sends no push"
-        eq "" "$(cat "$STEPS")" "unreadable token file, running VM: $_cmd --macos runs no guest step (no clock/timezone sync)"
+        if [[ "$_cmd" == up ]]; then
+            has "$(cat "$STEPS")" "verify_macos_egress_locked" "unreadable token file, running VM: up --macos still runs the egress self-test first"
+        else
+            eq "" "$(cat "$STEPS")" "unreadable token file, running VM: $_cmd --macos runs no guest step (no clock/timezone sync)"
+        fi
         eq "$before" "$(cat "$ENV_FILE")" "unreadable token file, running VM: $_cmd --macos leaves the guest's ~/.augur-env unchanged"
     done
     RUNNING=0
@@ -323,11 +331,19 @@ for _cmd in shell claude; do
     grep -q '^-t ' "$SSHLOG" && ok "push fails, running VM: $_cmd --macos still launches" \
         || fail "push fails, running VM: $_cmd --macos did not launch"
 done
-run_cmd up
-nonzero "push fails, running VM: up --macos"
-RUNNING=0
-run_cmd up
-nonzero "push fails, boot: up --macos"
+# A dropped connection (ssh's 255) may have come after the rename, so it must not claim either way.
+has   "$out" "unknown outcome (ssh exit 255)" "connection dropped: the outcome is reported as unknown"
+hasnt "$out" "is unchanged"                   "connection dropped: it does not claim the old file is still there"
+FAIL_PUSH=2
+run_cmd shell
+has   "$out" "is unchanged"                   "guest reports a failed install: says the old file is kept"
+hasnt "$out" "unknown outcome"                "guest reports a failed install: the outcome is not called unknown"
+for FAIL_PUSH in 1 2; do
+    RUNNING=1; run_cmd up
+    nonzero "push fails ($FAIL_PUSH), running VM: up --macos"
+    RUNNING=0; run_cmd up
+    nonzero "push fails ($FAIL_PUSH), boot: up --macos"
+done
 RUNNING=1
 FAIL_PUSH=0
 eq "$before" "$(cat "$ENV_FILE")" "push fails: the guest's ~/.augur-env is unchanged"
