@@ -267,7 +267,7 @@ macos_vm_exists "$MACOS_BASE_VM" && ok "failed staging clone: the base VM is unt
 [[ -L "$WLOCK" ]] && fail "failed staging clone: the lock is left behind" || ok "failed staging clone: the lock is released"
 
 section "Tier 1 — update --macos: the swap always leaves one copy"
-reset_vms; ON_DELETE_BASE='kill -INT "$BASHPID"'
+reset_vms; ON_DELETE_BASE='kill -INT "$(sh -c "echo \$PPID")"'
 run_update
 eq 0 "$rc" "Ctrl-C between deleting the old base and saving the new one is ignored: the swap completes"
 macos_vm_exists "$MACOS_BASE_VM" && ok "…and the base VM exists" || fail "…and the base VM is gone" "$(cat "$LOG")"
@@ -414,7 +414,7 @@ torn_down "credential scrub failure"
 SCRUB_OK=1
 
 reset_vms
-sync_macos_guest_clock() { echo "clock $1" >> "$LOG"; kill -INT "$BASHPID"; }
+sync_macos_guest_clock() { echo "clock $1" >> "$LOG"; kill -INT "$(sh -c 'echo $PPID')"; }
 run_st
 sync_macos_guest_clock() { echo "clock $1" >> "$LOG"; }
 eq 130 "$rc" "Ctrl-C: exits 130"

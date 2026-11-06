@@ -8,13 +8,33 @@ set -euo pipefail
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# SCRIPT_DIR is the real install directory: symlinks to this script (a link in /usr/local/bin, say)
+# are followed by hand, since `readlink -f` is not portable to macOS. The result never depends on
+# the current directory.
+_augur_src="${BASH_SOURCE[0]}"
+_augur_hops=0
+while [[ -L "$_augur_src" ]]; do
+    _augur_link_dir="$(cd "$(dirname "$_augur_src")" && pwd)" || exit 1
+    _augur_src="$(readlink "$_augur_src")"
+    [[ "$_augur_src" == /* ]] || _augur_src="$_augur_link_dir/$_augur_src"
+    if (( ++_augur_hops > 40 )); then
+        echo "augur: too many levels of symbolic links resolving $0" >&2
+        return 1 2>/dev/null || exit 1
+    fi
+done
+if ! SCRIPT_DIR="$(cd "$(dirname "$_augur_src")" 2>/dev/null && pwd)"; then
+    echo "augur: cannot locate the install directory of $0 (dangling symlink?)" >&2
+    return 1 2>/dev/null || exit 1
+fi
+unset _augur_src _augur_hops _augur_link_dir
 
 # The agent definition (the agent_* data functions) is sourced from beside this script, by an
 # absolute path under SCRIPT_DIR — never from the workspace or the current directory. It is
-# host-trusted code like this script, so a missing or unreadable file is a hard stop rather than a
-# fallback; every entry path (help, version, completion helpers, tests that source augur) goes
-# through here. `return` covers being sourced, `exit` being executed.
+# host-trusted code like this script, so a missing, unreadable or incomplete file is a hard stop
+# rather than a fallback; every entry path (help, version, completion helpers, tests that source
+# augur) goes through here. `return` covers being sourced, `exit` being executed.
+# Today the definition is this one file; a second agent needs a selection point right here, which
+# is deliberately not built until a second agent exists.
 AGENT_DEFINITION_FILE="$SCRIPT_DIR/agents/claude.sh"  # AUGUR_AGENT_SEAM | the one agent definition file
 if [[ ! -f "$AGENT_DEFINITION_FILE" || ! -r "$AGENT_DEFINITION_FILE" ]]; then
     echo "augur: agent definition not found or unreadable: $AGENT_DEFINITION_FILE" >&2
@@ -23,6 +43,58 @@ if [[ ! -f "$AGENT_DEFINITION_FILE" || ! -r "$AGENT_DEFINITION_FILE" ]]; then
 fi
 # shellcheck source=agents/claude.sh
 source "$AGENT_DEFINITION_FILE"
+
+# Every accessor the rest of this script calls. A truncated, stale or hand-edited definition would
+# otherwise leave some undefined, and many call sites swallow "command not found" (no fixed env, no
+# credentials injected, an empty managed policy, an empty signing Team ID), so the load fails
+# closed here instead. A test keeps this list equal to the accessors augur actually calls.
+AGENT_REQUIRED_ACCESSORS=(
+    agent_auth_specs
+    agent_cli_name
+    agent_config_file_relpath
+    agent_config_seed_json
+    agent_display_name
+    agent_fixed_env
+    agent_installer_args
+    agent_installer_url
+    agent_launch_argv
+    agent_login_argv
+    agent_macos_cli_relpath
+    agent_macos_managed_settings_path
+    agent_macos_signing_team
+    agent_managed_settings_json
+    agent_profile_copy_files
+    agent_profile_guest_dir
+    agent_profile_guest_mount
+    agent_profile_host_subdir
+    agent_profile_link_dirs
+    agent_state_agents_host_subdir
+    agent_state_carryover_host_subdir
+    agent_state_guest_agents_dir
+    agent_state_guest_history_file
+    agent_state_guest_leaf
+    agent_state_guest_projects_dir
+    agent_state_host_subdir
+    agent_token_hint
+    agent_version_cmd
+)
+# The only accessors allowed to print nothing; every other one is a constant the core depends on
+# (the signing Team ID and the installer URL gate what runs in a guest).
+AGENT_EMPTY_OK_ACCESSORS=(agent_fixed_env agent_installer_args agent_profile_copy_files agent_profile_link_dirs)
+for _augur_acc in "${AGENT_REQUIRED_ACCESSORS[@]}"; do
+    if ! declare -F "$_augur_acc" >/dev/null; then
+        echo "augur: incomplete agent definition: $_augur_acc is not defined in $AGENT_DEFINITION_FILE" >&2
+        echo "augur: the install is out of date or damaged; re-run \`bash install\`." >&2
+        return 1 2>/dev/null || exit 1
+    fi
+    case " ${AGENT_EMPTY_OK_ACCESSORS[*]} " in *" $_augur_acc "*) continue ;; esac
+    if [[ -z "$("$_augur_acc" x 2>/dev/null)" ]]; then
+        echo "augur: incomplete agent definition: $_augur_acc returns nothing in $AGENT_DEFINITION_FILE" >&2
+        echo "augur: the install is out of date or damaged; re-run \`bash install\`." >&2
+        return 1 2>/dev/null || exit 1
+    fi
+done
+unset _augur_acc
 
 WORKSPACE_DIR="$(pwd)"
 SWIFT_VERSION="${SWIFT_VERSION:-}"
@@ -445,6 +517,14 @@ validate_resolved_credentials() {
     return 0
 }
 
+# Prompts on the terminal for the token the agent's login printed and prints what was pasted. The
+# prompt goes to stderr, so a caller captures just the value: token="$(read_agent_token_from_tty)".
+read_agent_token_from_tty() {
+    local token=""
+    read -rp "$(echo -e "${CYAN}[augur]${RESET} Paste the token ($(agent_token_hint)) here to save it on the host: ")" token < /dev/tty || true
+    printf '%s' "$token"
+}
+
 # Persist a captured Claude subscription token to the host token file augur reads whenever it
 # injects credentials (resolve_api_key picks it up as CLAUDE_CODE_OAUTH_TOKEN). Validates the
 # shape and writes it 0600. The host never needs claude installed for this.
@@ -520,7 +600,19 @@ macos_agent_bindir_rel() { dirname "$(agent_macos_cli_relpath)"; }
 
 # A container-side absolute path $1 (an agent_state_* / agent_profile_* value under the container
 # user's home), as a path relative to the macOS guest user's home.
-guest_home_relpath() { echo "${1#/home/dev/}"; }
+#
+# Fails (with a message, returning 1) unless $1 is a plain path strictly under /home/dev/ (no empty,
+# "." or ".." components): the value
+# lands inside remote scripts that rm -rf and ln -sfn it, so anything else must never get that far.
+# Callers propagate the failure.
+guest_home_relpath() {
+    local p="$1"
+    if [[ "$p" != /home/dev/?* || "$p" == *..* || "$p" == *//* || "$p" == */./* || "$p" == */. || "$p" == *[!A-Za-z0-9._/-]* ]]; then
+        echo "augur: the agent definition gives a guest path that is not a plain path under /home/dev/: $p" >&2
+        return 1
+    fi
+    echo "${p#/home/dev/}"
+}
 
 # True iff the agent binary in macOS VM $1 passes `codesign --verify --strict` against a Developer ID
 # requirement pinned to the vendor's Team ID (agent_macos_signing_team), AND codesign reports exactly
@@ -2951,8 +3043,8 @@ cmd_setup_token() {
     perl -e 'use Fcntl; fcntl(STDIN, F_SETFL, fcntl(STDIN, F_GETFL, 0) & ~O_NONBLOCK);' 2>/dev/null || true
     echo ""
     setup_token_security_notice
-    local token=""
-    read -rp "$(echo -e "${CYAN}[augur]${RESET} Paste the token (sk-ant-…) here to save it on the host: ")" token < /dev/tty || true   # AUGUR_AGENT_SEAM: token shape
+    local token
+    token="$(read_agent_token_from_tty)"
     local rc=0
     save_oauth_token "$token" || rc=1
     # Restore the prior state even if the save failed.
@@ -3665,7 +3757,7 @@ ensure_macos_workspace() {
 # the agent's projects dir. Keep both in lockstep when swapping agents.
 ensure_macos_agent_projects() {
     local vm="$1" dir share
-    dir="$(guest_home_relpath "$(agent_state_guest_projects_dir)")"
+    dir="$(guest_home_relpath "$(agent_state_guest_projects_dir)")" || return 1
     share="/Volumes/My Shared Files/$(agent_state_host_subdir)"
     # The remote script is double-quoted so the two seam constants expand host-side (the share into
     # single quotes); the guest's own $HOME stays escaped. The VM-local projects dir is throwaway
@@ -3685,7 +3777,7 @@ ensure_macos_agent_projects() {
 # AUGUR_AGENT_SEAM | macOS user-level subagent-defs persistence (share name = agent_state_agents_host_subdir)
 ensure_macos_agent_agents() {
     local vm="$1" dir share
-    dir="$(guest_home_relpath "$(agent_state_guest_agents_dir)")"
+    dir="$(guest_home_relpath "$(agent_state_guest_agents_dir)")" || return 1
     share="/Volumes/My Shared Files/$(agent_state_agents_host_subdir)"
     # Only wire the symlink once the host share is actually MOUNTED (it appears only after a
     # `vm run` with the --dir). Guards a VM booted BEFORE this share existed (upgrade-in-place):
@@ -3713,7 +3805,7 @@ ensure_macos_agent_agents() {
 ensure_macos_agent_profile() {
     local vm="$1" src pdir
     src="/Volumes/My Shared Files/$(agent_profile_host_subdir)"
-    pdir="$(guest_home_relpath "$(agent_profile_guest_dir)")"
+    pdir="$(guest_home_relpath "$(agent_profile_guest_dir)")" || return 1
     # The seam lists expand HOST-side into plain word lists (`commands skills`); every remote
     # variable stays escaped so it is the guest's shell that expands it.
     ssh_macos "$vm" "
@@ -4662,8 +4754,8 @@ cmd_setup_token_macos() {
     perl -e 'use Fcntl; fcntl(STDIN, F_SETFL, fcntl(STDIN, F_GETFL, 0) & ~O_NONBLOCK);' 2>/dev/null || true
     echo ""
     setup_token_security_notice
-    local token=""
-    read -rp "$(echo -e "${CYAN}[augur]${RESET} Paste the token (sk-ant-…) here to save it on the host: ")" token < /dev/tty || true   # AUGUR_AGENT_SEAM: token shape
+    local token
+    token="$(read_agent_token_from_tty)"
     local rc=0
     save_oauth_token "$token" || rc=1
     info "Removing the throwaway VM '${vm}'..."

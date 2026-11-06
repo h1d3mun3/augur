@@ -79,17 +79,22 @@ done
 # Copy files
 info "Installing to $INSTALL_DIR..."
 mkdir -p "$INSTALL_DIR"
-cp "$SCRIPT_DIR/augur" "$INSTALL_DIR/augur"
+# The agent definition augur sources at startup goes in FIRST: an install interrupted before the
+# `augur` copy leaves the old script beside the new definition, never a new script beside a missing
+# or older one. Always refreshed, never user-editable: it is host-trusted code, so it sits in its
+# own agents/ dir (nothing in there is ever mounted or shared into a guest) and is replaced
+# wholesale on every install. Each file is copied to a temporary name in the same directory and
+# renamed into place, so a reader never sees a half-written file.
+mkdir -p "$INSTALL_DIR/agents"
+cp "$SCRIPT_DIR/agents/claude.sh" "$INSTALL_DIR/agents/.claude.sh.new"
+mv -f "$INSTALL_DIR/agents/.claude.sh.new" "$INSTALL_DIR/agents/claude.sh"
+cp "$SCRIPT_DIR/augur" "$INSTALL_DIR/.augur.new"
+chmod +x "$INSTALL_DIR/.augur.new"
+mv -f "$INSTALL_DIR/.augur.new" "$INSTALL_DIR/augur"
 cp "$SCRIPT_DIR/Dockerfile" "$INSTALL_DIR/Dockerfile"
 # Ship the .dockerignore alongside the Dockerfile so the build context (~/.augur) stays
 # tiny — otherwise the multi-GB VM images under ~/.augur/vms get swept into `augur build`.
 cp "$SCRIPT_DIR/.dockerignore" "$INSTALL_DIR/.dockerignore"
-chmod +x "$INSTALL_DIR/augur"
-# The agent definition augur sources at startup. Always refreshed, never user-editable: it is
-# host-trusted code, so it sits in its own agents/ dir (nothing in there is ever mounted or shared
-# into a guest) and is replaced wholesale on every install.
-mkdir -p "$INSTALL_DIR/agents"
-cp "$SCRIPT_DIR/agents/claude.sh" "$INSTALL_DIR/agents/claude.sh"
 # Shell completion scripts; the rc-file hook that loads them is added with the PATH entry below.
 if [[ -d "$SCRIPT_DIR/completions" ]]; then
     mkdir -p "$INSTALL_DIR/completions"

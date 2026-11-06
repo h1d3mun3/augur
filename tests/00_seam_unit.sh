@@ -93,24 +93,102 @@ eq "latest"                       "$(agent_installer_args)" "agent_installer_arg
 eq "/Library/Application Support/ClaudeCode/managed-settings.json" "$(agent_macos_managed_settings_path)" "agent_macos_managed_settings_path"
 eq ".claude.json"                 "$(agent_config_file_relpath)" "agent_config_file_relpath"
 eq '{"hasCompletedOnboarding":true,"installMethod":"native"}' "$(agent_config_seed_json)" "agent_config_seed_json"
-# These values are interpolated into remote scripts, so each must be a plain constant: no quote,
-# backslash, `$`, backtick, `;`, `&`, `|` or control byte that could change the script's shape.
-# (The seed JSON is not interpolated: it is written to a file. A space is fine in all of them.)
-for _f in agent_cli_name agent_version_cmd agent_installer_url agent_installer_args agent_display_name \
-          agent_macos_cli_relpath agent_macos_signing_team agent_config_file_relpath \
-          agent_macos_managed_settings_path; do
-  case "$($_f)" in
-    *[!A-Za-z0-9._/:\ -]*) fail "$_f is a plain constant (safe to interpolate into a remote script)" "$($_f)";;
-    *)                     ok   "$_f is a plain constant (safe to interpolate into a remote script)";;
+eq "sk-ant-…" "$(agent_token_hint)" "agent_token_hint"
+# Every value augur interpolates into a remote script or an `-e` / `-v` argument must be a plain
+# constant: no quote, backslash, `$`, backtick, `;`, `&`, `|`, newline or other control byte that
+# could change the script's shape. The charset is an allowlist, so each of those is excluded.
+# Every accessor is classified below; one that is neither checked nor exempt (with a reason) fails,
+# so a new accessor cannot reach a remote script unreviewed.
+#   TEXT  words and flags (a space separates tokens; `=` for KEY=VALUE, `:` for URLs)
+#   GUEST an absolute guest path, strictly under /home/dev/
+#   HOST  a single directory name under $AUGUR_DIR (no slash, no `..`)
+#   REL   a path relative to the guest home
+#   ABS   an absolute guest path outside the home
+PLAIN_TEXT=(agent_display_name agent_cli_name agent_launch_argv agent_login_argv agent_fixed_env agent_version_cmd
+            agent_installer_url agent_installer_args agent_macos_signing_team agent_profile_link_dirs agent_profile_copy_files)
+PLAIN_GUEST=(agent_state_guest_projects_dir agent_state_guest_agents_dir agent_state_guest_history_file
+             agent_profile_guest_mount agent_profile_guest_dir)
+PLAIN_HOST=(agent_state_host_subdir agent_state_agents_host_subdir agent_state_carryover_host_subdir agent_profile_host_subdir)
+PLAIN_REL=(agent_macos_cli_relpath agent_config_file_relpath)
+PLAIN_ABS=(agent_macos_managed_settings_path)
+# Exempt, with the reason:
+EXEMPT=(
+  "agent_config_seed_json::JSON written to a file through stdin, never interpolated"
+  "agent_managed_settings_json::JSON written to a file through stdin, never interpolated"
+  "agent_auth_specs::parsed field by field (checked below), values reach the guest only via an env file"
+  "agent_state_guest_leaf::takes an argument; checked below with a sample slug"
+  "agent_token_hint::shown in an operator prompt only; checked below"
+)
+plain_ok() {  # plain_ok NAME VALUE
+  local v="$2"
+  [[ -n "$v" ]] || { fail "$1 is a plain constant (safe to interpolate into a remote script)" "empty"; return; }
+  case "$v" in
+    *[!A-Za-z0-9._/:=\ -]*) fail "$1 is a plain constant (safe to interpolate into a remote script)" "$v";;
+    *)                      ok   "$1 is a plain constant (safe to interpolate into a remote script)";;
   esac
+}
+for _f in "${PLAIN_TEXT[@]}"; do
+  _v="$($_f)"
+  # Empty is legitimate for a list or an installer argument; every other text value must be non-empty.
+  if [[ -z "$_v" ]]; then
+    case "$_f" in agent_fixed_env|agent_installer_args|agent_profile_link_dirs|agent_profile_copy_files) ok "$_f is empty (allowed for this accessor)";; *) fail "$_f is non-empty" "empty";; esac
+  else plain_ok "$_f" "$_v"; fi
+done
+for _f in "${PLAIN_GUEST[@]}"; do
+  _v="$($_f)"; plain_ok "$_f" "$_v"
+  case "$_v" in /home/dev/?*) case "$_v" in *..*|*//*|*" "*) fail "$_f is a clean path under /home/dev/" "$_v";; *) ok "$_f is a clean path under /home/dev/";; esac;;
+                *)          fail "$_f is a clean path under /home/dev/" "$_v";; esac
+done
+for _f in "${PLAIN_HOST[@]}"; do
+  _v="$($_f)"; plain_ok "$_f" "$_v"
+  case "$_v" in ""|/*|*/*|*..*|*" "*) fail "$_f is a single directory name" "$_v";; *) ok "$_f is a single directory name";; esac
+done
+for _f in "${PLAIN_REL[@]}"; do
+  _v="$($_f)"; plain_ok "$_f" "$_v"
+  case "$_v" in ""|/*|*..*|*" "*) fail "$_f is a relative path with no '..'" "$_v";; *) ok "$_f is a relative path with no '..'";; esac
+done
+for _f in "${PLAIN_ABS[@]}"; do
+  _v="$($_f)"
+  case "$_v" in /*..*|*..*) fail "$_f is an absolute path with no '..'" "$_v";; /*) ok "$_f is an absolute path with no '..'";; *) fail "$_f is an absolute path with no '..'" "$_v";; esac
+  plain_ok "$_f" "$_v"
+done
+case "$(agent_state_guest_leaf my-proj.1)" in
+  *[!A-Za-z0-9._/-]*) fail "agent_state_guest_leaf stays plain for a plain slug" "$(agent_state_guest_leaf my-proj.1)";;
+  *)                  ok   "agent_state_guest_leaf stays plain for a plain slug";;
+esac
+# Credential specs: GUEST_ENV|HOST_ENV are variable names, the file is under HOME, the validator a word.
+while IFS='|' read -r _g _h _file _val; do
+  [[ -n "$_g" ]] || continue
+  if [[ "$_g" =~ ^[A-Z_][A-Z0-9_]*$ && "$_h" =~ ^[A-Z_][A-Z0-9_]*$ && "$_val" =~ ^[a-z]+$ && "$_file" == /h/* ]]
+  then ok "agent_auth_specs line for $_g has plain names, a HOME file and a plain validator"
+  else fail "agent_auth_specs line for $_g is well-formed" "$_g|$_h|$_file|$_val"; fi
+done < <(HOME=/h agent_auth_specs)
+case "$(agent_token_hint)" in
+  *[\"\'\\\$\`\;]*|*[[:cntrl:]]*) fail "agent_token_hint has no quote, backslash, \$, backtick, ; or control byte" "$(agent_token_hint)";;
+  *)                              ok   "agent_token_hint has no quote, backslash, \$, backtick, ; or control byte";;
+esac
+# Every accessor in the file is classified exactly once.
+_classified=" ${PLAIN_TEXT[*]} ${PLAIN_GUEST[*]} ${PLAIN_HOST[*]} ${PLAIN_REL[*]} ${PLAIN_ABS[*]} "
+for _e in "${EXEMPT[@]}"; do _classified+="${_e%%::*} "; done
+for _f in $(grep -oE '^agent_[a-z0-9_]+\(\)' "$REPO/agents/claude.sh" | tr -d '()'); do
+  case "$_classified" in *" $_f "*) ok "$_f is classified (plain-constant check or documented exemption)";;
+                         *)         fail "$_f is classified (plain-constant check or documented exemption)" "add it to a PLAIN_* list or EXEMPT with a reason";; esac
 done
 # Home-relative helpers: derived from the container-side seam values.
 # shellcheck disable=SC2034  # the helpers live in augur's core, not the seam block: extract them.
-eval "$(grep -E '^(guest_home_relpath|macos_agent_bindir_rel)\(\)' "$REPO/augur")"
+eval "$(grep -E '^macos_agent_bindir_rel\(\)' "$REPO/augur")"
+eval "$(awk '/^guest_home_relpath\(\)/{f=1} f{print} f&&/^}/{exit}' "$REPO/augur")"
 eq ".claude/projects" "$(guest_home_relpath "$(agent_state_guest_projects_dir)")" "guest_home_relpath (projects dir)"
 eq ".claude/agents"   "$(guest_home_relpath "$(agent_state_guest_agents_dir)")"   "guest_home_relpath (agents dir)"
 eq ".claude"          "$(guest_home_relpath "$(agent_profile_guest_dir)")"        "guest_home_relpath (profile dir)"
 eq ".local/bin"       "$(macos_agent_bindir_rel)"                                  "macos_agent_bindir_rel"
+# guest_home_relpath fails closed on anything that is not a plain path strictly under /home/dev/.
+for _bad in "/abs/path" "/home/dev" "/home/dev/" "/home/devx/a" "relative/path" "/home/dev/../etc" "/home/dev/a/../b" \
+            "/home/dev//a" "/home/dev/." "/home/dev/./a" "/home/dev/a/." "/home/dev/a/./b" '/home/dev/a b' '/home/dev/a;b' '/home/dev/$x' '/home/dev/`x`' "/home/dev/a'b" '/home/dev/a"b' \
+            $'/home/dev/a\nb' ""; do
+  if _out="$(guest_home_relpath "$_bad" 2>/dev/null)"; then fail "guest_home_relpath refuses $(printf %q "$_bad")" "accepted: $_out"
+  else ok "guest_home_relpath refuses $(printf %q "$_bad")"; fi
+done
 
 # The Dockerfile cannot call these functions, so its copies must mirror them.
 if grep -qF -- "curl -fsSL $(agent_installer_url) -o" "$REPO/Dockerfile"

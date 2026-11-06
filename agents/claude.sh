@@ -4,8 +4,10 @@
 # Claude Code. Every Claude-/Anthropic-specific value and command is funneled through the
 # agent_* functions in this file (plus a few in-place members tagged `AUGUR_AGENT_SEAM` in
 # `augur` where extraction would change behavior, and markers in Dockerfile / augur.conf). A
-# future swap is then one discoverable change surface: replace this file and
-# `grep -rn AUGUR_AGENT_SEAM`.
+# future swap therefore has one discoverable change surface: `grep -rn AUGUR_AGENT_SEAM`.
+# Today the definition is this one file: its name is fixed in augur's loader, `install`, the
+# Makefile and the tests. A second agent needs a selection point in the loader, which is
+# deliberately not built until a second agent exists.
 #
 # This file is sourced by `augur` from the install dir, never executed on its own. It is
 # host-trusted code exactly like `augur`: it must live where no guest can write (never under a
@@ -22,6 +24,10 @@ agent_display_name() { echo "Claude Code"; }
 
 # Guest CLI binary / command name. DATA.
 agent_cli_name() { echo "claude"; }
+
+# Shape of the token the login command prints, shown in the operator's paste prompt. DATA; the
+# validator that enforces the shape is core code (save_oauth_token).
+agent_token_hint() { echo "sk-ant-…"; }
 
 # Interactive launch argv (space-separated tokens). DATA.
 # CONTRACT (launch string): on macOS this is interpolated into an SSH remote-command string. It is

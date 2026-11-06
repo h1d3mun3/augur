@@ -21,6 +21,7 @@ on:
       - 'augur-proxy/**'
       - 'gvproxy/**'
       - 'augur-vm/**'
+      - 'agents/**'
 
 permissions:
   contents: read
@@ -61,7 +62,7 @@ jobs:
               marker,
               '### 🧭 Egress drift reminder',
               '',
-              'This PR changes the **egress core** (`augur` / `augur-proxy/` / `gvproxy/` / `augur.conf` / `augur-vm/`) but does **not** touch `docs/security-reviews/`.',
+              'This PR changes the **egress core** (`augur` / `augur-proxy/` / `gvproxy/` / `augur.conf` / `augur-vm/` / `agents/`) but does **not** touch `docs/security-reviews/`.',
               '',
               'If this change alters the egress posture, please:',
               '- run `/egress-survey` (the bounded drift audit), and',
