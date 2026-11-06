@@ -277,7 +277,7 @@ augur version --macos   # show augur version (macOS mode)
 ```
 
 `augur update --macos` works on a staging copy that replaces the base VM only if every step passes
-(a failure leaves the base VM as it was). It reinstalls Claude Code with the official installer and
+(a failure leaves the base VM as it was). It refuses while the base VM is running (started by hand, an `install-cert` window, or left over from an interrupted run; the message gives the `augur-vm stop` command), as does `install-cert --macos`. It reinstalls Claude Code with the official installer and
 runs `brew update` and `brew upgrade --formula`, which upgrades `gh` and every other installed
 Homebrew formula, including the ones your manifest installed. Casks are left alone, because an
 upgrade can need `sudo`. Both run over the staging VM's plain NAT, as the Homebrew and `gh` installs
