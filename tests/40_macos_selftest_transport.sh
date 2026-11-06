@@ -71,6 +71,8 @@ teardown_ran() { logged "stop $1" && logged stop_gvproxy && logged stop_proxy; }
 G_GVPROXY=1 G_VMIP="" G_SSH_OK=1
 macos_project_vm() { echo testvm; }                     # so macos_via_gvproxy's name test matches
 gvproxy_running()  { [[ "$G_GVPROXY" == 1 ]]; }
+# The forward port is read back from the running gvproxy (see macos_ssh_port); answer for the stand-in.
+macos_vm_gvproxy_fwd_port() { [[ "$G_GVPROXY" == 1 && "${G_FWD:-1}" == 1 ]] && echo 20123; }
 
 # Shadow the ssh BINARY, below the real ssh_macos. The remote command is ssh's last argument.
 ssh() {
@@ -153,6 +155,25 @@ else fail "it reports through the normal fail-closed verdict" "got: $out"; fi
 # ssh_macos and exit the script from inside a suppressed context all over again.
 if [[ ! -s "$SSHLOG" ]]; then ok "no probe is attempted without a transport"
 else fail "no probe is attempted without a transport" "issued: $(tr '\n' ' ' < "$SSHLOG")"; fi
+
+section "gvproxy up but its SSH forward port unreadable — same fail-closed verdict"
+
+# ssh_macos also exits (not returns) on an empty port, so the precheck must cover the port too.
+G_GVPROXY=1 G_FWD=0 G_VMIP="" G_SSH_OK=1
+mech3="$( set -e; ssh_macos testvm true 2>&1; echo REACHED-NEXT-LINE )"
+if [[ "$mech3" == *"Cannot resolve SSH port"* && "$mech3" != *REACHED-NEXT-LINE* ]]; then
+  ok "ssh_macos terminates the shell with its own message when no port resolves"
+else fail "ssh_macos terminates the shell when no port resolves" "got '$mech3'"; fi
+selftest
+if [[ $rc -ne 0 ]]; then ok "an unreadable forward port ends the self-test non-zero"
+else fail "an unreadable forward port ends the self-test non-zero" "rc=$rc"; fi
+if teardown_ran testvm; then ok "…and tears the VM, gvproxy and the proxy down"
+else fail "…and tears the VM, gvproxy and the proxy down" "recorded: $(tr '\n' ' ' < "$LOG")"; fi
+if [[ "$out" == *"no SSH transport"* ]]; then ok "…naming the missing transport"
+else fail "…naming the missing transport" "got: $out"; fi
+if [[ ! -s "$SSHLOG" ]]; then ok "…without attempting any probe"
+else fail "…without attempting any probe" "issued: $(tr '\n' ' ' < "$SSHLOG")"; fi
+G_FWD=1
 
 section "Resolvable transport — the precheck must not break the happy path"
 

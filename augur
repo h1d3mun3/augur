@@ -105,6 +105,8 @@ AUGUR_PROXY_HTTP_PORT="${AUGUR_PROXY_HTTP_PORT:-$((13000 + _augur_port_offset))}
 AUGUR_PROXY_SOCKS_PORT="${AUGUR_PROXY_SOCKS_PORT:-$((14000 + _augur_port_offset))}"
 # In egress mode the guest has no host-routable IP (gvproxy user-space network);
 # SSH reaches it via gvproxy's host-side forward 127.0.0.1:<this port> → guest:22.
+# Only start_gvproxy uses it: it belongs to the current directory's project, so anything that
+# connects to a VM reads the port back from that VM's running gvproxy instead (macos_ssh_port).
 AUGUR_SSH_FWD_PORT="${AUGUR_SSH_FWD_PORT:-$((20000 + _augur_port_offset))}"
 # Egress filtering is on by default. The managed baseline (augur.conf.default) is always
 # active; add global domains to ~/.augur/augur.conf or per-project ones to
@@ -544,13 +546,15 @@ validate_secret_value() {
 # branch, which by design cannot re-push ~/.augur-env — so the guest would keep running with no
 # credentials at all until `down --macos && up --macos`. cmd_up_macos therefore calls this before
 # the clone. Container mode injects at session start instead, so cmd_claude / cmd_shell call it
-# before bringing the container up; cmd_up itself injects nothing there and does not check, which
-# keeps `augur setup-token` usable to replace a stored token that fails the check.
+# before bringing the container up; cmd_up itself injects nothing there and does not check.
+# Deliberately NOT called by setup-token in either mode: it injects no credentials (container mode
+# runs the login in the project container with no --env-file, macOS mode in a throwaway clone of the
+# base VM), so a stored token that fails the check can still be replaced by `augur setup-token`.
 #
 # Deliberately NOT an error: an ABSENT credential. A guest with no token is a supported state in both
-# modes (`augur setup-token` runs `claude setup-token` inside it), so this refuses only a value that
-# exists and cannot be injected — exactly what container mode refuses. Fails closed, and the message
-# still names the offending variable because validate_secret_value does.
+# modes (the operator mints one with `augur setup-token`), so this refuses only a value that exists
+# and cannot be injected — exactly what container mode refuses. Fails closed, and the message still
+# names the offending variable because validate_secret_value does.
 # AUGUR_AGENT_SEAM | credential CHECK — the agent DECLARES names + host sources (agent_auth_specs)
 # and the core owns both the resolver (resolve_api_key) and the validator (validate_secret_value).
 # CONTRACT (credentials): a future multi-agent build adds its per-spec VALIDATOR field here, in ONE
@@ -591,6 +595,11 @@ save_oauth_token() {
     chmod 600 "$dest"
     success "Saved subscription token to ${BOLD}${dest}${RESET} (chmod 600)."
     info "augur injects it as CLAUDE_CODE_OAUTH_TOKEN from the next session (macOS VM mode: the next 'up') — no host claude needed."
+    # resolve_api_key prefers the host env var over this file, so a set variable hides the new token.
+    if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+        warn "CLAUDE_CODE_OAUTH_TOKEN is set in this shell, and augur injects that value instead of ${dest}."
+        warn "  The new token is not used until you unset it (${BOLD}unset CLAUDE_CODE_OAUTH_TOKEN${RESET}, and remove it from your shell profile)."
+    fi
 }
 
 # Security notice shown before the operator pastes a setup-token. The token is produced by
@@ -803,15 +812,20 @@ stop_and_reap_macos_vm() {
 
 # SSH target for a VM. The project VM in egress mode lives behind gvproxy's
 # user-space network (no host-routable IP); SSH reaches it via gvproxy's host-side
-# forward at 127.0.0.1:<AUGUR_SSH_FWD_PORT>. Every other case (build/base VM, or a
-# project VM without egress) uses the DHCP-leased guest IP on port 22. Keyed on the
-# project VM having a *running* gvproxy, so build/base flows are never affected.
+# forward at 127.0.0.1:<port>. Every other case (build/base VM, or a project VM without
+# egress) uses the DHCP-leased guest IP on port 22. Keyed on the project VM having a
+# *running* gvproxy, so build/base flows are never affected.
+# The forward port is the one that VM's running gvproxy was started with, read back from its argv
+# (macos_vm_gvproxy_fwd_port), never AUGUR_SSH_FWD_PORT: that is derived from the current
+# directory, and `destroy --macos <name>` run from another project's directory would otherwise
+# reach THAT project's VM through its forward. Prints nothing when the port cannot be read back;
+# ssh_macos and scp_to_macos refuse an empty port, so nothing ever connects to a guessed one.
 macos_via_gvproxy() { [[ "$1" == "$(macos_project_vm)" ]] && gvproxy_running; }
 macos_ssh_host() {
     if macos_via_gvproxy "$1"; then echo "127.0.0.1"; else "$VM_CLI" ip "$1" 2>/dev/null; fi
 }
 macos_ssh_port() {
-    if macos_via_gvproxy "$1"; then echo "$AUGUR_SSH_FWD_PORT"; else echo "22"; fi
+    if macos_via_gvproxy "$1"; then macos_vm_gvproxy_fwd_port "$1" || true; else echo "22"; fi
 }
 
 # Per-VM host key store (TOFU): accept a new key on first connect, reject changes thereafter.
@@ -883,6 +897,7 @@ ssh_macos() {
     local host port
     host="$(macos_ssh_host "$vm")"; port="$(macos_ssh_port "$vm")"
     [[ -n "$host" ]] || { error "Cannot resolve SSH host for '${vm}'."; exit 1; }
+    [[ -n "$port" ]] || { error "Cannot resolve SSH port for '${vm}': its gvproxy reports no SSH forward port."; exit 1; }
     local key_opts=()
     if [[ -f "$MACOS_SSH_KEY" ]]; then
         key_opts=(-i "$MACOS_SSH_KEY" -o PasswordAuthentication=no -o BatchMode=yes)
@@ -915,6 +930,7 @@ scp_to_macos() {
     local host port
     host="$(macos_ssh_host "$vm")"; port="$(macos_ssh_port "$vm")"
     [[ -n "$host" ]] || { error "Cannot resolve SSH host for '${vm}'."; exit 1; }
+    [[ -n "$port" ]] || { error "Cannot resolve SSH port for '${vm}': its gvproxy reports no SSH forward port."; exit 1; }
     local key_opts=()
     if [[ -f "$MACOS_SSH_KEY" ]]; then
         key_opts=(-i "$MACOS_SSH_KEY" -o PasswordAuthentication=no -o BatchMode=yes)
@@ -2028,12 +2044,21 @@ gvproxy_running() {
 # The pidfile name is the VM name minus its `augur-macos-` prefix — both are `<slug>-<path hash>`
 # (see gvproxy_pidfile, macos_project_vm). The port is read back from gvproxy's own argv because
 # it is derived from the project's full path, which the VM name does not carry.
+# The pid in the pidfile may be stale and reused by an unrelated process, so the process is
+# trusted only if its argv also names THIS VM's own vfkit socket (the path gvproxy_socket gives:
+# the slug cut to 24 characters, then the path hash); otherwise this fails rather than guess.
+# `-ww`: on a terminal, BSD ps cuts args at the terminal width, and gvproxy's long socket and
+# allowlist paths come before --ssh-port.
 macos_vm_gvproxy_fwd_port() {
-    local pf="$AUGUR_PROXY_DIR/${1#augur-macos-}.gvproxy.pid" pid args
+    local stem="${1#augur-macos-}" pf pid args sock slug
+    pf="$AUGUR_PROXY_DIR/${stem}.gvproxy.pid"
+    slug="${stem%-*}"
+    sock="$AUGUR_PROXY_DIR/${slug:0:24}-${stem##*-}.vfkit.sock"
     [[ -f "$pf" ]] || return 1
     pid="$(cat "$pf" 2>/dev/null)"
     [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null || return 1
-    args="$(ps -o args= -p "$pid" 2>/dev/null)" || return 1
+    args="$(ps -ww -o args= -p "$pid" 2>/dev/null)" || return 1
+    [[ "$args " == *"unixgram://${sock} "* ]] || return 1
     [[ "$args" =~ --ssh-port[[:space:]]+([0-9]+) ]] || return 1
     echo "${BASH_REMATCH[1]}"
 }
@@ -2159,8 +2184,9 @@ verify_macos_egress_locked() {
     # `eng exec` stops working, because its proxy probe then returns no status either.
     #
     # RESOLVABILITY is checked BEFORE the first probe, and separately, because ssh_macos does not
-    # RETURN when it cannot name a host for the VM — it `exit 1`s the whole script:
+    # RETURN when it cannot name a host or port for the VM — it `exit 1`s the whole script:
     #     host="$(macos_ssh_host "$vm")"; [[ -n "$host" ]] || { error …; exit 1; }
+    #     port="$(macos_ssh_port "$vm")"; [[ -n "$port" ]] || { error …; exit 1; }
     # Every probe below invokes it under `&>/dev/null` or inside `$( … )`, so without this check that
     # exit would be UNOBSERVABLE and, being an exit rather than a non-zero return, it would jump clean
     # over the fail-closed teardown at the bottom of this function — leaving precisely the live VM
@@ -2176,11 +2202,12 @@ verify_macos_egress_locked() {
     #
     # Fixing it HERE rather than in ssh_macos is deliberate: turning that `exit 1` into `return 1`
     # would change the failure mode of all 47 call sites at once, many of which rely on `set -e`
-    # aborting the operation. Checking the same condition first is local and total — once a host
-    # resolves, ssh_macos has no other exit path, so every probe below is covered.
-    if [[ -z "$(macos_ssh_host "$vm")" ]]; then
+    # aborting the operation. Checking the same conditions first is local and total — once a host
+    # and a port resolve, ssh_macos has no other exit path, so every probe below is covered. An empty
+    # port (gvproxy up, forward unreadable; see macos_ssh_port) is the same no-way-in state.
+    if [[ -z "$(macos_ssh_host "$vm")" || -z "$(macos_ssh_port "$vm")" ]]; then
         error "Self-test: no SSH transport to '${vm}' — egress cannot be VERIFIED."
-        error "  The VM is running but gvproxy is not, so nothing on the host can reach the guest."
+        error "  The VM is running but gvproxy is not (or has no readable SSH forward), so nothing can reach it."
         error "  gvproxy cannot be restarted under a live VM (its unixgram socket IS the guest's"
         error "  NIC), so this fails closed and stops the VM below; \`augur up --macos\` then boots a"
         error "  fresh guest with a working datapath."
@@ -3180,13 +3207,7 @@ confirm_cert_install() {
 cmd_install_cert() {
     local cert="${1:-}"
     [[ -n "$cert" ]] || { error "Usage: augur install-cert <cert.crt>"; exit 1; }
-    # `--macos` selects the VM path, but the global flag parser stops at the first positional, so
-    # `install-cert <cert> --macos` would reach here (container) with --macos as a trailing arg.
-    # Reject it rather than silently baking into the Linux image when the VM was meant.
     local _a
-    for _a in "$@"; do
-        [[ "$_a" == "--macos" ]] && { error "Put ${BOLD}--macos${RESET} BEFORE the cert path: augur install-cert --macos <cert.crt>"; exit 1; }
-    done
     require_engine
     validate_cert_file "$cert" || exit 1
     # The image tag is shared by EVERY project built on this Swift tag (IMAGE_NAME=augur:swift-<tag>),
@@ -3710,16 +3731,15 @@ wait_for_macos_ssh() {
     local vm="$1"
     local max_secs="${2:-120}"
     local host port key_opts=()
-    port="$(macos_ssh_port "$vm")"
     [[ -f "$MACOS_SSH_KEY" ]] && key_opts=(-i "$MACOS_SSH_KEY" -o PasswordAuthentication=no -o BatchMode=yes)
     local deadline=$(( SECONDS + max_secs ))
     while (( SECONDS < deadline )); do
-        host="$(macos_ssh_host "$vm")"
+        host="$(macos_ssh_host "$vm")"; port="$(macos_ssh_port "$vm")"
         # ServerAlive* caps a probe that connects but then stalls (e.g. sshd accepted the
         # TCP connection while the guest is still mid-boot): without it such a probe blocks
         # forever — ConnectTimeout only bounds the handshake — and wedges the whole retry
         # loop past its nominal timeout, which shows up as an indefinite silent hang.
-        [[ -n "$host" ]] && \
+        [[ -n "$host" && -n "$port" ]] && \
             ssh -F /dev/null \
                 -p "$port" \
                 -o StrictHostKeyChecking=accept-new \
@@ -4813,12 +4833,21 @@ macos_guest_poweroff() {
 # Power a running project VM off from the inside, ahead of a teardown that then calls
 # `augur-vm stop` (see macos_guest_poweroff for why that is faster than the stop alone). Must run
 # BEFORE stop_gvproxy: the SSH request reaches the guest through gvproxy's forward, so once gvproxy
-# is down there is no way in, which is why this is skipped when gvproxy is not running. Its failure
-# is not an error: the caller's `augur-vm stop` is the fallback, and the caller's own check is the
-# authority on whether the VM is down.
+# is down there is no way in, which is why this is skipped when gvproxy is not running. Also skipped
+# when the forward port cannot be read back from that gvproxy (see macos_ssh_port): the shutdown
+# must never be sent to a guessed port, which could be another project's VM. Its failure is not an
+# error: the caller's `augur-vm stop` is the fallback, and the caller's own check is the authority
+# on whether the VM is down.
 macos_poweroff_before_teardown() {
     local vm="$1"
     if macos_vm_exists "$vm" && macos_vm_running "$vm" && gvproxy_running; then
+        if [[ -z "$(macos_ssh_port "$vm")" ]]; then
+            # Accepted trade-off: the VM is hard-stopped without a graceful in-guest shutdown, which
+            # risks unflushed guest disk state in the clone augur keeps; that is accepted over
+            # connecting to a guessed port, which could be another project's VM.
+            warn "Cannot read the SSH forward port of '${vm}' from its gvproxy; stopping it without an in-guest shutdown."
+            return 0
+        fi
         info "Shutting down VM '${vm}'..."
         macos_guest_poweroff "$vm" || true
     fi
@@ -4914,9 +4943,10 @@ cmd_status_macos() {
     echo -e "${BOLD}Resources:${RESET}     $(resolve_macos_vm_cpu) vCPU / $(resolve_macos_vm_memory_mb) MB$(macos_vm_running "$project_vm" && echo " (applies on next up --macos if changed)")"
 
     if macos_vm_running "$project_vm"; then
-        local ip
+        local ip port
         if macos_via_gvproxy "$project_vm"; then
-            ip="127.0.0.1:${AUGUR_SSH_FWD_PORT} (gvproxy fwd)"
+            port="$(macos_ssh_port "$project_vm")"
+            ip="127.0.0.1:${port:-?} (gvproxy fwd)"
         else
             ip="$("$VM_CLI" ip "$project_vm" 2>/dev/null || echo '?')"
         fi
@@ -4956,7 +4986,7 @@ cmd_status_macos() {
     echo -e "${BOLD}Toolchain:${RESET}"
     # Gate on the address ssh_macos will actually use: with egress on, that is gvproxy's local
     # forward and the guest has no DHCP lease, so a lease-based check would never pass.
-    if macos_vm_running "$project_vm" && [[ -n "$(macos_ssh_host "$project_vm")" ]]; then
+    if macos_vm_running "$project_vm" && [[ -n "$(macos_ssh_host "$project_vm")" && -n "$(macos_ssh_port "$project_vm")" ]]; then
         # DEVELOPER_DIR (full Xcode, not the CLT) comes from ~/.augur-env; see cmd_up_macos.
         # AUGUR_AGENT_SEAM | agent version (macOS, in-VM; runs `claude --version`)
         ssh_macos "$project_vm" '
@@ -4965,6 +4995,8 @@ cmd_status_macos() {
             echo "    xcode:  $(xcodebuild -version 2>/dev/null | head -1 || echo "(unable to fetch)")"
             echo "    claude: $(claude --version 2>/dev/null || echo "(unable to fetch)")"
         ' | sanitize_guest_lines || true
+    elif macos_vm_running "$project_vm"; then
+        echo -e "    ${YELLOW}(VM is running, but its SSH forward port could not be read from gvproxy — run: augur down --macos && augur up --macos)${RESET}"
     else
         echo -e "    ${YELLOW}(VM not running — run: augur up --macos)${RESET}"
     fi
@@ -6187,7 +6219,7 @@ cmd_help() {
     echo -e "    augur ${CYAN}update${RESET}  --macos                                   Update CLI tools in base VM"
     echo -e "    augur ${CYAN}version${RESET} --macos                                   Show augur version (macOS mode)"
     echo ""
-    echo -e "  ${BOLD}OPTIONS${RESET}"
+    echo -e "  ${BOLD}OPTIONS${RESET}  (put them right after the command: ${CYAN}augur up --macos --gui${RESET}; a misplaced one is refused)"
     echo -e "    --swift VERSION    Swift version for container mode (default: ${CYAN}latest${RESET})"
     echo -e "    --macos            Use macOS VM with Xcode instead of a Linux container"
     echo -e "    --gui              Open a VM window in macOS VM mode (for: augur up --macos)"
@@ -6269,6 +6301,59 @@ cmd_help() {
 # errors, and `|| true` falls through to normal dispatch.
 if [[ "${AUGUR_SOURCE_ONLY:-0}" == "1" ]]; then return 0 2>/dev/null || true; fi
 
+# Refuse whatever the global flag loop below left unparsed for command $1 ($2… are those words).
+# That loop reads --macos/--gui/--egress/--no-egress/--swift only directly after the command and
+# stops at the first other word, so a flag placed later would otherwise be dropped without a word:
+# `augur down extra --macos` would stop the container, `augur build --ipsw X --xcode-xip Y --macos`
+# would build the container image. Every refusal exits 1 before anything runs.
+# - `-h`/`--help` anywhere in the leftovers: print the usage and exit 0, ahead of every check below.
+# - A global flag anywhere in the leftovers: say where it goes.
+# - `build` without --macos: the macOS base-VM build options mean --macos was left out.
+# - Any other leftover word, for a command that takes none.
+# Deliberately NOT checked: `build --macos` (cmd_build_macos parses its own options and refuses an
+# unknown one), the positional argument of `destroy` (cmd_destroy* refuse extras themselves; only a
+# misplaced global flag is refused here; `install-cert` takes zero or one, and its own missing-argument
+# check handles zero), `help` (extra words are harmless),
+# and an unknown command (the dispatch reports it).
+reject_extra_args() {
+    local cmd="$1" a; shift
+    case "$cmd" in
+        help|--help|-h) return 0 ;;
+        build|up|claude|shell|setup-token|install-cert|down|destroy|status|init-conf|list|__names|update|version) ;;
+        *) return 0 ;;
+    esac
+    for a in "$@"; do
+        case "$a" in -h|--help) cmd_help; exit 0 ;; esac
+    done
+    [[ "$cmd" == build ]] && $MACOS_MODE && return 0
+    for a in "$@"; do
+        case "$a" in
+            --macos|--gui|--egress|--no-egress|--swift)
+                error "Put ${a} right after the command: augur ${cmd} ${a}$([[ "$a" == --swift ]] && echo " <version>") …"
+                exit 1 ;;
+        esac
+    done
+    case "$cmd" in
+        install-cert)
+            (( $# <= 1 )) && return 0
+            error "Usage: augur install-cert [--macos] <cert.crt>  (got extra: $*)"
+            exit 1 ;;
+        destroy) return 0 ;;
+    esac
+    if [[ "$cmd" == build ]]; then
+        for a in "$@"; do
+            case "$a" in
+                --ipsw|--xcode-xip|--platforms|--manual-setup)
+                    error "${a} is an option of the macOS base-VM build: augur build --macos --ipsw <path> --xcode-xip <path> …"
+                    exit 1 ;;
+            esac
+        done
+    fi
+    (( $# == 0 )) && return 0
+    error "augur ${cmd} takes no arguments (got: $*)"
+    exit 1
+}
+
 COMMAND="${1:-help}"
 shift || true
 
@@ -6279,7 +6364,13 @@ while [[ $# -gt 0 ]]; do
         --egress)    AUGUR_EGRESS=1; shift ;;
         --no-egress) AUGUR_EGRESS=0; shift ;;
         --swift)
-            SWIFT_VERSION="${2:?'--swift requires a version (e.g. --swift 6.0)'}"
+            # A flag (or nothing) in the value slot means the version was left out; taking it would
+            # swallow the flag and build a bogus image tag.
+            if [[ -z "${2:-}" || "$2" == -* ]]; then
+                error "--swift needs a version: augur ${COMMAND} --swift <version> (e.g. --swift 6.0)"
+                exit 1
+            fi
+            SWIFT_VERSION="$2"
             shift 2
             ;;
         *) break ;;
@@ -6308,6 +6399,8 @@ MACOS_SHARE="workspace-$(workspace_slug)"
 # container/VM a pre-fix augur made in $HOME can still be cleaned up; init-conf/build/update/
 # install-cert/version/help never hand this directory to a guest (`build` uses $SCRIPT_DIR as
 # its context), and neither does `setup-token --macos` (its throwaway VM gets no workspace share).
+# The argument check comes first, so a misplaced flag is named even in a directory the gate refuses.
+reject_extra_args "$COMMAND" "$@"
 case "$COMMAND" in
     up|claude|shell) require_safe_workspace ;;
     setup-token)     $MACOS_MODE || require_safe_workspace ;;

@@ -34,7 +34,7 @@ AUGUR_PROXY_DIR="$TMPD/proxy"; mkdir -p "$AUGUR_PROXY_DIR"
 # A gvproxy stand-in: argv carries the flags augur passes, the process just sleeps.
 printf 'sleep 60\n' > "$TMPD/fake-gvproxy"
 fake_gvproxy() {   # fake_gvproxy <pidfile-stem> <ssh-port>
-    bash "$TMPD/fake-gvproxy" --listen-vfkit "unixgram://x" --ssh-port "$2" &
+    bash "$TMPD/fake-gvproxy" --listen-vfkit "unixgram://$AUGUR_PROXY_DIR/$1.vfkit.sock" --ssh-port "$2" &
     PIDS+=("$!"); echo "$!" > "$AUGUR_PROXY_DIR/$1.gvproxy.pid"
 }
 fake_gvproxy app-aaaaaaaaaaaa 20286
@@ -49,6 +49,12 @@ macos_vm_gvproxy_fwd_port augur-macos-base >/dev/null
 eq "1" "$?" "fails for a VM with no gvproxy pidfile (the base VM)"
 macos_vm_gvproxy_fwd_port augur-macos-old-cccccccccccc >/dev/null
 eq "1" "$?" "fails for a pidfile whose gvproxy is gone"
+# A reused pid: a live process that carries --ssh-port but a DIFFERENT gvproxy socket (another
+# project's gvproxy) must not be believed.
+bash "$TMPD/fake-gvproxy" --listen-vfkit "unixgram://$AUGUR_PROXY_DIR/zzz-ffffffffffff.vfkit.sock" --ssh-port 20999 &
+PIDS+=("$!"); echo "$!" > "$AUGUR_PROXY_DIR/reused-dddddddddddd.gvproxy.pid"
+macos_vm_gvproxy_fwd_port augur-macos-reused-dddddddddddd >/dev/null
+eq "1" "$?" "fails when the pid's args carry --ssh-port but another VM's socket path"
 # The name mapping must match the pidfile start_gvproxy really writes for the current project.
 WORKSPACE_DIR="$TMPD/My Project"
 eq "$(gvproxy_pidfile)" "$AUGUR_PROXY_DIR/$(macos_project_vm | sed 's/^augur-macos-//').gvproxy.pid" \

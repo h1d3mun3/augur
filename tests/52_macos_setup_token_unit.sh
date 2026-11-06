@@ -545,6 +545,48 @@ grep -q "^vm run .*--net-vfkit=" "$LOG" && ok "--no-egress: still the filtered d
 tail_case="$(sed -n '/^case "\$COMMAND" in$/,/^esac$/p' "$AUGUR" | head -n 4)"
 has "$tail_case" 'setup-token)     $MACOS_MODE || require_safe_workspace' "the workspace gate skips setup-token --macos only"
 
+section "Tier 1 — setup-token --macos: SSH reaches the throwaway VM on its own fixed forward port"
+# The real port resolution (macos_ssh_port → the running gvproxy's --ssh-port), with a stand-in
+# gvproxy started the way start_gvproxy starts it: with whatever AUGUR_SSH_FWD_PORT holds once the
+# throwaway identity is adopted. The current project's port (20111 here) must never be used.
+printf 'sleep 60\n' > "$TMPD/fake-gvproxy"
+resolved="$(
+    AUGUR_SSH_FWD_PORT=20111
+    adopt_setup_token_identity
+    bash "$TMPD/fake-gvproxy" --listen-vfkit "unixgram://$(gvproxy_socket)" --ssh-port "$AUGUR_SSH_FWD_PORT" >/dev/null 2>&1 &
+    echo $! > "$(gvproxy_pidfile)"
+    printf '%s %s %s\n' "$(macos_project_vm)" "$(macos_ssh_host "$(macos_project_vm)")" "$(macos_ssh_port "$(macos_project_vm)")"
+    kill $! 2>/dev/null; rm -f "$(gvproxy_pidfile)"
+)"
+eq "$(TARGET_SLUG=""; TARGET_HASH=""; adopt_setup_token_identity; macos_project_vm) 127.0.0.1 ${AUGUR_SSH_FWD_PORT_SETUP_TOKEN}" "$resolved" \
+   "the throwaway VM resolves to 127.0.0.1:${AUGUR_SSH_FWD_PORT_SETUP_TOKEN} (its fixed port, read back from its gvproxy)"
+eq "20998" "$AUGUR_SSH_FWD_PORT_SETUP_TOKEN" "the throwaway VM's fixed forward port is 20998"
+
+section "Tier 1 — setup-token --macos replaces a stored token that cannot be injected"
+# A stored token that the injection check refuses (a quote, a newline) and a gh token that fails it
+# too: setup-token must still reach the login and the save, or the operator could never replace it.
+# The save is wrapped to supply the paste, so this holds with or without a terminal for /dev/tty.
+eval "$(declare -f save_oauth_token | sed '1s/^save_oauth_token/real_save_oauth_token/')"
+NEW_TOKEN="sk-ant-oat01-replacement_token-0123456789"
+save_oauth_token() { echo "save" >> "$LOG"; real_save_oauth_token "$NEW_TOKEN"; }
+gh() { [[ "$*" == "auth token" ]] && printf '%s\n' $'ghp_bad\nEVIL=1'; }
+unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN
+for bad in "sk-ant-oat01-it's-bad-0123456789" $'sk-ant-oat01-bad\nEVIL=1'; do
+  label="stored token with $([[ "$bad" == *\'* ]] && echo "a quote" || echo "a newline")"
+  printf '%s\n' "$bad" > "$HOME/.claude_code_oauth_token"
+  reset_vms; run_st
+  eq 0 "$rc" "$label: setup-token --macos exits 0"
+  logged "vm clone $MACOS_BASE_VM $TV" && ok "$label: the throwaway VM is cloned" || fail "$label: never cloned" "$out"
+  grep -q $'\t-t ' "$SSHLOG" && ok "$label: the login is launched" || fail "$label: the login never ran" "$out"
+  logged "save" && ok "$label: the token is saved" || fail "$label: save_oauth_token never ran" "$out"
+  eq "$NEW_TOKEN" "$(cat "$HOME/.claude_code_oauth_token")" "$label: the file now holds the new token"
+  hasnt "$out" "Refusing to inject" "$label: no injection check refuses it"
+done
+section "Tier 1 — setup-token --macos warns when CLAUDE_CODE_OAUTH_TOKEN hides the saved token"
+reset_vms; CLAUDE_CODE_OAUTH_TOKEN="sk-ant-oat01-from-the-env-0123456789" run_st
+has "$out" "CLAUDE_CODE_OAUTH_TOKEN is set in this shell" "env var set: warns that it takes precedence"
+reset_vms; run_st
+hasnt "$out" "CLAUDE_CODE_OAUTH_TOKEN is set in this shell" "env var unset: no warning"
 
 # ── 5. The credential scrub, run for real against a stand-in guest home ─────────────────────────
 section "Tier 1 — macos_scrub_augur_credentials removes exactly what augur writes into a guest"

@@ -67,6 +67,8 @@ stop_gvproxy() { echo "stop_gvproxy" >> "$LOG"; }
 stop_proxy()   { echo "stop_proxy"   >> "$LOG"; }
 _gvproxy_up=0                             # 0 = gvproxy (hence the SSH forward) is up, 1 = down
 gvproxy_running() { return $_gvproxy_up; }
+# The forward port is read back from the running gvproxy (see macos_ssh_port); answer for the stand-in.
+macos_vm_gvproxy_fwd_port() { (( _gvproxy_up == 0 )) && echo 20123; }
 _real_poweroff_defs="$(declare -f macos_guest_poweroff macos_kill_tree)"
 macos_guest_poweroff() { echo "poweroff $1" >> "$LOG"; return 0; }
 _vm_exists=0                              # 0 = a clone exists for this dir, 1 = none
