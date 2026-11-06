@@ -53,7 +53,7 @@ Read from the host env, else `~/.claude_code_oauth_token`, via `resolve_api_key`
 - Both auth vars are injected whenever set; `augur` applies **no** precedence itself — Claude Code applies the official `ANTHROPIC_API_KEY` > `CLAUDE_CODE_OAUTH_TOKEN` order when both are present. Both modes (container and macOS VM) forward it, resolved from the same `agent_auth_specs` table. (`cmd_status` still only *reads* it host-side for a display checkmark.)
 
 ### `GH_TOKEN` — both modes (named secret)
-Obtained by running the subprocess `gh auth token` (in `session_credential_env` / `push_macos_guest_env`).
+Obtained by running the subprocess `gh auth token` (in `resolve_session_credentials`, shared by both modes).
 - Container: a `GH_TOKEN=…` line in the same per-session `--env-file` (in `cmd_claude` / `cmd_shell`).
 - macOS: `export GH_TOKEN='…'` in `~/.augur-env`, plus a `git config --global` credential helper that echoes `password=$GH_TOKEN` for `github.com` (in `push_macos_guest_env`) — the helper stores only the *reference* `$GH_TOKEN`, not the value.
 - **Note (unnamed-host-var transit):** `augur` does not read the shell `$GH_TOKEN`/`$GITHUB_TOKEN` directly, but `gh auth token` honors them, so a host token can transit into the guest's `GH_TOKEN` via that subprocess. This is the one path by which a host variable `augur` never *names* crosses in container mode too (macOS is the same).

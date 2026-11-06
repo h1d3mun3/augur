@@ -88,12 +88,12 @@ guest_values() {   # every value the guest's global config holds for KEY, newlin
     HOME="$GUEST_HOME" XDG_CONFIG_HOME="$GUEST_HOME/.config" \
         git config --global --get-all "$KEY" 2>/dev/null
 }
-# Run the REAL push (push_macos_guest_env writes the helper in the same ssh session as
-# ~/.augur-env) the way its callers run it: inside `set -e`. Without that a helper failure that
-# aborts would be indistinguishable from one that only warns.
+# Resolve the credentials and run the REAL push (push_macos_guest_env writes the helper in the same
+# ssh session as ~/.augur-env) the way its callers run it: inside `set -e`. Without that a helper
+# failure that aborts would be indistinguishable from one that only warns.
 wire() {   # wire <host gh token> — sets $out / $rc
     : > "$SSHLOG"; GH_HOST_TOKEN="$1"
-    out="$( set -e; push_macos_guest_env testvm 2>&1 )"; rc=$?
+    out="$( set -e; _creds=(); resolve_session_credentials; push_macos_guest_env testvm 2>&1 )"; rc=$?
 }
 
 section "Tier 1 — a DUPLICATED credential.helper (what \`gh auth setup-git\` leaves) must not break up"
