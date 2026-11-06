@@ -19,15 +19,15 @@ has "$claude_macos" '${_rargv}'          "macOS launch interpolates the seam lau
 up_macos="$(awk '/^cmd_up_macos\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
 has "$up_macos" 'agent_state_host_subdir' "macOS history share dir name comes from agent_state_host_subdir (A3/C7)"
 # The per-VM user-level subagent-defs share (#113) mirrors history: share name from the seam, and
-# the guest ~/.claude/agents symlink wired via ensure_macos_claude_agents.
+# the guest ~/.claude/agents symlink wired via ensure_macos_agent_agents.
 has "$up_macos" 'agent_state_agents_host_subdir' "macOS agents share dir name comes from agent_state_agents_host_subdir (A3/C7)"
-has "$up_macos" 'ensure_macos_claude_agents'     "macOS up wires ~/.claude/agents (ensure_macos_claude_agents)"
+has "$up_macos" 'ensure_macos_agent_agents'     "macOS up wires ~/.claude/agents (ensure_macos_agent_agents)"
 # No folder-trust seed: augur does not pre-trust the mounted workspace on macOS either — a
 # regression guard against re-introducing the per-workspace key.
 hasnt "$up_macos" 'hasTrustDialogAccepted'       "macOS up does NOT pre-trust the workspace in the .claude.json stub"
-seed_fn="$(awk '/^macos_seed_claude_json\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
-has "$up_macos" 'macos_seed_claude_json'         "macOS up still seeds the onboarding-only stub"
-has "$seed_fn"  'hasCompletedOnboarding'         "the macOS stub carries onboarding state"
+seed_fn="$(awk '/^macos_seed_agent_config\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
+has "$up_macos" 'macos_seed_agent_config'         "macOS up still seeds the onboarding-only stub"
+has "$(grep "^agent_config_seed_json()" "$AUGUR")" 'hasCompletedOnboarding' "the macOS stub carries onboarding state"
 hasnt "$seed_fn" 'hasTrustDialogAccepted'        "the macOS stub does NOT pre-trust a folder"
 # Write-once, gated on "did we just clone this VM" — NOT the file's absence.
 # `down --macos` keeps the clone, so an unconditional scp on every `up`
@@ -40,7 +40,7 @@ has "$up_macos" '_fresh_clone'                   "macOS .claude.json seed is gat
 # ── Opt-in operator profile: a host-GLOBAL, READ-ONLY share wired into the VM's ~/.claude.
 #    Host-global is exactly why :ro is load-bearing — every project on this host reads it. ──
 has "$up_macos" 'agent_profile_host_subdir'      "macOS profile share dir name comes from agent_profile_host_subdir"
-has "$up_macos" 'ensure_macos_claude_profile'    "macOS up wires the operator profile"
+has "$up_macos" 'ensure_macos_agent_profile'    "macOS up wires the operator profile"
 if grep -Eq -- '--dir="\$\(agent_profile_host_subdir\):\$\{AUGUR_DIR\}/\$\(agent_profile_host_subdir\):ro"' "$AUGUR"
 then ok "macOS profile share is mounted READ-ONLY"
 else fail "macOS profile share is not read-only" "expected a --dir=…:ro for the profile"; fi
@@ -48,9 +48,9 @@ hasnt "$up_macos" 'agent_profile_host_subdir)/${project_vm}' "macOS profile shar
 # `claude`/`shell` can attach to an already-running VM, so they must wire it too, not just `up`.
 claude_macos_body="$(awk '/^cmd_claude_macos\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
 shell_macos_body="$(awk '/^cmd_shell_macos\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
-has "$claude_macos_body" 'ensure_macos_claude_profile' "macOS claude wires the operator profile"
-has "$shell_macos_body"  'ensure_macos_claude_profile' "macOS shell wires the operator profile"
-profile_fn="$(awk '/^ensure_macos_claude_profile\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
+has "$claude_macos_body" 'ensure_macos_agent_profile' "macOS claude wires the operator profile"
+has "$shell_macos_body"  'ensure_macos_agent_profile' "macOS shell wires the operator profile"
+profile_fn="$(awk '/^ensure_macos_agent_profile\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
 has "$profile_fn" '|| exit 0'                    "macOS profile wiring skips a VM whose share is not mounted (upgrade guard)"
 has "$profile_fn" 'agent_profile_link_dirs'      "macOS profile wiring reads the link list from the seam"
 has "$profile_fn" 'agent_profile_copy_files'     "macOS profile wiring reads the copy list from the seam"
@@ -108,8 +108,8 @@ has "$up_macos" 'if $_fresh_clone; then'         "macOS .claude.json seed overwr
 # automatically, so it is the natural self-healing checkpoint between builds.
 build_macos="$(awk '/^cmd_build_macos\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
 update_macos="$(awk '/^cmd_update_macos\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
-has "$build_macos"  'rm -f ~/.claude.json' "macOS build scrubs any accumulated ~/.claude.json before saving the base VM"
-has "$update_macos" 'rm -f ~/.claude.json' "macOS update scrubs any accumulated ~/.claude.json (self-healing between builds)"
+has "$build_macos"  'macos_scrub_agent_config' "macOS build scrubs any accumulated agent config file before saving the base VM"
+has "$update_macos" 'macos_scrub_agent_config' "macOS update scrubs any accumulated agent config file (self-healing between builds)"
 
 section "Tier 2 — per-project VM naming is path-hash keyed, not basename-only (run anywhere)"
 # macos_project_vm() must not key purely on basename(WORKSPACE_DIR): two distinct

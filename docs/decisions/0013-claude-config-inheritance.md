@@ -149,7 +149,7 @@ Apple Container **bind mount**, and a host-side edit is visible immediately (ver
 hardware). macOS VM mode reaches it through a **virtiofs share**
 (`VZVirtioFileSystemDeviceConfiguration`, see `augur-vm/Sources/augur-vm/RunSession.swift`), and
 there the guest's virtiofs client keeps serving stale file data after a host-side edit. augur holds
-no cache of its own — `ensure_macos_claude_profile` only `ln -sfn`s and `cp`s — and
+no cache of its own — `ensure_macos_agent_profile` only `ln -sfn`s and `cp`s — and
 Virtualization.framework exposes **no** cache-control knob for these shares (Apple's documentation
 is silent on caching entirely; `isReadOnly` is documented purely as access control). The workaround
 is `down --macos && up --macos`.

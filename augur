@@ -225,6 +225,21 @@ agent_version_cmd() { echo "claude --version"; }
 # DATA. The core launches setup-token by this absolute path and runs the signature check on it.
 agent_macos_cli_relpath() { echo ".local/bin/claude"; }
 
+# macOS VM mode: the official installer's download URL and its argument (a release channel). DATA.
+# The core downloads the script to a temp file and runs it; it never pipes it into a shell.
+agent_installer_url()  { echo "https://claude.ai/install.sh"; }
+agent_installer_args() { echo "latest"; }
+
+# macOS VM mode: where the system-wide managed policy (agent_managed_settings_json) lives. DATA.
+agent_macos_managed_settings_path() { echo "/Library/Application Support/ClaudeCode/managed-settings.json"; }
+
+# The agent's per-user config file, relative to the guest user's home. DATA. It holds account and
+# onboarding state, so the core scrubs it from the base VM and seeds the stub below into project VMs.
+agent_config_file_relpath() { echo ".claude.json"; }
+# The onboarding-only stub written to that file: no auth, no folder-trust. Same bytes as the
+# Dockerfile's (a test asserts both copies). DATA.
+agent_config_seed_json() { printf '{"hasCompletedOnboarding":true,"installMethod":"native"}\n'; }
+
 # macOS VM mode: the Apple Developer ID Team ID that signs the agent's macOS binary (Anthropic PBC).
 # DATA. The signature check (agent_verify_integrity_macos) accepts only a Developer ID signature
 # issued to exactly this team.
@@ -276,7 +291,7 @@ agent_state_guest_history_file()    { echo "/home/dev/.claude/history.jsonl"; }
 # Opt-in operator profile — the operator's OWN Claude Code assets (personal slash commands, skills,
 # a user-level CLAUDE.md, user-scope settings.json) carried into the guest. DATA only; the CORE
 # owns the mechanism (host dir mounted/shared READ-ONLY, wired by apply_guest_profile /
-# ensure_macos_claude_profile).
+# ensure_macos_agent_profile).
 #
 # This is deliberately NOT the host's real ~/.claude, which augur never reads. That tree is
 # EXECUTABLE config: a RW mount would let a compromised guest plant a hook/skill/command that every
@@ -630,8 +645,8 @@ setup_token_security_notice() {
 agent_verify_integrity_engine() {
     AGENT_VERIFIED_BIN=""
     local img_line img_hash bin cont_hash
-    # sha256sum prints "HASH  PATH"; the PATH is the one the image resolves `claude` to.
-    img_line="$(eng run --rm "$IMAGE_NAME" "$ENGINE_CHECK_SH" -c '/usr/bin/sha256sum "$(command -v claude)"' 2>/dev/null | head -n1)"
+    # sha256sum prints "HASH  PATH"; the PATH is the one the image resolves the agent CLI to.
+    img_line="$(eng run --rm "$IMAGE_NAME" "$ENGINE_CHECK_SH" -c "/usr/bin/sha256sum \"\$(command -v $(agent_cli_name))\"" 2>/dev/null | head -n1)"
     img_hash="${img_line%%  *}"; bin="${img_line#*  }"
     [[ "$img_hash" =~ ^[0-9a-f]{64}$ && "$bin" =~ ^/[A-Za-z0-9._/+-]+$ ]] || return 1
     cont_hash="$(eng exec "$CONTAINER_NAME" /usr/bin/sha256sum "$bin" 2>/dev/null | awk '{print $1}')"
@@ -641,6 +656,12 @@ agent_verify_integrity_engine() {
 
 # Absolute guest path of the agent CLI in a macOS VM (see agent_macos_cli_relpath).
 macos_agent_bin() { echo "/Users/${MACOS_SSH_USER}/$(agent_macos_cli_relpath)"; }
+# The directory holding it, relative to the guest user's home (what goes on the guest's PATH).
+macos_agent_bindir_rel() { dirname "$(agent_macos_cli_relpath)"; }
+
+# A container-side absolute path $1 (an agent_state_* / agent_profile_* value under the container
+# user's home), as a path relative to the macOS guest user's home.
+guest_home_relpath() { echo "${1#/home/dev/}"; }
 
 # True iff the agent binary in macOS VM $1 passes `codesign --verify --strict` against a Developer ID
 # requirement pinned to the vendor's Team ID (agent_macos_signing_team), AND codesign reports exactly
@@ -1199,7 +1220,7 @@ require_fresh_egress_helpers() {
         error "helper, and this refusal repeats after every restart."
     fi
     error "Restart the guest and its egress helpers from the installed binaries: ${BOLD}${remedy}${RESET}"
-    error "  \`down\` ends every running claude/shell session of this project; the workspace and"
+    error "  \`down\` ends every running $(agent_cli_name)/shell session of this project; the workspace and"
     error "  ${kept} are kept."
     exit 1
 }
@@ -2626,7 +2647,7 @@ finish_up() {
     apply_guest_profile
     success "Container '${CONTAINER_NAME}' is up."
     echo ""
-    echo -e "  ${BOLD}augur claude${RESET}  → Launch Claude Code"
+    echo -e "  ${BOLD}augur claude${RESET}  → Launch $(agent_display_name)"
     echo -e "  ${BOLD}augur shell${RESET}   → Open bash shell"
     echo -e "  ${BOLD}augur down${RESET}    → Stop (kept for a fast restart)"
     echo -e "  ${BOLD}augur destroy${RESET} → Remove the container entirely"
@@ -2978,7 +2999,7 @@ cmd_claude() {
     # The line above reaches `cmd_up` only when the container is NOT running, so on the common case
     # — repeated `claude`/`shell` calls without an intervening `down` — cmd_up (and therefore its
     # finish_up, and the apply_guest_profile inside it) never runs. Call it here too, matching macOS
-    # mode's ensure_macos_claude_profile (already called from cmd_claude_macos/cmd_shell_macos
+    # mode's ensure_macos_agent_profile (already called from cmd_claude_macos/cmd_shell_macos
     # unconditionally). Content edits inside an already-symlinked entry are live via the mount with
     # no re-wiring needed; this is for STRUCTURAL changes — an entry added, removed, or replaced in
     # the profile since the guest was last wired — which only apply_guest_profile can pick up.
@@ -3041,7 +3062,7 @@ cmd_setup_token() {
     # does not. Because `down` only STOPS (the tampered filesystem persists), the clean-binary
     # remedy is `augur destroy` (full removal) followed by `augur up`, NOT `down && up`.
     if ! agent_verify_integrity_engine; then
-        error "The claude binary in '${CONTAINER_NAME}' differs from the image — it may have been modified by the guest."
+        error "The $(agent_cli_name) binary in '${CONTAINER_NAME}' differs from the image — it may have been modified by the guest."
         error "Recreate a clean container first: ${BOLD}augur destroy && augur up${RESET}, then re-run setup-token."
         if $started_here; then cmd_down; fi
         return 1
@@ -3072,7 +3093,7 @@ cmd_setup_token() {
     echo ""
     setup_token_security_notice
     local token=""
-    read -rp "$(echo -e "${CYAN}[augur]${RESET} Paste the token (sk-ant-…) here to save it on the host: ")" token < /dev/tty || true
+    read -rp "$(echo -e "${CYAN}[augur]${RESET} Paste the token (sk-ant-…) here to save it on the host: ")" token < /dev/tty || true   # AUGUR_AGENT_SEAM: token shape
     local rc=0
     save_oauth_token "$token" || rc=1
     # Restore the prior state even if the save failed.
@@ -3226,7 +3247,7 @@ cmd_install_cert() {
     success "Custom CA installed into image '${IMAGE_NAME}'."
     # Same rebuild-orphans-the-previous-image effect as `update` — see the comment there.
     eng image prune
-    info "Trusted by OS-store clients: curl, git, wget, gh, and Claude Code. Tools with their OWN"
+    info "Trusted by OS-store clients: curl, git, wget, gh, and $(agent_display_name). Tools with their OWN"
     info "trust store need their own knob: Node/npm → ${BOLD}NODE_EXTRA_CA_CERTS${RESET}, Python → ${BOLD}REQUESTS_CA_BUNDLE${RESET}."
     warn "Single custom root: re-running ${BOLD}install-cert${RESET} REPLACES it (not additive)."
     warn "A later ${BOLD}augur build${RESET}/${BOLD}update${RESET} rebuilds the image clean and DROPS the CA — re-run install-cert after those."
@@ -3634,7 +3655,10 @@ cmd_build_macos() {
 
     # Step 6: Install CLI tools (Homebrew + Claude Code)
     info "Installing Homebrew and CLI tools..."
-    ssh_macos "$MACOS_BUILD_VM" '
+    # The agent installer's URL, channel and PATH directory come from the seam as constants, set as
+    # variables ahead of the single-quoted script, which expands them guest-side.
+    ssh_macos "$MACOS_BUILD_VM" "_agent_url='$(agent_installer_url)'; _agent_args='$(agent_installer_args)'; _agent_bindir='$(macos_agent_bindir_rel)'
+"'
         # Download installers to temp files before executing — separates network fetch from execution
         # so the scripts can be inspected and avoids piping untrusted content directly to a shell.
         _brew_installer=$(mktemp)
@@ -3653,11 +3677,11 @@ cmd_build_macos() {
         # on launch (SIGKILL / "zsh: killed"). The official installer downloads a correctly
         # Developer-ID-signed + notarized binary straight from Anthropic, which passes AMFI.
         # Its signer is verified last, right before the base VM is saved (agent_verify_integrity_macos).
-        _claude_installer=$(mktemp)
-        curl -fsSL https://claude.ai/install.sh -o "$_claude_installer"
-        bash "$_claude_installer" latest
-        rm -f "$_claude_installer"
-        echo '\''export PATH="$HOME/.local/bin:$PATH"'\'' >> ~/.zprofile
+        _agent_installer=$(mktemp)
+        curl -fsSL "$_agent_url" -o "$_agent_installer"
+        bash "$_agent_installer" "$_agent_args"
+        rm -f "$_agent_installer"
+        echo "export PATH=\"\$HOME/$_agent_bindir:\$PATH\"" >> ~/.zprofile
         # Pin the Xcode developer directory via DEVELOPER_DIR so xcodebuild/xcrun use the full
         # Xcode install regardless of what xcode-select points at. ~/.zshenv, not ~/.zprofile:
         # zsh reads it for every invocation, including the non-login `ssh host "cmd"` shells
@@ -3675,8 +3699,8 @@ cmd_build_macos() {
     # otherwise be inherited by every `augur up --macos` clone forever. Neither this build script
     # nor run_base_provisioning invokes `claude` interactively, so this is normally a no-op; it
     # exists to guarantee the invariant even when a human has poked at the VM by hand.
-    info "Scrubbing any accumulated Claude Code account state from the base VM..."
-    ssh_macos "$MACOS_BUILD_VM" "rm -f ~/.claude.json"
+    info "Scrubbing any accumulated $(agent_display_name) account state from the base VM..."
+    macos_scrub_agent_config "$MACOS_BUILD_VM"
 
     # augur's managed Claude Code policy — the one settings layer a repo cannot override. Must land
     # before the sudo revoke below, and before the base VM is frozen, since /Library is root-owned.
@@ -3718,7 +3742,7 @@ cmd_build_macos() {
     success "macOS base VM '${MACOS_BASE_VM}' is ready."
     echo ""
     echo -e "  ${BOLD}augur up --macos${RESET}     → Start VM for current directory"
-    echo -e "  ${BOLD}augur claude --macos${RESET} → Launch Claude Code in VM"
+    echo -e "  ${BOLD}augur claude --macos${RESET} → Launch $(agent_display_name) in VM"
     echo ""
 }
 
@@ -3780,49 +3804,57 @@ ensure_macos_workspace() {
 # AUGUR_AGENT_SEAM | macOS state symlink — in-VM agent projects dir → shared share.
 # CONTRACT (state dir): the share name MUST equal agent_state_host_subdir; the in-VM path is
 # the agent's projects dir. Keep both in lockstep when swapping agents.
-ensure_macos_claude_projects() {
-    local vm="$1"
-    ssh_macos "$vm" '
+ensure_macos_agent_projects() {
+    local vm="$1" dir share
+    dir="$(guest_home_relpath "$(agent_state_guest_projects_dir)")"
+    share="/Volumes/My Shared Files/$(agent_state_host_subdir)"
+    # The remote script is double-quoted so the two seam constants expand host-side (the share into
+    # single quotes); the guest's own $HOME stays escaped. The VM-local projects dir is throwaway
+    # (lost on clone), so a non-symlink is replaced with the share.
+    ssh_macos "$vm" "
         set -e
-        mkdir -p "$HOME/.claude"
-        # The VM-local projects dir is throwaway (lost on clone); replace a non-symlink with the share.
-        [ -L "$HOME/.claude/projects" ] || rm -rf "$HOME/.claude/projects"
-        ln -sfn "/Volumes/My Shared Files/claude-projects" "$HOME/.claude/projects"
-    '
+        mkdir -p \"\$HOME/$(dirname "$dir")\"
+        [ -L \"\$HOME/${dir}\" ] || rm -rf \"\$HOME/${dir}\"
+        ln -sfn '${share}' \"\$HOME/${dir}\"
+    "
 }
 
 # Point the guest's ~/.claude/agents at the per-VM host share so user-level subagent defs created
 # in the VM via `/agents` persist across down/up AND destroy/re-clone (the share is host-side,
-# under $AUGUR_DIR — untouched by `vm delete`). Mirrors ensure_macos_claude_projects; the share
+# under $AUGUR_DIR — untouched by `vm delete`). Mirrors ensure_macos_agent_projects; the share
 # name here ("claude-agents") must match the --dir= share cmd_up_macos adds.
 # AUGUR_AGENT_SEAM | macOS user-level subagent-defs persistence (share name = agent_state_agents_host_subdir)
-ensure_macos_claude_agents() {
-    local vm="$1"
-    ssh_macos "$vm" '
+ensure_macos_agent_agents() {
+    local vm="$1" dir share
+    dir="$(guest_home_relpath "$(agent_state_guest_agents_dir)")"
+    share="/Volumes/My Shared Files/$(agent_state_agents_host_subdir)"
+    # Only wire the symlink once the host share is actually MOUNTED (it appears only after a
+    # `vm run` with the --dir). Guards a VM booted BEFORE this share existed (upgrade-in-place):
+    # without this, the agent/shell paths would rm -rf a real VM-local agents dir and leave
+    # a DANGLING symlink until the next up. Skipping here leaves it untouched; `down --macos &&
+    # up --macos` re-runs `vm run` with the --dir and self-heals. ensure_macos_agent_projects needs
+    # no such guard — its share predates this one, so a running VM always already has it.
+    # Quoted as in ensure_macos_agent_projects. The VM-local agents dir is throwaway (lost on
+    # clone), so a non-symlink is replaced with the share.
+    ssh_macos "$vm" "
         set -e
-        # Only wire the symlink once the host share is actually MOUNTED (it appears only after a
-        # `vm run` with the --dir). Guards a VM booted BEFORE this share existed (upgrade-in-place):
-        # without this, the claude/shell paths would rm -rf a real VM-local ~/.claude/agents and leave
-        # a DANGLING symlink until the next up. Skipping here leaves it untouched; `down --macos &&
-        # up --macos` re-runs `vm run` with the --dir and self-heals. ensure_macos_claude_projects needs
-        # no such guard — its share predates this one, so a running VM always already has it.
-        [ -d "/Volumes/My Shared Files/claude-agents" ] || exit 0
-        mkdir -p "$HOME/.claude"
-        # VM-local agents dir is throwaway (lost on clone); replace a non-symlink with the share.
-        [ -L "$HOME/.claude/agents" ] || rm -rf "$HOME/.claude/agents"
-        ln -sfn "/Volumes/My Shared Files/claude-agents" "$HOME/.claude/agents"
-    '
+        [ -d '${share}' ] || exit 0
+        mkdir -p \"\$HOME/$(dirname "$dir")\"
+        [ -L \"\$HOME/${dir}\" ] || rm -rf \"\$HOME/${dir}\"
+        ln -sfn '${share}' \"\$HOME/${dir}\"
+    "
 }
 
 # AUGUR_AGENT_SEAM | macOS peer of apply_guest_profile — wire the opt-in operator profile from the
-# READ-ONLY host share into the VM's ~/.claude. The share name here must match the --dir=
+# READ-ONLY host share into the VM's agent config dir (agent_profile_guest_dir). The share name here must match the --dir=
 # cmd_up_macos adds (agent_profile_host_subdir). Same split as the container path: symlink what
 # Claude only reads, copy what Claude may rewrite. Unlike the history/agents shares this one is
 # host-GLOBAL (no per-VM subdir) — personal tooling is not project-scoped — which is exactly why the
 # share is mounted read-only. Idempotent; runs on every `up`.
-ensure_macos_claude_profile() {
-    local vm="$1" src
+ensure_macos_agent_profile() {
+    local vm="$1" src pdir
     src="/Volumes/My Shared Files/$(agent_profile_host_subdir)"
+    pdir="$(guest_home_relpath "$(agent_profile_guest_dir)")"
     # The seam lists expand HOST-side into plain word lists (`commands skills`); every remote
     # variable stays escaped so it is the guest's shell that expands it.
     ssh_macos "$vm" "
@@ -3833,29 +3865,29 @@ ensure_macos_claude_profile() {
         # loop below would replace a real ~/.claude/commands with a DANGLING symlink. Skipping
         # leaves the guest untouched; \`down --macos && up --macos\` re-runs \`vm run\` and self-heals.
         [ -d \"\$src\" ] || exit 0
-        mkdir -p \"\$HOME/.claude\"
+        mkdir -p \"\$HOME/${pdir}\"
         for d in $(agent_profile_link_dirs); do
             if [ -d \"\$src/\$d\" ]; then
                 # Same non-destructive rule as the container peer: never rm -rf a real directory the
                 # guest may have created. Empty is free to drop; otherwise move it aside once, and
                 # if that name is taken leave the entry unwired rather than destroy either copy.
-                if [ ! -L \"\$HOME/.claude/\$d\" ] && [ -e \"\$HOME/.claude/\$d\" ]; then
-                    if rmdir \"\$HOME/.claude/\$d\" 2>/dev/null; then
+                if [ ! -L \"\$HOME/${pdir}/\$d\" ] && [ -e \"\$HOME/${pdir}/\$d\" ]; then
+                    if rmdir \"\$HOME/${pdir}/\$d\" 2>/dev/null; then
                         :
-                    elif [ ! -e \"\$HOME/.claude/\$d.pre-profile\" ]; then
-                        mv \"\$HOME/.claude/\$d\" \"\$HOME/.claude/\$d.pre-profile\"
+                    elif [ ! -e \"\$HOME/${pdir}/\$d.pre-profile\" ]; then
+                        mv \"\$HOME/${pdir}/\$d\" \"\$HOME/${pdir}/\$d.pre-profile\"
                     else
                         continue
                     fi
                 fi
-                ln -sfn \"\$src/\$d\" \"\$HOME/.claude/\$d\"
-            elif [ -L \"\$HOME/.claude/\$d\" ]; then
-                rm -f \"\$HOME/.claude/\$d\"
+                ln -sfn \"\$src/\$d\" \"\$HOME/${pdir}/\$d\"
+            elif [ -L \"\$HOME/${pdir}/\$d\" ]; then
+                rm -f \"\$HOME/${pdir}/\$d\"
             fi
         done
         for f in $(agent_profile_copy_files); do
             [ -f \"\$src/\$f\" ] || continue
-            cp \"\$src/\$f\" \"\$HOME/.claude/\$f\"
+            cp \"\$src/\$f\" \"\$HOME/${pdir}/\$f\"
         done
     " || warn "Could not wire the operator profile into the VM; continuing without it."
     return 0
@@ -3919,17 +3951,16 @@ warn_if_macos_egress_pinned() {
 # that password can rewrite it. It still does the job it is here for: stopping a repository's own
 # settings from re-enabling the auto-updater and swapping out the binary the integrity gate
 # verifies. In Container mode the same file IS root-owned against an unprivileged agent.
-macos_managed_settings_path() { echo "/Library/Application Support/ClaudeCode/managed-settings.json"; }
 install_macos_managed_settings() {
     local vm="$1" dst parent staged
-    dst="$(macos_managed_settings_path)"; parent="$(dirname "$dst")"
+    dst="$(agent_macos_managed_settings_path)"; parent="$(dirname "$dst")"
     staged="/Users/${MACOS_SSH_USER}/.augur-managed-settings.json"
-    info "Installing augur's managed Claude Code policy into the base VM..."
+    info "Installing augur's managed $(agent_display_name) policy into the base VM..."
     # Two calls on purpose. The payload travels over STDIN because it contains double quotes that
     # would terminate the host-side quoted string if interpolated — and `sudo -S` reads the PASSWORD
     # from stdin, so the transfer and the privileged move cannot share one invocation.
     agent_managed_settings_json | ssh_macos "$vm" "cat > '${staged}'" || {
-        warn "Could not stage the managed Claude Code policy in the VM; skipping."
+        warn "Could not stage the managed $(agent_display_name) policy in the VM; skipping."
         return 0
     }
     # `sudo -S` works whether or not the build-time NOPASSWD grant is still present, which is what
@@ -3941,7 +3972,7 @@ install_macos_managed_settings() {
         mv \"${staged}\" \"${dst}\" &&
         chown root:wheel \"${dst}\" &&
         chmod 644 \"${dst}\"'" \
-        || warn "Could not install the managed Claude Code policy in the VM; continuing without it."
+        || warn "Could not install the managed $(agent_display_name) policy in the VM; continuing without it."
     return 0
 }
 
@@ -3965,7 +3996,7 @@ select_macos_full_xcode() {
 # nothing the guest does not already hold. The check guards where a binary is attached to the
 # operator's TTY to capture a credential, i.e. setup-token, which runs in a fresh clone.
 # AUGUR_AGENT_SEAM | macOS agent presence (installed by build/update at agent_macos_cli_relpath).
-ensure_macos_claude_bin() {
+ensure_macos_agent_bin() {
     local vm="$1" bin state
     bin="$(macos_agent_bin)"
     state="$(ssh_macos "$vm" "if [ -x '${bin}' ]; then echo present; else echo missing; fi" 2>/dev/null || true)"
@@ -4004,7 +4035,7 @@ ensure_macos_claude_bin() {
 # ~/.gitconfig read-only and injects the identical helper per session via GIT_CONFIG_KEY_0/VALUE_0
 # (_add_session_exec_env).
 #
-# Best-effort like ensure_macos_claude_profile, for the residue --replace-all cannot fix: the copied
+# Best-effort like ensure_macos_agent_profile, for the residue --replace-all cannot fix: the copied
 # file is arbitrary operator-authored input, and a shape git cannot parse at all still fails (exit
 # 128 on a malformed section header). A guest with no push credential plus a warning beats an `up`
 # that dies with the VM already running.
@@ -4180,16 +4211,22 @@ sync_macos_guest_timezone() {
 }
 
 
-# Write a minimal ~/.claude.json into VM $1 that carries onboarding state only: NOT auth (on macOS
+# Delete the agent's per-user config file (agent_config_file_relpath) from VM $1, so no account state
+# it accumulated is frozen into the base VM.
+macos_scrub_agent_config() {
+    ssh_macos "$1" "rm -f ~/$(agent_config_file_relpath)"
+}
+
+# Write a minimal agent config file into VM $1 that carries onboarding state only: NOT auth (on macOS
 # the OAuth token lives in the Keychain, not in this file) and NOT folder-trust (augur deliberately
 # does not pre-trust the workspace). The host's ~/.claude.json is deliberately never copied, not even
 # stripped: it enumerates every repo on the host (`projects`) and can hold third-party MCP API keys
 # (`mcpServers`), and the guest needs none of it. This is the exact static stub the container image
 # bakes (Dockerfile), independent of the host config and of whether jq is installed. Overwrites.
-macos_seed_claude_json() {
+macos_seed_agent_config() {
     local cj; cj="$(mktemp)"
-    printf '{"hasCompletedOnboarding":true,"installMethod":"native"}\n' > "$cj"
-    scp_to_macos "$1" "$cj" "/Users/${MACOS_SSH_USER}/.claude.json" || { rm -f "$cj"; return 1; }
+    agent_config_seed_json > "$cj"
+    scp_to_macos "$1" "$cj" "/Users/${MACOS_SSH_USER}/$(agent_config_file_relpath)" || { rm -f "$cj"; return 1; }
     rm -f "$cj"
 }
 
@@ -4403,14 +4440,14 @@ cmd_up_macos() {
     sync_macos_guest_timezone "$project_vm"
 
     ensure_macos_workspace "$project_vm"
-    ensure_macos_claude_projects "$project_vm"
-    ensure_macos_claude_agents "$project_vm"
-    ensure_macos_claude_profile "$project_vm"
+    ensure_macos_agent_projects "$project_vm"
+    ensure_macos_agent_agents "$project_vm"
+    ensure_macos_agent_profile "$project_vm"
     # Not fatal here: the VM is still usable through `augur shell --macos`; `claude --macos` refuses.
-    ensure_macos_claude_bin "$project_vm" \
+    ensure_macos_agent_bin "$project_vm" \
         || warn "Continuing: 'augur shell --macos' works, but 'augur claude --macos' will refuse until this is fixed."
 
-    # Copy git config, and seed the onboarding-only .claude.json (macos_seed_claude_json).
+    # Copy git config, and seed the onboarding-only .claude.json (macos_seed_agent_config).
     #
     # WRITE-ONCE, gated on `_fresh_clone` (this `up` just created the VM above) — NOT on the
     # file's absence. `down --macos` keeps the clone, so unlike a throwaway VM
@@ -4423,7 +4460,7 @@ cmd_up_macos() {
     # `.claude.json` between builds (see cmd_build_macos/cmd_update_macos's scrub) —
     # an existence check alone would silently inherit that into every new project clone again.
     if $_fresh_clone; then
-        macos_seed_claude_json "$project_vm"
+        macos_seed_agent_config "$project_vm"
     fi
     [[ -f "$HOME/.gitconfig" ]] && \
         scp_to_macos "$project_vm" "$HOME/.gitconfig" "/Users/${MACOS_SSH_USER}/.gitconfig"
@@ -4449,10 +4486,13 @@ cmd_up_macos() {
     # validate_secret_value failure in there would exit only that subshell, whereas `exit 1` here
     # aborts the whole `up` (fail-closed).
     validate_resolved_credentials || exit 1
+    # Built before the pipe so the writer forks nothing for it.
+    local _path_line
+    _path_line="export PATH=\"\$HOME/$(macos_agent_bindir_rel):\$PATH\"   # $(agent_cli_name) (official installer)"
     {
         echo '# augur (regenerated at VM startup)'
         echo 'eval "$(/opt/homebrew/bin/brew shellenv)" 2>/dev/null || true'
-        echo 'export PATH="$HOME/.local/bin:$PATH"   # claude (official installer)'
+        echo "$_path_line"
         # Also written into the base VM's ~/.zshenv at build time; repeated here because a base VM
         # built by an older augur has it only in ~/.zprofile, which non-login SSH shells never read.
         echo 'export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer'
@@ -4476,7 +4516,7 @@ cmd_up_macos() {
 
     success "VM '${project_vm}' is up."
     echo ""
-    echo -e "  ${BOLD}augur claude --macos${RESET} → Launch Claude Code"
+    echo -e "  ${BOLD}augur claude --macos${RESET} → Launch $(agent_display_name)"
     echo -e "  ${BOLD}augur shell --macos${RESET}  → Open bash shell"
     echo -e "  ${BOLD}augur down --macos${RESET}   → Stop and remove"
 }
@@ -4499,11 +4539,11 @@ cmd_claude_macos() {
     sync_macos_guest_clock "$project_vm"
     sync_macos_guest_timezone "$project_vm"
     ensure_macos_workspace "$project_vm"
-    ensure_macos_claude_projects "$project_vm"
-    ensure_macos_claude_agents "$project_vm"
-    ensure_macos_claude_profile "$project_vm"
+    ensure_macos_agent_projects "$project_vm"
+    ensure_macos_agent_agents "$project_vm"
+    ensure_macos_agent_profile "$project_vm"
     warn_if_macos_egress_pinned "$project_vm"
-    ensure_macos_claude_bin "$project_vm" || exit 1
+    ensure_macos_agent_bin "$project_vm" || exit 1
     info "Launching $(agent_display_name) in '${project_vm}'..."
     # AUGUR_AGENT_SEAM | interactive launch (macOS: interpolated into SSH string — see agent_launch_argv)
     local _renv _rargv
@@ -4524,9 +4564,9 @@ cmd_shell_macos() {
     sync_macos_guest_clock "$project_vm"
     sync_macos_guest_timezone "$project_vm"
     ensure_macos_workspace "$project_vm"
-    ensure_macos_claude_projects "$project_vm"
-    ensure_macos_claude_agents "$project_vm"
-    ensure_macos_claude_profile "$project_vm"
+    ensure_macos_agent_projects "$project_vm"
+    ensure_macos_agent_agents "$project_vm"
+    ensure_macos_agent_profile "$project_vm"
     warn_if_macos_egress_pinned "$project_vm"
     info "Opening shell in '${project_vm}'..."
     ssh_macos "$project_vm" -t "cd ~/${MACOS_SHARE} && exec zsh -l"
@@ -4742,7 +4782,7 @@ cmd_setup_token_macos() {
         error "Refusing to run setup-token. Reinstall it in the base VM: ${BOLD}augur update --macos${RESET} (or rebuild: ${BOLD}augur build --macos${RESET})."
         exit 1
     fi
-    macos_seed_claude_json "$vm"
+    macos_seed_agent_config "$vm"
 
     info "Running '$(agent_login_argv)' in '${vm}'..."
     info "Complete the browser sign-in; when it prints the token, copy it."
@@ -4764,7 +4804,7 @@ cmd_setup_token_macos() {
     echo ""
     setup_token_security_notice
     local token=""
-    read -rp "$(echo -e "${CYAN}[augur]${RESET} Paste the token (sk-ant-…) here to save it on the host: ")" token < /dev/tty || true
+    read -rp "$(echo -e "${CYAN}[augur]${RESET} Paste the token (sk-ant-…) here to save it on the host: ")" token < /dev/tty || true   # AUGUR_AGENT_SEAM: token shape
     local rc=0
     save_oauth_token "$token" || rc=1
     info "Removing the throwaway VM '${vm}'..."
@@ -4989,11 +5029,14 @@ cmd_status_macos() {
     if macos_vm_running "$project_vm" && [[ -n "$(macos_ssh_host "$project_vm")" && -n "$(macos_ssh_port "$project_vm")" ]]; then
         # DEVELOPER_DIR (full Xcode, not the CLT) comes from ~/.augur-env; see cmd_up_macos.
         # AUGUR_AGENT_SEAM | agent version (macOS, in-VM; runs `claude --version`)
-        ssh_macos "$project_vm" '
+        # The agent's name, version command and bin dir are seam constants set as variables ahead of
+        # the single-quoted script; eval re-splits the command, which the guest's zsh does not do itself.
+        ssh_macos "$project_vm" "_agent_name='$(agent_cli_name)'; _agent_ver='$(agent_version_cmd)'; _agent_bindir='$(macos_agent_bindir_rel)'
+"'
             eval "$(/opt/homebrew/bin/brew shellenv)" 2>/dev/null
-            export PATH="$HOME/.local/bin:$PATH"
+            export PATH="$HOME/$_agent_bindir:$PATH"
             echo "    xcode:  $(xcodebuild -version 2>/dev/null | head -1 || echo "(unable to fetch)")"
-            echo "    claude: $(claude --version 2>/dev/null || echo "(unable to fetch)")"
+            echo "    $_agent_name: $(eval "$_agent_ver" 2>/dev/null || echo "(unable to fetch)")"
         ' | sanitize_guest_lines || true
     elif macos_vm_running "$project_vm"; then
         echo -e "    ${YELLOW}(VM is running, but its SSH forward port could not be read from gvproxy — run: augur down --macos && augur up --macos)${RESET}"
@@ -5322,8 +5365,10 @@ cmd_update_macos() {
         error "The base VM was left as-is; it may just be slow to boot — re-run ${BOLD}augur update --macos${RESET}."
         exit 1
     fi
-    if ! ssh_macos "$MACOS_UPDATE_VM" '
-        # Claude Code via the official installer (see cmd_build_macos for why npm is avoided).
+    # Seam constants set as variables ahead of the single-quoted script, as in cmd_build_macos.
+    if ! ssh_macos "$MACOS_UPDATE_VM" "_agent_url='$(agent_installer_url)'; _agent_args='$(agent_installer_args)'; _agent_bindir='$(macos_agent_bindir_rel)'; _agent_name='$(agent_display_name)'
+"'
+        # The agent via its official installer (see cmd_build_macos for why npm is avoided).
         # The VM has no virtiofs mounts here, so ~/.claude is local and writable.
         # Download to a temp file before executing — avoids piping untrusted content to a shell.
         # No "timeout" binary on stock macOS: background the command, race it against a
@@ -5339,12 +5384,12 @@ cmd_update_macos() {
             return $_rc
         }
         _installer=$(mktemp)
-        curl -fsSL --connect-timeout 10 --max-time 120 https://claude.ai/install.sh -o "$_installer" \
-            || { echo "augur: ERROR failed to download the Claude Code installer (timed out or unreachable)" >&2; rm -f "$_installer"; exit 1; }
-        _with_timeout 180 bash "$_installer" latest \
-            || { echo "augur: ERROR Claude Code installer failed or timed out" >&2; rm -f "$_installer"; exit 1; }
+        curl -fsSL --connect-timeout 10 --max-time 120 "$_agent_url" -o "$_installer" \
+            || { echo "augur: ERROR failed to download the $_agent_name installer (timed out or unreachable)" >&2; rm -f "$_installer"; exit 1; }
+        _with_timeout 180 bash "$_installer" "$_agent_args" \
+            || { echo "augur: ERROR $_agent_name installer failed or timed out" >&2; rm -f "$_installer"; exit 1; }
         rm -f "$_installer"
-        grep -q ".local/bin" ~/.zprofile 2>/dev/null || echo '\''export PATH="$HOME/.local/bin:$PATH"'\'' >> ~/.zprofile
+        grep -q "$_agent_bindir" ~/.zprofile 2>/dev/null || echo "export PATH=\"\$HOME/$_agent_bindir:\$PATH\"" >> ~/.zprofile
     '; then
         error "Failed to update CLI tools (see the error above — often a transient network issue)."
         error "The base VM was left as-is. Try running 'augur update --macos' again."
@@ -5361,7 +5406,7 @@ cmd_update_macos() {
     # into `claude` by hand between updates (the actual leak vector — neither build's provisioning
     # nor this update step ever runs `claude` interactively); running this on every update makes
     # that self-healing instead of requiring a full rebuild to notice and fix.
-    ssh_macos "$MACOS_UPDATE_VM" "rm -f ~/.claude.json"
+    macos_scrub_agent_config "$MACOS_UPDATE_VM"
 
     # Same reasoning as the scrub above: re-assert augur's managed policy on every update, so a base
     # VM built before this existed self-heals on routine maintenance instead of needing a full

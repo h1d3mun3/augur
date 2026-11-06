@@ -20,7 +20,7 @@
   models — at this point still only analyzed, not built (§9 as first written) — and an
   incidentally-found, out-of-scope `macos_project_vm` naming-collision gap (appended to
   §6). Additional method: reading `cmd_shell`/`cmd_shell_macos`, `agent_fixed_env`,
-  `cmd_up_macos`/`cmd_down_macos`/`cmd_destroy_macos`, `ensure_macos_claude_projects`,
+  `cmd_up_macos`/`cmd_down_macos`/`cmd_destroy_macos`, `ensure_macos_agent_projects`,
   `macos_project_vm`, `workspace_slug`/`workspace_path_hash`; an empirical
   `git clone --local` inode check confirming object hardlinking is a generic
   same-filesystem git behavior, not APFS-specific.
@@ -330,7 +330,7 @@ this way, for two independent reasons — either alone would already close gap 2
    `--worktree`/history question this section is about — is recorded separately in
    [`0006-macos-vm-clone-persistence.md`](./0006-macos-vm-clone-persistence.md).)
 2. **`~/.claude/projects` is shared as a whole directory, not one pinned leaf.**
-   `ensure_macos_claude_projects` symlinks the VM's entire `~/.claude/projects` to
+   `ensure_macos_agent_projects` symlinks the VM's entire `~/.claude/projects` to
    `/Volumes/My Shared Files/claude-projects`, a virtiofs share backed by a host-side
    per-project directory (`~/.augur/claude-projects/<vm-name>`, keyed by
    `macos_project_vm`). This is exactly the "Option A" pattern §3's first option proposes
@@ -344,13 +344,13 @@ this way, for two independent reasons — either alone would already close gap 2
 > `~/.augur/claude-projects/<vm-name>` directory item 2 backs `~/.claude/projects` with.
 > Since `macos_project_vm()` is a deterministic function of the project directory's path
 > (not a random ID), a fresh `up --macos` after `destroy` resolves to the *same* VM name
-> and therefore the *same* host-side directory, and `ensure_macos_claude_projects`
+> and therefore the *same* host-side directory, and `ensure_macos_agent_projects`
 > (called again by the very next `claude --macos`/`shell --macos`, not just by `up`)
 > re-establishes the same symlink. Confirmed live: `destroy --macos` → fresh
 > `up --macos` → `shell --macos` → both the main and `--worktree` leaves were still
 > there. Item 1 (the VM disk surviving `down`) is real but doesn't actually decide this
 > either way for `~/.claude/projects` — that path is redirected to the host from the
-> moment `ensure_macos_claude_projects` first runs, never mind what happens to the VM
+> moment `ensure_macos_agent_projects` first runs, never mind what happens to the VM
 > disk afterward. The only ways to actually lose this project's `--macos`-mode Claude
 > history: manually delete `~/.augur/claude-projects/<vm-name>` on the host, or move/
 > rename the project directory (changes `workspace_path_hash`, hence the VM name — the

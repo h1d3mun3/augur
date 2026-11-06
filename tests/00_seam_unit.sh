@@ -90,4 +90,37 @@ if grep -qF -- "printf '{\"env\":{\"DISABLE_AUTOUPDATER\":\"1\"}}\\n' > /etc/cla
 then ok "Dockerfile bakes the same managed payload at /etc/claude-code/managed-settings.json"
 else fail "Dockerfile managed payload drifted from the seam" "grep found no matching RUN line"; fi
 
+# ── macOS-guest data: installer, managed-policy path, config file ────────────
+eq "https://claude.ai/install.sh" "$(agent_installer_url)"  "agent_installer_url"
+eq "latest"                       "$(agent_installer_args)" "agent_installer_args"
+eq "/Library/Application Support/ClaudeCode/managed-settings.json" "$(agent_macos_managed_settings_path)" "agent_macos_managed_settings_path"
+eq ".claude.json"                 "$(agent_config_file_relpath)" "agent_config_file_relpath"
+eq '{"hasCompletedOnboarding":true,"installMethod":"native"}' "$(agent_config_seed_json)" "agent_config_seed_json"
+# These values are interpolated into remote scripts, so each must be a plain constant: no quote,
+# backslash, `$`, backtick, `;`, `&`, `|` or control byte that could change the script's shape.
+# (The seed JSON is not interpolated: it is written to a file. A space is fine in all of them.)
+for _f in agent_cli_name agent_version_cmd agent_installer_url agent_installer_args agent_display_name \
+          agent_macos_cli_relpath agent_macos_signing_team agent_config_file_relpath \
+          agent_macos_managed_settings_path; do
+  case "$($_f)" in
+    *[!A-Za-z0-9._/:\ -]*) fail "$_f is a plain constant (safe to interpolate into a remote script)" "$($_f)";;
+    *)                     ok   "$_f is a plain constant (safe to interpolate into a remote script)";;
+  esac
+done
+# Home-relative helpers: derived from the container-side seam values.
+# shellcheck disable=SC2034  # the helpers live in augur's core, not the seam block: extract them.
+eval "$(grep -E '^(guest_home_relpath|macos_agent_bindir_rel)\(\)' "$REPO/augur")"
+eq ".claude/projects" "$(guest_home_relpath "$(agent_state_guest_projects_dir)")" "guest_home_relpath (projects dir)"
+eq ".claude/agents"   "$(guest_home_relpath "$(agent_state_guest_agents_dir)")"   "guest_home_relpath (agents dir)"
+eq ".claude"          "$(guest_home_relpath "$(agent_profile_guest_dir)")"        "guest_home_relpath (profile dir)"
+eq ".local/bin"       "$(macos_agent_bindir_rel)"                                  "macos_agent_bindir_rel"
+
+# The Dockerfile cannot call these functions, so its copies must mirror them.
+if grep -qF -- "curl -fsSL $(agent_installer_url) -o" "$REPO/Dockerfile"
+then ok "Dockerfile installs from the seam's installer URL"
+else fail "Dockerfile installer URL drifted from the seam" "grep found no matching curl line"; fi
+if grep -qF -- "printf '$(agent_config_seed_json | tr -d '\n')\\n' > /home/dev/$(agent_config_file_relpath)" "$REPO/Dockerfile"
+then ok "Dockerfile bakes the same agent config stub at the seam's config path"
+else fail "Dockerfile config stub drifted from the seam" "grep found no matching RUN line"; fi
+
 finish
