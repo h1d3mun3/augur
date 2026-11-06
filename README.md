@@ -297,7 +297,12 @@ are destroyed and brought up again; it removes the current project's container s
 keychain, and a CA trusted earlier stays trusted. augur does not remove CAs, because it cannot tell
 which ones in that keychain you put there; delete one by hand in the base VM if you need to. Container
 mode's `install-cert` replaces its single custom CA instead. A full `augur build --macos` drops
-every CA installed this way.
+every CA installed this way. Re-running it for a certificate that is already in the keychain is a
+no-op: augur boots the base VM headless, finds the certificate by its SHA-256 fingerprint, prints its
+subject and expiry, and stops without opening a window. It does not check the certificate's trust
+setting, only that it is present, and nothing forces the window flow again; the notice it prints gives
+the manual commands (`sudo security add-trusted-cert …` in the VM's Terminal, or delete the certificate
+and re-run).
 
 A VM keeps the egress mode it was started with. If it is running and you ask for the other one
 (e.g. `augur up --macos --no-egress`, then a plain `augur claude --macos`), augur refuses rather than

@@ -778,4 +778,47 @@ cert_fn="$(declare -f cmd_install_cert_macos)"
 has "$cert_fn" 'host_lock_acquire "$MACOS_BASE_WRITER_LOCK" install-cert' "install-cert --macos (which writes into the base VM) takes the base-writer lock"
 has "$cert_fn" 'host_lock_release "$MACOS_BASE_WRITER_LOCK" install-cert' "…and releases it"
 
+section "Tier 1 — install-cert --macos skips a certificate that is already in the keychain"
+if command -v openssl >/dev/null; then
+  CRT="$TMPD/ca.crt"
+  openssl req -x509 -newkey rsa:2048 -nodes -keyout /dev/null -out "$CRT" -days 30 -subj "/CN=augur-skip-test" 2>/dev/null
+  eval "$(declare -f vm_cli_rec | sed '1s/vm_cli_rec/vm_cli_cert/')"
+  VM_CLI=vm_cli_cert
+  require_macos_admin_password() { :; }
+  confirm_cert_install() { return 0; }
+  wait_for_macos_ssh() { echo "$MACOS_BASE_VM" >> "$RUNF"; echo "ssh-up" >> "$LOG"; return 0; }
+  scp_to_macos() { echo "scp" >> "$LOG"; return 0; }
+  ssh_macos() { cat >/dev/null 2>&1 </dev/null; echo "ssh" >> "$LOG"; return 0; }
+  CERT_PRESENT=1
+  _cert_present_in_base_vm() { [[ "$CERT_PRESENT" == 1 ]]; }
+  run_cert() { out="$( exec 2>&1 </dev/null; set -e; cmd_install_cert_macos "$CRT"; echo "done" )"; rc=$?; }
+
+  reset_vms; : > "$RUNF"; CERT_PRESENT=1
+  run_cert
+  eq 0 "$rc" "already present: exits 0"
+  has "$out" "already in the System keychain" "already present: says so"
+  has "$out" "augur-skip-test" "already present: shows the subject"
+  has "$out" "Expires:" "already present: shows the expiry"
+  has "$out" "TRUST SETTING was NOT verified" "already present: says the trust setting was not verified"
+  has "$out" "sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain" "already present: gives the manual trust command"
+  hasnt "$out" "Existing project VMs are NOT updated" "already present: no project-VM reminder"
+  logged "vm run --no-graphics --net-nat $MACOS_BASE_VM" && ok "already present: the base VM boots headless" || fail "already present: no headless boot" "$(cat "$LOG")"
+  logged "vm run --net-nat $MACOS_BASE_VM" && fail "already present: a GUI window was opened" || ok "already present: no GUI window"
+  logged scp && fail "already present: the certificate was copied into the VM" || ok "already present: nothing is copied into the VM"
+  logged "vm stop $MACOS_BASE_VM" && ok "already present: the base VM is stopped" || fail "already present: the base VM is left running"
+  grep -qx "$MACOS_BASE_VM" "$RUNF" && fail "already present: the base VM is still marked running" || ok "already present: the base VM is not running afterwards"
+  [[ -L "$WLOCK" ]] && fail "already present: the base-writer lock is left behind" || ok "already present: the base-writer lock is released"
+
+  reset_vms; : > "$RUNF"; CERT_PRESENT=0
+  run_cert
+  [[ "$rc" -ne 0 ]] && ok "absent: proceeds to the interactive step (refused without a terminal)" || fail "absent: did not reach the interactive step"
+  hasnt "$out" "already in the System keychain" "absent: no skip notice"
+  logged "vm run --no-graphics --net-nat $MACOS_BASE_VM" && logged "vm run --net-nat $MACOS_BASE_VM" && ok "absent: headless check, then a GUI boot" || fail "absent: boots are wrong" "$(cat "$LOG")"
+  b1="$(grep -n '^vm run --no-graphics' "$LOG" | head -n1 | cut -d: -f1)"; s1="$(grep -n "^vm stop $MACOS_BASE_VM" "$LOG" | cut -d: -f1 | awk -v b="$b1" '$1>b{print;exit}')"; g1="$(grep -n '^vm run --net-nat' "$LOG" | head -n1 | cut -d: -f1)"
+  [[ -n "$b1" && -n "$s1" && -n "$g1" && "$b1" -lt "$s1" && "$s1" -lt "$g1" ]] && ok "absent: the headless VM is stopped before the GUI boot" || fail "absent: boot order" "headless@$b1 stop@$s1 gui@$g1"
+  logged scp && ok "absent: the certificate is staged in the VM" || fail "absent: certificate never staged"
+  grep -qx "$MACOS_BASE_VM" "$RUNF" && fail "absent: the base VM is left running after the abort" || ok "absent: the base VM is stopped on the abort path"
+  [[ -L "$WLOCK" ]] && fail "absent: the base-writer lock is left behind" || ok "absent: the base-writer lock is released"
+else skip "install-cert skip branch" "openssl not available"; fi
+
 finish

@@ -5150,12 +5150,33 @@ _cert_present_in_base_vm() {
         | tr -d ':' | tr 'a-f' 'A-F' | grep -q "$want"
 }
 
+# Notice for install-cert --macos when certificate $1 is already in the base VM's System keychain.
+# Presence is checked by fingerprint only; the trust setting is not read, so say so plainly and
+# give the manual way to (re)apply it.
+report_cert_already_installed() {
+    local cert="$1" subject enddate sha1
+    subject="$(openssl x509 -in "$cert" -noout -subject 2>/dev/null | sed 's/^subject=[[:space:]]*//')"
+    enddate="$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null | sed 's/^notAfter=//')"
+    sha1="$(openssl x509 -in "$cert" -noout -fingerprint -sha1 2>/dev/null | sed 's/^.*=//; s/://g')"
+    success "This certificate is already in the System keychain of base VM '${MACOS_BASE_VM}'; nothing was changed."
+    echo -e "    Subject:  ${subject:-<unknown>}"
+    echo -e "    Expires:  ${enddate:-<unknown>}"
+    warn "Its TRUST SETTING was NOT verified (augur checks only that the certificate is present). It is"
+    warn "assumed trusted, because trusting it is part of the normal install."
+    warn "No option forces the GUI flow again. To re-apply the trust by hand: boot the base VM with a"
+    warn "window (${BOLD}augur-vm run --net-nat ${MACOS_BASE_VM}${RESET}), put the certificate file in the VM, and run in the"
+    warn "VM's own Terminal:"
+    echo -e "    ${BOLD}sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain <cert>${RESET}"
+    warn "Or remove the certificate there (${BOLD}sudo security delete-certificate -Z ${sha1:-<sha1>} /Library/Keychains/System.keychain${RESET})"
+    warn "and re-run ${BOLD}augur install-cert --macos${RESET}. Shut the VM down afterwards, before any ${BOLD}augur up --macos${RESET}."
+}
+
 # macOS mode: install the CA into the base VM's System keychain, so every cloned project VM
 # inherits it (keychain-consulting clients — curl, git, gh (Go uses Security.framework on
 # darwin), and native Claude Code — then trust it). Modifying System-keychain trust settings
 # needs an interactive GUI authorization that a non-console SSH session cannot obtain (an
 # SSH-invoked `security add-trusted-cert` fails "authorization denied, no user interaction
-# possible" — confirmed on macOS 26). So we boot the base VM WITH a GUI window, copy the cert in,
+# possible" — confirmed on macOS 26). So we first boot the base VM headless and stop if the cert is already in the keychain; otherwise we boot it WITH a GUI window, copy the cert in,
 # and have the OPERATOR run `security add-trusted-cert` in the VM's own Terminal; augur then
 # verifies it landed. Mirrors cmd_update_macos's boot-base-VM/stop-and-reap shape.
 cmd_install_cert_macos() {
@@ -5181,9 +5202,10 @@ cmd_install_cert_macos() {
     trap 'host_lock_release "$MACOS_BASE_WRITER_LOCK" install-cert' EXIT
     # Stop a stale base VM from a previous interrupted run before booting a fresh one.
     macos_vm_running "$MACOS_BASE_VM" && "$VM_CLI" stop "$MACOS_BASE_VM" 2>/dev/null || true
-    info "Booting base VM '${MACOS_BASE_VM}' with a GUI window (for the trust prompt)..."
-    # GUI (no --no-graphics) + NAT, backgrounded so we can drive it over SSH.
-    "$VM_CLI" run --net-nat "$MACOS_BASE_VM" &>"$(macos_base_vm_log)" &
+    info "Booting base VM '${MACOS_BASE_VM}' headless to check whether the certificate is already installed..."
+    # Headless + NAT, backgrounded so we can drive it over SSH. A window is opened (second boot
+    # below) only when the certificate is missing and the operator has to approve the trust.
+    "$VM_CLI" run --no-graphics --net-nat "$MACOS_BASE_VM" &>"$(macos_base_vm_log)" &
     local vm_pid=$!
     # CRITICAL: the base VM is now running. Guarantee it is stopped on EVERY exit — including
     # Ctrl-C at the interactive prompts below. A base VM left running would be cloned in a live,
@@ -5198,6 +5220,23 @@ cmd_install_cert_macos() {
     # set -u crash, per this codebase's "traps referencing locals are fragile" rule.
     trap 'stop_and_reap_macos_vm "$MACOS_BASE_VM" "${vm_pid:-}"; host_lock_release "$MACOS_BASE_WRITER_LOCK" install-cert' EXIT
     trap 'exit 130' INT TERM
+    if ! wait_for_macos_ssh "$MACOS_BASE_VM" 300 &>/dev/null; then
+        error "Base VM '${MACOS_BASE_VM}' did not become reachable over SSH in time."
+        error "  VM log: $(macos_base_vm_log)"
+        exit 1
+    fi
+    if _cert_present_in_base_vm "$cert"; then
+        report_cert_already_installed "$cert"
+        stop_and_reap_macos_vm "$MACOS_BASE_VM" "$vm_pid"
+        trap - EXIT INT TERM
+        host_lock_release "$MACOS_BASE_WRITER_LOCK" install-cert
+        return 0
+    fi
+    info "Not installed yet. Restarting base VM '${MACOS_BASE_VM}' with a GUI window (for the trust prompt)..."
+    stop_and_reap_macos_vm "$MACOS_BASE_VM" "$vm_pid"
+    # GUI (no --no-graphics) + NAT.
+    "$VM_CLI" run --net-nat "$MACOS_BASE_VM" &>"$(macos_base_vm_log)" &
+    vm_pid=$!
     if ! wait_for_macos_ssh "$MACOS_BASE_VM" 300 &>/dev/null; then
         error "Base VM '${MACOS_BASE_VM}' did not become reachable over SSH in time."
         error "  VM log: $(macos_base_vm_log)"
@@ -6317,7 +6356,7 @@ cmd_help() {
     echo -e "    • ${BOLD}install-cert${RESET}: trust a private/self-signed CA in the guest (edge case). Pass ONE PEM"
     echo -e "      X.509 cert (${CYAN}.crt${RESET}). Container bakes it into the image (dropped by ${BOLD}build${RESET}/${BOLD}update${RESET} — re-run);"
     echo -e "      macOS adds it to the base VM's System keychain (approve the prompt in the VM window; new"
-    echo -e "      clones inherit it; earlier CAs stay trusted, only a full build --macos drops them). A trusted CA can MITM the guest's TLS — install only CAs you trust."
+    echo -e "      clones inherit it; earlier CAs stay trusted, only a full build --macos drops them; a cert already in the keychain is skipped, its trust setting not re-checked). A trusted CA can MITM the guest's TLS — install only CAs you trust."
     echo ""
 }
 
