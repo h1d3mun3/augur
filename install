@@ -209,13 +209,19 @@ if [[ "$(uname)" == "Darwin" ]]; then
     fi
 fi
 
-# Add to PATH
+# Add to PATH. The rc file follows the login shell, not whichever rc file happens to exist: a zsh
+# user with only a leftover ~/.bashrc must get ~/.zshrc, the file zsh actually reads. A missing file
+# (a fresh macOS account has no ~/.zshrc) is created by the append. Other shells (fish, ...) only get
+# a warning and set PATH themselves.
+login_shell="${SHELL##*/}"
 SHELL_CONFIG=""
-[[ -f "$HOME/.zshrc" ]]  && SHELL_CONFIG="$HOME/.zshrc"
-[[ -z "$SHELL_CONFIG" ]] && [[ -f "$HOME/.bashrc" ]] && SHELL_CONFIG="$HOME/.bashrc"
+case "$login_shell" in
+    zsh)  SHELL_CONFIG="$HOME/.zshrc" ;;
+    bash) SHELL_CONFIG="$HOME/.bashrc" ;;
+esac
 
 if [[ -z "$SHELL_CONFIG" ]]; then
-    warn "Neither ~/.zshrc nor ~/.bashrc found. Add $INSTALL_DIR to PATH manually."
+    warn "Login shell '${login_shell:-unknown}' is not supported for automatic setup. Add $INSTALL_DIR to PATH manually."
 elif grep -q 'export PATH=.*\.augur' "$SHELL_CONFIG" 2>/dev/null; then
     warn "PATH already configured in $SHELL_CONFIG"
 else
@@ -224,10 +230,10 @@ else
 fi
 
 # Tab completion (subcommands, options, and the container/VM names `augur destroy` takes). The
-# script matches the rc file's shell; the hook is skipped if it is already there, so re-running
+# script matches the login shell; the hook is skipped if it is already there, so re-running
 # install never duplicates it.
 if [[ -n "$SHELL_CONFIG" && -d "$INSTALL_DIR/completions" ]]; then
-    comp_ext="bash"; [[ "$SHELL_CONFIG" == *zshrc ]] && comp_ext="zsh"
+    comp_ext="$login_shell"
     if grep -q '\.augur/completions/' "$SHELL_CONFIG" 2>/dev/null; then
         warn "Completion already configured in $SHELL_CONFIG"
     else
@@ -242,7 +248,11 @@ echo ""
 success "Installation complete!"
 echo ""
 echo -e "  ${BOLD}Next steps:${RESET}"
-echo -e "    1. ${CYAN}source ${SHELL_CONFIG:-~/.zshrc}${RESET}"
+if [[ -n "$SHELL_CONFIG" ]]; then
+    echo -e "    1. ${CYAN}source $SHELL_CONFIG${RESET}"
+else
+    echo -e "    1. Add ${CYAN}$INSTALL_DIR${RESET} to PATH manually"
+fi
 echo -e "    2. ${CYAN}augur build${RESET}"
 echo -e "    3. ${CYAN}augur up${RESET} (in any project directory)"
 echo ""
