@@ -159,8 +159,10 @@ in time," this **prescribes** "what must never break." It changes rarely.
 
 ### I10. Do not expose credentials on argv  🟡 partial
 - **Rule:** No injected agent or gh credential (`agent_auth_specs` values, `GH_TOKEN`) is ever
-  placed on a command line. On macOS the token is written to
-  `~/.augur-env` (chmod 600) via SSH stdin. In Container mode credentials are never passed to
+  placed on a command line. On macOS the credentials are written to
+  `~/.augur-env` via SSH stdin (`push_macos_guest_env`: a temp file created under `umask 077`, then
+  renamed over it), on every boot and at the start of every `augur claude --macos` /
+  `augur shell --macos` session on a running VM. In Container mode credentials are never passed to
   `container run` at all; they reach only the `container exec` that starts `augur claude` /
   `augur shell`, through `--env-file <(…)` written by the bash builtin `printf`
   (`session_credential_env`). `augur setup-token` and augur's own execs get none. In macOS VM mode
@@ -175,9 +177,13 @@ in time," this **prescribes** "what must never break." It changes rarely.
   `claude` / `shell` exec carries `--env-file` whose captured content holds the credentials while
   no engine argv holds a value; `setup-token` and the profile/history execs carry no `--env-file`.
   `tests/21_container_live.sh` (live, `AUGUR_TEST_LIVE=1`) additionally checks `container inspect`
-  shows no credential. macOS mode ⚠ review-only, except `setup-token --macos`:
-  `tests/52_macos_setup_token_unit.sh` asserts that no credential value (API key, OAuth token file,
-  gh token) and no `~/.augur-env` / `~/.gitconfig` reaches its throwaway VM.
+  shows no credential. macOS mode: `tests/56_macos_session_credentials.sh` asserts, through a
+  recording `ssh_macos`, that the `~/.augur-env` push (`push_macos_guest_env`, both on a running
+  VM's `claude --macos` / `shell --macos` and inside the boot of `cmd_up_macos`) carries the
+  credential values only on stdin and none on any ssh argv; the guest-side process list on a real
+  VM stays ⚠ review-only. `tests/52_macos_setup_token_unit.sh` asserts that no credential value (API
+  key, OAuth token file, gh token) and no `~/.augur-env` / `~/.gitconfig` reaches the throwaway VM
+  of `setup-token --macos`.
 - **Note:** The rule does not cover the macOS guest's admin password (`macos_admin_password`),
   but it is kept off argv the same way: every guest `sudo -S` call gets it on ssh's stdin via
   `macos_admin_password_stdin` (the bash builtin `printf` piped into `ssh_macos` /
@@ -191,9 +197,10 @@ in time," this **prescribes** "what must never break." It changes rarely.
 ---
 
 > Of the 10, I1–I8 are enforced by tests/self-tests; I9 is partial (entitlement only); I10 is
-> partial (Container mode test-enforced, plus `setup-token --macos`'s credential-free throwaway VM).
+> partial (Container mode test-enforced, plus the macOS `~/.augur-env` push's ssh argv and
+> `setup-token --macos`'s credential-free throwaway VM).
 > The remaining review-only surface is the rest of the macOS half of I10 (credentials not on argv:
-> a project VM's `~/.augur-env` goes through a file written over SSH stdin, which no test asserts), the hardware-dependent part of I9 (the live NIC count — the gvproxy UDP/ICMP drop is now probed
+> a real guest's process list while `~/.augur-env` is written over SSH stdin), the hardware-dependent part of I9 (the live NIC count — the gvproxy UDP/ICMP drop is now probed
 > live on every `up --macos`), and two gaps inside I7 (the TOFU gate's interactive and no-sha256
 > branches, and the approval record's full-path keying). Note that "enforced by tests" does not extend to augur's own
 > argv for I5 and I8: see their notes. For background on each item, see the newest

@@ -17,7 +17,7 @@
 |---|---|---|
 | Wholesale host-env forwarding | **No** | **No** |
 | Host-derived secrets that become guest env vars | `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `GH_TOKEN` | `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `GH_TOKEN` |
-| When secrets are injected | per session, on the `augur claude` / `augur shell` exec only (not `container run`, not `setup-token`) | at VM start, into `~/.augur-env` |
+| When secrets are injected | per session, on the `augur claude` / `augur shell` exec only (not `container run`, not `setup-token`) | at VM boot and at the start of every `augur claude --macos` / `augur shell --macos` session on a running VM, into `~/.augur-env` |
 | augur-built (non-secret) guest env vars | `HTTP(S)_PROXY`/`NO_PROXY` (egress only, at `run`); per session: `TZ` (from `/etc/localtime`, not env), `GIT_CONFIG_*` (only when a gh token is present), `DISABLE_AUTOUPDATER=1` (claude only) | `DISABLE_AUTOUPDATER=1` |
 | Unnamed host vars that can cross | none¹ | `TERM` only (always, via SSH PTY) |
 
@@ -44,18 +44,18 @@ The user's question is specifically about **environment variables**. Host *files
 Read from the host env, else from `~/.anthropic_api_key`, via the `resolve_api_key` helper driven by the `agent_auth_specs` seam table.
 - Container: a `ANTHROPIC_API_KEY=…` line in `container exec --env-file <(session_credential_env)`, on the `augur claude` / `augur shell` exec only (in `cmd_claude` / `cmd_shell`). Never on `container run`, so it is not in the container's persisted config or `container inspect`, and never on any argv.
   - **Correction (2026-09-24):** an earlier revision said `container run -e "ANTHROPIC_API_KEY=…"` (in `cmd_up`). Container mode no longer passes any credential to `container run`; the same applies to `CLAUDE_CODE_OAUTH_TOKEN` and `GH_TOKEN` below.
-- macOS: written as `export ANTHROPIC_API_KEY='…'` into `~/.augur-env` (`chmod 600`), which `~/.zshenv` sources for every shell — i.e. a real guest env var (in `cmd_up_macos`).
+- macOS: written as `export ANTHROPIC_API_KEY='…'` into `~/.augur-env` (mode 600 from creation, renamed into place), which `~/.zshenv` sources for every shell — i.e. a real guest env var (in `push_macos_guest_env`).
 
 ### `CLAUDE_CODE_OAUTH_TOKEN` — **both modes** (named secret)
 Read from the host env, else `~/.claude_code_oauth_token`, via `resolve_api_key` — from the **same** `agent_auth_specs` table as `ANTHROPIC_API_KEY`.
 - Container: a `CLAUDE_CODE_OAUTH_TOKEN=…` line in the same per-session `--env-file` (in `cmd_claude` / `cmd_shell`).
-- macOS: `export CLAUDE_CODE_OAUTH_TOKEN='…'` in `~/.augur-env` (in `cmd_up_macos`).
+- macOS: `export CLAUDE_CODE_OAUTH_TOKEN='…'` in `~/.augur-env` (in `push_macos_guest_env`).
 - Both auth vars are injected whenever set; `augur` applies **no** precedence itself — Claude Code applies the official `ANTHROPIC_API_KEY` > `CLAUDE_CODE_OAUTH_TOKEN` order when both are present. Both modes (container and macOS VM) forward it, resolved from the same `agent_auth_specs` table. (`cmd_status` still only *reads* it host-side for a display checkmark.)
 
 ### `GH_TOKEN` — both modes (named secret)
 Obtained by running the subprocess `gh auth token` (in `session_credential_env` / `cmd_up_macos`).
 - Container: a `GH_TOKEN=…` line in the same per-session `--env-file` (in `cmd_claude` / `cmd_shell`).
-- macOS: `export GH_TOKEN='…'` in `~/.augur-env`, plus a `git config --global` credential helper that echoes `password=$GH_TOKEN` for `github.com` (in `cmd_up_macos`) — the helper stores only the *reference* `$GH_TOKEN`, not the value.
+- macOS: `export GH_TOKEN='…'` in `~/.augur-env`, plus a `git config --global` credential helper that echoes `password=$GH_TOKEN` for `github.com` (in `push_macos_guest_env`) — the helper stores only the *reference* `$GH_TOKEN`, not the value.
 - **Note (unnamed-host-var transit):** `augur` does not read the shell `$GH_TOKEN`/`$GITHUB_TOKEN` directly, but `gh auth token` honors them, so a host token can transit into the guest's `GH_TOKEN` via that subprocess. This is the one path by which a host variable `augur` never *names* crosses in container mode too (macOS is the same).
 
 ### `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` (+ lowercase) — container mode, egress only (augur-built, not host-derived)

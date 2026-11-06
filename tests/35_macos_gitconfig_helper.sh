@@ -209,7 +209,11 @@ done
 # behavioural test of the function alone can see: swap them and the helper is silently discarded on
 # every fresh `up`, with git push failing only later, in the guest, at the operator's first push.
 scp_at="$(printf  '%s\n' "$up_macos_body" | grep -n 'scp_to_macos .* "\$HOME/\.gitconfig"' | head -n1 | cut -d: -f1)"
-wire_at="$(printf '%s\n' "$up_macos_body" | grep -n '^ *ensure_macos_git_credential_helper '   | head -n1 | cut -d: -f1)"
+# The helper is written by push_macos_guest_env, so its call site in cmd_up_macos is what must follow
+# the scp.
+push_fn_body="$(fn_body push_macos_guest_env)"
+has "$push_fn_body" 'ensure_macos_git_credential_helper "$vm"' "the ~/.augur-env push writes the git credential helper"
+wire_at="$(printf '%s\n' "$up_macos_body" | grep -n '^ *push_macos_guest_env '   | head -n1 | cut -d: -f1)"
 if [[ -n "$scp_at" && -n "$wire_at" && "$scp_at" -lt "$wire_at" ]]; then
   ok "macOS up copies ~/.gitconfig BEFORE writing the helper into it (scp@$scp_at < helper@$wire_at)"
 else

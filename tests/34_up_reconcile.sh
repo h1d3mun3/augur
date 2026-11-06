@@ -19,7 +19,7 @@
 # because it HAS a fingerprint; macOS mode refuses only an egress-mode mismatch against the host-side
 # record written at boot (tests/51_macos_egress_mode_unit.sh owns that), applies what the host owns,
 # and WARNS about what a live VM cannot pick up (gvproxy's DNS allowlist is read once at startup, VM
-# sizing needs the VM stopped, ~/.augur-env is not re-pushed). It does re-run a boot self-test on this
+# sizing needs the VM stopped). It does re-run a boot self-test on this
 # path — verify_macos_egress_locked, whose behaviour tests/36_macos_egress_selftest.sh owns — which
 # ends the path non-zero on a DETECTED leak.
 #
@@ -27,7 +27,8 @@
 # already-running path with a credential-less guest in the first place. Validated only at the
 # ~/.augur-env writer — after clone, sizing, boot and the SSH wait — a value that could not be
 # injected would abort `up` with a VM already running and nothing torn down; the retry would then
-# hit the branch above, which cannot re-push ~/.augur-env. So the check runs before the clone.
+# hit the branch above, which pushes no ~/.augur-env (only the next `claude --macos` / `shell --macos`
+# session does). So the check runs before the clone.
 # (Container mode injects credentials per session, so its check runs at session start instead;
 # tests/11_construct_container.sh covers that.)
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/.." && pwd)"
@@ -212,7 +213,7 @@ pin_out="$(pinned_run)"
 has "$pin_out" "changed since VM 'testvm' booted"          "policy newer than gvproxy's snapshot → warns, naming the VM"
 has "$pin_out" "gvproxy snapshots its DNS allowlist ONCE"   "…names gvproxy's read-once DNS allowlist (thing 1)"
 has "$pin_out" "VM sizing (cpu/memory)"                     "…names VM sizing (thing 2)"
-has "$pin_out" ".augur-env credentials"                     "…names the ~/.augur-env credentials (thing 3)"
+hasnt "$pin_out" ".augur-env"                               "…does not name the ~/.augur-env credentials (each session pushes them)"
 has "$pin_out" "augur down --macos && augur up --macos"     "…and states the same remedy as its profile-stale peer"
 has "$pin_out" "newly APPROVED domain stays unresolvable"   "…is honest that only WIDENING is blocked (DNS is the first gate)"
 
@@ -223,8 +224,8 @@ section "Tier 1 — macOS: a credential that cannot be injected fails BEFORE any
 # `augur-vm clone`, `augur-vm set`, `augur-vm run` and the SSH wait — that `exit 1` would tear
 # NOTHING down (unlike the SSH-timeout path right above it, which stops the VM, gvproxy and the
 # proxy). The operator would fix the value, re-run `up --macos`, and land on the already-running
-# branch tested above, which by design cannot re-push ~/.augur-env: a live guest with no
-# credentials at all, remedy `down --macos && up --macos`.
+# branch tested above, which pushes no ~/.augur-env: a live guest with no credentials until the
+# next `claude --macos` / `shell --macos` session.
 #
 # The load-bearing assertion is therefore NOT the exit code — it is that the augur-vm CLI was never
 # invoked. Nothing was cloned, nothing was resized, nothing was booted.

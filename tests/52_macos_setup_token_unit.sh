@@ -652,7 +652,7 @@ eq "" "$(cat "$GHOME/.zshenv")" "…and is left empty"
 rm -f "$GHOME/.zshenv"
 macos_scrub_augur_credentials testvm; rc=$?
 eq 0 "$rc" "scrub: nothing to remove is fine"
-has "$(declare -f cmd_up_macos)" 'MACOS_AUGUR_ENV_SOURCE_LINE' "up --macos writes the same ~/.zshenv line the scrub removes"
+has "$(declare -f push_macos_guest_env)" 'MACOS_AUGUR_ENV_SOURCE_LINE' "the ~/.augur-env push writes the same ~/.zshenv line the scrub removes"
 
 # ── 6. build / update with provisioning files present ──────────────────────────────────────────
 # run_base_provisioning stops the scratch VM's NAT session to boot it on the filtered datapath. Every

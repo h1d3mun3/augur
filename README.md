@@ -327,7 +327,7 @@ start it unfiltered).
 
 On macOS, Claude Code stores its OAuth login in the Keychain, which is unreadable over SSH and
 absent from a freshly cloned VM. So macOS mode injects a credential through the environment
-each time the VM boots (the same way it does for the GitHub token; a VM that is already running keeps what it booted with until `augur down --macos && augur up --macos`):
+each time the VM boots and at the start of every `augur claude --macos` / `augur shell --macos` session (the same way it does for the GitHub token), so a changed credential reaches the next session without a VM restart:
 
 - `CLAUDE_CODE_OAUTH_TOKEN` — subscription token; either set the env var / save it to
   `~/.claude_code_oauth_token`, or run **`augur setup-token --macos`**: it runs `claude setup-token`
@@ -679,8 +679,10 @@ In Container mode, credentials are injected per session: each `augur claude` / `
 resolves them afresh, so a rotated key or token takes effect on the next session with no
 container recreate. A session already running keeps the value it started with. `augur
 setup-token` runs with **no** credentials injected (it exists to mint one), and neither does a
-`container exec` you run by hand outside augur. In macOS VM mode they are written to
-`~/.augur-env` when the VM starts.
+`container exec` you run by hand outside augur. In macOS VM mode they are rewritten into the
+guest's `~/.augur-env` when the VM boots and again at the start of every `augur claude --macos` /
+`augur shell --macos` session, so a rotated key or token likewise reaches the next session with no
+VM restart; a guest shell already open keeps the values it started with.
 
 **GitHub CLI:**
 
@@ -690,7 +692,7 @@ gh auth login
 ```
 
 `gh` credentials are shared automatically in both modes: the host's `gh auth token` is injected
-as `GH_TOKEN` (per session in Container mode, like the Claude credentials above), and a guest-only
+as `GH_TOKEN` (per session, like the Claude credentials above), and a guest-only
 git credential helper makes HTTPS `git push` work off it. Neither mode shares the host's
 `~/.config/gh`: on a macOS host gh keeps the token in the Keychain, so a shared `hosts.yml` would
 only make `gh auth status` show a second, failed login next to the working `GH_TOKEN` one, and after
