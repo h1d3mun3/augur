@@ -6311,8 +6311,9 @@ if [[ "${AUGUR_SOURCE_ONLY:-0}" == "1" ]]; then return 0 2>/dev/null || true; fi
 # - `build` without --macos: the macOS base-VM build options mean --macos was left out.
 # - Any other leftover word, for a command that takes none.
 # Deliberately NOT checked: `build --macos` (cmd_build_macos parses its own options and refuses an
-# unknown one), the positional arguments of `install-cert` and `destroy` (their own usage checks
-# handle those; only a misplaced global flag is refused here), `help` (extra words are harmless),
+# unknown one), the positional argument of `destroy` (cmd_destroy* refuse extras themselves; only a
+# misplaced global flag is refused here; `install-cert` takes zero or one, and its own missing-argument
+# check handles zero), `help` (extra words are harmless),
 # and an unknown command (the dispatch reports it).
 reject_extra_args() {
     local cmd="$1" a; shift
@@ -6333,7 +6334,11 @@ reject_extra_args() {
         esac
     done
     case "$cmd" in
-        install-cert|destroy) return 0 ;;
+        install-cert)
+            (( $# <= 1 )) && return 0
+            error "Usage: augur install-cert [--macos] <cert.crt>  (got extra: $*)"
+            exit 1 ;;
+        destroy) return 0 ;;
     esac
     if [[ "$cmd" == build ]]; then
         for a in "$@"; do
@@ -6359,7 +6364,13 @@ while [[ $# -gt 0 ]]; do
         --egress)    AUGUR_EGRESS=1; shift ;;
         --no-egress) AUGUR_EGRESS=0; shift ;;
         --swift)
-            SWIFT_VERSION="${2:?'--swift requires a version (e.g. --swift 6.0)'}"
+            # A flag (or nothing) in the value slot means the version was left out; taking it would
+            # swallow the flag and build a bogus image tag.
+            if [[ -z "${2:-}" || "$2" == -* ]]; then
+                error "--swift needs a version: augur ${COMMAND} --swift <version> (e.g. --swift 6.0)"
+                exit 1
+            fi
+            SWIFT_VERSION="$2"
             shift 2
             ;;
         *) break ;;

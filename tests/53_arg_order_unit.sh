@@ -50,6 +50,20 @@ refused "Put --no-egress right after the command: augur up --no-egress" up --mac
 refused "Put --gui right after the command: augur up --gui" up x --gui
 refused "Put --egress right after the command: augur shell --egress" shell x --egress
 
+section "Tier 1 — --swift needs a version, not another flag"
+refused "--swift <version>" build --swift --macos
+refused "--swift <version>" build --swift
+refused "--swift <version>" build --swift ""
+refused "--swift <version>" up --swift --gui
+
+section "Tier 1 — install-cert and destroy take at most one argument"
+refused "Usage: augur install-cert" install-cert c.crt extra
+refused "Usage: augur install-cert" install-cert --macos c.crt extra
+refused "Usage: augur destroy" destroy a b
+refused "Usage: augur destroy" destroy --macos a b
+run_augur install-cert
+has "$out" "Usage: augur install-cert <cert.crt>" "augur install-cert: own missing-argument error still fires"
+
 section "Tier 1 — macOS build options without --macos are refused"
 refused "augur build --macos --ipsw <path> --xcode-xip <path>" build --ipsw X
 refused "augur build --macos --ipsw <path> --xcode-xip <path>" build --swift 6.0 --xcode-xip Y
