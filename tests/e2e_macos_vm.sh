@@ -139,7 +139,7 @@ else
   fail "a second augur up --macos against the running VM succeeds" "exited $rerc — last lines:
 $(printf '%s\n' "$reout" | tail -n 12)"
 fi
-if [[ "$reout" == *"already running — reconciling host-side state only"* ]]; then
+if [[ "$reout" == *"already running — reconciling host-side state and refreshing credentials"* ]]; then
   ok "it took the reconcile branch (not a fresh boot)"
 else
   fail "it took the reconcile branch" "the reconcile warning is absent — this arm proved nothing:

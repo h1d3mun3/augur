@@ -24,6 +24,8 @@ injected per session instead, only on the `container exec` that starts `augur cl
   Moving the helper off `run` also means a later host `gh auth login` needs no recreate.
 - **Validation** (`validate_resolved_credentials` / `validate_secret_value`) runs at session
   start, before the `exec`.
+  - *Amendment (2026-11-07):* resolution and validation now live in `resolve_session_credentials`,
+    which macOS VM mode shares; `validate_resolved_credentials` no longer exists.
 - **`augur setup-token` gets no credentials injected.** It exists to mint one; the current token is
   not handed to a guest binary for that flow. A manual `container exec` outside augur also gets
   none — accepted and documented.

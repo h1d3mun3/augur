@@ -46,10 +46,13 @@ then ok "macOS profile share is mounted READ-ONLY"
 else fail "macOS profile share is not read-only" "expected a --dir=…:ro for the profile"; fi
 hasnt "$up_macos" 'agent_profile_host_subdir)/${project_vm}' "macOS profile share is NOT per-VM (personal tooling is not project-scoped)"
 # `claude`/`shell` can attach to an already-running VM, so they must wire it too, not just `up`.
+# Both go through prepare_macos_session.
 claude_macos_body="$(awk '/^cmd_claude_macos\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
 shell_macos_body="$(awk '/^cmd_shell_macos\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
-has "$claude_macos_body" 'ensure_macos_agent_profile' "macOS claude wires the operator profile"
-has "$shell_macos_body"  'ensure_macos_agent_profile' "macOS shell wires the operator profile"
+prep_macos_body="$(awk '/^prepare_macos_session\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
+has "$claude_macos_body" 'prepare_macos_session "$project_vm"' "macOS claude goes through prepare_macos_session"
+has "$shell_macos_body"  'prepare_macos_session "$project_vm"' "macOS shell goes through prepare_macos_session"
+has "$prep_macos_body" 'ensure_macos_agent_profile' "macOS claude/shell wire the operator profile"
 profile_fn="$(awk '/^ensure_macos_agent_profile\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
 has "$profile_fn" '|| exit 0'                    "macOS profile wiring skips a VM whose share is not mounted (upgrade guard)"
 has "$profile_fn" 'agent_profile_link_dirs'      "macOS profile wiring reads the link list from the seam"
@@ -92,12 +95,15 @@ else
 fi
 # DEVELOPER_DIR must reach NON-login shells too (`ssh host "cmd"` reads ~/.zshenv, never
 # ~/.zprofile): the build writes it to ~/.zshenv, and ~/.augur-env (sourced from ~/.zshenv, rewritten
-# on every up) repeats it for clones of a base VM that only has it in ~/.zprofile.
+# on every boot and session by push_macos_guest_env) repeats it for clones of a base VM that only
+# has it in ~/.zprofile.
+push_env_fn="$(awk '/^push_macos_guest_env\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
 _devdir="export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer"
 has   "$build_macos_body" "${_devdir}'\\'' >> ~/.zshenv"   "macOS build pins DEVELOPER_DIR in ~/.zshenv (read by non-login SSH shells)"
 hasnt "$build_macos_body" "${_devdir}'\\'' >> ~/.zprofile" "macOS build does not pin DEVELOPER_DIR in ~/.zprofile (login shells only)"
-has   "$up_macos"         "echo '${_devdir}'"               "macOS up writes DEVELOPER_DIR into ~/.augur-env (heals clones of an older base VM)"
-has   "$up_macos"         'for _kv in $(agent_fixed_env)'   "macOS up writes the agent's fixed env into ~/.augur-env (every guest session, not just the launch)"
+has   "$push_env_fn"      "_content+='${_devdir}'"            "macOS ~/.augur-env push writes DEVELOPER_DIR (heals clones of an older base VM)"
+has   "$push_env_fn"      'for _kv in $(agent_fixed_env)'   "macOS ~/.augur-env push writes the agent's fixed env (every guest session, not just the launch)"
+has   "$up_macos"         'push_macos_guest_env "$project_vm"' "macOS up pushes ~/.augur-env (push_macos_guest_env)"
 has "$up_macos" 'if $_fresh_clone; then'         "macOS .claude.json seed overwrites unconditionally on a fresh clone"
 
 # Base-VM account-state scrub: the base VM is long-lived and mutable, so a human can

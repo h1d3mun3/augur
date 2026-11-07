@@ -3,13 +3,15 @@
 #
 # THE BUG THIS EXISTS FOR (measured, not hypothetical):
 #
-# augur pushes credentials by piping into the guest:
-#     { … } | ssh_macos "$vm" "cat > ~/.augur-env && chmod 600 ~/.augur-env"
-# and immediately afterwards runs a command that merely NAMES that file, unpiped:
-#     ssh_macos "$vm" "grep -q '.augur-env' ~/.zshenv || echo … >> ~/.zshenv"
+# augur pushes credentials by piping into the guest (push_macos_guest_env):
+#     printf '%s\n' "$_content" | ssh_macos "$vm" "… cat > ~/.augur-env.tmp.$$ … mv …"
+# while other guest commands merely NAME that file, unpiped — macos_scrub_augur_credentials'
+#     ssh_macos "$vm" "rm -f ~/.augur-env ~/.gitconfig && …"
+# is one.
 #
-# A test stub matching `*".augur-env"*` catches BOTH and answers the piped one with
-# `cat >/dev/null`. On the unpiped call that `cat` drains whatever stdin the SUITE inherited.
+# A test stub matching `*".augur-env"*` catches BOTH and answers them by reading stdin (`cat`, or
+# running the real command, which does). On an unpiped call that drains whatever stdin the SUITE
+# inherited.
 #
 # Under CI and inside a subagent stdin is /dev/null, so `cat` sees EOF and the bug is invisible.
 # On a developer's terminal stdin is the TTY: `make offline-tests` stops dead, printing a section

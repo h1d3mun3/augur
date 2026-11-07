@@ -53,7 +53,7 @@ verify_macos_egress_locked() { echo "selftest" >> "$LOG"; }
 warn_if_macos_egress_pinned() { :; }
 sync_macos_guest_clock() { :; }; sync_macos_guest_timezone() { :; }; configure_macos_guest_session() { :; }
 ensure_macos_workspace() { :; }; ensure_macos_agent_projects() { :; }; ensure_macos_agent_agents() { :; }
-ensure_macos_agent_profile() { :; }; ensure_macos_agent_bin() { :; }; ensure_macos_git_credential_helper() { :; }
+ensure_macos_agent_profile() { :; }; ensure_macos_agent_bin() { :; }; push_macos_guest_env() { :; }
 macos_poweroff_before_teardown() { :; }
 scp_to_macos() { :; }
 ssh_macos() { echo "ssh $*" >> "$LOG"; [[ "$*" == *"cat > "* ]] && cat >/dev/null; [[ "$*" == *" -t "* ]] && echo AGENT_ATTACHED; return 0; }
@@ -96,7 +96,7 @@ VM_UP=1
 egress_on; record off
 run_cmd cmd_up_macos
 refused "up --macos on a --no-egress VM" "augur down --macos && augur up --macos"
-hasnt "$out" "reconciling host-side state only" "up --macos on a --no-egress VM: the reconcile is not reached"
+hasnt "$out" "reconciling host-side state" "up --macos on a --no-egress VM: the reconcile is not reached"
 
 egress_off; record on
 run_cmd cmd_up_macos

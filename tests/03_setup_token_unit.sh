@@ -90,7 +90,8 @@ info() { printf '%s\n' "$*" >> "$INFOS"; }
 has "$(cat "$INFOS")" "every new session" "container hint: applies to every new session"
 hasnt "$(cat "$INFOS")" "augur down --macos" "container hint: no macOS restart advice"
 : > "$INFOS"; save_oauth_token "$valid" macos
-has "$(cat "$INFOS")" "augur down --macos && augur up --macos" "macOS hint: a running VM needs down + up"
+has "$(cat "$INFOS")" "claude --macos" "macOS hint: the next claude/shell --macos picks it up"
+hasnt "$(cat "$INFOS")" "augur down --macos" "macOS hint: no VM restart advice (every session refreshes credentials)"
 hasnt "$(cat "$INFOS")" "every new session" "macOS hint: does not claim it applies to the next session"
 info() { :; }
 

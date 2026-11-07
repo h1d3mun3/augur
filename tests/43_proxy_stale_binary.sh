@@ -220,6 +220,7 @@ apply_guest_profile() { :; }; save_guest_history() { :; }
 eng() { [[ "$1" == exec ]] && echo "AGENT_LAUNCHED"; return 0; }
 ssh_macos() { echo "AGENT_LAUNCHED"; }
 sync_macos_guest_clock() { :; }; sync_macos_guest_timezone() { :; }; ensure_macos_workspace() { :; }
+push_macos_guest_env() { :; }   # its stdin pipe would SIGPIPE against the ssh_macos stub above
 ensure_macos_agent_projects() { :; }; ensure_macos_agent_agents() { :; }; ensure_macos_agent_profile() { :; }
 ensure_macos_agent_bin() { :; }; warn_if_macos_egress_pinned() { :; }; macos_project_vm() { echo augur-test-vm; }
 check_project_conf_approved() { :; }; macos_vm_exists() { return 0; }
@@ -338,8 +339,8 @@ gate_before cmd_claude ensure_session_container   # container mode's claude/shel
 gate_before cmd_shell ensure_session_container
 gate_before cmd_setup_token container_running
 gate_before cmd_up_macos macos_vm_running
-gate_before cmd_claude_macos macos_vm_running
-gate_before cmd_shell_macos macos_vm_running
+gate_before cmd_claude_macos prepare_macos_session   # its running-vs-up branch lives there
+gate_before cmd_shell_macos prepare_macos_session
 # setup-token --macos never attaches to the project VM: it boots its own throwaway clone and helpers
 # (tests/52_macos_setup_token_unit.sh), so the project's helpers have nothing to gate there.
 hasnt "$(declare -f cmd_setup_token_macos)" "require_fresh_egress_helpers" "cmd_setup_token_macos is not gated by the project's helpers"

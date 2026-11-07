@@ -19,15 +19,15 @@
 # because it HAS a fingerprint; macOS mode refuses only an egress-mode mismatch against the host-side
 # record written at boot (tests/51_macos_egress_mode_unit.sh owns that), applies what the host owns,
 # and WARNS about what a live VM cannot pick up (gvproxy's DNS allowlist is read once at startup, VM
-# sizing needs the VM stopped, ~/.augur-env is not re-pushed). It does re-run a boot self-test on this
+# sizing needs the VM stopped). It does re-run a boot self-test on this
 # path — verify_macos_egress_locked, whose behaviour tests/36_macos_egress_selftest.sh owns — which
 # ends the path non-zero on a DETECTED leak.
 #
 # The last section covers the OTHER half of that story: HOW an operator could end up on the
 # already-running path with a credential-less guest in the first place. Validated only at the
 # ~/.augur-env writer — after clone, sizing, boot and the SSH wait — a value that could not be
-# injected would abort `up` with a VM already running and nothing torn down; the retry would then
-# hit the branch above, which cannot re-push ~/.augur-env. So the check runs before the clone.
+# injected would abort `up` with a VM already running, credential-less, and nothing torn down.
+# So the check runs before the clone.
 # (Container mode injects credentials per session, so its check runs at session start instead;
 # tests/11_construct_container.sh covers that.)
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/.." && pwd)"
@@ -212,7 +212,7 @@ pin_out="$(pinned_run)"
 has "$pin_out" "changed since VM 'testvm' booted"          "policy newer than gvproxy's snapshot → warns, naming the VM"
 has "$pin_out" "gvproxy snapshots its DNS allowlist ONCE"   "…names gvproxy's read-once DNS allowlist (thing 1)"
 has "$pin_out" "VM sizing (cpu/memory)"                     "…names VM sizing (thing 2)"
-has "$pin_out" ".augur-env credentials"                     "…names the ~/.augur-env credentials (thing 3)"
+hasnt "$pin_out" ".augur-env"                               "…does not name the ~/.augur-env credentials (each session pushes them)"
 has "$pin_out" "augur down --macos && augur up --macos"     "…and states the same remedy as its profile-stale peer"
 has "$pin_out" "newly APPROVED domain stays unresolvable"   "…is honest that only WIDENING is blocked (DNS is the first gate)"
 
@@ -223,8 +223,8 @@ section "Tier 1 — macOS: a credential that cannot be injected fails BEFORE any
 # `augur-vm clone`, `augur-vm set`, `augur-vm run` and the SSH wait — that `exit 1` would tear
 # NOTHING down (unlike the SSH-timeout path right above it, which stops the VM, gvproxy and the
 # proxy). The operator would fix the value, re-run `up --macos`, and land on the already-running
-# branch tested above, which by design cannot re-push ~/.augur-env: a live guest with no
-# credentials at all, remedy `down --macos && up --macos`.
+# branch tested above: a VM cloned, sized and booted for an `up` that failed, running with no
+# credentials until the fixed value is pushed.
 #
 # The load-bearing assertion is therefore NOT the exit code — it is that the augur-vm CLI was never
 # invoked. Nothing was cloned, nothing was resized, nothing was booted.
@@ -303,8 +303,8 @@ section "Tier 1 — source guards: the reconcile is wired where behaviour cannot
 fn_body() { awk -v n="$1" '$0 ~ "^"n"\\(\\) \\{"{f=1} f{print} f&&/^}/{exit}' "$AUGUR"; }
 reconcile_body="$(fn_body reconcile_running_container)"
 up_macos_body="$(awk '/^cmd_up_macos\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
-claude_macos_body="$(awk '/^cmd_claude_macos\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
-shell_macos_body="$(awk '/^cmd_shell_macos\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
+claude_macos_body="$(awk '/^prepare_macos_session\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"   # claude and shell share it
+shell_macos_body="$claude_macos_body"
 pinned_fn="$(awk '/^warn_if_macos_egress_pinned\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
 
 # `claude`/`shell` attach to a running VM WITHOUT going through cmd_up_macos, so they must warn
@@ -326,14 +326,16 @@ has   "$reconcile_body" 'require_running_container_current' "container up's runn
 has   "$current_body"   'exit 1' "container up's running path can refuse on drift (it has container_fingerprint)"
 running_branch="$(printf '%s\n' "$up_macos_body" | sed -n '/if macos_vm_running "\$project_vm"; then/,/^    fi$/p')"
 has "$running_branch" 'require_macos_egress_mode_current' "cmd_up_macos's already-running path refuses an egress-mode mismatch"
-if printf '%s\n' "$running_branch" | grep -q 'exit 1'
+# A credential that cannot be injected, or that cannot be delivered, is not a drift refusal: it
+# stops every path, running or not.
+if printf '%s\n' "$running_branch" | grep -v 'resolve_session_credentials || exit 1' | grep -v 'push_macos_guest_env "$project_vm" || exit 1' | grep -q 'exit 1'
 then fail "cmd_up_macos refuses on some other drift on the already-running path" "only the egress mode is a refusal"
 else ok "cmd_up_macos refuses on no other drift on the already-running path"; fi
 
 # The credential check's POSITION in the source, not just its effect: a future edit that moves it
 # back below the boot must fail here too, not only behaviourally.
-cred_fn="$(awk '/^validate_resolved_credentials\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
-v_at="$(printf  '%s\n' "$up_macos_body" | grep -n '^ *validate_resolved_credentials ' | head -n1 | cut -d: -f1)"
+cred_fn="$(awk '/^resolve_session_credentials\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
+v_at="$(printf  '%s\n' "$up_macos_body" | grep -n '^ *resolve_session_credentials ' | head -n1 | cut -d: -f1)"
 cl_at="$(printf '%s\n' "$up_macos_body" | grep -n '"\$VM_CLI" clone' | head -n1 | cut -d: -f1)"
 st_at="$(printf '%s\n' "$up_macos_body" | grep -n '"\$VM_CLI" set'   | head -n1 | cut -d: -f1)"
 rn_at="$(printf '%s\n' "$up_macos_body" | grep -n '"\$VM_CLI" run'   | head -n1 | cut -d: -f1)"

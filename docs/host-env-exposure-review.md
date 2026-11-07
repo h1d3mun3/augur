@@ -2,7 +2,7 @@
 
 - **Date:** 2026-06-25 (citations re-verified 2026-06-28; re-baselined 2026-07-08 for the Apple Container engine migration, the unified auth seam, and the hermetic SSH helpers; re-baselined again 2026-07-08 after Docker support was dropped — Apple Container is now the sole container engine; re-baselined 2026-07-20 after macOS mode stopped scp'ing `~/.claude.json` entirely, commit `3d59f7d`; re-baselined 2026-09-24 after Container mode moved credentials, `TZ` and the git credential helper from `container run` to the per-session `container exec`).
 - **Scope:** Whether host (developer-machine) *environment variables* are exposed to the guest OS, in **container mode** (Apple Container, macOS 26+) and **macOS VM mode**.
-- **Status:** Living document — re-verify when the container `run`/`exec` invocations (`cmd_up` / `cmd_claude` / `cmd_shell`), the macOS `cmd_up_macos` injection block, the SSH helpers (`ssh_macos` / `ssh_macos_provision`), the base-image provisioning path, or the `augur-vm` VM configuration change. Source citations reference `augur` functions by name (not line numbers) so they survive unrelated edits.
+- **Status:** Living document — re-verify when the container `run`/`exec` invocations (`cmd_up` / `cmd_claude` / `cmd_shell`), the macOS `push_macos_guest_env` injection block (called by `cmd_up_macos` and `prepare_macos_session`), the SSH helpers (`ssh_macos` / `ssh_macos_provision`), the base-image provisioning path, or the `augur-vm` VM configuration change. Source citations reference `augur` functions by name (not line numbers) so they survive unrelated edits.
 - **Method:** Multi-angle source inspection (container runtime, macOS runtime, build-time baking, mounted/copied files, full env-var census) followed by an adversarial pass that actively hunted for any channel leaking an *unnamed* host variable, plus a completeness pass that opened every otherwise-unread file/command path. Re-verified 2026-07-08 against the post-migration source (the `eng` engine abstraction, the `agent_auth_specs` auth seam, and the hermetic `-F /dev/null` SSH helpers), with an adversarial completeness sweep per mode.
 
 > This is an **assessment of the current security posture**, not a decision record. The genuine *decisions* it rests on (inject credentials via the environment rather than mounting the Keychain; never forward the host environment wholesale) belong in an ADR that links back here, if/when one is written.
@@ -17,7 +17,7 @@
 |---|---|---|
 | Wholesale host-env forwarding | **No** | **No** |
 | Host-derived secrets that become guest env vars | `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `GH_TOKEN` | `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `GH_TOKEN` |
-| When secrets are injected | per session, on the `augur claude` / `augur shell` exec only (not `container run`, not `setup-token`) | at VM start, into `~/.augur-env` |
+| When secrets are injected | per session, on the `augur claude` / `augur shell` exec only (not `container run`, not `setup-token`) | on every `augur up --macos` / `augur claude --macos` / `augur shell --macos`, booting or running VM alike, into `~/.augur-env` (not `setup-token`) |
 | augur-built (non-secret) guest env vars | `HTTP(S)_PROXY`/`NO_PROXY` (egress only, at `run`); per session: `TZ` (from `/etc/localtime`, not env), `GIT_CONFIG_*` (only when a gh token is present), `DISABLE_AUTOUPDATER=1` (claude only) | `DISABLE_AUTOUPDATER=1` |
 | Unnamed host vars that can cross | none¹ | `TERM` only (always, via SSH PTY) |
 
@@ -44,25 +44,25 @@ The user's question is specifically about **environment variables**. Host *files
 Read from the host env, else from `~/.anthropic_api_key`, via the `resolve_api_key` helper driven by the `agent_auth_specs` seam table.
 - Container: a `ANTHROPIC_API_KEY=…` line in `container exec --env-file <(session_credential_env)`, on the `augur claude` / `augur shell` exec only (in `cmd_claude` / `cmd_shell`). Never on `container run`, so it is not in the container's persisted config or `container inspect`, and never on any argv.
   - **Correction (2026-09-24):** an earlier revision said `container run -e "ANTHROPIC_API_KEY=…"` (in `cmd_up`). Container mode no longer passes any credential to `container run`; the same applies to `CLAUDE_CODE_OAUTH_TOKEN` and `GH_TOKEN` below.
-- macOS: written as `export ANTHROPIC_API_KEY='…'` into `~/.augur-env` (`chmod 600`), which `~/.zshenv` sources for every shell — i.e. a real guest env var (in `cmd_up_macos`).
+- macOS: written as `export ANTHROPIC_API_KEY='…'` into `~/.augur-env` (mode 600 from creation, renamed into place), which `~/.zshenv` sources for every shell — i.e. a real guest env var (in `push_macos_guest_env`).
 
 ### `CLAUDE_CODE_OAUTH_TOKEN` — **both modes** (named secret)
 Read from the host env, else `~/.claude_code_oauth_token`, via `resolve_api_key` — from the **same** `agent_auth_specs` table as `ANTHROPIC_API_KEY`.
 - Container: a `CLAUDE_CODE_OAUTH_TOKEN=…` line in the same per-session `--env-file` (in `cmd_claude` / `cmd_shell`).
-- macOS: `export CLAUDE_CODE_OAUTH_TOKEN='…'` in `~/.augur-env` (in `cmd_up_macos`).
+- macOS: `export CLAUDE_CODE_OAUTH_TOKEN='…'` in `~/.augur-env` (in `push_macos_guest_env`).
 - Both auth vars are injected whenever set; `augur` applies **no** precedence itself — Claude Code applies the official `ANTHROPIC_API_KEY` > `CLAUDE_CODE_OAUTH_TOKEN` order when both are present. Both modes (container and macOS VM) forward it, resolved from the same `agent_auth_specs` table. (`cmd_status` still only *reads* it host-side for a display checkmark.)
 
 ### `GH_TOKEN` — both modes (named secret)
-Obtained by running the subprocess `gh auth token` (in `session_credential_env` / `cmd_up_macos`).
+Obtained by running the subprocess `gh auth token` (in `resolve_session_credentials`, shared by both modes).
 - Container: a `GH_TOKEN=…` line in the same per-session `--env-file` (in `cmd_claude` / `cmd_shell`).
-- macOS: `export GH_TOKEN='…'` in `~/.augur-env`, plus a `git config --global` credential helper that echoes `password=$GH_TOKEN` for `github.com` (in `cmd_up_macos`) — the helper stores only the *reference* `$GH_TOKEN`, not the value.
+- macOS: `export GH_TOKEN='…'` in `~/.augur-env`, plus a `git config --global` credential helper that echoes `password=$GH_TOKEN` for `github.com` (in `push_macos_guest_env`) — the helper stores only the *reference* `$GH_TOKEN`, not the value.
 - **Note (unnamed-host-var transit):** `augur` does not read the shell `$GH_TOKEN`/`$GITHUB_TOKEN` directly, but `gh auth token` honors them, so a host token can transit into the guest's `GH_TOKEN` via that subprocess. This is the one path by which a host variable `augur` never *names* crosses in container mode too (macOS is the same).
 
 ### `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` (+ lowercase) — container mode, egress only (augur-built, not host-derived)
 Set in the guest to force traffic through augur-proxy (in `cmd_up`, only when `egress_enabled`). **The host's own proxy variables are never read.** The value comes from `egress_proxy_url`: it points at the host-only gateway (`container_egress_gateway`, overridable by `AUGUR_CONTAINER_GATEWAY`). `NO_PROXY` is the literal `localhost,127.0.0.1`. macOS VM mode does not set these (its datapath is transparent via gvproxy/SOCKS).
 
 ### `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_0` / `GIT_CONFIG_VALUE_0` — container mode only (augur literals)
-Added per session as `container exec -e` (in `_add_session_exec_env`, called by `cmd_claude` / `cmd_shell`) only when `gh auth token` returns a value, to give the container a self-contained git credential helper that reads `GH_TOKEN` without writing to the read-only `~/.gitconfig`. All three are hardcoded literals; `GIT_CONFIG_VALUE_0` is single-quoted so its embedded `$GH_TOKEN` expands **inside the container** at push time, not on the host. No host value rides in these — the secret only crosses via `GH_TOKEN`. (macOS achieves the same with a `git config --global` credential helper in `cmd_up_macos`, not env vars.)
+Added per session as `container exec -e` (in `_add_session_exec_env`, called by `cmd_claude` / `cmd_shell`) only when `gh auth token` returns a value, to give the container a self-contained git credential helper that reads `GH_TOKEN` without writing to the read-only `~/.gitconfig`. All three are hardcoded literals; `GIT_CONFIG_VALUE_0` is single-quoted so its embedded `$GH_TOKEN` expands **inside the container** at push time, not on the host. No host value rides in these — the secret only crosses via `GH_TOKEN`. (macOS achieves the same with a `git config --global` credential helper written by `push_macos_guest_env`, not env vars.)
 
 ### `DISABLE_AUTOUPDATER=1` — both modes (augur literal)
 Hardcoded in `agent_fixed_env`. Container: `container exec -e DISABLE_AUTOUPDATER=1` at agent launch (in `cmd_claude` and the setup-token exec; `cmd_shell` passes only the per-session `TZ` / `GIT_CONFIG_*` and the credential `--env-file`). It is also baked as `ENV DISABLE_AUTOUPDATER=1` in the `Dockerfile`. macOS: an inline `DISABLE_AUTOUPDATER=1 claude` assignment prefix in the `zsh -l -c` command (in `cmd_claude_macos`). Not a host-env read.
