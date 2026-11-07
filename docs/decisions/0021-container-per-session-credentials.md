@@ -22,6 +22,13 @@ injected per session instead, only on the `container exec` that starts `augur cl
 - **Non-secret per-session values** go as plain `-e`: `TZ`, and the `GIT_CONFIG_COUNT` /
   `GIT_CONFIG_KEY_0` / `GIT_CONFIG_VALUE_0` git credential helper (only when a gh token exists).
   Moving the helper off `run` also means a later host `gh auth login` needs no recreate.
+  - *Amendment (2026-11-08):* the helper is now `GIT_CONFIG_COUNT=2`: entry 0 is
+    `credential.https://github.com.helper` with an empty value, which resets git's helper chain so
+    no helper from the mounted host `~/.gitconfig` (or any other config layer) is asked for
+    github.com, and entry 1 is augur's `$GH_TOKEN` helper. Both come from `git_credential_env`,
+    which macOS VM mode writes into `~/.augur-env` as well. The empty entry relies on the CLI
+    passing `-e GIT_CONFIG_VALUE_0=` through as set-and-empty (the explicit-empty `K=` semantics
+    cited for the 1.0.0 minimum below); `tests/21_container_live.sh` checks it in a real container.
 - **Validation** (`validate_resolved_credentials` / `validate_secret_value`) runs at session
   start, before the `exec`.
   - *Amendment (2026-11-07):* resolution and validation now live in `resolve_session_credentials`,

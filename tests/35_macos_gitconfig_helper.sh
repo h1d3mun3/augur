@@ -1,30 +1,25 @@
 #!/usr/bin/env bash
-# Tier 1 — macOS mode's git credential-helper wiring survives a host ~/.gitconfig that already
-# defines credential.https://github.com.helper MORE THAN ONCE (runs anywhere; nothing is ever
-# cloned, booted or SSH'd — the guest shell is a local `bash -c` against a sandboxed $HOME).
+# Tier 1 — git's GitHub credential helper in both modes (runs anywhere; nothing is ever cloned,
+# booted or SSH'd — the macOS guest is a local `bash -c` against a sandboxed $HOME).
 #
-# The hazard. cmd_up_macos scp's the HOST's ~/.gitconfig into the guest and then MUTATES that copy
-# with `git config --global 'credential.https://github.com.helper' <helper>`, so HTTPS `git push`
-# works off GH_TOKEN alone. But `credential.<url>.helper` is a multi-valued key by git's design, and
-# `gh auth setup-git` writes TWO entries for github.com — an empty one to reset the helper chain,
-# then its own. Against such a file the plain form refuses:
+# git_credential_env is the one definition of augur's helper: GIT_CONFIG_* env config holding an
+# empty helper value (which resets git's helper chain) and then augur's helper, which answers with
+# the REFERENCE `$GH_TOKEN`. macOS writes it into the guest's ~/.augur-env (push_macos_guest_env),
+# Container passes it as `container exec -e` (_add_session_exec_env). Pinned here, against REAL git:
 #
-#     warning: credential.https://github.com.helper has multiple values
-#     error: cannot overwrite multiple values with a single value
-#     $? = 5
-#
-# Under augur's `set -e` that would abort `up` after the clone, the sizing, the boot and the SSH
-# wait, tearing none of it down — the stranded-guest shape the pre-clone credential check (34)
-# exists to prevent. Container mode is immune: it bind-mounts ~/.gitconfig read-only and injects
-# the same helper per session through GIT_CONFIG_KEY_0/VALUE_0, never touching the file. The remedy is
-# --replace-all, which collapses the duplicates to the single value augur intends, plus `|| warn`
-# for the residue --replace-all cannot fix (a ~/.gitconfig git cannot parse at all fails with 128).
-#
-# Two INDEPENDENT properties, one assertion each, because `|| warn` alone would hide the first:
-#   1. the guest's config ends up holding EXACTLY augur's helper (without --replace-all git writes
-#      nothing and the guest keeps the host's inert helpers — a silently unpushable guest);
-#   2. `up` is not aborted when the write fails anyway (asserted under a real `set -e` subshell,
-#      which is the only context in which the `|| warn` is observable at all).
+#   • git asks EVERY configured helper on `get` and calls `store` on every one after a successful
+#     push: macOS's system-level osxkeychain ("failed to store: -25308" over SSH, and a GH_TOKEN copy
+#     in an unlocked guest keychain) and anything the host's ~/.gitconfig or the repository names. A
+#     fake helper that logs its calls sits in system config, XDG config, the global file before and
+#     after the github.com section, an unconditional [include], an [includeIf "gitdir:"] matching the
+#     repository, and the repository's own .git/config. It must never be called while augur's helper
+#     answers with the token.
+#   • the guest sees the value literally: `$GH_TOKEN` survives the ~/.augur-env quoting and is only
+#     expanded by the helper's shell, so the token is on no ssh argv and in no GIT_CONFIG_* value.
+#   • a github.com section an older augur wrote into the guest's ~/.gitconfig is harmless.
+#   • no host gh token → nothing is emitted in either mode, and ~/.gitconfig is never touched.
+#   • deliberately broken variants (no reset, reset after the helper, `$GH_TOKEN` expanded when the
+#     file is written or sourced) are each caught by the same probe, so the probe is not vacuous.
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/.." && pwd)"
 source "$HERE/lib.sh"
 AUGUR="$REPO/augur"
@@ -34,206 +29,334 @@ trap 'rm -rf "$TMPD"' EXIT
 
 # BOOT-PROOFING (the technique tests/30_macos_vm.sh and tests/34_up_reconcile.sh use): point
 # AUGUR_VM_BIN at a path that cannot exist BEFORE sourcing, so the resolved $VM_CLI can never be a
-# real augur-vm. Nothing here calls it; if a future edit does, the fallback is "command not found",
-# never a cloned or booted VM. Set before the source because resolve_vm_cli runs at source time.
+# real augur-vm. Set before the source because resolve_vm_cli runs at source time.
 export AUGUR_VM_BIN="$TMPD/no-such-augur-vm"
 
-# Pull the REAL functions out of augur without running its dispatch tail (AUGUR_SOURCE_ONLY seam),
-# so this can never drift from the shipped code. The ssh_macos stub is installed AFTER the source on
-# purpose: bash resolves function names at CALL time, so a later definition wins.
+# Pull the REAL functions out of augur without running its dispatch tail (AUGUR_SOURCE_ONLY seam).
+# The ssh_macos stub is installed AFTER the source on purpose: bash resolves function names at CALL
+# time, so a later definition wins.
 AUGUR_SOURCE_ONLY=1 source "$AUGUR"
 set +e                                    # augur enables `set -e`; restore lib.sh assert-and-continue
 
-# Keep every write inside the sandbox. This runner exports CLAUDE_CODE_OAUTH_TOKEN and has a real
-# ~/.gitconfig of its own; neither may be reachable from here (constraint: never mutate the real
-# global git config). GIT_CONFIG_NOSYSTEM keeps /etc/gitconfig out of the picture, and the
-# GIT_CONFIG_* trio is unset so an ambient one cannot masquerade as a value augur wrote.
+# Keep everything inside the sandbox: never the runner's real ~/.gitconfig, /etc/gitconfig or an
+# ambient GIT_CONFIG_* set.
 HOME="$TMPD/host-home"; mkdir -p "$HOME"
 AUGUR_DIR="$TMPD/augur"
 export GIT_CONFIG_NOSYSTEM=1
-unset GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_COUNT
+unset GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GH_TOKEN
+unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN
 
-# The exact value augur means to install. Pinned as a literal on purpose: it is the contract
-# with the guest (`$GH_TOKEN` stays a REFERENCE, expanded at push time, never the token itself), and
-# a silent edit to the helper body should have to be re-affirmed here.
-WANT='!f() { test "$1" = get && echo username=x-access-token && echo password=$GH_TOKEN; }; f'
+# The exact helper augur means to install. Pinned as a literal on purpose: it is the contract with
+# the guest (`$GH_TOKEN` stays a REFERENCE), and a silent edit to the helper body should have to be
+# re-affirmed here.
+WANT_HELPER='!f() { test "$1" = get && echo username=x-access-token && echo "password=$GH_TOKEN"; }; f'
 KEY='credential.https://github.com.helper'
+TOKEN="ghp_hosttoken0123456789"
 
-# Stand-in for the guest. ssh runs its argv joined-and-parsed by the remote shell, so `bash -c` with
-# $HOME redirected at a throwaway "guest home" (and the guest's /Users/<user> mapped onto it) is a
-# faithful stand-in — and it means the assertions below are made against REAL `git config`
-# behaviour, not a model of it.
+# Stand-in for the guest: ssh runs its argv joined-and-parsed by the remote shell, so `bash -c` with
+# $HOME redirected at a throwaway guest home (and /Users/<user> mapped onto it) is faithful.
 GUEST_HOME=""
-SSHLOG="$TMPD/sshlog"
-: > "$SSHLOG"
+SSHLOG="$TMPD/sshlog"; ALL_SSH="$TMPD/all-ssh"; : > "$ALL_SSH"
 ssh_macos() {
     local vm="$1"; shift
     local cmd="$*"
-    printf '%s\n' "$cmd" >> "$SSHLOG"
+    printf '%s\n' "$cmd" | tee -a "$ALL_SSH" >> "$SSHLOG"
     cmd="${cmd//\/Users\/${MACOS_SSH_USER}/$GUEST_HOME}"
-    HOME="$GUEST_HOME" XDG_CONFIG_HOME="$GUEST_HOME/.config" bash -c "$cmd"
+    HOME="$GUEST_HOME" bash -c "$cmd"
 }
-unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN
 GH_HOST_TOKEN=""
 gh() { [[ -n "$GH_HOST_TOKEN" ]] || return 1; printf '%s\n' "$GH_HOST_TOKEN"; }
 
-# mk_guest <name> <heredoc-on-stdin> — a fresh guest home holding the scp'd ~/.gitconfig
-mk_guest() {
-    GUEST_HOME="$TMPD/guest-$1"
-    rm -rf "$GUEST_HOME"; mkdir -p "$GUEST_HOME"
-    cat > "$GUEST_HOME/.gitconfig"
-    cp "$GUEST_HOME/.gitconfig" "$TMPD/guest-$1.orig"
-}
-guest_values() {   # every value the guest's global config holds for KEY, newline-joined
-    HOME="$GUEST_HOME" XDG_CONFIG_HOME="$GUEST_HOME/.config" \
-        git config --global --get-all "$KEY" 2>/dev/null
-}
-# Resolve the credentials and run the REAL push (push_macos_guest_env writes the helper in the same
-# ssh session as ~/.augur-env) the way its callers run it: inside `set -e`. Without that a helper
-# failure that aborts would be indistinguishable from one that only warns.
+# Resolve the credentials and run the REAL push the way its callers do: inside `set -e`.
 wire() {   # wire <host gh token> — sets $out / $rc
     : > "$SSHLOG"; GH_HOST_TOKEN="$1"
     out="$( set -e; _creds=(); resolve_session_credentials; push_macos_guest_env testvm 2>&1 )"; rc=$?
 }
 
-section "Tier 1 — a DUPLICATED credential.helper (what \`gh auth setup-git\` leaves) must not break up"
+# A stand-in for osxkeychain or a host-path gh helper: answers nothing, logs every call.
+FAKE="$TMPD/fake-helper"; FAKELOG="$TMPD/fake-helper.log"
+printf '#!/bin/sh\necho "$1" >> "%s"\ncat > /dev/null\n' "$FAKELOG" > "$FAKE"
+chmod +x "$FAKE"
+SYSCONF="$TMPD/system-gitconfig"       # the role Apple git's system gitconfig plays on macOS
+printf '[credential]\n\thelper = %s\n' "$FAKE" > "$SYSCONF"
+fake_calls() { tr '\n' ' ' < "$FAKELOG" 2>/dev/null; }
 
-# Byte-for-byte what `gh auth setup-git` writes: the chain-reset empty helper, then gh's own.
-mk_guest dup <<'EOF'
+# mk_guest <name> — a fresh guest home whose every config layer names the fake helper, and a
+# repository under ~/work that the includeIf matches.
+mk_guest() {
+    GUEST_HOME="$TMPD/guest-$1"
+    rm -rf "$GUEST_HOME"; mkdir -p "$GUEST_HOME/.config/git" "$GUEST_HOME/work"
+    printf '[credential]\n\thelper = %s\n' "$FAKE" > "$GUEST_HOME/.config/git/config"
+    printf '[credential]\n\thelper = %s\n' "$FAKE" > "$GUEST_HOME/.gitconfig-inc"
+    printf '[credential]\n\thelper = %s\n' "$FAKE" > "$GUEST_HOME/.gitconfig-work"
+    cat > "$GUEST_HOME/.gitconfig" <<EOF
 [user]
 	name = Test Operator
 	email = op@example.com
+[credential]
+	helper = $FAKE
+[credential "https://github.com"]
+	helper = $FAKE
+[include]
+	path = $GUEST_HOME/.gitconfig-inc
+[credential]
+	helper = $FAKE
+[includeIf "gitdir:$GUEST_HOME/work/"]
+	path = $GUEST_HOME/.gitconfig-work
+EOF
+    REPO_DIR="$GUEST_HOME/work/repo"
+    git init -q "$REPO_DIR"
+    git -C "$REPO_DIR" config credential.helper "$FAKE"
+    cp "$GUEST_HOME/.gitconfig" "$TMPD/guest-$1.gitconfig.orig"
+}
+
+# guest_sh <cmd> — a guest shell in the repository with the env exactly as a guest zsh gets it:
+# nothing inherited (env -i) except what ~/.zshenv sources, i.e. augur's ~/.augur-env. (bash stands
+# in for zsh: the file is plain `export NAME='value'` lines.) The system config is the fake-helper
+# file; GIT_TERMINAL_PROMPT=0 turns a would-be prompt into a failure.
+guest_sh() {
+    env -i PATH="$PATH" HOME="$GUEST_HOME" GIT_CONFIG_SYSTEM="$SYSCONF" GIT_TERMINAL_PROMPT=0 \
+        bash -c 'source "$HOME/.zshenv" 2>/dev/null; cd "$1" && eval "$2"' _ "$REPO_DIR" "$1"
+}
+cred_fill()    { guest_sh "printf 'protocol=https\nhost=github.com\n\n' | git credential fill" 2>&1; }
+cred_approve() {
+    guest_sh "printf 'protocol=https\nhost=github.com\nusername=x-access-token\npassword=%s\n\n' \"\$GH_TOKEN\" | git credential approve" 2>&1
+}
+# Every helper git runs for one `get`, from git's own trace.
+helper_runs() {
+    guest_sh "printf 'protocol=https\nhost=github.com\n\n' | GIT_TRACE=1 git credential fill" 2>&1 \
+        | grep -c 'trace: run_command: .* get' || true
+}
+
+# probe — run a fill and an approve in the guest repository; sets:
+#   P_FILL   what `git credential fill` printed
+#   P_FAKE   every call the fake helper received (get and store)
+#   P_VALUE1 GIT_CONFIG_VALUE_1 as the guest shell sees it
+probe() {
+    : > "$FAKELOG"
+    P_FILL="$(cred_fill)"
+    cred_approve >/dev/null
+    P_FAKE="$(fake_calls)"
+    P_VALUE1="$(guest_sh 'printf %s "${GIT_CONFIG_VALUE_1-}"')"
+}
+# probe_ok — the probe's verdict as one word, so a broken variant can be asserted to be caught.
+probe_ok() {
+    [[ "$P_FILL" == *"password=$TOKEN"* ]] || { echo "no-token-answer"; return; }
+    [[ -z "$P_FAKE" ]]                     || { echo "fake-called"; return; }
+    [[ "$P_VALUE1" == "${WANT_HELPER}" ]]  || { echo "value-not-literal"; return; }
+    grep -E '^export GIT_CONFIG_' "$GUEST_HOME/.augur-env" | grep -qF "$TOKEN" && { echo "token-in-git-config"; return; }
+    echo ok
+}
+
+section "Tier 1 — controls: the fixture really reaches the fake helper at every layer"
+
+mk_guest control
+: > "$GUEST_HOME/.zshenv"; : > "$GUEST_HOME/.augur-env"     # no augur env at all
+store_calls() {   # store_calls [dir] — how many times one approve reaches the fake helper
+    : > "$FAKELOG"
+    env -i PATH="$PATH" HOME="$GUEST_HOME" GIT_CONFIG_SYSTEM="$SYSCONF" bash -c \
+        "cd \"\$1\" && printf 'protocol=https\nhost=github.com\nusername=u\npassword=p\n\n' | git credential approve" _ "${1:-$REPO_DIR}" >/dev/null 2>&1
+    wc -l < "$FAKELOG" | tr -d ' '
+}
+# system, XDG, global generic before, github.com section, [include], generic after, includeIf,
+# repository: eight helpers, so eight stores.
+eq "8" "$(store_calls)" "control: without augur, one store reaches the fake helper at all eight layers"
+for _f in "$SYSCONF" "$GUEST_HOME/.config/git/config" "$GUEST_HOME/.gitconfig-inc" \
+          "$GUEST_HOME/.gitconfig-work" "$REPO_DIR/.git/config"; do
+    cp "$_f" "$TMPD/layer.orig"
+    git config --file "$_f" --unset-all credential.helper
+    eq "7" "$(store_calls)" "control: ${_f#"$TMPD"/} contributes exactly one of them"
+    cp "$TMPD/layer.orig" "$_f"
+done
+eq "6" "$(store_calls "$GUEST_HOME")" "control: outside the repository the includeIf and repo helpers drop out (the gitdir: match is real)"
+
+section "Tier 1 — macOS: ~/.augur-env carries the reset and the helper, and git obeys it"
+
+mk_guest macos
+wire "$TOKEN"
+eq "0" "$rc" "the push returns 0"
+envf="$(cat "$GUEST_HOME/.augur-env")"
+has "$envf" "export GIT_CONFIG_COUNT='2'"                        "~/.augur-env exports GIT_CONFIG_COUNT=2"
+has "$envf" "export GIT_CONFIG_KEY_0='${KEY}'"                    "~/.augur-env: entry 0 is the github.com helper key"
+has "$envf" "export GIT_CONFIG_VALUE_0=''"                        "~/.augur-env: entry 0's value is the empty reset"
+has "$envf" "export GIT_CONFIG_KEY_1='${KEY}'"                    "~/.augur-env: entry 1 is the github.com helper key"
+has "$envf" "export GIT_CONFIG_VALUE_1='${WANT_HELPER}'"          "~/.augur-env: entry 1 is augur's helper, single-quoted"
+probe
+has "$P_FILL" "password=$TOKEN"         "macOS: augur's helper answers get with the token (from \$GH_TOKEN)"
+has "$P_FILL" "username=x-access-token" "macOS: …with the x-access-token username"
+eq  "" "$P_FAKE"                        "macOS: the fake helper is called on neither get nor store, at any layer"
+eq  "$WANT_HELPER" "$P_VALUE1"          "macOS: the guest shell sees GIT_CONFIG_VALUE_1 literally (\$GH_TOKEN unexpanded)"
+eq  "1" "$(helper_runs)"                "macOS: git runs exactly one helper for get"
+eq  "ok" "$(probe_ok)"                  "macOS: the probe's verdict is ok"
+
+# The token: in ~/.augur-env only on its own GH_TOKEN line, and on no argv.
+eq "1" "$(grep -cF "$TOKEN" "$GUEST_HOME/.augur-env")" "the token appears once in ~/.augur-env…"
+eq "export GH_TOKEN='$TOKEN'" "$(grep -F "$TOKEN" "$GUEST_HOME/.augur-env")" "…on the GH_TOKEN line, never in a GIT_CONFIG_* value"
+if grep -qF "$TOKEN" "$ALL_SSH"; then fail "the token is on an ssh argv" "$(cat "$ALL_SSH")"
+else ok "the token is on no ssh argv"; fi
+[[ -s "$ALL_SSH" ]] && ok "control: the argv log is not empty" || fail "control: no ssh call was recorded"
+# augur leaves the copied ~/.gitconfig byte-identical: the helper lives only in ~/.augur-env.
+if cmp -s "$GUEST_HOME/.gitconfig" "$TMPD/guest-macos.gitconfig.orig"; then
+    ok "macOS: the copied ~/.gitconfig is left byte-identical"
+else fail "macOS: the copied ~/.gitconfig was modified" "$(diff "$TMPD/guest-macos.gitconfig.orig" "$GUEST_HOME/.gitconfig")"; fi
+hasnt "$(cat "$SSHLOG")" "git config" "macOS: the push sends no git config command"
+
+# A GIT_CONFIG_* set the operator exports BEFORE augur's source line is replaced (the accepted
+# trade-off at git_credential_env).
+{ printf "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0='%s'\n" "$FAKE"
+  cat "$GUEST_HOME/.zshenv"; } > "$GUEST_HOME/.zshenv.new" && mv "$GUEST_HOME/.zshenv.new" "$GUEST_HOME/.zshenv"
+probe
+eq "ok" "$(probe_ok)" "an operator GIT_CONFIG_* set exported before ~/.augur-env is replaced by augur's"
+
+section "Tier 1 — macOS: a github.com section an older augur left in ~/.gitconfig is harmless"
+
+# What an older augur wrote at the end of the guest's ~/.gitconfig. ~/.gitconfig is re-copied from
+# the host only on boot, so a running VM keeps it across claude/shell sessions.
+mk_guest leftover
+cat >> "$GUEST_HOME/.gitconfig" <<'EOF'
 [credential "https://github.com"]
 	helper =
-	helper = !/opt/homebrew/bin/gh auth git-credential
+	helper = !f() { test \"$1\" = get && echo username=x-access-token && echo password=$GH_TOKEN; }; f
 EOF
-# Control for the fixture itself: prove the key really IS duplicated, or the whole section is
-# vacuous — it would then be testing the ordinary single-value path under a misleading name.
-if [[ "$(guest_values | wc -l | tr -d ' ')" == "2" ]]; then
-  ok "fixture: the guest's copied ~/.gitconfig really does define the helper twice (control)"
-else
-  fail "fixture: the guest ~/.gitconfig is not duplicated" "values: [$(guest_values)]"
-fi
+wire "$TOKEN"
+probe
+eq "ok" "$(probe_ok)"   "leftover section: augur's helper answers, the fake helper is never called"
+eq "1" "$(helper_runs)" "leftover section: git still runs exactly one helper (the env reset clears the old one too)"
 
-wire "ghp_hosttoken0123456789"
-# THE assertion. Only --replace-all can produce this: a plain `git config` exits 5 and writes
-# NOTHING, leaving the two host values in place. Anchored on the resulting config, not on the exit
-# code (the `|| warn` keeps that at 0 either way) and not on any string a failing run also prints.
-eq "$WANT" "$(guest_values)" "duplicated helper: the guest's config ends up holding EXACTLY augur's helper, once"
-# …and stated the other way round, so a fix that merely APPENDED augur's value would fail too.
-if [[ "$(guest_values | wc -l | tr -d ' ')" == "1" ]]; then
-  ok "duplicated helper: the duplicates are collapsed to a single value (not appended to)"
-else
-  fail "duplicated helper: the key still has multiple values" "values: [$(guest_values)]"
-fi
-# The host's helpers are gone — which is the intended lossy collapse, and is what makes the guest's
-# git use augur's GH_TOKEN helper rather than falling through to a host path that does not exist here.
-hasnt "$(guest_values)" "gh auth git-credential" "duplicated helper: the host's own gh helper does not survive into the guest"
-eq "0" "$rc" "duplicated helper: the wiring returns 0, so \`up\` continues past it"
-hasnt "$out" "Could not configure git's credential helper" "duplicated helper: no warning — the write genuinely succeeded"
-if [[ "$(wc -l < "$SSHLOG" | tr -d ' ')" == "1" ]]; then
-  ok "duplicated helper: exactly one guest round-trip (control: the stub was really exercised)"
-else
-  fail "duplicated helper: unexpected number of guest calls" "sshlog: [$(cat "$SSHLOG")]"
-fi
+section "Tier 1 — no host gh token: nothing is emitted in either mode"
 
-section "Tier 1 — single-value and absent-key controls (the fix must not regress the working path)"
-
-# A host that sets ONE helper is the common path, where the plain form simply overwrites it.
-# --replace-all must land on the same result, or it would be a behaviour change for everyone.
-mk_guest single <<'EOF'
-[credential "https://github.com"]
-	helper = osxkeychain
-EOF
-wire "ghp_hosttoken0123456789"
-eq "$WANT" "$(guest_values)" "single-value helper: still overwritten with augur's helper (unchanged behaviour)"
-eq "0" "$rc" "single-value helper: the wiring returns 0"
-
-# No credential section at all — the majority case. --replace-all must ADD, not require a match.
-mk_guest nokey <<'EOF'
-[user]
-	name = Test Operator
-EOF
-wire "ghp_hosttoken0123456789"
-eq "$WANT" "$(guest_values)" "no existing helper: augur's helper is created"
-eq "0" "$rc" "no existing helper: the wiring returns 0"
-
-section "Tier 1 — no host gh token: the guest is never touched at all"
-
-mk_guest notoken <<'EOF'
-[credential "https://github.com"]
-	helper = osxkeychain
-EOF
+mk_guest notoken
 wire ""
-eq "0" "$rc" "no gh token: the wiring returns 0"
-if grep -q "git config" "$SSHLOG"; then
-  fail "no gh token: a git config command WAS sent" "sshlog: [$(cat "$SSHLOG")]"
-else
-  ok "no gh token: no helper is written (a helper referencing an unset \$GH_TOKEN is worse than none)"
-fi
-if cmp -s "$GUEST_HOME/.gitconfig" "$TMPD/guest-notoken.orig"; then
-  ok "no gh token: the copied ~/.gitconfig is left byte-identical"
-else
-  fail "no gh token: the copied ~/.gitconfig was modified" "$(diff "$TMPD/guest-notoken.orig" "$GUEST_HOME/.gitconfig")"
-fi
+eq "0" "$rc" "no gh token: the push returns 0"
+hasnt "$(cat "$GUEST_HOME/.augur-env")" "GIT_CONFIG_" "no gh token: ~/.augur-env carries no GIT_CONFIG_*"
+hasnt "$(cat "$GUEST_HOME/.augur-env")" "GH_TOKEN"    "no gh token: …and no GH_TOKEN"
+if cmp -s "$GUEST_HOME/.gitconfig" "$TMPD/guest-notoken.gitconfig.orig"; then
+    ok "no gh token: the copied ~/.gitconfig is left byte-identical"
+else fail "no gh token: the copied ~/.gitconfig was modified"; fi
+# git behaves as it would without augur: the configured helpers are asked.
+probe
+has "$P_FAKE" "store" "no gh token: git runs the configured helpers as without augur (no lone reset)"
+_creds=(); _env=(); _add_session_exec_env
+hasnt "${_env[*]}" "GIT_CONFIG_" "no gh token: the container exec env carries no GIT_CONFIG_*"
+eq "" "$(git_credential_env)" "no gh token: git_credential_env prints nothing"
 
-section "Tier 1 — a ~/.gitconfig git cannot parse warns instead of aborting the bring-up"
+section "Tier 1 — Container: the same set, via -e, and real git obeys it"
 
-# --replace-all fixes the duplicate-key shape; it cannot fix arbitrary operator-authored syntax
-# (`git config` exits 128 on a malformed section header). The copied file is arbitrary host input,
-# and this wiring runs with the VM already cloned, sized, booted and SSH-reachable — so a hard
-# failure here is the stranded-guest shape again, for a convenience feature. It must warn instead.
-mk_guest malformed <<'EOF'
-[credential "https://github.com"
-	helper = osxkeychain
-EOF
-wire "ghp_hosttoken0123456789"
-# Non-vacuous by construction: `wire` runs under `set -e`, so dropping the `|| warn` makes rc != 0.
-eq "0" "$rc" "malformed ~/.gitconfig: the wiring still returns 0 under \`set -e\` (\`up\` is not aborted)"
-has "$out" "Could not configure git's credential helper" "malformed ~/.gitconfig: warns, so the missing push credential is not silent"
-has "$out" "git push"                                    "malformed ~/.gitconfig: the warning names the capability that is lost"
-has "$(cat "$GUEST_HOME/.augur-env" 2>/dev/null)" "export GH_TOKEN='ghp_hosttoken0123456789'" "malformed ~/.gitconfig: ~/.augur-env is still installed (the helper failure undoes nothing)"
+_creds=("GH_TOKEN=$TOKEN")
+_env=()
+_add_session_exec_env
+cenv=()
+for ((i = 0; i < ${#_env[@]}; i++)); do
+  [[ "${_env[i]}" == -e && "${_env[i+1]:-}" == GIT_CONFIG_* ]] && cenv+=("${_env[i+1]}")
+done
+eq "$(git_credential_env)" "$(printf '%s\n' "${cenv[@]}")" "container: the -e GIT_CONFIG_* pairs are exactly git_credential_env's lines, in order"
+eq "GIT_CONFIG_VALUE_0=" "${cenv[2]:-}" "container: the first helper value is the empty reset"
+eq "GIT_CONFIG_VALUE_1=$WANT_HELPER" "${cenv[4]:-}" "container: the second is augur's helper, \$GH_TOKEN unexpanded"
+hasnt "${_env[*]}" "$TOKEN" "container: the token is in no -e argument"
+_creds=()
+mk_guest container
+: > "$FAKELOG"
+cfill="$(cd "$REPO_DIR" && printf 'protocol=https\nhost=github.com\n\n' | env -i PATH="$PATH" HOME="$GUEST_HOME" \
+    GIT_CONFIG_SYSTEM="$SYSCONF" GIT_TERMINAL_PROMPT=0 GH_TOKEN="$TOKEN" "${cenv[@]}" git credential fill 2>&1)"
+( cd "$REPO_DIR" && printf 'protocol=https\nhost=github.com\nusername=x-access-token\npassword=%s\n\n' "$TOKEN" \
+    | env -i PATH="$PATH" HOME="$GUEST_HOME" GIT_CONFIG_SYSTEM="$SYSCONF" "${cenv[@]}" git credential approve >/dev/null 2>&1 )
+has "$cfill" "password=$TOKEN" "container: augur's helper answers get (password from \$GH_TOKEN)"
+eq "" "$(fake_calls)"          "container: the fake helper is called on neither get nor store, at any layer"
 
-section "Tier 1 — source guards: ordering, and container mode's immunity"
+section "Tier 1 — deliberate breakage: each broken variant is caught by the probe"
 
-up_macos_body="$(awk '/^cmd_up_macos\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
-up_body="$(awk       '/^cmd_up\(\)/{f=1}       f{print} f&&/^}/{exit}' "$AUGUR")"
+real_gce="$(declare -f git_credential_env)"
+real_export="$(declare -f macos_env_add_export)"
+broken() {   # broken <slug> <label> <expected verdict> — wire with the current (broken) definitions, probe
+    mk_guest "broken-$1"; shift
+    wire "$TOKEN"
+    probe
+    local v; v="$(probe_ok)"
+    if [[ "$v" == ok ]]; then fail "breakage '$1' is NOT caught" "probe said ok"
+    else eq "$2" "$v" "breakage '$1' is caught ($v)"; fi
+    eval "$real_gce"; eval "$real_export"
+}
+
+# 1. No empty reset: the helpers from every config layer are asked again.
+git_credential_env() {
+    creds_have_gh_token || return 0
+    printf '%s\n' 'GIT_CONFIG_COUNT=1' "GIT_CONFIG_KEY_0=$KEY" "GIT_CONFIG_VALUE_0=$WANT_HELPER"
+}
+broken noreset "no reset" fake-called
+
+# 2. The reset AFTER the helper: it clears augur's helper too, so nothing answers.
+git_credential_env() {
+    creds_have_gh_token || return 0
+    printf '%s\n' 'GIT_CONFIG_COUNT=2' "GIT_CONFIG_KEY_0=$KEY" "GIT_CONFIG_VALUE_0=$WANT_HELPER" \
+        "GIT_CONFIG_KEY_1=$KEY" 'GIT_CONFIG_VALUE_1='
+}
+broken resetafter "reset after the helper" no-token-answer
+
+# 3. `$GH_TOKEN` expanded on the host when the value is written (a double-quoted helper body, with
+# the token in augur's own environment, as `gh auth token` sees a host GH_TOKEN).
+git_credential_env() {
+    creds_have_gh_token || return 0
+    printf '%s\n' 'GIT_CONFIG_COUNT=2' "GIT_CONFIG_KEY_0=$KEY" 'GIT_CONFIG_VALUE_0=' "GIT_CONFIG_KEY_1=$KEY" \
+        "GIT_CONFIG_VALUE_1=!f() { test \"\${1-}\" = get && echo username=x-access-token && echo \"password=$GH_TOKEN\"; }; f"
+}
+GH_TOKEN="$TOKEN" broken hostexp "\$GH_TOKEN expanded when ~/.augur-env is written" value-not-literal
+grep -E '^export GIT_CONFIG_' "$TMPD/guest-broken-hostexp/.augur-env" 2>/dev/null \
+    | grep -qF "$TOKEN" && ok "…and the token value did land in a GIT_CONFIG_* line (the hazard is real)" \
+    || fail "…the host-expansion variant did not put the token in ~/.augur-env (fixture is vacuous)"
+
+# 4. `$GH_TOKEN` expanded when the guest SOURCES ~/.augur-env: the writer double-quotes the value.
+eval "$(printf '%s\n' "$real_export" | sed 's/='"'"'\${value}'"'"'/=\\"${value}\\"/')"
+[[ "$(declare -f macos_env_add_export)" != "$real_export" ]] \
+    && ok "control: the writer was really mutated to double quotes" || fail "control: the sed did not change the writer"
+broken sourceexp "\$GH_TOKEN expanded when ~/.augur-env is sourced" no-token-answer
+
+eq "$real_gce" "$(declare -f git_credential_env)" "control: the real git_credential_env is restored"
+eq "$real_export" "$(declare -f macos_env_add_export)" "control: the real ~/.augur-env line writer is restored"
+
+section "Tier 1 — macOS: a value the single-quoted export cannot hold aborts the push before ssh"
+
+# refused <slug> <label> — wire with the current (unsafe) git_credential_env; the push must fail
+# with nothing sent and the guest's existing ~/.augur-env untouched.
+refused() {
+    mk_guest "refused-$1"; shift
+    printf '%s\n' 'export OLD=1' '# augur-env: end' > "$GUEST_HOME/.augur-env"
+    cp "$GUEST_HOME/.augur-env" "$TMPD/refused.orig"
+    wire "$TOKEN"
+    [[ "$rc" != 0 ]] && ok "$1: the push fails" || fail "$1: the push returned 0" "$out"
+    has "$out" "Refusing to" "$1: it says why"
+    [[ -s "$SSHLOG" ]] && fail "$1: an ssh call was made" "$(cat "$SSHLOG")" || ok "$1: no ssh call was made"
+    cmp -s "$GUEST_HOME/.augur-env" "$TMPD/refused.orig" && ok "$1: the guest's ~/.augur-env is unchanged" \
+        || fail "$1: the guest's ~/.augur-env changed"
+    eval "$real_gce"
+}
+git_credential_env() {
+    creds_have_gh_token || return 0
+    printf '%s\n' 'GIT_CONFIG_COUNT=1' "GIT_CONFIG_KEY_0=$KEY" "GIT_CONFIG_VALUE_0=!f() { echo 'x'; }; f"
+}
+refused quote "a single quote in a helper value"
+git_credential_env() {
+    creds_have_gh_token || return 0
+    printf '%s\n' 'GIT_CONFIG_COUNT=1' "GIT_CONFIG_KEY_0=$KEY" $'GIT_CONFIG_VALUE_0=a\tb'
+}
+refused ctrl "a control byte in a helper value"
+git_credential_env() {
+    creds_have_gh_token || return 0
+    printf '%s\n' 'GIT CONFIG=1'
+}
+refused name "an entry whose name is not a shell variable name"
+eq "$real_gce" "$(declare -f git_credential_env)" "control: the real git_credential_env is restored again"
+
+section "Tier 1 — source guards"
+
 fn_body() { awk -v n="$1" '$0 ~ "^"n"\\(\\) \\{"{f=1} f{print} f&&/^}/{exit}' "$AUGUR"; }
 host_config_body="$(fn_body _add_host_config_run_args)"
-session_env_body="$(fn_body _add_session_exec_env)"
-# The whole container-up path: cmd_up plus every function it was split into, plus the per-session
-# env the claude/shell exec adds.
-up_path_body="$up_body"
-for _f in reconcile_running_container recreate_container _add_egress_run_args \
-          _add_state_mount_run_args _add_host_config_run_args migrate_pre_option_a_history \
-          _add_session_exec_env session_credential_env ensure_session_container; do
-  _fb="$(fn_body "$_f")"
-  [[ -n "$_fb" ]] || fail "source guard: could not extract $_f() from augur" "the up-path guard below would pass vacuously"
-  up_path_body+=$'\n'"$_fb"
-done
-
-# The scp REPLACES the file the helper is written into, so their order is load-bearing in a way no
-# behavioural test of the function alone can see: swap them and the helper is silently discarded on
-# every fresh `up`, with git push failing only later, in the guest, at the operator's first push.
-scp_at="$(printf  '%s\n' "$up_macos_body" | grep -n 'scp_to_macos .* "\$HOME/\.gitconfig"' | head -n1 | cut -d: -f1)"
-# The helper is written by push_macos_guest_env, so its call site in cmd_up_macos is what must follow
-# the scp.
-push_fn_body="$(fn_body push_macos_guest_env)"
-has "$push_fn_body" '$(macos_git_credential_helper_cmd) || exit 3' "the ~/.augur-env push writes the git credential helper, best-effort"
-wire_at="$(printf '%s\n' "$up_macos_body" | grep -n '^ *push_macos_guest_env '   | tail -n1 | cut -d: -f1)"
-if [[ -n "$scp_at" && -n "$wire_at" && "$scp_at" -lt "$wire_at" ]]; then
-  ok "macOS up copies ~/.gitconfig BEFORE writing the helper into it (scp@$scp_at < helper@$wire_at)"
-else
-  fail "macOS up does not write the credential helper after the ~/.gitconfig copy" \
-       "scp@${scp_at:-none} helper@${wire_at:-none}"
-fi
-
-# Container mode's immunity is the reason only one mode is exposed to this, and it is a property worth
-# pinning: the mounted ~/.gitconfig is read-only there, so the helper MUST arrive via env vars.
-hasnt "$up_path_body" 'git config --global' "container up/session (cmd_up and every helper it calls) never mutates the mounted ~/.gitconfig"
-has   "$session_env_body" 'GIT_CONFIG_KEY_0=credential.https://github.com.helper' \
-                                       "container sessions get the same helper through GIT_CONFIG_* env vars instead"
+has   "$(fn_body _add_session_exec_env)" '< <(git_credential_env)'  "container sessions take the helper from git_credential_env"
+has   "$(fn_body push_macos_guest_env)"  '< <(git_credential_env)'  "the macOS ~/.augur-env push takes it from git_credential_env"
+eq    "3" "$(fn_body push_macos_guest_env | grep -c 'macos_env_add_export "$_kv" || return 1')" \
+      "the push writes the fixed env, the credentials and the git helper through macos_env_add_export, aborting on refusal"
+hasnt "$(fn_body push_macos_guest_env)"  '${_kv#*=}'  "the push formats no NAME=value pair itself"
 hasnt "$host_config_body" 'GIT_CONFIG_' "container \`run\` bakes no GIT_CONFIG_* (the helper is per session)"
 has   "$host_config_body" '.gitconfig:/home/dev/.gitconfig:ro' "container up mounts ~/.gitconfig READ-ONLY"
+hasnt "$(cat "$AUGUR")" 'git config --global' "augur never mutates a global git config, in either mode"
 
 finish

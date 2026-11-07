@@ -74,6 +74,25 @@ if ( cd "$proj" && ANTHROPIC_API_KEY="$probe_key" bash "$REPO/augur" up --no-egr
   eq "$probe_key" "$fifo_out" "container exec --env-file <(…) delivers the value to the session process"
   hasnt "$(container inspect "$cont" 2>/dev/null)" "AUGUR_FIFO_PROBE" "an exec-time env-file value is not persisted in the container config"
 
+  # ── git's credential helper as an augur session gets it: augur's own _add_session_exec_env and
+  #    session_credential_env build the exec env, with a probe gh token. The empty reset value must
+  #    reach git as an empty entry ahead of augur's helper, and the helper must answer from GH_TOKEN
+  #    with no helper from the mounted host ~/.gitconfig asked. ──
+  gh_probe="ghp_augurliveprobe$$"
+  want_helper='!f() { test "$1" = get && echo username=x-access-token && echo "password=$GH_TOKEN"; }; f'
+  session_exec() {   # session_exec <cmd> — /bin/sh -c <cmd> in $cont with augur's session env
+    ( AUGUR_SOURCE_ONLY=1 source "$REPO/augur" >/dev/null 2>&1; set +e
+      _creds=("GH_TOKEN=$gh_probe"); _env=(); _add_session_exec_env
+      container exec --env-file <(session_credential_env) "${_env[@]}" "$cont" /bin/sh -c "$1" )
+  }
+  helpers="$(session_exec 'git config --get-all credential.https://github.com.helper | tail -n 2' 2>&1)"
+  eq $'\n'"$want_helper" "$helpers" "the session's last two github.com helpers are the empty reset, then augur's"
+  cfill="$(session_exec 'cd /tmp && printf "protocol=https\nhost=github.com\n\n" | GIT_TERMINAL_PROMPT=0 git credential fill' 2>&1)"
+  has   "$cfill" "username=x-access-token" "git credential fill in the session answers with augur's username"
+  has   "$cfill" "password=$gh_probe"      "…and the session's GH_TOKEN as the password"
+  hasnt "$cfill" "not a git command"       "…without asking a host helper missing from the image (credential-osxkeychain)"
+  hasnt "$cfill" "not found"               "…or one at a host-only path (/opt/homebrew/bin/gh)"
+
   # ── Persistence: `down` keeps the container; `up` reuses it and the writable layer survives ──
   # Write a marker OUTSIDE the bind-mounted workspace (in the container's own writable layer),
   # then down (stop) + up (reuse) and confirm it's still there — proof the container was not
