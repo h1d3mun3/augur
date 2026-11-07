@@ -8,9 +8,11 @@
 #     values only in that ssh process's environment: on no argv, in no file in the guest, and (for
 #     values augur reads from a host file or `gh`) in no other ssh call's environment;
 #   • ~/.augur-env (the guest's per-VM, non-secret env) is pushed on every up/claude/shell, holds no
-#     credential, and a push replaces one an older augur wrote with credentials in it;
-#   • the write is atomic and mode 600, the guest installs only content ending in the end marker,
-#     and temp files older than a minute (left by a killed push) are removed while a fresh one stays;
+#     credential, and a push replaces one an older augur wrote with credentials in it; git's helper
+#     lines in it apply only in a shell that has GH_TOKEN;
+#   • the write is atomic and mode 600, the guest installs only content ending in the end marker;
+#     a plain push removes temp files older than a minute (left by a killed push) while a fresh one
+#     stays, and a push that carries the acceptance check removes every one, whatever its age;
 #   • each credential is read once per invocation and the values sent are the values validated;
 #   • a credential that cannot be injected, or a credential file that cannot be read, aborts with no
 #     session (on a boot: before the VM backend is called at all); on a running VM only after the
@@ -22,6 +24,10 @@
 #     boot, no GIT_CONFIG_* helper lines either), and still has the credentials an older augur wrote
 #     removed, all in the one push that carries the check; the refusal is reported even when a later
 #     step of that push fails; so is one whose acceptance cannot be checked;
+#   • a boot whose first push fails (refusal, transport, a failed write) stops the VM, its gvproxy
+#     and its proxy, and keeps the clone;
+#   • a session whose guest is missing a credential it sent (an sshd that dropped it) never starts
+#     the agent or shell, and is refused with the remedy, printing no value;
 #   • a push that fails is fatal on every path;
 #   • every path launches exactly once and pushes exactly once, plus, on a boot, the earlier push
 #     that carries the acceptance check and no credential or GIT_CONFIG_* helper lines: running VM,
@@ -72,14 +78,26 @@ VMCHECKS="$TMPD/vmchecks"
 : > "$ALL_SSH"; : > "$OTHERENV"; : > "$PUSHLOG"
 
 # The real `ssh` a session execs, on PATH: records its argv (one argument per line, after an
-# "ARGV" line) and the credential variables in ITS OWN environment. Exits $SHIM_RC.
+# "ARGV" line) and the credential variables in ITS OWN environment. Exits $SHIM_RC, unless
+# SHIM_SSHD is set: then it plays the guest's sshd and runs the remote command (its last argument)
+# under `sh` with the variables its SendEnv options name, minus those SHIM_SSHD=drop:<NAME,...>
+# lists, as an sshd that dropped them would. The guest's `zsh` there is a stand-in that only logs
+# LAUNCHED to $SHIM_LAUNCHLOG.
 SHIMDIR="$TMPD/shim"; mkdir -p "$SHIMDIR"
-export SESSLOG="$TMPD/sesslog" SHIM_RC=0
+export SESSLOG="$TMPD/sesslog" SHIM_RC=0 SHIM_SSHD="" SHIM_LAUNCHLOG="$TMPD/launchlog" SHIM_GUESTBIN="$TMPD/guestbin"
+mkdir -p "$SHIM_GUESTBIN"
+printf '#!/bin/sh\necho LAUNCHED >> "$SHIM_LAUNCHLOG"\n' > "$SHIM_GUESTBIN/zsh"; chmod +x "$SHIM_GUESTBIN/zsh"
 cat > "$SHIMDIR/ssh" <<'EOF'
 #!/usr/bin/env bash
 { echo "ARGV"; printf '%s\n' "$@"; echo "ENV"
   env | grep -E '^(ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|GH_TOKEN)=' | sort; echo "END"; } >> "$SESSLOG"
-exit "$SHIM_RC"
+[[ -n "$SHIM_SSHD" ]] || exit "$SHIM_RC"
+sent=(); for a in "$@"; do [[ "$a" == SendEnv=* ]] && sent+=("${a#SendEnv=}"); done
+drop=",${SHIM_SSHD#drop:},"; pass=()
+for n in ${sent[@]+"${sent[@]}"}; do [[ "$drop" == *",$n,"* ]] || pass+=("$n=${!n}"); done
+home="$(mktemp -d)"; mkdir -p "$home/$MACOS_SHARE"
+env -i PATH="$SHIM_GUESTBIN:/usr/bin:/bin" HOME="$home" SHIM_LAUNCHLOG="$SHIM_LAUNCHLOG" ${pass[@]+"${pass[@]}"} sh -c "${!#}"
+rc=$?; rm -rf "$home"; exit "$rc"
 EOF
 chmod +x "$SHIMDIR/ssh"
 PATH="$SHIMDIR:$PATH"
@@ -142,6 +160,8 @@ egress_enabled()                    { return 0; }
 check_project_conf_approved()       { echo gate >> "$HOSTLOG"; }
 start_proxy()                       { echo start_proxy >> "$HOSTLOG"; }
 start_gvproxy()                     { :; }
+stop_gvproxy()                      { echo stop_gvproxy >> "$HOSTLOG"; }
+stop_proxy()                        { echo stop_proxy >> "$HOSTLOG"; }
 resolve_macos_vm_cpu()              { echo 4; }
 resolve_macos_vm_memory_mb()        { echo 8192; }
 wait_for_macos_ssh()                { return 0; }
@@ -232,6 +252,14 @@ mode_of()    { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
 pushcmd()    { grep 'cat > .*\.augur-env' "$SSHLOG" | head -n1; }
 push_content() { awk -v n="$1" '/^PUSH$/{i++; next} i == n' "$PUSHLOG"; }   # the content of push n
 nonzero()    { if [[ "$rc" -ne 0 ]]; then ok "$1: exits non-zero"; else fail "$1: exited 0"; fi; }
+# stopped_boot <label>: the run stopped the VM it booted, and its gvproxy and proxy, and kept the clone.
+stopped_boot() {
+    has "$(cat "$VMLOG")" "stop $(macos_project_vm)" "$1: stops the VM it booted"
+    hasnt "$(cat "$VMLOG")" "delete" "$1: keeps the clone"
+    has "$(cat "$HOSTLOG")" "stop_gvproxy" "$1: stops gvproxy"
+    has "$(cat "$HOSTLOG")" "stop_proxy" "$1: stops the proxy"
+    has "$out" "Stopping VM '$(macos_project_vm)' (its clone is kept)" "$1: says it stops the VM"
+}
 
 section "Tier 1 — the base VM build writes the sshd drop-in that accepts the session's credentials"
 
@@ -337,6 +365,13 @@ eq "" "$(find "$GUEST_HOME" -maxdepth 1 -name '.augur-env.*' -print)" "no temp f
 eq "1" "$(grep -c '.augur-env' "$GUEST_HOME/.zshenv")" "~/.zshenv sources ~/.augur-env"
 has "$envc" "export GIT_CONFIG_VALUE_1='" "git's credential helper is exported in ~/.augur-env"
 has "$(grep '^export GIT_CONFIG_VALUE_1=' "$ENV_FILE")" 'password=$GH_TOKEN' "…holding only the \$GH_TOKEN reference"
+# The helper lines apply only in a shell that has GH_TOKEN (an augur session's): a GUI Terminal or a
+# hand-run ssh keeps git's own helpers. Sourced under sh, which runs it as zsh would.
+src_git_env() { env -i PATH=/usr/bin:/bin HOME="$GUEST_HOME" "$@" sh -c '. "$HOME/.augur-env" >/dev/null 2>&1; env | grep "^GIT_CONFIG_" | sort'; }
+eq "" "$(src_git_env)" "a shell without GH_TOKEN that sources ~/.augur-env gets no GIT_CONFIG_*"
+has "$(src_git_env GH_TOKEN=ghp_session)" "GIT_CONFIG_COUNT=2" "a session shell with GH_TOKEN gets git's helper lines"
+has "$(src_git_env GH_TOKEN=ghp_session)" "GIT_CONFIG_VALUE_0=" "…with the reset"
+eq "" "$(src_git_env GH_TOKEN=)" "a shell whose GH_TOKEN is empty gets no GIT_CONFIG_* either"
 [[ -e "$GUEST_HOME/.gitconfig" ]] && fail "the push created ~/.gitconfig" || ok "the push does not write ~/.gitconfig"
 grep -q sync_macos_guest_clock "$STEPS" && ok "shell --macos: the clock is synced on this path (control)" \
     || fail "shell --macos: the clock sync did not run" "steps: $(tr '\n' ' ' < "$STEPS")"
@@ -413,18 +448,44 @@ eq "" "$(find "$GUEST_HOME" -maxdepth 1 -name '.augur-env.*' -print)" "truncated
 
 # A temp file left by a push killed mid-write long ago (an older augur's may hold a credential), a
 # fresh one (a concurrent push still writing), and a file that is not augur's at all.
-printf "export GH_TOKEN='ghp_revoked'\n" > "$GUEST_HOME/.augur-env.tmp.4242"; touch -t 202001010000 "$GUEST_HOME/.augur-env.tmp.4242"
-printf 'in progress\n'                   > "$GUEST_HOME/.augur-env.tmp.4343"
-printf 'mine\n'                          > "$GUEST_HOME/.augur-env.bak"; touch -t 202001010000 "$GUEST_HOME/.augur-env.bak"
+stale_fixture() {
+    printf "export GH_TOKEN='ghp_revoked'\n" > "$GUEST_HOME/.augur-env.tmp.4242"; touch -t 202001010000 "$GUEST_HOME/.augur-env.tmp.4242"
+    printf "export GH_TOKEN='ghp_revoked'\n" > "$GUEST_HOME/.augur-env.tmp.4343"
+    printf 'mine\n'                          > "$GUEST_HOME/.augur-env.bak"; touch -t 202001010000 "$GUEST_HOME/.augur-env.bak"
+}
+# A push without the acceptance check (the boot path's last one) keeps a fresh temp file.
+stale_fixture
+: > "$SSHLOG"
+out="$( _creds=(); push_macos_guest_env "$(macos_project_vm)" 2>&1 )"; rc=$?
+eq "0" "$rc" "stale temp files, plain push: completes"
+[[ -e "$GUEST_HOME/.augur-env.tmp.4242" ]] && fail "plain push: an old temp file survives (it may hold revoked secrets)" \
+    || ok "plain push: a temp file older than a minute is removed"
+[[ -e "$GUEST_HOME/.augur-env.tmp.4343" ]] && ok "plain push: a fresh temp file (a concurrent push) is left alone" \
+    || fail "plain push: a concurrent push's temp file was removed (its mv would then fail)"
+[[ -e "$GUEST_HOME/.augur-env.bak" ]] && ok "plain push: a file outside augur's temp-name pattern is left alone" \
+    || fail "plain push: cleanup removed a file that is not augur's"
+# The push that carries the acceptance check (every session, `up` on a running VM, the boot's first
+# push) removes every temp file whatever its age: a guest clock that lags after a boot makes an old
+# one look new, and a refused guest gets no later push.
+stale_fixture
 run_cmd shell
 eq "0" "$rc" "stale temp files: shell --macos completes"
-[[ -e "$GUEST_HOME/.augur-env.tmp.4242" ]] && fail "an old temp file survives (it may hold revoked secrets)" \
-    || ok "a temp file older than a minute is removed"
-[[ -e "$GUEST_HOME/.augur-env.tmp.4343" ]] && ok "a fresh temp file (a concurrent push) is left alone" \
-    || fail "a concurrent push's temp file was removed (its mv would then fail)"
-[[ -e "$GUEST_HOME/.augur-env.bak" ]] && ok "a file outside augur's temp-name pattern is left alone" \
-    || fail "cleanup removed a file that is not augur's"
-rm -f "$GUEST_HOME/.augur-env.tmp.4343" "$GUEST_HOME/.augur-env.bak"
+[[ -e "$GUEST_HOME/.augur-env.tmp.4242" ]] && fail "checked push: an old temp file survives" \
+    || ok "checked push: a temp file older than a minute is removed"
+[[ -e "$GUEST_HOME/.augur-env.tmp.4343" ]] && fail "checked push: a temp file that looks fresh survives (a lagging guest clock keeps an old one)" \
+    || ok "checked push: a temp file that looks fresh is removed too"
+[[ -e "$GUEST_HOME/.augur-env.bak" ]] && ok "checked push: a file outside augur's temp-name pattern is left alone" \
+    || fail "checked push: cleanup removed a file that is not augur's"
+has "$(pushcmd)" "! -name .augur-env.tmp.\$\$" "checked push: the push's own temp file is spared"
+hasnt "$(pushcmd)" "-mmin" "checked push: no age filter"
+# On a refused guest too.
+mv "$DROPIN" "$TMPD/dropin.saved"
+stale_fixture
+run_cmd shell
+nonzero "stale temp files, refused guest: shell --macos"
+eq "" "$(find "$GUEST_HOME" -maxdepth 1 -name '.augur-env.tmp.*' -print)" "stale temp files, refused guest: every temp file is removed"
+mv "$TMPD/dropin.saved" "$DROPIN"
+rm -f "$GUEST_HOME/.augur-env.bak"
 
 section "Tier 1 — a guest whose sshd does not accept the session's credentials is refused"
 
@@ -449,7 +510,7 @@ for _cmd in shell claude up; do
     hasnt "$(cat "$STEPS")" "ensure_macos_workspace" "no drop-in, running VM: $_cmd --macos stops at the push"
 done
 # Stopped: refused right after the SSH wait, before the clock, the self-test and the rest of the
-# bring-up. The VM is left running (augur-vm is never asked to stop it), as after a failed push.
+# bring-up. The VM is stopped with its egress helpers (its self-test never ran), the clone kept.
 # A host gh token is resolved here, so a push that wrote git's GIT_CONFIG_* helper lines would show it.
 RUNNING=0
 for _cmd in claude up; do
@@ -458,7 +519,7 @@ for _cmd in claude up; do
     grep -q '^run ' "$VMLOG" && ok "no drop-in, VM stopped: $_cmd --macos booted the VM (control)" \
         || fail "no drop-in, VM stopped: $_cmd --macos never booted" "$(cat "$VMLOG")"
     eq "" "$(cat "$STEPS")" "no drop-in, VM stopped: $_cmd --macos refuses before the clock, the self-test and the wiring"
-    hasnt "$(cat "$VMLOG")" "stop" "no drop-in, VM stopped: $_cmd --macos leaves the VM running"
+    stopped_boot "no drop-in, VM stopped: $_cmd --macos"
     eq "1" "$(pushes)" "no drop-in, VM stopped: $_cmd --macos pushes once (the check and the cleanup in one)"
     eq "1" "$(ssh_calls)" "no drop-in, VM stopped: $_cmd --macos makes no other guest connection"
     has "$(pushcmd)" "sshd_config.d" "no drop-in, VM stopped: $_cmd --macos checks within that push (the running VM's code path)"
@@ -495,6 +556,7 @@ nonzero "the acceptance check cannot connect: claude --macos"
 has "$out" "unknown outcome (ssh exit 255)" "the acceptance check cannot connect: says the push's outcome is unknown"
 eq "" "$(cat "$STEPS")" "the acceptance check cannot connect: the boot stops before the clock and the self-test"
 eq "0" "$(launches)" "the acceptance check cannot connect: no session"
+stopped_boot "the acceptance check cannot connect: claude --macos"
 RUNNING=1
 FAIL_CHECK=0
 
@@ -511,6 +573,7 @@ for _run in "1 shell" "1 up" "0 up"; do
     has "$out" "does not accept augur's session credentials" "$_l: still reports the refusal"
     has "$out" "augur destroy --macos && augur up --macos" "$_l: still names the remedy"
     eq "0" "$(launches)" "$_l: no session"
+    [[ "$RUNNING" == 0 ]] && stopped_boot "$_l"
     rm -f "$GUEST_HOME/.zshenv"; FAIL_STEP=zshenv; run_cmd "$_cmd"; FAIL_STEP=""
     _l="no drop-in and the ~/.zshenv write fails (running=$RUNNING): $_cmd --macos"
     nonzero "$_l"
@@ -518,6 +581,7 @@ for _run in "1 shell" "1 up" "0 up"; do
     has "$out" "does not accept augur's session credentials" "$_l: still reports the refusal"
     hasnt "$(cat "$ENV_FILE")" "oldbase" "$_l: the old credentials are still removed"
     eq "0" "$(launches)" "$_l: no session"
+    [[ "$RUNNING" == 0 ]] && stopped_boot "$_l"
 done
 RUNNING=1
 mv "$TMPD/dropin.saved" "$DROPIN"
@@ -679,6 +743,7 @@ for FAIL_PUSH in 1 2; do
     nonzero "push fails ($FAIL_PUSH), running VM: up --macos"
     RUNNING=0; run_cmd up
     nonzero "push fails ($FAIL_PUSH), boot: up --macos"
+    stopped_boot "push fails ($FAIL_PUSH), boot: up --macos"
     RUNNING=0; run_cmd claude
     nonzero "push fails ($FAIL_PUSH), boot: claude --macos"
     eq "0" "$(launches)" "push fails ($FAIL_PUSH), boot: claude --macos starts no session"
@@ -686,6 +751,49 @@ done
 RUNNING=1
 FAIL_PUSH=0
 eq "$before" "$(cat "$ENV_FILE")" "push fails: the guest's ~/.augur-env is unchanged"
+
+section "Tier 1 — a session checks in the guest that every credential it sent arrived"
+
+# The guest's sshd plays along (SHIM_SSHD): the remote command runs, the stand-in zsh logs a launch.
+export MACOS_SHARE ANTHROPIC_API_KEY="test-api-key-BBB222"
+GH_HOST_TOKEN="ghp_rotated22222"
+RUNNING=1
+for _cmd in claude shell; do
+    : > "$SHIM_LAUNCHLOG"; SHIM_SSHD="drop:"; run_cmd "$_cmd"
+    eq "0" "$rc" "every credential arrives: $_cmd --macos completes"
+    eq "LAUNCHED" "$(cat "$SHIM_LAUNCHLOG")" "every credential arrives: $_cmd --macos launches"
+    for _n in ANTHROPIC_API_KEY GH_TOKEN; do
+        has "$(sess_argv | tail -n1)" "[ -n \"\${${_n}:-}\" ] || exit $MACOS_SESSION_ENV_MISSING_RC" \
+            "$_cmd --macos: the remote command checks ${_n} before it launches"
+    done
+    for _drop in GH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_API_KEY,GH_TOKEN; do
+        : > "$SHIM_LAUNCHLOG"; SHIM_SSHD="drop:$_drop"; run_cmd "$_cmd"
+        _l="the guest's sshd drops $_drop: $_cmd --macos"
+        nonzero "$_l"
+        eq "" "$(cat "$SHIM_LAUNCHLOG")" "$_l: the agent or shell never starts"
+        has "$out" "sshd did not accept augur's session credentials" "$_l: says why"
+        has "$out" "augur destroy --macos && augur up --macos" "$_l: names the recreate"
+        has "$out" "augur update --macos" "$_l: names the base VM update"
+        hasnt "$out" "test-api-key-BBB222" "$_l: prints no API key"
+        hasnt "$out" "ghp_rotated22222" "$_l: prints no gh token"
+    done
+done
+# The check comes before the agent starts, in the same remote command, and prints nothing.
+pre="$(sess_argv | tail -n1)"; pre="${pre%%zsh -l*}"
+hasnt "$pre" "echo" "the delivery check prints nothing in the guest"
+hasnt "$pre" "printf" "…no printf either"
+# Nothing to send: nothing to check, and the session launches.
+unset ANTHROPIC_API_KEY; GH_HOST_TOKEN=""
+: > "$SHIM_LAUNCHLOG"; SHIM_SSHD="drop:"; run_cmd shell
+eq "0" "$rc" "no credentials on the host: shell --macos completes with no delivery check"
+eq "LAUNCHED" "$(cat "$SHIM_LAUNCHLOG")" "no credentials on the host: shell --macos launches"
+hasnt "$(sess_argv | tail -n1)" "exit $MACOS_SESSION_ENV_MISSING_RC" "no credentials on the host: no check is sent"
+# An agent that exits with some other status: passed through, no refusal claimed.
+SHIM_SSHD=""; SHIM_RC=3; run_cmd shell
+eq "3" "$rc" "the session's own exit status is passed through"
+hasnt "$out" "sshd did not accept" "…and no refusal is claimed for it"
+SHIM_RC=0
+export ANTHROPIC_API_KEY="test-api-key-BBB222"; GH_HOST_TOKEN="ghp_rotated22222"
 
 section "Tier 1 — a guest that fails its boot self-test gets no session"
 
@@ -708,6 +816,7 @@ for _cmd in shell claude up; do
     eq "2" "$(pushes)" "not running: $_cmd --macos pushes ~/.augur-env twice (the check's, then the wiring)"
     eq "1" "$(gh_calls)" "not running: $_cmd --macos asks gh for the token once"
     eq "1" "$(grep -c '^ensure_macos_workspace$' "$STEPS")" "not running: $_cmd --macos wires the guest once"
+    hasnt "$(cat "$VMLOG")" "stop " "not running: $_cmd --macos leaves the booted VM running"
     hasnt "$(cat "$ENV_FILE")" "ghp_boot333333" "not running: $_cmd --macos: ~/.augur-env holds no gh token"
     if [[ "$_cmd" == up ]]; then
         eq "0" "$(launches)" "not running: up --macos starts no session"

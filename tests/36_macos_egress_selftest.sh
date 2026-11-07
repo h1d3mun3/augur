@@ -128,7 +128,7 @@ ssh_macos() {
         *"curl "*)                                     # everything else curl'd is an IP literal
             [[ "$G_IPLIT" == 1 ]] && return 0
             return 28 ;;
-        *"cat > "*".augur-env"*)                       # the credential push, which IS piped:
+        *"cat > "*".augur-env"*)                       # the ~/.augur-env push, which IS piped:
             cat >/dev/null; return 0 ;;                #   { … } | ssh_macos … "cat > ~/.augur-env"
         *".augur-env"*)                                # ANY OTHER command that merely NAMES it —
             return 0 ;;                                # notably `grep -q '.augur-env' ~/.zshenv ||
@@ -258,7 +258,7 @@ leak_case "guest unreachable over SSH" "egress cannot be VERIFIED"
 # The transport check must short-circuit: probing on regardless would report an isolated guest.
 eq "1" "$(wc -l < "$SSHLOG" | tr -d ' ')" "guest unreachable: exactly one attempt (the liveness check), then stop"
 
-section "Tier 1 — call site: the FRESH bring-up path (before the credentials, before the banner)"
+section "Tier 1 — call site: the FRESH bring-up path (before the ~/.augur-env wiring, before the banner)"
 
 require_vz()                    { :; }
 macos_vm_running()              { return 1; }                                  # take the bring-up path
@@ -366,17 +366,17 @@ section "Tier 1 — source guards: the wiring is pinned where behaviour cannot s
 up_macos_body="$(awk '/^cmd_up_macos\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
 selftest_fn="$(awk '/^verify_macos_egress_locked\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
 
-# Position in the source, not just its effect: an edit that moves the call below the credential
-# writer or the banner must fail here too. (grep -n indexes within the extracted function body.)
+# Position in the source, not just its effect: an edit that moves the call below the ~/.augur-env
+# push or the banner must fail here too. (grep -n indexes within the extracted function body.)
 v_at="$(printf  '%s\n' "$up_macos_body" | grep -n 'verify_macos_egress_locked "\$project_vm"' | tail -n1 | cut -d: -f1)"
 env_at="$(printf '%s\n' "$up_macos_body" | grep -n 'push_macos_guest_env "\$project_vm"' | tail -n1 | cut -d: -f1)"
 ban_at="$(printf '%s\n' "$up_macos_body" | grep -n "success \"VM '"           | head -n1 | cut -d: -f1)"
 ssh_at="$(printf '%s\n' "$up_macos_body" | grep -n '^ *wait_for_macos_ssh '   | head -n1 | cut -d: -f1)"
 if [[ -n "$v_at" && -n "$env_at" && -n "$ban_at" && -n "$ssh_at" \
       && "$ssh_at" -lt "$v_at" && "$v_at" -lt "$env_at" && "$v_at" -lt "$ban_at" ]]; then
-  ok "macOS up self-tests AFTER the SSH wait and BEFORE the credentials/banner (ssh@$ssh_at < test@$v_at < env@$env_at, banner@$ban_at)"
+  ok "macOS up self-tests AFTER the SSH wait and BEFORE the ~/.augur-env push/banner (ssh@$ssh_at < test@$v_at < env@$env_at, banner@$ban_at)"
 else
-  fail "macOS up does not self-test between the SSH wait and the credential push" \
+  fail "macOS up does not self-test between the SSH wait and the ~/.augur-env push" \
        "ssh@${ssh_at:-none} test@${v_at:-none} env@${env_at:-none} banner@${ban_at:-none}"
 fi
 if printf '%s\n' "$up_macos_body" | sed -n '/already running/,/^    fi$/p' | grep -q 'verify_macos_egress_locked'; then

@@ -16,6 +16,9 @@
 #     answers with the token.
 #   • the guest sees the value literally: `$GH_TOKEN` survives the ~/.augur-env quoting and is only
 #     expanded by the helper's shell, so the token is on no ssh argv and in no GIT_CONFIG_* value.
+#   • in ~/.augur-env the set applies only in a shell with GH_TOKEN (an augur session's): a guest
+#     shell without it (GUI Terminal, a hand-run ssh) has no GIT_CONFIG_* and git runs its own
+#     helpers there.
 #   • a github.com section an older augur wrote into the guest's ~/.gitconfig is harmless.
 #   • no host gh token → nothing is emitted in either mode, and ~/.gitconfig is never touched.
 #   • deliberately broken variants (no reset, reset after the helper, `$GH_TOKEN` expanded when the
@@ -191,9 +194,16 @@ eq  "" "$P_FAKE"                        "macOS: the fake helper is called on nei
 eq  "$WANT_HELPER" "$P_VALUE1"          "macOS: the guest shell sees GIT_CONFIG_VALUE_1 literally (\$GH_TOKEN unexpanded)"
 eq  "1" "$(helper_runs)"                "macOS: git runs exactly one helper for get"
 eq  "ok" "$(probe_ok)"                  "macOS: the probe's verdict is ok"
-# Control: the token the helper answers with comes from the session's environment, not the file.
+eq  "2" "$(guest_sh 'printf %s "${GIT_CONFIG_COUNT-}"')" "macOS: a session shell with GH_TOKEN has the GIT_CONFIG_* set"
+# A guest shell augur did not open (the VM's GUI Terminal, a hand-run ssh) has no GH_TOKEN: it gets
+# none of the GIT_CONFIG_* set, so git keeps its own helpers there instead of an empty password.
 _saved_session_env=("${SESSION_ENV[@]}"); SESSION_ENV=()
-hasnt "$(cred_fill)" "password=$TOKEN"  "macOS: without the session's GH_TOKEN the helper has no token to answer with"
+eq "" "$(guest_sh 'env | grep -E "^GIT_CONFIG_(COUNT|KEY_|VALUE_)"')" "macOS: a shell without GH_TOKEN that sources ~/.augur-env has no GIT_CONFIG_*"
+probe
+hasnt "$P_FILL" "password=$TOKEN"       "macOS: without GH_TOKEN there is no token to answer with"
+hasnt "$P_FILL" "username=x-access-token" "macOS: …and augur's helper does not answer at all (no empty password)"
+has "$P_FAKE" "get"                     "macOS: …so git asks the guest's own helpers"
+has "$P_FAKE" "store"                   "macOS: …and stores through them, as without augur"
 SESSION_ENV=("${_saved_session_env[@]}")
 
 # The token: nowhere in ~/.augur-env (the helper gets it from the session's environment), and on no
