@@ -297,15 +297,16 @@ if [[ -n "$_st_at" && -n "$_up_at" && "$_st_at" -lt "$_up_at" ]]; then
 else
   fail "locked guest: the self-test does not precede the banner" "self-test@${_st_at:-none} banner@${_up_at:-none}"
 fi
-# …and before the credential injection. Both go through ssh_macos, so their ORDER in SSHLOG is the
-# assertion: a guest whose egress is not contained must not be handed an Anthropic or gh token.
+# …and before the ~/.augur-env push, the first of the wiring. Both go through ssh_macos, so their
+# ORDER in SSHLOG is the assertion. (A session that boots the VM launches only after all of this, so
+# its credentials follow the self-test too; tests/56 asserts that a leaky guest gets no launch.)
 _probe_at="$(grep -n "ping -c 1" "$SSHLOG" | head -n1 | cut -d: -f1)"
 _cred_at="$( grep -n ".augur-env" "$SSHLOG" | head -n1 | cut -d: -f1)"
 if [[ -n "$_probe_at" && -n "$_cred_at" && "$_probe_at" -lt "$_cred_at" ]]; then
-  ok "locked guest: every probe precedes the ~/.augur-env push (probe@$_probe_at < credentials@$_cred_at)"
+  ok "locked guest: every probe precedes the ~/.augur-env push (probe@$_probe_at < push@$_cred_at)"
 else
-  fail "locked guest: the self-test does not precede the credential push" \
-       "probe@${_probe_at:-none} credentials@${_cred_at:-none}"
+  fail "locked guest: the self-test does not precede the ~/.augur-env push" \
+       "probe@${_probe_at:-none} push@${_cred_at:-none}"
 fi
 
 reset_guest; G_BADDNS=1
@@ -315,11 +316,11 @@ else fail "leaky guest: \`up --macos\` exited 0" "the bring-up continued past a 
 hasnt "$out" "is up." "leaky guest: the success banner is NEVER printed (this is the new failure mode)"
 if teardown_ran "$PV"; then ok "leaky guest: the VM, gvproxy AND the proxy are torn down (nothing stranded)"
 else fail "leaky guest: the teardown did not run" "log: [$(tr '\n' ' ' < "$LOG")]"; fi
-# The security point of running the self-test where it runs: no token ever reaches a leaky guest.
+# The self-test ends the bring-up before any of the guest wiring.
 if grep -q ".augur-env" "$SSHLOG"; then
-  fail "leaky guest: credentials were pushed anyway" "$(cat "$SSHLOG")"
+  fail "leaky guest: ~/.augur-env was pushed anyway" "$(cat "$SSHLOG")"
 else
-  ok "leaky guest: ~/.augur-env is never written (no token enters an uncontained guest)"
+  ok "leaky guest: ~/.augur-env is never written (the bring-up ends at the self-test)"
 fi
 
 # --no-egress has no allowlist to be locked to, so the self-test must not run — and must not be
@@ -340,7 +341,7 @@ macos_record_egress_mode       # booted with egress on (the --no-egress run abov
 reset_guest
 up_macos
 eq "0" "$rc" "already-running + locked: still returns 0 (same egress mode ⇒ no refusal)"
-has "$out" "reconciling host-side state and refreshing credentials" "already-running: the reconcile branch was taken (control)"
+has "$out" "reconciling host-side state and refreshing the guest's environment" "already-running: the reconcile branch was taken (control)"
 has "$out" "Egress self-test passed"          "already-running: I1's tripwire fires on this path too"
 if logged "start_proxy 127.0.0.1"; then ok "already-running: the proxy is still revived first (the self-test verifies THAT)"
 else fail "already-running: start_proxy was not called" "log: [$(tr '\n' ' ' < "$LOG")]"; fi

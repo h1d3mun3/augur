@@ -170,6 +170,7 @@ ssh_macos() { echo "ssh $1" >> "$LOG"; return 0; }
 prov_real="$(declare -f run_base_provisioning)"
 run_base_provisioning()          { echo "provision $1" >> "$LOG"; }
 install_macos_managed_settings() { echo "managed $1" >> "$LOG"; }
+install_macos_session_env_acceptance() { echo "sessionenv $1" >> "$LOG"; }
 select_macos_full_xcode()        { echo "xcode $1" >> "$LOG"; }
 SIG_OK=1
 verify_real="$(declare -f agent_verify_integrity_macos)"
@@ -186,7 +187,7 @@ logged "vm delete $MACOS_BASE_VM" && fail "signature failure: the base VM was de
 logged "vm clone $MACOS_UPDATE_VM $MACOS_BASE_VM" && fail "signature failure: the update was saved as the base VM" || ok "signature failure: nothing is saved as the base VM"
 logged "vm delete $MACOS_UPDATE_VM" && ok "signature failure: the staging copy is discarded" || fail "signature failure: the staging copy is left behind"
 grep -q "^ssh $MACOS_BASE_VM$" "$LOG" && fail "update ran a command in the base VM itself" || ok "nothing runs inside the base VM itself"
-for s in provision managed xcode; do
+for s in provision managed sessionenv xcode; do
   v_at="$(line_of "verify $MACOS_UPDATE_VM")"; s_at="$(line_of "$s $MACOS_UPDATE_VM")"
   [[ -n "$s_at" && -n "$v_at" && "$s_at" -lt "$v_at" ]] && ok "the check runs on the final guest state, after $s" || fail "the check ran before $s" "$(cat "$LOG")"
 done
@@ -250,7 +251,7 @@ c_at="$(line_of "vm clone $MACOS_UPDATE_VM $MACOS_BASE_VM")"; x_at="$(line_of "v
 if [[ -n "$v_at" && -n "$d_at" && -n "$c_at" && -n "$x_at" && "$v_at" -lt "$d_at" && "$d_at" -lt "$c_at" && "$c_at" -lt "$x_at" ]]; then
   ok "the base VM is replaced only after the check (verify@$v_at < delete@$d_at < save@$c_at < drop staging@$x_at)"
 else fail "the base VM replacement is out of order" "$(cat "$LOG")"; fi
-for s in provision managed xcode; do
+for s in provision managed sessionenv xcode; do
   logged "$s $MACOS_UPDATE_VM" && ok "$s runs on the staging copy" || fail "$s did not run on the staging copy"
 done
 macos_vm_exists "$MACOS_BASE_VM" && ok "the base VM exists afterwards" || fail "the base VM is gone"

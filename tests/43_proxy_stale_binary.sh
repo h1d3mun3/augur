@@ -219,6 +219,7 @@ container_fingerprint_matches() { return 0; }   # the running container is curre
 apply_guest_profile() { :; }; save_guest_history() { :; }
 eng() { [[ "$1" == exec ]] && echo "AGENT_LAUNCHED"; return 0; }
 ssh_macos() { echo "AGENT_LAUNCHED"; }
+ssh_macos_session() { ssh_macos "$@"; }
 sync_macos_guest_clock() { :; }; sync_macos_guest_timezone() { :; }; ensure_macos_workspace() { :; }
 push_macos_guest_env() { :; }   # its stdin pipe would SIGPIPE against the ssh_macos stub above
 ensure_macos_agent_projects() { :; }; ensure_macos_agent_agents() { :; }; ensure_macos_agent_profile() { :; }

@@ -5,6 +5,8 @@
 - **Date:** 2026-09-24.
 - **Applies to:** Apple Container mode only. macOS VM mode (`~/.augur-env` over SSH stdin) is
   unchanged.
+  - *Amendment (2026-11-07):* macOS VM mode now delivers credentials per session too, as the
+    session ssh's environment; see [`0023`](./0023-macos-per-session-credentials.md).
 
 ## Decision
 

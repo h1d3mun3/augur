@@ -57,6 +57,7 @@ ensure_macos_agent_profile() { :; }; ensure_macos_agent_bin() { :; }; push_macos
 macos_poweroff_before_teardown() { :; }
 scp_to_macos() { :; }
 ssh_macos() { echo "ssh $*" >> "$LOG"; [[ "$*" == *"cat > "* ]] && cat >/dev/null; [[ "$*" == *" -t "* ]] && echo AGENT_ATTACHED; return 0; }
+ssh_macos_session() { ssh_macos "$@"; }
 egress_on()  { AUGUR_EGRESS=auto; }
 egress_off() { AUGUR_EGRESS=0; }
 record() { mkdir -p "$AUGUR_PROXY_DIR"; printf '%s\n' "$1" > "$(macos_egress_mode_file)"; }
