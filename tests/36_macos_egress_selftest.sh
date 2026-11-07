@@ -138,8 +138,6 @@ ssh_macos() {
                                                        # in a subagent, but on a developer's TTY the
                                                        # whole suite silently blocks on the keyboard.
                                                        # Measured: `make offline-tests` hung here.
-        *"sshd_config.d"*)                             # the session-env acceptance check after
-            return 0 ;;                                # the SSH wait passes (tests/56 owns it)
         "/bin/date +%s")                               # the guest-clock sync that now precedes the
             printf '%s\n' "$(date +%s)"; return 0 ;;    # self-test on both up paths (tests/38 owns
                                                        # it). Answering with the host's own clock
@@ -299,11 +297,14 @@ if [[ -n "$_st_at" && -n "$_up_at" && "$_st_at" -lt "$_up_at" ]]; then
 else
   fail "locked guest: the self-test does not precede the banner" "self-test@${_st_at:-none} banner@${_up_at:-none}"
 fi
-# …and before the ~/.augur-env push, the first of the wiring. Both go through ssh_macos, so their
-# ORDER in SSHLOG is the assertion. (A session that boots the VM launches only after all of this, so
-# its credentials follow the self-test too; tests/56 asserts that a leaky guest gets no launch.)
+# …and before the ~/.augur-env push that wires the guest, the first of the wiring. Both go through
+# ssh_macos, so their ORDER in SSHLOG is the assertion. The push that carries the session-env
+# acceptance check right after the SSH wait is not it: it holds no credential and wires no git
+# helper (tests/56 owns it). (A session that boots the VM launches only after all of this, so its
+# credentials follow the self-test too; tests/56 asserts that a leaky guest gets no launch.)
+wiring_pushes() { grep -n ".augur-env" "$SSHLOG" | grep -v 'sshd_config\.d'; }
 _probe_at="$(grep -n "ping -c 1" "$SSHLOG" | head -n1 | cut -d: -f1)"
-_cred_at="$( grep -n ".augur-env" "$SSHLOG" | head -n1 | cut -d: -f1)"
+_cred_at="$( wiring_pushes | head -n1 | cut -d: -f1)"
 if [[ -n "$_probe_at" && -n "$_cred_at" && "$_probe_at" -lt "$_cred_at" ]]; then
   ok "locked guest: every probe precedes the ~/.augur-env push (probe@$_probe_at < push@$_cred_at)"
 else
@@ -319,10 +320,10 @@ hasnt "$out" "is up." "leaky guest: the success banner is NEVER printed (this is
 if teardown_ran "$PV"; then ok "leaky guest: the VM, gvproxy AND the proxy are torn down (nothing stranded)"
 else fail "leaky guest: the teardown did not run" "log: [$(tr '\n' ' ' < "$LOG")]"; fi
 # The self-test ends the bring-up before any of the guest wiring.
-if grep -q ".augur-env" "$SSHLOG"; then
-  fail "leaky guest: ~/.augur-env was pushed anyway" "$(cat "$SSHLOG")"
+if [[ -n "$(wiring_pushes)" ]]; then
+  fail "leaky guest: the wiring push ran anyway" "$(cat "$SSHLOG")"
 else
-  ok "leaky guest: ~/.augur-env is never written (the bring-up ends at the self-test)"
+  ok "leaky guest: the wiring push never runs (the bring-up ends at the self-test)"
 fi
 
 # --no-egress has no allowlist to be locked to, so the self-test must not run — and must not be

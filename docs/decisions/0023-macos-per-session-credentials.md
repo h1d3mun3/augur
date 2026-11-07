@@ -32,7 +32,11 @@ That kept them off argv, but:
 - **Host side.** The ssh options are resolved first (so the commands that look up the VM's host
   and port never see a value), then a subshell `export`s each resolved `NAME=value` — `export` is a
   builtin, so no value is on any argv — and execs `ssh` with `-o SendEnv=<NAME>` for exactly the
-  resolved names. augur's own shell and every other child never hold the values. Not
+  resolved names. For a value read from a host file or from `gh`, augur's own shell and every other
+  child never hold it. A credential the operator exported into augur's environment
+  (`ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` set in their shell) is already held by augur and
+  inherited by every child, like any other variable of that shell; that is an accepted trade-off
+  (those processes run as the operator), and none of them forwards it. Not
   `-o SetEnv=NAME=value`: that is argv. `ssh_macos` stays hermetic (`-F /dev/null`, which already
   drops the stock `SendEnv LANG LC_*`) and adds nothing; augur's other ssh calls (clock sync,
   `ensure_*`, the self-test, the `~/.augur-env` push, `setup-token --macos`) carry no `SendEnv` and
@@ -49,7 +53,14 @@ That kept them off argv, but:
   `Include` of the candidate at the top) must parse and accept every name, from one `sshd -T` run.
   Only then is it renamed into place; the live configuration is checked once more (the drop-in is
   removed if that fails) and one fresh ssh connection must succeed. sshd's own error is shown on
-  failure, and the build/update refuses to save the base VM.
+  failure, and the build/update refuses to save the base VM. If that last connection fails, the
+  drop-in stays live and is not rolled back; this is an accepted trade-off, because only a scratch
+  VM kept with `AUGUR_KEEP_BUILD_VM=1` survives the failure (a guest-side rollback timer or an
+  in-guest probe would need a detached root process or guest-side SSH credentials, neither
+  verifiable off a Mac). `update --macos` installs the drop-in first, right after its staging clone
+  boots and before the agent installer, Homebrew and custom provisioning, so it does not wait on
+  the network. The update still saves the base only once every step has passed, so while a
+  Homebrew upgrade keeps failing, an old base stays without the drop-in.
 - **`~/.augur-env` stays, without credentials.** It still carries the non-secret per-VM env (brew
   shellenv, the agent's PATH, `DEVELOPER_DIR`, `agent_fixed_env`) and is pushed on every
   `up` / `claude` / `shell --macos`. It is rewritten whole, so the first push to a guest whose file
@@ -57,22 +68,32 @@ That kept them off argv, but:
   well as for `up`: `~/.zshenv` sources the file in every session shell *after* sshd has set the
   session's environment, so a stale `export GH_TOKEN=…` would silently replace the fresh value.
 - **Old bases are refused, not migrated.** `up`, `claude` and `shell --macos` check over ssh that
-  the drop-in holds exactly the line augur would write (`macos_session_env_check_cmd`): on a boot,
-  right after the SSH wait (before the clock, the self-test and the rest of the bring-up); on a
-  running VM, as the first step of the `~/.augur-env` push, so it costs no extra connection. A
-  project VM cloned from a base built before this — or for a different set of names — still gets
-  the new `~/.augur-env` (removing credentials an older augur wrote there) and is then refused,
-  before any credential is sent, with the remedy `augur update --macos` then `augur destroy --macos && augur up --macos`.
+  the drop-in holds exactly the line augur would write (`macos_session_env_check_cmd`), always as
+  the first step of a `~/.augur-env` push (`push_macos_guest_env --require-session-env`), so every
+  refusal takes one code path and costs no extra connection. On a boot that push runs right after
+  the SSH wait (before the clock, the self-test and the rest of the bring-up) with no credential in
+  scope, so it wires no git helper into a guest not yet self-tested; a second push after the
+  self-test wires it. On a running VM it is the session's or `up`'s one push. A project VM cloned
+  from a base built before this — or for a different set of names — still gets the new
+  `~/.augur-env` (removing credentials an older augur wrote there) and is then refused, before any
+  credential is sent, with the remedy `augur update --macos` then `augur destroy --macos && augur up --macos`.
+  The refusal and its remedy are reported even when a later step of that push (the `~/.augur-env`
+  write, the `~/.zshenv` line) fails, together with that step.
   There is deliberately no fallback to writing credentials to disk, and no in-place patching of
   project VMs. Without the check the guest's sshd would silently drop the values and the agent
   would start unauthenticated. A guest that lies to the check gains nothing: its sshd decides what
   it accepts, and the worst case is a session without credentials. A VM refused at boot is left
   running, as after any other failure past the SSH wait except a detected leak; `destroy` removes
   it.
-- **Ordering and validation are unchanged.** Resolve once, validate, refuse before touching the
-  guest; `cmd_up_macos` resolves before the clone (and, on its already-running branch, after the
-  self-test), and a `claude` / `shell --macos` that boots the VM through it launches with those
-  same values (`cmd_up_macos` fills the caller's `_creds`). The launch is the last step, so on every
+- **Ordering and validation.** Resolve once and validate; `cmd_up_macos` resolves before the clone
+  (and, on its already-running branch, after the self-test). On a running VM a value that fails
+  still gets the guest one push without credentials (`resolve_running_macos_vm_credentials`) before
+  the command stops, so an older augur's credential-bearing `~/.augur-env` cannot outlive a bad
+  host credential, and an old base is named with its remedy next to the resolution error. That
+  push carries no secret, and on `up`'s running branch it still comes after the self-test. A
+  stopped VM is not booted for it. A `claude` / `shell --macos` that boots the VM through
+  `cmd_up_macos` launches with those same values (`cmd_up_macos` fills the caller's `_creds`).
+  The launch is the last step, so on every
   path the credentials go only to a guest that passed its boot self-test or attaches to one that
   did at its last `up` (the accepted trade-off Container mode's per-session exec makes too).
 - **What `up --macos` delivers:** the non-secret `~/.augur-env` and git's credential helper (only
@@ -87,9 +108,10 @@ That kept them off argv, but:
   `ControlPath`, so every call is its own connection and the env a session sends belongs to it
   alone. (OpenSSH would forward a mux client's `SendEnv` in its new-session request too, but augur
   does not rely on that.)
-- **Host-side visibility.** macOS serves another process's environment through the same sysctl as
-  its arguments, and only to the process's own user and root. That is exactly who can already read
-  the host files and `gh` token the values come from. ADR-0021 accepted the same exposure for the
+- **Host-side visibility (expected, not yet observed; see below).** macOS serves another process's
+  environment through the same sysctl as its arguments, and is expected to serve it only to the
+  process's own user and root. That is exactly who can already read the host files and `gh` token
+  the values come from. ADR-0021 accepted the same exposure for the
   `container` CLI ("export into the CLI process's environment": an acceptable fallback). Plain
   `ps` does not print environments, so a credential no longer appears in casual process listings
   the way argv would.
@@ -112,6 +134,17 @@ That kept them off argv, but:
   `$GH_TOKEN` when git runs it inside the session. Processes started outside the session (a manual
   `ssh`, a daemon) do not have them.
 
+### Depends on: git's credential helper chain in the guest is reset
+
+"Nothing on the guest disk" also relies on git's credential helper chain in the guest being reset,
+so that augur's `$GH_TOKEN` helper is the only helper git hands the token to. As of this decision
+the chain is never reset: after a successful push, git's `store` step hands `GH_TOKEN` to every
+configured helper, including the system or host `osxkeychain` helper, which can write it into
+the guest's login keychain on disk if that keychain is unlocked. Branch
+`fix/macos-git-helper-reset` resets the chain and is planned to merge **before** this decision;
+this decision does not duplicate that fix. Without it, the guest's keychain is a path by which a
+session's `GH_TOKEN` can reach the guest's disk.
+
 ## Alternatives considered
 
 - **Keep `~/.augur-env` with the credentials (status quo).** Leaves the secrets at rest in a
@@ -131,7 +164,8 @@ That kept them off argv, but:
 
 ## Consequences
 
-- No credential at rest in any macOS guest written by this augur; a stopped clone holds none.
+- No credential at rest in any macOS guest written by this augur; a stopped clone holds none, given
+  the git helper chain reset above.
 - Credentials exist only in the environment of augur-started session processes in the guest, for
   the life of those processes, as in Container mode. A manual `ssh` into the guest gets none.
 - `up --macos` hands the guest no credential.

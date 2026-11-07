@@ -139,7 +139,6 @@ ssh_macos() {
         *".augur-env"*)       return 0 ;;                  # any other command that merely names it
         *"exec zsh -l"*)      return 0 ;;                  # cmd_shell_macos' interactive launch
         *"zsh -l -c"*)        return 0 ;;                  # cmd_claude_macos' interactive launch
-        *"sshd_config.d"*)    return 0 ;;                  # the session-env acceptance check passes
         *) echo "UNEXPECTED GUEST COMMAND: $cmd" >&2; return 1 ;;
     esac
 }
@@ -156,6 +155,10 @@ sync() {   # sets $out / $rc; truncates the log first
 # Recorded-call helpers. Line NUMBERS, because ORDER is half of what this file proves.
 at()      { grep -nxF "$1" "$SSHLOG" | head -n1 | cut -d: -f1; }   # exact whole-line match
 at_re()   { grep -nE  "$1" "$SSHLOG" | head -n1 | cut -d: -f1; }
+# The ~/.augur-env push that wires the guest. The boot path's first push, right after the SSH wait,
+# carries the session-env acceptance check and no credential or git helper (tests/56 owns it); it
+# is not the one the clock must precede.
+at_push() { grep -n '\.augur-env' "$SSHLOG" | grep -v 'sshd_config\.d' | head -n1 | cut -d: -f1; }
 n_calls() { wc -l < "$SSHLOG" | tr -d ' '; }
 SET_RE="^sudo -S -p '' /bin/date -u '[0-9]{12}\.[0-9]{2}'$"
 did_set() { grep -qE "$SET_RE" "$SSHLOG"; }
@@ -362,7 +365,7 @@ else fail "fresh bring-up: no clock set was sent" "log: [$(tr '\n' ' ' < "$SSHLO
 # nbf/exp the agent checks against this clock.
 _clk_at="$(at "$READ_CMD")"
 _st_at="$(at 'MARK:egress-self-test')"
-_env_at="$(at_re '\.augur-env')"
+_env_at="$(at_push)"
 if [[ -n "$_clk_at" && -n "$_st_at" && -n "$_env_at" && "$_clk_at" -lt "$_st_at" && "$_st_at" -lt "$_env_at" ]]; then
   ok "fresh bring-up: clock BEFORE the self-test BEFORE the ~/.augur-env push (clock@$_clk_at < self-test@$_st_at < env@$_env_at)"
 else
