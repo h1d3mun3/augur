@@ -328,7 +328,7 @@ running_branch="$(printf '%s\n' "$up_macos_body" | sed -n '/if macos_vm_running 
 has "$running_branch" 'require_macos_egress_mode_current' "cmd_up_macos's already-running path refuses an egress-mode mismatch"
 # A credential that cannot be injected, or that cannot be delivered, is not a drift refusal: it
 # stops every path, running or not.
-if printf '%s\n' "$running_branch" | grep -v 'resolve_session_credentials || exit 1' | grep -v 'push_macos_guest_env "$project_vm" || exit 1' | grep -q 'exit 1'
+if printf '%s\n' "$running_branch" | grep -v 'resolve_session_credentials || exit 1' | grep -v 'push_macos_guest_env "$project_vm" --require-session-env || exit 1' | grep -q 'exit 1'
 then fail "cmd_up_macos refuses on some other drift on the already-running path" "only the egress mode is a refusal"
 else ok "cmd_up_macos refuses on no other drift on the already-running path"; fi
 

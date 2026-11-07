@@ -138,6 +138,8 @@ ssh_macos() {
                                                        # in a subagent, but on a developer's TTY the
                                                        # whole suite silently blocks on the keyboard.
                                                        # Measured: `make offline-tests` hung here.
+        *"sshd_config.d"*)                             # the session-env acceptance check after
+            return 0 ;;                                # the SSH wait passes (tests/56 owns it)
         "/bin/date +%s")                               # the guest-clock sync that now precedes the
             printf '%s\n' "$(date +%s)"; return 0 ;;    # self-test on both up paths (tests/38 owns
                                                        # it). Answering with the host's own clock

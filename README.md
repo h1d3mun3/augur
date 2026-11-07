@@ -332,7 +332,7 @@ way it does for the GitHub token), so a changed credential reaches the next sess
 restart. The values travel as the session's SSH environment (OpenSSH `SendEnv`, accepted by the
 guest's sshd for exactly these names) and are never written to the guest's disk; `augur up --macos`
 alone hands the guest no credential. A base VM built before this needs `augur update --macos`, and
-each project VM cloned from it `augur destroy --macos && augur up --macos`; until then `claude` /
+each project VM cloned from it `augur destroy --macos && augur up --macos`; until then `up`, `claude` and
 `shell --macos` refuse with that remedy rather than start without credentials:
 
 - `CLAUDE_CODE_OAUTH_TOKEN` — subscription token; either set the env var / save it to

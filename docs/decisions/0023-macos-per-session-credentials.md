@@ -42,26 +42,33 @@ That kept them off argv, but:
   one `AcceptEnv` line naming exactly `session_credential_names` (the `agent_auth_specs` guest
   variables plus `GH_TOKEN`; exact names, no patterns, charset-checked before they reach a root
   script). macOS's `sshd_config` includes `sshd_config.d/*`, and `AcceptEnv` patterns add up across
-  files, so macOS's own `AcceptEnv LANG LC_*` stays. The install then asks `sshd -T` for the
-  configuration a new sshd would run with and checks every name is accepted; on any failure the
-  drop-in is removed again (a file sshd cannot parse must never stay and lock SSH out) and the
-  build/update refuses to save the base VM. Nothing is reloaded: sshd reads its configuration when
-  it starts, and every clone boots from the saved disk.
+  files, so macOS's own `AcceptEnv LANG LC_*` stays. macOS starts a new sshd per connection
+  (launchd), so a file in `sshd_config.d` is live for the next login, and one sshd cannot parse
+  would lock SSH out at once. So the candidate is verified before it goes live: written outside
+  `sshd_config.d`, then `sshd -T -f <test config>` (a copy of `/etc/ssh/sshd_config` with an
+  `Include` of the candidate at the top) must parse and accept every name, from one `sshd -T` run.
+  Only then is it renamed into place; the live configuration is checked once more (the drop-in is
+  removed if that fails) and one fresh ssh connection must succeed. sshd's own error is shown on
+  failure, and the build/update refuses to save the base VM.
 - **`~/.augur-env` stays, without credentials.** It still carries the non-secret per-VM env (brew
   shellenv, the agent's PATH, `DEVELOPER_DIR`, `agent_fixed_env`) and is pushed on every
   `up` / `claude` / `shell --macos`. It is rewritten whole, so the first push to a guest whose file
   an older augur wrote removes the credentials from it. That push is now **fatal for a session** as
   well as for `up`: `~/.zshenv` sources the file in every session shell *after* sshd has set the
   session's environment, so a stale `export GH_TOKEN=…` would silently replace the fresh value.
-- **Old bases are refused, not migrated.** Before every `claude` / `shell --macos` session
-  (`require_macos_session_env_accepted`) augur checks over ssh that the drop-in holds exactly the
-  line it would write. A project VM cloned from a base built before this — or for a different set
-  of names — is refused, before any credential is sent and, on a running VM, before the guest is
-  changed, with the remedy `augur update --macos` then `augur destroy --macos && augur up --macos`.
+- **Old bases are refused, not migrated.** `up`, `claude` and `shell --macos` check over ssh that
+  the drop-in holds exactly the line augur would write (`macos_session_env_check_cmd`): on a boot,
+  right after the SSH wait (before the clock, the self-test and the rest of the bring-up); on a
+  running VM, as the first step of the `~/.augur-env` push, so it costs no extra connection. A
+  project VM cloned from a base built before this — or for a different set of names — still gets
+  the new `~/.augur-env` (removing credentials an older augur wrote there) and is then refused,
+  before any credential is sent, with the remedy `augur update --macos` then `augur destroy --macos && augur up --macos`.
   There is deliberately no fallback to writing credentials to disk, and no in-place patching of
   project VMs. Without the check the guest's sshd would silently drop the values and the agent
   would start unauthenticated. A guest that lies to the check gains nothing: its sshd decides what
-  it accepts, and the worst case is a session without credentials.
+  it accepts, and the worst case is a session without credentials. A VM refused at boot is left
+  running, as after any other failure past the SSH wait except a detected leak; `destroy` removes
+  it.
 - **Ordering and validation are unchanged.** Resolve once, validate, refuse before touching the
   guest; `cmd_up_macos` resolves before the clone (and, on its already-running branch, after the
   self-test), and a `claude` / `shell --macos` that boots the VM through it launches with those
@@ -118,7 +125,7 @@ That kept them off argv, but:
 - `up --macos` hands the guest no credential.
 - Existing base VMs need one `augur update --macos`, and each project VM cloned from an old base
   `augur destroy --macos && augur up --macos` (its Claude history lives on the host and survives).
-  Until then `claude` / `shell --macos` refuse with that remedy.
+  Until then `up`, `claude` and `shell --macos` refuse with that remedy.
 - A failed `~/.augur-env` push now stops a session instead of warning.
 - Old credential bytes from an earlier `~/.augur-env` may remain in the clone's free disk blocks
   after the file is rewritten; augur does not scrub them.

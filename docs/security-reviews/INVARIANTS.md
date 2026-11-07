@@ -165,7 +165,7 @@ in time," this **prescribes** "what must never break." It changes rarely.
   `ssh`, which names exactly the resolved variables with `-o SendEnv=<NAME>` (never
   `-o SetEnv=NAME=value`, which would be argv); the guest's sshd accepts exactly those names through
   a root-owned drop-in the base VM build/update writes (`install_macos_session_env_acceptance`), and
-  a guest without it is refused before any credential is sent (`require_macos_session_env_accepted`).
+  a guest without it is refused before any credential is sent (`macos_session_env_check_cmd`).
   They are never written to the guest's disk: `~/.augur-env` (`push_macos_guest_env`) holds only
   non-secret per-VM env, and augur's other ssh calls (`ssh_macos`) carry no `SendEnv`. In Container
   mode credentials are never passed to `container run` at all; they reach only the `container exec`
