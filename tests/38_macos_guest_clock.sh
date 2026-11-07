@@ -156,8 +156,8 @@ sync() {   # sets $out / $rc; truncates the log first
 at()      { grep -nxF "$1" "$SSHLOG" | head -n1 | cut -d: -f1; }   # exact whole-line match
 at_re()   { grep -nE  "$1" "$SSHLOG" | head -n1 | cut -d: -f1; }
 # The ~/.augur-env push that wires the guest. The boot path's first push, right after the SSH wait,
-# carries the session-env acceptance check and no credential or git helper (tests/56 owns it); it
-# is not the one the clock must precede.
+# carries the session-env acceptance check and no credential or GIT_CONFIG_* helper lines (tests/56
+# owns it); it is not the one the clock must precede.
 at_push() { grep -n '\.augur-env' "$SSHLOG" | grep -v 'sshd_config\.d' | head -n1 | cut -d: -f1; }
 n_calls() { wc -l < "$SSHLOG" | tr -d ' '; }
 SET_RE="^sudo -S -p '' /bin/date -u '[0-9]{12}\.[0-9]{2}'$"

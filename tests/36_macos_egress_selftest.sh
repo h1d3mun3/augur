@@ -299,8 +299,8 @@ else
 fi
 # …and before the ~/.augur-env push that wires the guest, the first of the wiring. Both go through
 # ssh_macos, so their ORDER in SSHLOG is the assertion. The push that carries the session-env
-# acceptance check right after the SSH wait is not it: it holds no credential and wires no git
-# helper (tests/56 owns it). (A session that boots the VM launches only after all of this, so its
+# acceptance check right after the SSH wait is not it: it holds no credential and no GIT_CONFIG_*
+# helper lines (tests/56 owns it). (A session that boots the VM launches only after all of this, so its
 # credentials follow the self-test too; tests/56 asserts that a leaky guest gets no launch.)
 wiring_pushes() { grep -n ".augur-env" "$SSHLOG" | grep -v 'sshd_config\.d'; }
 _probe_at="$(grep -n "ping -c 1" "$SSHLOG" | head -n1 | cut -d: -f1)"

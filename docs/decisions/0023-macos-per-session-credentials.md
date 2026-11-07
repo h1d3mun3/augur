@@ -72,8 +72,11 @@ That kept them off argv, but:
   the first step of a `~/.augur-env` push (`push_macos_guest_env --require-session-env`), so every
   refusal takes one code path and costs no extra connection. On a boot that push runs right after
   the SSH wait (before the clock, the self-test and the rest of the bring-up) with no credential in
-  scope, so it wires no git helper into a guest not yet self-tested; a second push after the
-  self-test wires it. On a running VM it is the session's or `up`'s one push. A project VM cloned
+  scope, so a guest not yet self-tested gets no `GIT_CONFIG_*` git helper lines either
+  (`git_credential_env` prints none without a gh token); a second push after the self-test writes
+  them. On a running VM it is the session's or `up`'s one push, whose `~/.augur-env` carries the
+  `GIT_CONFIG_*` lines whenever the host has a gh token, refused or not (they hold no secret, and no
+  session follows a refusal). A project VM cloned
   from a base built before this — or for a different set of names — still gets the new
   `~/.augur-env` (removing credentials an older augur wrote there) and is then refused, before any
   credential is sent, with the remedy `augur update --macos` then `augur destroy --macos && augur up --macos`.
@@ -136,14 +139,15 @@ That kept them off argv, but:
 
 ### Depends on: git's credential helper chain in the guest is reset
 
-"Nothing on the guest disk" also relies on git's credential helper chain in the guest being reset,
-so that augur's `$GH_TOKEN` helper is the only helper git hands the token to. As of this decision
-the chain is never reset: after a successful push, git's `store` step hands `GH_TOKEN` to every
-configured helper, including the system or host `osxkeychain` helper, which can write it into
-the guest's login keychain on disk if that keychain is unlocked. Branch
-`fix/macos-git-helper-reset` resets the chain and is planned to merge **before** this decision;
-this decision does not duplicate that fix. Without it, the guest's keychain is a path by which a
-session's `GH_TOKEN` can reach the guest's disk.
+"Nothing on the guest disk" also relies on the helper-chain reset in `git_credential_env`, so that
+augur's `$GH_TOKEN` helper is the only helper git hands the token to. Without the reset, git's
+`store` step after a successful push would hand `GH_TOKEN` to every configured helper, including
+the system or host `osxkeychain` helper, which can write it into the guest's login keychain on
+disk if that keychain is unlocked. The reset is the first of the two `GIT_CONFIG_*` entries
+`push_macos_guest_env` writes into `~/.augur-env` (an empty `credential.https://github.com.helper`
+value); those lines hold only the `$GH_TOKEN` reference, and the token itself reaches the helper
+from the session's environment. `tests/35_macos_gitconfig_helper.sh` pins the reset against real
+git, with `GH_TOKEN` set the way the session ssh sets it.
 
 ## Alternatives considered
 
@@ -165,7 +169,7 @@ session's `GH_TOKEN` can reach the guest's disk.
 ## Consequences
 
 - No credential at rest in any macOS guest written by this augur; a stopped clone holds none, given
-  the git helper chain reset above.
+  the helper-chain reset in `git_credential_env` (above).
 - Credentials exist only in the environment of augur-started session processes in the guest, for
   the life of those processes, as in Container mode. A manual `ssh` into the guest gets none.
 - `up --macos` hands the guest no credential.

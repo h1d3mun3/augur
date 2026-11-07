@@ -167,12 +167,15 @@ in time," this **prescribes** "what must never break." It changes rarely.
   a root-owned drop-in the base VM build/update writes (`install_macos_session_env_acceptance`), and
   a guest without it is refused before any credential is sent (`macos_session_env_check_cmd`).
   They are never written to the guest's disk: `~/.augur-env` (`push_macos_guest_env`) holds only
-  non-secret per-VM env, and augur's other ssh calls (`ssh_macos`) carry no `SendEnv`. A
-  `~/.augur-env` an older augur wrote with credentials in it loses them at the first push, including
-  the push that refuses a guest without the drop-in (the check is that push's first step, and the
-  refusal follows the rewrite) and the push a running VM still gets when its credentials fail to
-  resolve (`resolve_running_macos_vm_credentials`). In Container
-  mode credentials are never passed to `container run` at all; they reach only the `container exec`
+  non-secret per-VM env (git's `GIT_CONFIG_*` credential helper among it, which carries only the
+  `$GH_TOKEN` reference), and augur's other ssh calls (`ssh_macos`) carry no `SendEnv`. That
+  helper's first entry resets git's helper chain (`git_credential_env`), so after a push git hands
+  `GH_TOKEN` to no other helper's `store`, such as the guest's `osxkeychain`, which could write it
+  into the login keychain on disk. A `~/.augur-env` an older augur wrote with credentials in it
+  loses them at the first push, including the push that refuses a guest without the drop-in (the
+  check is that push's first step, and the refusal follows the rewrite) and the push a running VM
+  still gets when its credentials fail to resolve (`resolve_running_macos_vm_credentials`). In
+  Container mode credentials are never passed to `container run` at all; they reach only the `container exec`
   that starts `augur claude` / `augur shell`, through `--env-file <(…)` written by the bash builtin `printf`
   (`session_credential_env`). `augur setup-token` and augur's own execs get none. In macOS VM mode
   `augur setup-token --macos` never uses the project VM: it runs in a throwaway clone of the base VM
@@ -195,13 +198,15 @@ in time," this **prescribes** "what must never break." It changes rarely.
   carries `-o SendEnv=` for exactly the resolved names with the values only in its own environment,
   that no value is on any ssh/scp argv, in any guest file (`~/.augur-env` included) or (for
   file- and `gh`-sourced values) in any other ssh call's environment, that the build/update write
-  the `AcceptEnv` drop-in, and that a guest without it gets no session and no git helper, and has
-  an older augur's credential lines removed from `~/.augur-env` (also when a later step of that push
-  fails, and when a running VM's credentials fail to resolve). That the real guest sshd honours the
+  the `AcceptEnv` drop-in, that the `GIT_CONFIG_*` lines in `~/.augur-env` hold no token value,
+  and that a guest without the drop-in gets no session (on a boot, no `GIT_CONFIG_*` lines either)
+  and has an older augur's credential lines removed from `~/.augur-env` (also when a later step of
+  that push fails, and when a running VM's credentials fail to resolve). That the real guest sshd honours the
   drop-in, the guest's process list and the host-side environment visibility stay ⚠ review-only
-  (Mac-only). `tests/52_macos_setup_token_unit.sh` asserts that no credential value (API
-  key, OAuth token file, gh token) and no `~/.augur-env` / `~/.gitconfig` reaches the throwaway VM
-  of `setup-token --macos`.
+  (Mac-only). `tests/35_macos_gitconfig_helper.sh` drives real `git credential fill/approve` with
+  the env a session's shell gets and asserts no other configured helper is called.
+  `tests/52_macos_setup_token_unit.sh` asserts that no credential value (API key, OAuth token file,
+  gh token) and no `~/.augur-env` / `~/.gitconfig` reaches the throwaway VM of `setup-token --macos`.
 - **Note:** The rule does not cover the macOS guest's admin password (`macos_admin_password`),
   but it is kept off argv the same way: every guest `sudo -S` call gets it on ssh's stdin via
   `macos_admin_password_stdin` (the bash builtin `printf` piped into `ssh_macos` /
