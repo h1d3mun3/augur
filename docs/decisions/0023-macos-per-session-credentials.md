@@ -93,6 +93,18 @@ That kept them off argv, but:
   `container` CLI ("export into the CLI process's environment": an acceptable fallback). Plain
   `ps` does not print environments, so a credential no longer appears in casual process listings
   the way argv would.
+- **Observed on a macOS 27 guest** (a clone of the base VM, 2026-11-07):
+  - `/etc/ssh/sshd_config` has `Include /etc/ssh/sshd_config.d/*` (absolute path, near the top), and
+    `sshd_config.d` holds only macOS's own `100-macos.conf` (root:wheel, 644).
+  - `sudo sshd -T` prints `AcceptEnv LANG` and `AcceptEnv LC_*`: mixed-case keyword, one name per
+    line, not upstream's lowercase `acceptenv`. The install's parse lowercases the keyword and reads
+    every field, so it accepts both forms.
+  - `launchctl print system/com.openssh.sshd` shows a LaunchDaemon (`ssh.plist`) with
+    `active count = 0` even while a session is open, consistent with one sshd per connection.
+- **Not yet observed on a Mac:** that macOS serves another user's process environment to no one
+  but that user and root (`ps -E` from a second account); that `sshd -T -f <test config>` follows
+  the staged config's absolute `Include` as described; and end-to-end delivery (the session's
+  `SendEnv` values present in `claude --macos` / `shell --macos`, absent from a plain `ssh`).
 - **Guest login shells keep it.** sshd sets the accepted variables in the session's environment
   before it starts the user's shell. `zsh -l -c …` / `exec zsh -l` inherit them, and nothing augur
   writes (`~/.zshenv`, `~/.augur-env`) or macOS's `/etc/zprofile` (`path_helper`, PATH only) unsets

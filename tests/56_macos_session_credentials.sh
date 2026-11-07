@@ -148,8 +148,9 @@ macos_vm_running() {
 # The base VM build's drop-in install, run for real against GUEST_ETC: the staged script is written
 # into GUEST_HOME, `sudo -S -p ''` reads the password line and runs it with the guest's paths mapped,
 # `chown root:wheel` is a no-op (no root here), and `sshd -T [-f <config>]` follows Include lines
-# from <config> (default: the guest's sshd_config) and prints one `acceptenv` line per AcceptEnv
-# pattern, as OpenSSH does. Each sshd run is logged with whether the drop-in was live at that moment.
+# from <config> (default: the guest's sshd_config) and prints one `AcceptEnv <NAME>` line per
+# pattern, the form macOS's sshd -T prints (SSHD_LOWER=1: upstream OpenSSH's lowercase
+# `acceptenv`). Each sshd run is logged with whether the drop-in was live at that moment.
 # SSHD_T_FAILS=1 makes every sshd -T fail with a parse error on stderr; =live only the one without -f.
 # FRESH_RC is what the fresh connection after the install exits with.
 SSHD_T_FAILS=0; FRESH_RC=0
@@ -157,6 +158,7 @@ SSHDLOG="$TMPD/sshd-calls"
 printf 'Include %s/ssh/sshd_config.d/*\nAcceptEnv LANG LC_*\n' "$GUEST_ETC" > "$GUEST_ETC/ssh/sshd_config"
 cat > "$SHIMDIR/sshd" <<'EOF2'
 #!/usr/bin/env bash
+kw=AcceptEnv; [[ "${SSHD_LOWER:-0}" == 1 ]] && kw=acceptenv
 cfg="$GUEST_ETC/ssh/sshd_config"
 [[ "$1" == -T ]] || exit 255
 [[ "${2:-}" == -f ]] && cfg="$3"
@@ -170,7 +172,7 @@ parse() {
     while read -r l; do
         case "$l" in
             Include\ *) for f in ${l#Include }; do [[ -f "$f" ]] && parse "$f"; done ;;
-            AcceptEnv\ *) read -ra p <<< "${l#AcceptEnv }"; for f in "${p[@]}"; do echo "acceptenv $f"; done ;;
+            AcceptEnv\ *) read -ra p <<< "${l#AcceptEnv }"; for f in "${p[@]}"; do echo "$kw $f"; done ;;
         esac
     done < "$1"
 }
@@ -188,7 +190,7 @@ build_ssh() {   # an ssh_macos for the build path
             IFS= read -r _pw; printf '%s\n' "$_pw" > "$TMPD/build-stdin"
             s="$(guest_map "$(cat "$GUEST_HOME/.augur-session-env-install.sh")")"
             s="${s//\/usr\/sbin\/sshd/$SHIMDIR/sshd}"; s="${s//chown root:wheel/true}"
-            GUEST_ETC="$GUEST_ETC" DROPIN="$DROPIN" SSHDLOG="$SSHDLOG" SSHD_T_FAILS="$SSHD_T_FAILS" sh -c "$s"
+            GUEST_ETC="$GUEST_ETC" DROPIN="$DROPIN" SSHDLOG="$SSHDLOG" SSHD_T_FAILS="$SSHD_T_FAILS" SSHD_LOWER="${SSHD_LOWER:-0}" sh -c "$s"
             local r=$?; rm -f "$GUEST_HOME/.augur-session-env-install.sh"; return $r ;;
         true) return "$FRESH_RC" ;;
         *) echo "UNEXPECTED BUILD COMMAND: $c" >&2; return 1 ;;
@@ -232,6 +234,11 @@ eq "" "$(ls "$GUEST_ETC/ssh/sshd_config.d" | grep -v '^200-augur-session-env.con
 eq $'sshd -f drop-in-live=no\nsshd  drop-in-live=yes' "$(cat "$SSHDLOG")" \
    "sshd -T runs once against a test config BEFORE the drop-in is live, then once against the live config"
 has "$(cat "$BUILDLOG")" $'\ntrue' "one fresh connection follows the install"
+rm -f "$DROPIN"
+SSHD_LOWER=1
+install_dropin
+eq "0" "$rc" "the install also accepts upstream OpenSSH's lowercase acceptenv output"
+SSHD_LOWER=0
 rm -f "$DROPIN"
 SSHD_T_FAILS=1
 install_dropin

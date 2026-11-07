@@ -4086,6 +4086,7 @@ dst='${dst}'; cand=/etc/ssh/augur-session-env.candidate; main=/etc/ssh/augur-ses
 err="\$(mktemp)" || exit 1
 cleanup() { rm -f "\$cand" "\$main" "\$err"; }
 # accepts [sshd -T args]: the configuration parses and accepts every name, from ONE sshd -T run.
+# macOS prints `AcceptEnv <NAME>`, one name per line; upstream OpenSSH prints `acceptenv`.
 accepts() {
     out="\$(/usr/sbin/sshd -T "\$@" 2>"\$err")" || return 1
     envs="\$(printf '%s\n' "\$out" | awk 'tolower(\$1) == "acceptenv" { for (i = 2; i <= NF; i++) print \$i }')"
