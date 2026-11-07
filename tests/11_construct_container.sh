@@ -204,8 +204,10 @@ if [[ -f "$ex" && -n "$launch_line" ]]; then
   hasnt "$envc" "CLAUDE_CODE_OAUTH_TOKEN"              "claude: the unset oauth token is omitted (named-only, non-empty only)"
   hasnt "$envc" "unreadable"                           "claude: the env-file pipe was readable by the engine process"
   has   "$body" "TZ="                                  "claude: TZ is set per session"
-  has   "$body" "GIT_CONFIG_COUNT=1"                   "claude: git credential helper count set (gh token present)"
+  has   "$body" "GIT_CONFIG_COUNT=2"                   "claude: git credential helper count set (gh token present)"
   has   "$body" "GIT_CONFIG_KEY_0=credential.https://github.com.helper" "claude: git credential helper key set"
+  has   "$body" "GIT_CONFIG_VALUE_0= -e GIT_CONFIG_KEY_1=credential.https://github.com.helper" "claude: an empty helper resets the chain before augur's helper"
+  has   "$body" "GIT_CONFIG_KEY_1=credential.https://github.com.helper -e GIT_CONFIG_VALUE_1=!f() " "claude: augur's helper is the last entry, after the reset"
   has   "$body" 'password=$GH_TOKEN'                   "claude: the helper carries only the \$GH_TOKEN reference"
   # augur's own non-interactive execs (profile wiring, history snapshot) get no credentials.
   if printf '%s\n' "$full_trace" | grep '^container exec ' | grep -v '^container exec -it ' | grep -q -- '--env-file'

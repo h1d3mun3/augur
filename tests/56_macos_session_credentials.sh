@@ -147,8 +147,9 @@ eq "$MACOS_AUGUR_ENV_END_LINE" "$(tail -n 1 "$ENV_FILE")" "the installed file en
 eq "600" "$(mode_of "$ENV_FILE")" "the rewritten ~/.augur-env is mode 600 (a 644 one is replaced)"
 eq "" "$(find "$GUEST_HOME" -maxdepth 1 -name '.augur-env.*' -print)" "no temp file is left behind"
 eq "1" "$(grep -c '.augur-env' "$GUEST_HOME/.zshenv")" "~/.zshenv sources ~/.augur-env"
-helper="$(HOME="$GUEST_HOME" git config --global --get-all 'credential.https://github.com.helper')"
-has "$helper" 'password=$GH_TOKEN' "git's credential helper is wired, holding only the \$GH_TOKEN reference"
+has "$envc" "export GIT_CONFIG_VALUE_1='" "git's credential helper is exported in ~/.augur-env"
+has "$(grep '^export GIT_CONFIG_VALUE_1=' "$ENV_FILE")" 'password=$GH_TOKEN' "…holding only the \$GH_TOKEN reference"
+[[ -e "$GUEST_HOME/.gitconfig" ]] && fail "the push created ~/.gitconfig" || ok "the push does not write ~/.gitconfig"
 grep -q sync_macos_guest_clock "$STEPS" && ok "shell --macos: the clock is synced on this path (control)" \
     || fail "shell --macos: the clock sync did not run" "steps: $(tr '\n' ' ' < "$STEPS")"
 
@@ -162,7 +163,6 @@ has "$pc" "mv -f " "the temp file is renamed over ~/.augur-env (a concurrent zsh
 
 GH_HOST_TOKEN="ghp_rotated22222"
 export ANTHROPIC_API_KEY="test-api-key-BBB222"
-gitcfg_inode="$(ls -i "$GUEST_HOME/.gitconfig" | awk '{print $1}')"
 run_cmd claude
 eq "0" "$rc" "claude --macos: completes"
 eq "1" "$(pushes)" "claude --macos: pushes ~/.augur-env exactly once"
@@ -173,24 +173,20 @@ has   "$envc" "export GH_TOKEN='ghp_rotated22222'"       "claude --macos: a rota
 hasnt "$envc" "ghp_first111111"                          "claude --macos: the old gh token is gone"
 has   "$envc" "export ANTHROPIC_API_KEY='test-api-key-BBB222'" "claude --macos: a changed API key reaches the running guest"
 eq "1" "$(grep -c '.augur-env' "$GUEST_HOME/.zshenv")" "~/.zshenv's source line is not duplicated by a second session"
-eq "$gitcfg_inode" "$(ls -i "$GUEST_HOME/.gitconfig" | awk '{print $1}')" \
-   "an already-correct git helper is not rewritten (no ~/.gitconfig.lock for a concurrent session to lose to)"
 launch_at="$(grep -n '^-t ' "$SSHLOG" | cut -d: -f1)"; push_at="$(grep -n 'cat > .*\.augur-env' "$SSHLOG" | cut -d: -f1)"
 if [[ -n "$launch_at" && -n "$push_at" && "$push_at" -lt "$launch_at" ]]; then
     ok "claude --macos: the push precedes the launch (push@$push_at < launch@$launch_at)"
 else fail "claude --macos: the agent launches before the push" "push@${push_at:-none} launch@${launch_at:-none}"; fi
 
-# A host `gh auth logout`: the whole file is rewritten, so GH_TOKEN disappears from the guest. The
-# helper stays (deliberately; see macos_git_credential_helper_cmd) and holds no secret.
+# A host `gh auth logout`: the whole file is rewritten, so GH_TOKEN disappears from the guest, and
+# the GIT_CONFIG_* credential helper goes with it (see git_credential_env).
 GH_HOST_TOKEN=""
 run_cmd shell
 eq "0" "$rc" "gh logged out on the host: shell --macos still completes"
 envc="$(cat "$ENV_FILE")"
 hasnt "$envc" "GH_TOKEN" "gh logged out on the host: GH_TOKEN is dropped from ~/.augur-env"
 has   "$envc" "ANTHROPIC_API_KEY" "gh logged out on the host: the other credentials are still written"
-hasnt "$(pushcmd)" "git config" "gh logged out on the host: no helper write is sent"
-helper="$(HOME="$GUEST_HOME" git config --global --get-all 'credential.https://github.com.helper')"
-hasnt "$helper" "ghp_" "gh logged out on the host: the helper left in ~/.gitconfig holds no token"
+hasnt "$envc" "GIT_CONFIG_" "gh logged out on the host: git's credential helper is dropped from ~/.augur-env too"
 
 section "Tier 1 — the guest installs only complete content, and cleans up stale temp files"
 
