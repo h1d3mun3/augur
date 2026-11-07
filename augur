@@ -548,6 +548,52 @@ creds_have_gh_token() {
     return 1
 }
 
+# git's credential helper for github.com, as NAME=value lines of git's environment config
+# (GIT_CONFIG_COUNT, then GIT_CONFIG_KEY_<n> / GIT_CONFIG_VALUE_<n> pairs). The one definition for
+# both modes: Container mode passes each line as a `container exec -e` (_add_session_exec_env), macOS
+# mode writes each into the guest's ~/.augur-env as `export NAME='value'` (macos_env_add_export,
+# which refuses a value holding a single quote or a control byte).
+#
+# The Container half relies on the container CLI passing `-e GIT_CONFIG_VALUE_0=` through as a
+# variable that is set and empty: neither dropped nor read as `-e NAME`, which takes the value from
+# the CLI's own environment. tests/21_container_live.sh checks this in a real container.
+#
+# The helper makes HTTPS `git push` work off GH_TOKEN alone, without writing any git config file and
+# without gh or `gh auth setup-git` in the guest. It holds only the REFERENCE `$GH_TOKEN`, never the
+# value: the single quotes keep it literal through augur, the `-e` or the sourced export, and git,
+# which hands the helper to `sh` at call time, and only that shell expands it.
+#
+# The empty value before it resets the helper chain. git collects every generic `credential.helper`
+# and every matching `credential.<url>.helper` into one list, in the order it reads its config, asks
+# them in turn on `get`, and calls `store` on ALL of them after a successful push; an empty value
+# clears the list collected so far. Environment config is read after every config file (system, XDG,
+# global, their includes and includeIfs, the repository's own .git/config), so the reset clears all
+# of them: macOS git's system-level osxkeychain (over SSH it prints "failed to store: -25308", and
+# with the guest keychain unlocked it would keep a copy of GH_TOKEN there) and the helpers the
+# host's ~/.gitconfig names, which the guest gets as a read-only mount or a copy and which cannot
+# run there ("'credential-osxkeychain' is not a git command", "/opt/homebrew/bin/gh: not found").
+# That includes a github.com section an older augur wrote into a macOS guest's ~/.gitconfig.
+# Accepted trade-off: a helper the operator sets up inside the guest is cleared for github.com too.
+# Only `git -c` on a command line is read after this.
+#
+# Prints nothing when the host has no gh token: git then runs whatever helpers the config files
+# name, as it would without augur. Deliberately no reset on its own: with no token there is nothing
+# to authenticate with either way, so it would only trade the host helpers' stray errors for a
+# prompt or failure, and it would clear a credential the operator set up inside the guest by hand.
+#
+# Accepted trade-off (macOS): augur owns these names in the guest. ~/.augur-env is sourced from the
+# end of ~/.zshenv, so it replaces any GIT_CONFIG_* exported before it (/etc/zshenv, earlier lines of
+# ~/.zshenv), and one exported after it (~/.zprofile, ~/.zshrc) replaces augur's, reset included.
+git_credential_env() {
+    creds_have_gh_token || return 0
+    printf '%s\n' \
+        'GIT_CONFIG_COUNT=2' \
+        'GIT_CONFIG_KEY_0=credential.https://github.com.helper' \
+        'GIT_CONFIG_VALUE_0=' \
+        'GIT_CONFIG_KEY_1=credential.https://github.com.helper' \
+        'GIT_CONFIG_VALUE_1=!f() { test "$1" = get && echo username=x-access-token && echo "password=$GH_TOKEN"; }; f'
+}
+
 # Prompts on the terminal for the token the agent's login printed and prints what was pasted. The
 # prompt goes to stderr, so a caller captures just the value: token="$(read_agent_token_from_tty)".
 read_agent_token_from_tty() {
@@ -2863,24 +2909,16 @@ session_credential_env() {
 # dynamic scoping), as plain `-e`:
 #   • TZ — Container mode shares the host kernel's clock but defaults to UTC like any bare Linux
 #     image. Per session, so a host that changed zone is picked up by the next session.
-#   • git's credential helper, only when the caller's `_creds` holds a gh token: GIT_CONFIG_* adds a
-#     self-contained helper so HTTPS `git push` works off GH_TOKEN alone — without writing to the
-#     read-only ~/.gitconfig and without depending on the host's helper being executable inside the
-#     Linux container (a macOS host's osxkeychain/gh helper is not). It carries only the REFERENCE
-#     `$GH_TOKEN`, expanded in the container at push time, never the value.
+#   • git's credential helper for github.com (git_credential_env): the GIT_CONFIG_* set, which
+#     holds no secret and is empty when the caller's `_creds` holds no gh token.
 # Deliberately NEVER at `run`, for these and for the credentials alike: Apple Container appends
 # exec env to the container's baked init env without de-duplicating, and libc `getenv` takes the
 # FIRST duplicate (bash takes the last), so a baked value would silently win over the per-session
 # one for `date` and any other program that reads it through libc.
 _add_session_exec_env() {
+    local _kv
     _env+=(-e "TZ=$(host_timezone)")
-    if creds_have_gh_token; then
-        _env+=(
-            -e "GIT_CONFIG_COUNT=1"
-            -e "GIT_CONFIG_KEY_0=credential.https://github.com.helper"
-            -e 'GIT_CONFIG_VALUE_0=!f() { test "$1" = get && echo username=x-access-token && echo "password=$GH_TOKEN"; }; f'
-        )
-    fi
+    while IFS= read -r _kv; do _env+=(-e "$_kv"); done < <(git_credential_env)
 }
 
 # Bring the container up for an interactive session. Not running → the FULL `up` (reconcile +
@@ -3984,58 +4022,28 @@ ensure_macos_agent_bin() {
     return 1
 }
 
-# The guest command that enables HTTPS `git push` off GH_TOKEN alone, by writing git's credential
-# helper into the guest's ~/.gitconfig. Independent of gh and of whether `gh auth setup-git` was
-# ever run, and it keeps working in non-login shells. The helper stores only the REFERENCE
-# `$GH_TOKEN` (expanded in the guest at push time), never the token value. Must run AFTER
-# cmd_up_macos scp's the host's ~/.gitconfig, which REPLACES the file this writes into.
-#
-# --replace-all, not a plain set. `credential.<url>.helper` is a MULTI-VALUED key by git's design,
-# and the file this writes into is the host's own ~/.gitconfig: `gh auth setup-git` writes TWO
-# entries for github.com (an empty one to reset the helper chain, then its own), so every operator
-# who has run it arrives here with the key already duplicated. A plain
-# `git config --global <key> <value>` then refuses to collapse them — exit 5, "cannot overwrite
-# multiple values with a single value" — which under augur's `set -e` aborted `up` AFTER the clone,
-# the sizing, the boot and the SSH wait, tearing none of it down: the same stranded-guest shape the
-# pre-clone credential check exists to prevent. Collapsing is exactly the intent: on a
-# single-valued file the plain form ALREADY overwrote whatever the host had, so --replace-all
-# changes nothing on the path that worked, and the host's values are inert in the guest regardless
-# (osxkeychain needs the host Keychain — the very reason augur injects GH_TOKEN at all — and a
-# `!/opt/homebrew/bin/gh …` helper needs that host path). Nor is the copy a faithful original to
-# begin with: it carries the host's `[include]`/`[includeIf]` lines while the files they point at
-# were never copied, so it is already a lossy snapshot. (An include CANNOT be what introduces the
-# duplicate, incidentally: `--includes` defaults OFF for a scope-limited `git config --global`.)
-# Container mode never hits any of this because it never mutates the file — it bind-mounts
-# ~/.gitconfig read-only and injects the identical helper per session via GIT_CONFIG_KEY_0/VALUE_0
-# (_add_session_exec_env).
-#
-# Best-effort like ensure_macos_agent_profile, for the residue --replace-all cannot fix: the copied
-# file is arbitrary operator-authored input, and a shape git cannot parse at all still fails (exit
-# 128 on a malformed section header). A guest with no push credential plus a warning beats an `up`
-# that dies with the VM already running. push_macos_guest_env runs this in the same ssh session as
-# the ~/.augur-env write and only warns when it fails.
-#
-# Deliberately NOT removed when the host has no gh token: a helper written earlier stays in the
-# guest's ~/.gitconfig while push_macos_guest_env drops GH_TOKEN from ~/.augur-env. The helper holds
-# no secret, and with GH_TOKEN unset it answers an empty password, so HTTPS `git push` fails
-# authentication instead of prompting. Without a token there is nothing for it to push with either
-# way, and the next session after a host `gh auth login` works with no rewiring.
-#
-# Skipped when the helper already holds exactly this value, and retried once after a second
-# otherwise: two sessions starting at once would race for ~/.gitconfig.lock, and the loser would
-# warn about a helper that the winner has just written.
-macos_git_credential_helper_cmd() {
-    local key="'credential.https://github.com.helper'"
-    local val="'!f() { test \"\$1\" = get && echo username=x-access-token && echo password=\$GH_TOKEN; }; f'"
-    printf '%s' "[ \"\$(git config --global --get-all ${key} 2>/dev/null)\" = ${val} ] || git config --global --replace-all ${key} ${val} || { sleep 1; git config --global --replace-all ${key} ${val}; }"
-}
-
 # The last line of every ~/.augur-env push. The guest installs the new file only when it ends with
 # this line, so content cut short in transit never replaces a working file.
 MACOS_AUGUR_ENV_END_LINE='# augur-env: end'
 
-# Write the caller's `_creds` (see resolve_session_credentials) into VM $1's ~/.augur-env, make
-# ~/.zshenv source it, and wire git's GitHub credential helper, all in one ssh session.
+# Append NAME=value $1 to the caller's `_content` (push_macos_guest_env) as the line
+# `export NAME='value'`, for the guest's ~/.augur-env, which the guest sources. The single quotes
+# keep the value literal, so the `$GH_TOKEN` in git's helper stays a reference. Fails closed, after
+# an error naming the variable and with nothing appended, when NAME is not a shell variable name or
+# the value holds a single quote (the one character that ends a single-quoted string) or a control
+# byte (a newline would start a second line of shell).
+macos_env_add_export() {
+    local name="${1%%=*}" value="${1#*=}"
+    if [[ "$1" != *=* || ! "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+        error "Refusing to write '${name}' into the guest env: not NAME=value with a valid variable name."
+        return 1
+    fi
+    validate_secret_value "$name" "$value" || return 1
+    _content+="export ${name}='${value}'"$'\n'
+}
+
+# Write the caller's `_creds` (see resolve_session_credentials) and git's GitHub credential helper
+# (git_credential_env) into VM $1's ~/.augur-env and make ~/.zshenv source it, in one ssh session.
 # cmd_up_macos calls it on every boot and every `augur up --macos` against a running VM, and
 # prepare_macos_session on every `augur claude --macos` / `augur shell --macos` against a running
 # VM, so a rotated key, a new token or a host `gh auth login` reaches the next session with no
@@ -4051,9 +4059,10 @@ MACOS_AUGUR_ENV_END_LINE='# augur-env: end'
 # SOURCED shell file as `export VAR='<value>'`, which is why only values resolve_session_credentials
 # has validated may be written here; nothing is resolved again.
 #
-# Returns non-zero, after saying what happened, when the install failed or its outcome is unknown
-# (ssh failure, a full disk, an unwritable ~/.zshenv). Callers decide whether that is fatal. A failing
-# git helper write only warns.
+# Returns non-zero, after saying what happened, when a value cannot be written safely
+# (macos_env_add_export; nothing is sent to the guest then, because the whole content is built
+# before the ssh), or when the install failed or its outcome is unknown (ssh failure, a full disk,
+# an unwritable ~/.zshenv). Callers decide whether that is fatal.
 push_macos_guest_env() {
     local vm="$1" _kv _content _cmd _rc=0
     local _env="/Users/${MACOS_SSH_USER}/.augur-env"
@@ -4066,8 +4075,9 @@ push_macos_guest_env() {
     _content+='export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer'$'\n'
     # The agent's fixed env goes in the file so every guest zsh session (a shell, an ssh one-off, the
     # agent started by hand) sees it, as in Container mode where it is part of the image environment.
-    for _kv in $(agent_fixed_env); do _content+="export ${_kv%%=*}='${_kv#*=}'"$'\n'; done
-    for _kv in ${_creds[@]+"${_creds[@]}"}; do _content+="export ${_kv%%=*}='${_kv#*=}'"$'\n'; done
+    for _kv in $(agent_fixed_env); do macos_env_add_export "$_kv" || return 1; done
+    for _kv in ${_creds[@]+"${_creds[@]}"}; do macos_env_add_export "$_kv" || return 1; done
+    while IFS= read -r _kv; do macos_env_add_export "$_kv" || return 1; done < <(git_credential_env)
     _content+="$MACOS_AUGUR_ENV_END_LINE"
 
     # Guest side, in one ssh session:
@@ -4083,23 +4093,17 @@ push_macos_guest_env() {
     #   3. The ~/.zshenv line that sources it (exit 4 if that fails). Accepted trade-off: two pushes
     #      racing here can both append it; a repeated line only sources the same file twice, and
     #      macos_scrub_augur_credentials removes every copy.
-    #   4. git's credential helper (only with a gh token), best-effort: exit 3 tells the host to
-    #      warn, with ~/.augur-env already installed. On the boot path cmd_up_macos calls this
-    #      after its ~/.gitconfig scp, which replaces the file the helper is written into.
     # Any other status (ssh's own 255 when the connection drops) leaves the outcome unknown: the
     # drop may have come before or after the rename.
     _cmd="find /Users/${MACOS_SSH_USER} -maxdepth 1 -name '.augur-env.tmp.*' -mmin +1 -exec rm -f {} + 2>/dev/null"
     _cmd+="; rm -f ${_tmp} && ( umask 077 && cat > ${_tmp} ) && [ \"\$(tail -n 1 ${_tmp})\" = '${MACOS_AUGUR_ENV_END_LINE}' ] && mv -f ${_tmp} ${_env} || { rm -f ${_tmp}; exit 1; }"
     _cmd+="; { grep -q '.augur-env' ~/.zshenv 2>/dev/null || echo '${MACOS_AUGUR_ENV_SOURCE_LINE}' >> ~/.zshenv; } || exit 4"
-    if creds_have_gh_token; then _cmd+="; $(macos_git_credential_helper_cmd) || exit 3"; fi
     # printf is a builtin, so the content reaches ssh's stdin without ever being on an argv. Only
     # ssh's status counts: the guest checked the end marker, so a printf cut short by an early
     # close cannot have installed anything.
     printf '%s\n' "$_content" | ssh_macos "$vm" "$_cmd" || _rc="${PIPESTATUS[1]}"
     case "$_rc" in
         0) return 0 ;;
-        3) warn "Could not configure git's credential helper in the VM; HTTPS 'git push' in the guest may prompt for credentials."
-           return 0 ;;
         4) warn "VM '${vm}' got its new ~/.augur-env, but ~/.zshenv could not be updated to source it."
            return 1 ;;
         1) warn "Could not write ~/.augur-env in VM '${vm}'; the guest's ~/.augur-env is unchanged."
@@ -4528,11 +4532,10 @@ cmd_up_macos() {
     [[ -f "$HOME/.gitconfig" ]] && \
         scp_to_macos "$project_vm" "$HOME/.gitconfig" "/Users/${MACOS_SSH_USER}/.gitconfig"
 
-    # Credentials, the ~/.zshenv source line and git's credential helper. Deliberately BELOW the
-    # ~/.gitconfig scp above: that copy replaces the very file the helper is written into, so the
-    # reverse order would silently discard the helper. A failed push ends `up` with the VM left
-    # running, booted and self-tested but without fresh credentials; the next `augur up`, `claude` or
-    # `shell --macos` attaches to it and pushes again, so nothing needs tearing down.
+    # Credentials, git's credential helper and the ~/.zshenv source line. A failed push ends `up`
+    # with the VM left running, booted and self-tested but without fresh credentials; the next
+    # `augur up`, `claude` or `shell --macos` attaches to it and pushes again, so nothing needs
+    # tearing down.
     push_macos_guest_env "$project_vm" || exit 1
 
     success "VM '${project_vm}' is up."
@@ -4746,11 +4749,13 @@ require_macos_vm_slot() {
     exit 1
 }
 
-# Remove from VM $1 the credential-bearing files augur itself writes into a guest: ~/.augur-env (and
+# Remove from VM $1 the credential-bearing files augur itself puts into a guest: ~/.augur-env (and
 # any ~/.augur-env.tmp.* a killed push left behind), the ~/.zshenv line that sources it
-# (push_macos_guest_env), and ~/.gitconfig, which carries the GH_TOKEN
-# credential helper (macos_git_credential_helper_cmd). augur writes these into project VMs only,
-# never into the base VM, so in setup-token's fresh clone this is defense in depth. Deliberately
+# (push_macos_guest_env), and ~/.gitconfig, the copy of the host's file that cmd_up_macos makes.
+# augur puts these into project VMs only, never into the base VM, so in setup-token's fresh clone
+# this is defense in depth. Deliberately includes ~/.gitconfig, though augur writes no helper into
+# it: the host's file may carry the host's own helpers or credentials (a token in a url.insteadOf
+# or an http.extraHeader), and none of that belongs in a clone handed to setup-token. Deliberately
 # limited to augur's own files: the Keychain and whatever a human may have left in the base VM by
 # hand are out of its scope.
 macos_scrub_augur_credentials() {
