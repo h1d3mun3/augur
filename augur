@@ -271,14 +271,19 @@ sanitize_guest_lines() {
     done
 }
 # Show guest text or a log excerpt from stdin as error lines, each `  | <line>`, sanitised
-# (sanitize_guest_lines). Every line is kept, blank ones included, so a multi-line log dump reads
-# as it was written; input with nothing but blank lines (an empty captured error, say) prints no
-# line at all, since a bare `  |` tells the operator nothing.
+# (sanitize_guest_lines). Blank lines (empty or only whitespace) between others are kept, so a multi-line log dump reads as it
+# was written; blank lines before the first non-blank line and after the last are dropped, so input
+# with nothing but blank lines (an empty captured error, say) prints no line at all: a bare `  |`
+# there tells the operator nothing.
 show_guest_lines() {
     sanitize_guest_lines | {
-        local _l _lines=() _any=false
-        while IFS= read -r _l; do _lines+=("$_l"); if [[ -n "$_l" ]]; then _any=true; fi; done
-        if $_any; then for _l in "${_lines[@]}"; do error "  | ${_l}"; done; fi
+        local _l _lines=() _first=-1 _last=-1 _i
+        while IFS= read -r _l; do
+            if [[ "$_l" == *[![:space:]]* ]]; then (( _first >= 0 )) || _first=${#_lines[@]}; _last=${#_lines[@]}; fi
+            _lines+=("$_l")
+        done
+        (( _first >= 0 )) || exit 0
+        for (( _i = _first; _i <= _last; _i++ )); do error "  | ${_lines[_i]}"; done
     }
 }
 

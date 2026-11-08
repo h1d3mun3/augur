@@ -94,20 +94,26 @@ eq 1 "$(grep -cF "host is '\${host_tz}'): \$(sanitize_guest_text \"\${setout%%\$
   "sync_macos_guest_timezone sanitises the failed sudo's first line"
 eq 2 "$(grep -c 'true 2>&1 | head -n 6 | show_guest_lines' "$AUGUR")" \
   "both ssh-probe diagnostics (up --macos, update --macos) go through show_guest_lines"
-eq 0 "$(grep -E 'do error "  \| ' "$AUGUR" | grep -vc 'for _l in "\${_lines\[@\]}"')" \
+eq 0 "$(grep -E 'do error "  \| ' "$AUGUR" | grep -vc 'do error "  | \${_lines\[_i\]}"')" \
   "every log tail / probe echoed through error() goes through show_guest_lines"
 eq 1 "$(grep -cE 'do error "  \| ' "$AUGUR")" \
   "one loop echoes guest lines through error() (show_guest_lines; every site uses it)"
 has "$(declare -f show_guest_lines)" 'sanitize_guest_lines |' "show_guest_lines reads its input through the sanitiser"
-# show_guest_lines itself: sanitised, one `  | ` line per input line, blank lines kept, and nothing
-# at all for input that is only blank lines.
+# show_guest_lines itself: sanitised, one `  | ` line per input line, blank lines between others
+# kept, blank lines before the first and after the last dropped, and nothing at all for input that
+# is only blank lines.
 shown="$(printf 'a\033[31m\n\nb\n' | show_guest_lines 2>&1)"
 has "$shown" '  | a\x1b[31m' "show_guest_lines sanitises each line"
 eq 3 "$(grep -c '  | ' <<<"$shown")" "show_guest_lines prints one line per input line, a blank one included"
 eq 1 "$(grep -cx '.*  | ' <<<"$shown")" "…the blank line as a bare '  | '"
 eq "" "$(printf '\n' | show_guest_lines 2>&1)" "show_guest_lines prints nothing for an empty captured error"
-eq "" "$(printf '\n\n\n' | show_guest_lines 2>&1)" "show_guest_lines prints nothing for blank lines only"
+eq "" "$(printf '\n \n   \n' | show_guest_lines 2>&1)" "show_guest_lines prints nothing for blank or space-only lines only"
 eq "" "$(show_guest_lines </dev/null 2>&1)" "show_guest_lines prints nothing for no input"
+trimmed="$(printf '\n\n  \na\n\n\nb\n\n\n' | show_guest_lines 2>&1)"
+eq 4 "$(grep -c '  | ' <<<"$trimmed")" "show_guest_lines drops blank lines before the first and after the last non-blank line"
+has "$(head -n 1 <<<"$trimmed")" '  | a' "…starts at the first non-blank line (a line of spaces counts as blank)"
+has "$(tail -n 1 <<<"$trimmed")" '  | b' "…ends at the last non-blank line"
+eq 2 "$(grep -cx '.*  | ' <<<"$trimmed")" "…and keeps the two blank lines between a and b"
 eq 0 "$(grep -E '^(info|success|warn|error)\(\) ' "$AUGUR" | grep -c 'echo -e')" \
   "no log helper interprets escapes (echo -e)"
 
