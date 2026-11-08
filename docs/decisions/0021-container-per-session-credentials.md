@@ -3,8 +3,8 @@
 - **Status:** Accepted. Amends [`0010`](./0010-container-persistence.md) — its rationale that
   credentials are baked at `run` and fingerprinted so a rotated token recreates the container.
 - **Date:** 2026-09-24.
-- **Applies to:** Apple Container mode only. macOS VM mode (`~/.augur-env` over SSH stdin) is
-  unchanged.
+- **Applies to:** Apple Container mode only; macOS VM mode is out of scope here (see the
+  amendment below).
   - *Amendment (2026-11-07):* macOS VM mode now delivers credentials per session too, as the
     session ssh's environment; see [`0023`](./0023-macos-per-session-credentials.md).
 
