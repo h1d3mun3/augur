@@ -104,7 +104,7 @@ Hardcoded in `agent_fixed_env`. Container: `container exec -e DISABLE_AUTOUPDATE
 
 Optional host-global provisioning (`~/.augur/provision/`) baked into / applied to the base image forwards no host env var:
 
-- **macOS:** `manifest.conf` (Homebrew package names) and `hook.sh` run over the hermetic, no-PTY `ssh_macos_provision`. Package names are read from a **file** (charset-validated, passed as `printf '%q'` brew args); `hook.sh` is scp'd as a file and executed guest-side (`sudo bash …`), so its process env is the guest's, never the host's (in `run_base_provisioning`).
+- **macOS:** `manifest.conf` (Homebrew package names) and `hook.sh` run over the hermetic, no-PTY provisioning ssh (`ssh_macos_provision`, and `ssh_macos_provision_stdin` for the hook). Package names are read from a **file** (charset-validated, passed as `printf '%q'` brew args); `hook.sh` travels base64-encoded inside a root script on one connection's stdin (`macos_run_root_script`, never on an argv or in a guest-user-writable file), and root runs it with `bash` from a fresh 0700 directory under `/var/root`, so its process env is the guest's (what `sudo` leaves), never the host's (`run_provision_hook`, in `run_base_provisioning`).
 - **Apple Container:** `container-packages.conf` (apt package names) is passed as a single `--build-arg EXTRA_APT_PACKAGES=…` from that **file** (in `container_provision_build_args`); the `Dockerfile` `ARG EXTRA_APT_PACKAGES` is consumed by a `RUN`, never re-exported as `ENV`. `SWIFT_VERSION` is the only other `--build-arg`. No host env feeds either.
 
 ---
