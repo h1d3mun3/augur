@@ -45,7 +45,8 @@ That kept them off argv, but:
   `/etc/ssh/sshd_config.d/200-augur-session-env.conf` as root (`install_macos_session_env_acceptance`):
   one `AcceptEnv` line naming exactly `session_credential_names` (the `agent_auth_specs` guest
   variables plus `GH_TOKEN`; exact names, no patterns, charset-checked before they reach a root
-  script). macOS's `sshd_config` includes `sshd_config.d/*`, and `AcceptEnv` patterns add up across
+  script; `macos_session_env_names` reads them from that list, not back out of the `AcceptEnv`
+  line). macOS's `sshd_config` includes `sshd_config.d/*`, and `AcceptEnv` patterns add up across
   files, so macOS's own `AcceptEnv LANG LC_*` stays. macOS starts a new sshd per connection
   (launchd), so a file in `sshd_config.d` is live for the next login, and one sshd cannot parse
   would lock SSH out at once. So the candidate is verified before it goes live: written outside
@@ -61,6 +62,23 @@ That kept them off argv, but:
   boots and before the agent installer, Homebrew and custom provisioning, so it does not wait on
   the network. The update still saves the base only once every step has passed, so while a
   Homebrew upgrade keeps failing, an old base stays without the drop-in.
+- **The root script is never staged.** It runs over one ssh connection whose stdin carries the
+  admin password line, a marker line, then the script (`macos_run_root_script`), under
+  `sudo -S -k -p ''` on a root `sh` that discards every line up to the marker and runs the rest
+  (`sh -s`). A script written to a file in the guest user's home first and run by a second
+  connection could be swapped in between by any process of that user, which would mean root in
+  the VM every project is cloned from. `sudo -S` reads the password one byte at a time up to its
+  newline, so it takes that line only; `-k` stops a cached credential from skipping the read. A
+  NOPASSWD grant (a build holds one until it revokes it) still skips it, which is what the marker
+  is for: whether or not sudo read the line, the password never reaches the shell running the
+  script, where an unknown command would print it. The marker is a shell comment. A wrong password
+  fails sudo, and no line of the script runs. The password stays on no argv.
+- **The drop-in is checked again last.** Homebrew, the agent installer and custom provisioning
+  (which runs a root hook) all run after `update --macos` installs the drop-in, and the build's
+  Xcode selection, sudo revoke and signature check run after its install. So both re-run the same
+  `sshd -T` test against the live configuration (`verify_macos_session_env_acceptance`, the shared
+  `macos_session_env_accepts_sh`, over `macos_run_root_script`) as their last guest step, after the
+  signature check and right before the VM is stopped and saved; a failure saves nothing.
 - **`~/.augur-env` stays, without credentials and without git's helper set.** It still carries the
   non-secret per-VM env (brew shellenv, the agent's PATH, `DEVELOPER_DIR`, `agent_fixed_env`) and
   is pushed on every `up` / `claude` / `shell --macos`. It never reads the resolved credentials, so
@@ -73,8 +91,10 @@ That kept them off argv, but:
   the drop-in holds exactly the line augur would write (`macos_session_env_check_cmd`), always as
   the first step of a `~/.augur-env` push (`push_macos_guest_env --require-session-env`), so every
   refusal takes one code path and costs no extra connection. On a boot that push runs right after
-  the SSH wait (before the clock, the self-test and the rest of the bring-up); on a running VM it
-  is the session's or `up`'s one push. A project VM cloned
+  the SSH wait (before the clock, the self-test and the rest of the bring-up) and is the boot's
+  only push: its content is built from host-side constants and nothing later in the bring-up
+  writes `~/.augur-env` or `~/.zshenv`. On a running VM it is the session's or `up`'s one push. A
+  project VM cloned
   from a base built before this — or for a different set of names — still gets the new
   `~/.augur-env` (removing credentials an older augur wrote there) and is then refused, before any
   credential is sent. The remedy names `augur destroy --macos && augur up --macos` as enough when
@@ -86,9 +106,9 @@ That kept them off argv, but:
   project VMs. Without the check the guest's sshd would silently drop the values and the agent
   would start unauthenticated. A guest that lies to the check gains nothing: its sshd decides what
   it accepts, and the worst case is a session without credentials.
-- **A VM whose containment is unproven is stopped.** Any failure of the boot's first push
-  (a refusal, a transport error, a full disk), the SSH-wait timeout and a failing self-test all
-  stop the VM, its gvproxy and its proxy through one teardown, `stop_unverified_macos_vm`, which
+- **A VM whose containment is unproven is stopped.** Any failure of the boot's push
+  (a refusal, a transport error, a full disk), the SSH-wait timeout, a failing self-test and a
+  passed one that cannot be recorded (below) all stop the VM, its gvproxy and its proxy through one teardown, `stop_unverified_macos_vm`, which
   also drops the record below and keeps the clone (`destroy` stays the operator's call;
   `setup-token --macos` deletes its throwaway clone itself). A VM left running there would be
   attached to by the next `claude` / `shell --macos`. A refused VM is of no use anyway. Under
@@ -102,13 +122,18 @@ That kept them off argv, but:
   `augur-vm run`, by `stop_unverified_macos_vm` and by `down` / `destroy`, and written by
   `cmd_up_macos` only once `verify_macos_egress_locked` has passed: on a boot, and on the
   already-running branch, which re-runs the self-test (so `up --macos` also clears a VM whose boot
-  was interrupted). It holds the VM's run id, the pid augur-vm's `run` writes to the VM's
-  `run.pid`, and `require_macos_egress_verified` accepts it only when that still matches, so a VM
-  booted again by any means (`augur-vm run` by hand after a host crash included) does not inherit
-  an old record. `prepare_macos_session` checks it right after the egress-mode check, before any
-  guest step, and refuses with `augur down --macos && augur up --macos`, leaving the VM running.
-  With no run id to tie it to, `up` records nothing and says so, and sessions refuse (fail
-  closed). A marker rather than a trap on the interrupted `up`: a trap cannot run on a kill or a
+  was interrupted). It holds the VM's run id (`macos_vm_run_id`): the pid augur-vm's `run` writes
+  to the VM's `run.pid`, and that process's start time as `ps -o lstart=` prints it (padding
+  collapsed). `require_macos_egress_verified` accepts the record only when both still match, so a
+  VM booted again by any means does not inherit an old record, and neither does an `augur-vm run`
+  started by hand after a host crash that happens to get the pid the old record holds. A pid alone
+  could match there. `prepare_macos_session` checks it right after the egress-mode check, before
+  any guest step, and refuses, leaving the VM running, with `augur up --macos` as the remedy: on
+  the running VM that re-runs the self-test and records it. (On a VM from an old base that `up`
+  then refuses with the old-base remedy; the first message promises only the self-test.) When the
+  run id cannot be read after a passed self-test (no `run.pid`, no process with that pid, no start
+  time), the pass cannot be recorded and every session would refuse the VM, so `up` fails and stops
+  it through `stop_unverified_macos_vm`, the clone kept. A marker rather than a trap on the interrupted `up`: a trap cannot run on a kill or a
   host crash. Deliberately egress-on only: a `--no-egress` boot has no self-test to record, and a
   `--no-egress` session attaches only to a VM booted that way (`require_macos_egress_mode_current`),
   where there is no containment for the record to vouch for.
@@ -178,11 +203,16 @@ That kept them off argv, but:
     `active count = 0` even while a session is open, consistent with one sshd per connection.
 - **Not yet observed on a Mac:** that macOS serves another user's process environment to no one
   but that user and root (`ps -E` from a second account); that `sshd -T -f <test config>` follows
-  the staged config's absolute `Include` as described; end-to-end delivery (the session's
+  the test config's absolute `Include` as described; end-to-end delivery (the session's
   `SendEnv` values and git's `GIT_CONFIG_*` set present in `claude --macos` / `shell --macos`,
   absent from a plain `ssh`); the temp-file cleanup's `mktemp /tmp/…XXXXXX` and
-  `find … \( -mmin +1 -o -newer … \)` under the guest's zsh and BSD userland; and that the VM's
-  `run.pid` keeps one value for the whole boot (the record of a passed self-test relies on it).
+  `find … \( -mmin +1 -o -newer … \)` under the guest's zsh and BSD userland; that the VM's
+  `run.pid` keeps one value for the whole boot, and that `ps -o lstart=` prints the same start time
+  for that process for the whole boot, across host sleep and clock syncs (the record of a passed
+  self-test relies on both; a change would refuse sessions until `up --macos`, never admit one);
+  and that the guest's `sudo -S -k` takes only the password line from the root-script stdin, and
+  that the guest's `/bin/sh` `read` loop and `sh -s` leave the rest for the script, with and
+  without the build's NOPASSWD grant.
 - **Guest login shells keep it.** sshd sets the accepted variables in the session's environment
   before it starts the user's shell. `zsh -l -c …` / `exec zsh -l` inherit them, and nothing augur
   writes (`~/.zshenv`, `~/.augur-env`) or macOS's `/etc/zprofile` (`path_helper`, PATH only) unsets
@@ -225,6 +255,11 @@ starts sources its own, so a `GIT_CONFIG_*` that a guest startup file exports (`
   mount on every boot, and still has a create/read/delete lifecycle to get wrong.
 - **`-o SetEnv=NAME=value`.** Same sshd side, but the value is on the host `ssh` argv for the whole
   session — an I10 violation.
+- **Stage the drop-in's root script in the guest user's home, then `sudo -S sh <file>` over a
+  second connection.** Keeps the password the only thing on sudo's stdin, but any process of the
+  guest user can replace the file between the two connections and run as root in the future base.
+- **Tie the passed-self-test record to the `run.pid` pid alone.** A recycled pid (a hand-started
+  `augur-vm run` after a host crash) would match an old record.
 - **Install the drop-in into existing project VMs on `up`** (augur can `sudo -S` there). Rejected as
   migration code for old bases; a base update plus re-clone is the supported path.
 
@@ -243,9 +278,12 @@ starts sources its own, so a `GIT_CONFIG_*` that a guest startup file exports (`
   the agent or shell starts, rather than running unauthenticated.
 - A failed `~/.augur-env` push now stops a session instead of warning.
 - A running VM whose `up --macos` was interrupted before the self-test, or one booted outside
-  augur, gets no session until `augur down --macos && augur up --macos` (or an `up --macos` on the
-  running VM, which re-runs the self-test and records it). Running VMs booted before this record
-  existed are refused once the same way.
+  augur, gets no session until an `augur up --macos`, which re-runs the self-test on the running VM
+  and records it (a restart works too). Running VMs booted before this record
+  existed are refused once the same way. An `up --macos` that cannot read the VM's run id after a
+  passed self-test fails and stops the VM (clone kept).
+- `build` / `update --macos` fail without saving a base whose sshd no longer accepts the session
+  credentials at the end, even if the drop-in installed earlier in the run.
 - A plain `ssh` into the guest, or its GUI Terminal, gets neither credentials nor git's helper set.
 - Old credential bytes from an earlier `~/.augur-env` may remain in the clone's free disk blocks
   after the file is rewritten; augur does not scrub them.

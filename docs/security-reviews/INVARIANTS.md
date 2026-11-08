@@ -45,10 +45,12 @@ in time," this **prescribes** "what must never break." It changes rarely.
   attaching to it — so a VM started with `--no-egress` is never silently used by a plain
   `claude --macos` (`tests/51_macos_egress_mode_unit.sh`). `claude`/`shell --macos` also attach to
   a running egress VM only when a second host-side record says its self-test passed during its
-  current boot (`macos_egress_verified_file`, tied to the boot by augur-vm's `run.pid`, checked by
+  current boot (`macos_egress_verified_file`, tied to the boot by the pid in augur-vm's `run.pid` and that
+  process's start time, so a recycled pid does not match; checked by
   `require_macos_egress_verified`): it is dropped before every `augur-vm run`, by `down`/`destroy`
   and by the teardown (`stop_unverified_macos_vm`), and written only after the self-test passes,
-  so an `up --macos` interrupted before its self-test leaves no VM a session trusts
+  so an `up --macos` interrupted before its self-test leaves no VM a session trusts (and an `up`
+  that cannot read the run id to record a pass fails and stops the VM)
   (`tests/51_macos_egress_mode_unit.sh`, `tests/56_macos_session_credentials.sh`). `setup-token --macos` boots its throwaway
   VM through the same datapath and self-test (`tests/52_macos_setup_token_unit.sh`). Both self-tests are inherently live (they need a
   booted guest); the *wiring* — invoked on both paths, and a NOT-locked verdict exits non-zero with
@@ -209,7 +211,10 @@ in time," this **prescribes** "what must never break." It changes rarely.
   carries `-o SendEnv=` for exactly the resolved names with the values only in its own environment,
   that no value is on any ssh/scp argv, in any guest file (`~/.augur-env` included) or (for
   file- and `gh`-sourced values) in any other ssh call's environment, that the build/update write
-  the `AcceptEnv` drop-in, that `~/.augur-env` holds no `GIT_CONFIG_*` line and the session's
+  the `AcceptEnv` drop-in (its root script over one connection, nothing staged, the password on no
+  argv and never printed, NOPASSWD sudo or not) and re-check it last before the save (with
+  `tests/52_macos_setup_token_unit.sh` for the order), that `~/.augur-env` holds no
+  `GIT_CONFIG_*` line and the session's
   remote command exports them, holding no token value, only when `GH_TOKEN` is sent, and that a
   guest without the drop-in gets no session and has an older augur's credential lines removed from
   `~/.augur-env` (also when a later step of that push fails, and when a running VM's credentials
@@ -226,7 +231,9 @@ in time," this **prescribes** "what must never break." It changes rarely.
 - **Note:** The rule does not cover the macOS guest's admin password (`macos_admin_password`),
   but it is kept off argv the same way: every guest `sudo -S` call gets it on ssh's stdin via
   `macos_admin_password_stdin` (the bash builtin `printf` piped into `ssh_macos` /
-  `ssh_macos_provision_stdin`), so it is on neither the host's local `ssh` argv nor the guest's
+  `ssh_macos_provision_stdin`; for the sshd drop-in's root script, followed on the same stdin by a
+  marker line and the script, `macos_run_root_script`), so it is on neither the host's local `ssh`
+  argv nor the guest's
   process list. `tests/44_macos_sudo_password_stdin.sh` asserts this through a recording `ssh`
   stub, plus a source guard that every `sudo -S` in `augur` is fed that way. This closes item 44
   of [`2026-09-24-egress.md`](./2026-09-24-egress.md) ("[LOW–MEDIUM; STILL OPEN]" there). The
