@@ -420,6 +420,23 @@ VM_UP=0; boot_id "$BOOT1"
 verify_macos_egress_locked() { echo "selftest" >> "$LOG"; boot_id "$BOOT2"; }
 run_cmd cmd_up_macos; rid_changes "boot, booted again during its self-test" boot
 eval "$verify_real"; VM_UP=1; boot_id "$BOOT1"
+# `set -e` holds inside the self-test: a command in it that fails unguarded ends the run, and no pass
+# is recorded, on both paths. (Called under `||` or `if !`, bash would ignore errexit there.)
+verify_macos_egress_locked() { echo "selftest" >> "$LOG"; false; echo "PAST_THE_FAILURE" >> "$LOG"; }
+for _path in running boot; do
+  if [[ "$_path" == running ]]; then VM_UP=1; else VM_UP=0; fi
+  egress_on; record on; no_pass; boot_id "$BOOT1"
+  run_cmd cmd_up_macos
+  [[ "$rc" -ne 0 ]] && ok "$_path: an unguarded failure in the self-test fails up --macos" || fail "$_path: up --macos exited 0 past a failure in the self-test"
+  logged PAST_THE_FAILURE && fail "$_path: the self-test went on past its failing command (errexit ignored)" \
+    || ok "$_path: the self-test stops at its failing command"
+  has_pass && fail "$_path: a pass was recorded after a failing self-test" "$(pass_of)" || ok "$_path: no pass is recorded"
+done
+has "$(declare -f cmd_up_macos)" 'macos_selftest_and_record "$project_vm" running' "the running branch calls the self-test as a plain statement"
+has "$(declare -f cmd_up_macos)" 'macos_selftest_and_record "$project_vm" boot' "the boot path calls the self-test as a plain statement"
+hasnt "$(declare -f cmd_up_macos)" 'macos_selftest_and_record "$project_vm" ||' "…never under ||"
+hasnt "$(declare -f cmd_up_macos)" '! macos_selftest_and_record' "…never under if !"
+eval "$verify_real"; VM_UP=1; boot_id "$BOOT1"
 # A run id read that fails once, as the self-test starts, on a running VM whose record already holds
 # a pass for the boot still running: that pass stands, and `up` goes on. Without such a pass, or
 # when the read after the self-test is the one that fails, nothing ties the pass to a boot: no pass.
@@ -470,9 +487,9 @@ fn="$(declare -f cmd_up_macos)"
 eq 2 "$(grep -c 'macos_selftest_and_record "$project_vm"' <<<"$fn")" "both self-tests in cmd_up_macos go through macos_selftest_and_record"
 hasnt "$fn" 'verify_macos_egress_locked' "…and cmd_up_macos runs no self-test outside it"
 _sr="$(declare -f macos_selftest_and_record)"
-_r_at="$(grep -n 'rid="$(macos_vm_run_id "$1")"' <<<"$_sr" | head -n1 | cut -d: -f1)"
-_v_at="$(grep -n 'verify_macos_egress_locked "$1"' <<<"$_sr" | head -n1 | cut -d: -f1)"
-_p_at="$(grep -n 'macos_record_egress_verified "$1" "$rid"' <<<"$_sr" | head -n1 | cut -d: -f1)"
+_r_at="$(grep -n 'rid="$(macos_vm_run_id "$vm")"' <<<"$_sr" | head -n1 | cut -d: -f1)"
+_v_at="$(grep -n 'verify_macos_egress_locked "$vm"' <<<"$_sr" | head -n1 | cut -d: -f1)"
+_p_at="$(grep -n 'macos_record_egress_verified "$vm" "$rid"' <<<"$_sr" | head -n1 | cut -d: -f1)"
 if [[ -n "$_r_at" && -n "$_v_at" && -n "$_p_at" && "$_r_at" -lt "$_v_at" && "$_v_at" -lt "$_p_at" ]]; then
   ok "macos_selftest_and_record reads the run id, then runs the self-test, then records against that id"
 else fail "macos_selftest_and_record's order is wrong" "read@$_r_at test@$_v_at record@$_p_at"; fi

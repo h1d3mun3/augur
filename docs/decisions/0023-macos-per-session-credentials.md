@@ -206,7 +206,9 @@ That kept them off argv, but:
   (a `down` / `destroy` removed it during the self-test), which fails `up` too, so a record is never
   re-created for a VM being torn down. `macos_selftest_and_record` is the one way `cmd_up_macos`
   runs the self-test: it reads the run id, runs `verify_macos_egress_locked`, and records the pass
-  against that id. `macos_record_egress_verified` is the one owner of the pass when it fails. On a
+  against that id, and on a pass it cannot record it stops a booted VM or refuses a running one
+  itself. Its callers run it as a plain statement, never under `||` or `if !`, which would make bash
+  ignore `set -e` for the whole self-test. `macos_record_egress_verified` is the one owner of the pass when it fails. On a
   boot `up` then stops the VM it just booted, its gvproxy and its proxy (`stop_macos_vm_and_egress`,
   the teardown of `stop_unverified_macos_vm` without its drop of the pass), the
   clone kept. On the already-running branch it deliberately leaves the VM running and refuses it

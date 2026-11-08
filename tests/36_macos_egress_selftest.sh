@@ -394,7 +394,7 @@ fi
 stop_fn="$(awk '/^stop_unverified_macos_vm\(\) \{/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
 grep -q '^ *stop_unverified_macos_vm "\$vm"$' <<<"$selftest_fn" \
   && ok "the self-test's teardown is stop_unverified_macos_vm" || fail "the self-test's teardown does not call stop_unverified_macos_vm"
-has "$(declare -f macos_selftest_and_record)" 'verify_macos_egress_locked "$1"' "macos_selftest_and_record runs the self-test"
+has "$(declare -f macos_selftest_and_record)" 'verify_macos_egress_locked "$vm"' "macos_selftest_and_record runs the self-test"
 grep -q '^ *stop_macos_vm_and_egress "\$1"$' <<<"$stop_fn" \
   && ok "the teardown stops the VM and its egress helpers (stop_macos_vm_and_egress)" || fail "the teardown does not call stop_macos_vm_and_egress"
 stop_fn="$(awk '/^stop_macos_vm_and_egress\(\) \{/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")$'\n'$stop_fn"
