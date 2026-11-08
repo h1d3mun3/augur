@@ -73,7 +73,9 @@ has "$managed_fn" 'macos_run_root_script "$vm"' "macOS managed policy is one roo
 hasnt "$managed_fn" 'macos_admin_password_stdin' "macOS managed policy makes no separate privileged call"
 hasnt "$managed_fn" 'cat > ' "macOS managed policy stages no file in the guest before root runs"
 hasnt "$managed_fn" 'MACOS_SSH_USER' "macOS managed policy names no path in the guest user's home"
-has "$managed_fn" "<<'\${delim}'" "macOS managed policy travels in a quoted heredoc (the guest shell expands nothing in it)"
+has "$managed_fn" "<<'AUGUR_MANAGED_SETTINGS_B64'" "macOS managed policy travels in a quoted heredoc (the guest shell expands nothing in it)"
+has "$managed_fn" 'agent_managed_settings_json | base64' "macOS managed policy travels base64-encoded (no payload byte can end the heredoc)"
+has "$managed_fn" '/usr/bin/base64 --decode' "macOS managed policy is decoded by the guest's own base64"
 has "$managed_fn" '/usr/sbin/chown root:wheel' "macOS managed policy is root-owned"
 # It must land BEFORE cmd_build_macos revokes the build-time sudo grant, or it silently fails.
 m_at="$(printf '%s\n' "$build_macos_body" | grep -n '^    install_macos_managed_settings ' | head -n1 | cut -d: -f1)"

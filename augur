@@ -4262,42 +4262,41 @@ warn_if_macos_egress_pinned() {
 # settings from re-enabling the auto-updater and swapping out the binary the integrity gate
 # verifies. In Container mode the same file IS root-owned against an unprivileged agent.
 install_macos_managed_settings() {
-    local vm="$1" dst parent payload body size delim script err
+    local vm="$1" dst parent b64 script
     dst="$(agent_macos_managed_settings_path)"; parent="$(dirname "$dst")"
     info "Installing augur's managed $(agent_display_name) policy into the base VM..."
-    # The payload, byte for byte: the trailing `x` keeps `$( )` from dropping its final newlines.
-    payload="$(agent_managed_settings_json; printf x)"; payload="${payload%x}"
-    size="$(printf '%s' "$payload" | wc -c | tr -d ' ')"
-    if (( size == 0 )); then
-        warn "The managed $(agent_display_name) policy is empty; not installing it."
+    # The payload travels base64-encoded, so the root script carries only base64 characters: none
+    # can end the quoted heredoc below early, and the decode restores the payload's exact bytes,
+    # quotes, `$`, backslashes and trailing newlines included. GNU base64 wraps its output and
+    # macOS's does not; the newlines are dropped so both give one line.
+    if ! b64="$(agent_managed_settings_json | base64 | tr -d '\n')" \
+            || [[ ! "$b64" =~ ^[A-Za-z0-9+/]+=*$ ]]; then
+        warn "Could not produce the managed $(agent_display_name) policy; not installing it."
         return 0
     fi
-    # The payload travels inside the root script, as a quoted heredoc: the guest shell expands
-    # nothing in it, so its quotes, `$` and backslashes arrive as written. Its delimiter is
-    # lengthened until no payload line equals it, so no payload can end the heredoc early. The
-    # heredoc always ends in a newline the payload may not have; `head -c` keeps exactly the
-    # payload's bytes.
-    delim="AUGUR_MANAGED_SETTINGS_EOF"
-    while grep -qxF -- "$delim" <<< "$payload"; do delim+="_"; done
-    body="$payload"; [[ "$body" == *$'\n' ]] || body+=$'\n'
-    # Root writes a root-owned temp file in the target directory (mktemp creates it 0600), sets its
-    # owner and mode, then renames it over the target, so the live file is never partial or
-    # writable by anyone else. Absolute tool paths, because the guest's PATH starts at ~/.local/bin.
-    # dst is a plain constant (agent_macos_managed_settings_path), safe inside single quotes.
+    # As root: the target directory is made root:wheel 755 (an existing one included, so no other
+    # user can rename the file away or put another in its place afterwards), and refused if it is a
+    # symlink. The payload goes into a temp file there (mktemp creates it 0600), which gets its
+    # owner and mode and is then renamed over the target, so the live file is never partial or
+    # writable by anyone else. Absolute tool paths, because the guest's PATH starts at
+    # ~/.local/bin. Deliberately `base64 --decode`: the spelling both macOS's base64 and GNU's
+    # accept. dst is a plain constant (agent_macos_managed_settings_path), safe in single quotes.
     script="dst='${dst}'; parent='${parent}'
-/bin/mkdir -p \"\$parent\" || exit 1
+[ ! -L \"\$parent\" ] || { echo \"\$parent is a symlink\" >&2; exit 1; }
+/bin/mkdir -p \"\$parent\" && /usr/sbin/chown root:wheel \"\$parent\" && /bin/chmod 755 \"\$parent\" || exit 1
 tmp=\"\$(/usr/bin/mktemp \"\$parent/.managed-settings.XXXXXX\")\" || exit 1
-/usr/bin/head -c ${size} > \"\$tmp\" <<'${delim}' || { /bin/rm -f \"\$tmp\"; exit 1; }
-${body}${delim}
+/usr/bin/base64 --decode > \"\$tmp\" <<'AUGUR_MANAGED_SETTINGS_B64' || { /bin/rm -f \"\$tmp\"; exit 1; }
+${b64}
+AUGUR_MANAGED_SETTINGS_B64
 /usr/sbin/chown root:wheel \"\$tmp\" && /bin/chmod 644 \"\$tmp\" && /bin/mv -f \"\$tmp\" \"\$dst\" || { /bin/rm -f \"\$tmp\"; exit 1; }"
     # `sudo -S` (inside macos_run_root_script) works whether or not the build-time NOPASSWD grant
     # is still present, which is what lets `update --macos` reach a base VM that no longer has it.
     # The password is this base VM's own admin password (see macos_admin_password()), so this takes
     # no privilege augur's build doesn't already take.
-    err="$(macos_run_root_script "$vm" "$script" 2>&1 >/dev/null)" || {
+    if ! macos_run_root_script "$vm" "$script" >/dev/null; then
         warn "Could not install the managed $(agent_display_name) policy in the VM; continuing without it."
-        printf '%s\n' "$err" | show_guest_lines
-    }
+        printf '%s\n' "$MACOS_ROOT_SCRIPT_ERR" | show_guest_lines
+    fi
     return 0
 }
 
@@ -4326,12 +4325,24 @@ MACOS_ROOT_SCRIPT_BEGIN='#augur-root-script'
 #     marker, so the password never reaches the shell that runs the script, where an unknown
 #     command would print it into the output.
 # A wrong password makes sudo fail after taking further lines as retries, so the script never runs.
-# The script must not read stdin itself (it is that stdin). Its output and exit status are the
-# caller's. The password is on no argv (see macos_admin_password_stdin).
+# The script must not read stdin itself (it is that stdin). The password is on no argv (see
+# macos_admin_password_stdin).
+# Its stdout and exit status are the caller's. Its stderr (sudo's, the script's, ssh's) is guest
+# text and is NOT passed on: it is left in MACOS_ROOT_SCRIPT_ERR, for the caller to show through
+# show_guest_lines. augur's own messages go to stderr as usual: before connecting, a VM with no
+# stored admin password or no SSH transport is refused (return 1, after augur's error), so nothing
+# connects without a password to send.
+MACOS_ROOT_SCRIPT_ERR=""
 macos_run_root_script() {
-    local vm="$1" script="$2"
+    local vm="$1" script="$2" _rc=0
+    MACOS_ROOT_SCRIPT_ERR=""
+    ( require_macos_admin_password "$vm" ) || return 1
+    macos_ssh_transport_ok "$vm" || { error "Cannot reach VM '${vm}' over SSH: its SSH host or port does not resolve."; return 1; }
+    { MACOS_ROOT_SCRIPT_ERR="$(
     { macos_admin_password_stdin "$vm" && printf '%s\n' "$MACOS_ROOT_SCRIPT_BEGIN" "$script"; } \
-        | ssh_macos "$vm" "sudo -S -k -p '' /bin/sh -c 'm=; while IFS= read -r l; do if [ \"\$l\" = \"${MACOS_ROOT_SCRIPT_BEGIN}\" ]; then m=1; break; fi; done; [ -n \"\$m\" ] && exec /bin/sh -s; exit 1'"
+        | ssh_macos "$vm" "sudo -S -k -p '' /bin/sh -c 'm=; while IFS= read -r l; do if [ \"\$l\" = \"${MACOS_ROOT_SCRIPT_BEGIN}\" ]; then m=1; break; fi; done; [ -n \"\$m\" ] && exec /bin/sh -s; exit 1'" 2>&1 >&3 3>&-
+    )"; } 3>&1 || _rc=$?
+    return "$_rc"
 }
 
 # The credential names of an augur session (session_credential_names) on one line, space-separated,
@@ -4404,7 +4415,8 @@ accepts || { cat "\$err" >&2; rm -f "\$dst"; cleanup; exit 3; }
 cleanup
 SCRIPT
 )"
-    _err="$(macos_run_root_script "$vm" "$_script" 2>&1 >/dev/null)" || _rc=$?
+    macos_run_root_script "$vm" "$_script" >/dev/null || _rc=$?
+    _err="$MACOS_ROOT_SCRIPT_ERR"
     if (( _rc == 0 )) && ! ssh_macos "$vm" true </dev/null; then
         _rc=4; _err="no new SSH connection is accepted after installing ${dst}"
     fi
@@ -4432,7 +4444,8 @@ verify_macos_session_env_acceptance() {
     _script="$(macos_session_env_accepts_sh "$_names")"
     _script+=$'\naccepts || { cat "$err" >&2; rm -f "$err"; exit 3; }\nrm -f "$err"'
     _script+=$'\n'"${_check} || { echo \"$(macos_session_sshd_dropin) does not hold the line every clone checks for: $(macos_session_accept_env_line "$_names")\" >&2; exit 5; }"
-    _err="$(macos_run_root_script "$vm" "$_script" 2>&1 >/dev/null)" || _rc=$?
+    macos_run_root_script "$vm" "$_script" >/dev/null || _rc=$?
+    _err="$MACOS_ROOT_SCRIPT_ERR"
     (( _rc == 0 )) && return 0
     error "The base VM's sshd no longer accepts augur's session credentials ($(macos_session_sshd_dropin)):"
     printf '%s\n' "$_err" | show_guest_lines

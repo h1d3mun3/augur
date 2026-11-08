@@ -129,7 +129,7 @@ reset_log
 out="$( set -e; install_macos_managed_settings testvm 2>&1 )"
 hasnt "$out" "Could not install" "managed policy: the install succeeded against a sudo that reads stdin"
 eq "1" "$(n_calls)" "managed policy: one ssh connection, nothing staged first"
-has "$(cat "$LOG/1.stdin")" "DISABLE_AUTOUPDATER" "managed policy: the JSON travels inside the root script on ssh's stdin"
+has "$(cat "$LOG/1.stdin")" "$(agent_managed_settings_json | base64 | tr -d '\n')" "managed policy: the JSON travels base64-encoded inside the root script on ssh's stdin"
 check_site "managed policy"
 
 section "Tier 1 — macos_run_root_script (the managed policy, the session-env sshd drop-in's install and re-check)"
@@ -141,10 +141,27 @@ eq "$MACOS_ROOT_SCRIPT_BEGIN" "$(sed -n 2p "$LOG/1.stdin")" "root script: the ma
 eq "echo root-script-ran" "$(sed -n 3p "$LOG/1.stdin")" "root script: the script follows the marker"
 check_site "root script"
 GUEST_PW="some-other-password"; reset_log
-macos_run_root_script testvm 'true' >/dev/null 2>&1; rc=$?
+# Not in a subshell, so MACOS_ROOT_SCRIPT_ERR can be read afterwards; stderr goes to a file.
+macos_run_root_script testvm 'true' >/dev/null 2>"$TMPD/rs-stderr"; rc=$?
 GUEST_PW="$SECRET"
 if [[ "$rc" -ne 0 ]]; then ok "root script, wrong password: reports failure to the caller"
 else fail "root script, wrong password: returned 0"; fi
+hasnt "$(cat "$TMPD/rs-stderr")" "Sorry, try again." "root script, wrong password: the guest's stderr is not passed through"
+has "$MACOS_ROOT_SCRIPT_ERR" "Sorry, try again." "root script, wrong password: the guest's stderr is kept in MACOS_ROOT_SCRIPT_ERR"
+
+# Refused before any connection: no stored password, or no SSH transport.
+reset_log
+err="$(macos_run_root_script nocredvm 'true' 2>&1 >/dev/null)"; rc=$?
+if [[ "$rc" -ne 0 ]]; then ok "root script, VM without a stored credential: fails"
+else fail "root script, VM without a stored credential: returned 0"; fi
+eq "0" "$(n_calls)" "root script, VM without a stored credential: no ssh connection is made"
+has "$err" "no stored admin password" "root script, VM without a stored credential: augur's own error says why, on stderr"
+reset_log
+err="$( macos_ssh_port() { :; }; macos_run_root_script testvm 'true' 2>&1 >/dev/null )"; rc=$?
+if [[ "$rc" -ne 0 ]]; then ok "root script, no SSH transport: fails"
+else fail "root script, no SSH transport: returned 0"; fi
+eq "0" "$(n_calls)" "root script, no SSH transport: no ssh connection is made"
+has "$err" "does not resolve" "root script, no SSH transport: augur's own error says why, on stderr"
 
 section "Tier 1 — select_macos_full_xcode"
 reset_log
