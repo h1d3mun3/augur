@@ -199,8 +199,16 @@ That kept them off argv, but:
   than this augur, or one that holds no UUID; no `run.pid`, no process with that pid, no start
   time), or the two reads differ, the pass cannot be recorded: `macos_record_egress_verified`
   drops any pass (one recorded earlier in the same boot included) and fails, so every session
-  refuses the VM, and `up`
-  fails. On a boot `up` then stops the VM it just booted through `stop_unverified_macos_vm`, the
+  refuses the VM, and `up` fails. One exception, on a running VM: when only the read before the
+  self-test failed and the record already holds a pass for the run id read after it, that boot,
+  still running, passed an earlier self-test; its pass stands and `up` goes on, with a warning. The
+  pass is written with the mode the record already holds, and not at all when there is no record
+  (a `down` / `destroy` removed it during the self-test), which fails `up` too, so a record is never
+  re-created for a VM being torn down. `macos_selftest_and_record` is the one way `cmd_up_macos`
+  runs the self-test: it reads the run id, runs `verify_macos_egress_locked`, and records the pass
+  against that id. `macos_record_egress_verified` is the one owner of the pass when it fails. On a
+  boot `up` then stops the VM it just booted, its gvproxy and its proxy (`stop_macos_vm_and_egress`,
+  the teardown of `stop_unverified_macos_vm` without its drop of the pass), the
   clone kept. On the already-running branch it deliberately leaves the VM running and refuses it
   as any running VM is refused (the push first), with `augur up --macos` again, then
   `augur down --macos && augur up --macos`, as the remedy: that VM has just passed its self-test

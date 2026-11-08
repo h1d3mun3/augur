@@ -462,7 +462,7 @@ prep_body="$(awk    '/^prepare_macos_session\(\)/{f=1} f{print} f&&/^}/{exit}' "
 # — either way the comparison below fails.
 c_at="$(printf   '%s\n' "$up_macos_body" | grep -n '^    sync_macos_guest_clock '          | head -n1 | cut -d: -f1)"
 ssh_at="$(printf '%s\n' "$up_macos_body" | grep -n '^ *wait_for_macos_ssh '                | head -n1 | cut -d: -f1)"
-v_at="$(printf   '%s\n' "$up_macos_body" | grep -n 'verify_macos_egress_locked "\$project_vm"' | tail -n1 | cut -d: -f1)"
+v_at="$(printf   '%s\n' "$up_macos_body" | grep -n 'macos_selftest_and_record "\$project_vm"' | tail -n1 | cut -d: -f1)"
 env_at="$(printf '%s\n' "$up_macos_body" | grep -n '^    ensure_macos_workspace "\$project_vm"'  | head -n1 | cut -d: -f1)"
 ban_at="$(printf '%s\n' "$up_macos_body" | grep -n "success \"VM '"                        | head -n1 | cut -d: -f1)"
 if [[ -n "$c_at" && -n "$ssh_at" && -n "$v_at" && -n "$env_at" && -n "$ban_at" \

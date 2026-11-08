@@ -420,10 +420,62 @@ VM_UP=0; boot_id "$BOOT1"
 verify_macos_egress_locked() { echo "selftest" >> "$LOG"; boot_id "$BOOT2"; }
 run_cmd cmd_up_macos; rid_changes "boot, booted again during its self-test" boot
 eval "$verify_real"; VM_UP=1; boot_id "$BOOT1"
+# A run id read that fails once, as the self-test starts, on a running VM whose record already holds
+# a pass for the boot still running: that pass stands, and `up` goes on. Without such a pass, or
+# when the read after the self-test is the one that fails, nothing ties the pass to a boot: no pass.
+cat_fails_once() { cat() { if [[ "${1:-}" == "$RUN_ID_FILE" && ! -e "$TMPD/cat-failed" ]]; then : > "$TMPD/cat-failed"; return 1; fi; command cat "$@"; }; }
+egress_on; record on; boot_id "$BOOT1"; verified_now; rm -f "$TMPD/cat-failed"
+: > "$LOG"; out="$( set -e; cat_fails_once; cmd_up_macos 2>&1 )"; rc=$?
+eq 0 "$rc" "running VM, the first run id read fails once, a pass for this boot recorded: up --macos completes"
+has "$out" "the pass recorded earlier for the same boot, which is still running, stands" "…saying the earlier pass stands"
+eq "$(macos_vm_run_id "$PV")" "$(pass_of)" "…and the pass is still recorded"
+record on; no_pass; rm -f "$TMPD/cat-failed"
+: > "$LOG"; out="$( set -e; cat_fails_once; cmd_up_macos 2>&1 )"; rc=$?
+no_run_id "running VM, the first run id read fails once, no pass recorded" running
+record on; verified "$(id_for "$BOOT2")"; rm -f "$TMPD/cat-failed"
+: > "$LOG"; out="$( set -e; cat_fails_once; cmd_up_macos 2>&1 )"; rc=$?
+no_run_id "running VM, the first run id read fails once, a pass for another boot recorded" running
+record on; verified_now
+verify_macos_egress_locked() { echo "selftest" >> "$LOG"; rm -f "$RUN_ID_FILE"; }
+run_cmd cmd_up_macos
+no_run_id "running VM, the run id read after the self-test fails (a pass for this boot was there)" running
+eval "$verify_real"; boot_id "$BOOT1"; unset -f cat
+# A `down` / `destroy` that removes the record while the self-test runs: the pass is not written,
+# so no record is re-created for a VM being torn down.
+verify_macos_egress_locked() { echo "selftest" >> "$LOG"; rm -f "$(macos_boot_record_file)"; }
+record on; no_pass
+run_cmd cmd_up_macos
+[[ "$rc" -ne 0 ]] && ok "the record removed during the self-test: up --macos fails" || fail "the record removed during the self-test: up --macos exited 0"
+has "$out" "has no boot record" "…saying the VM has no boot record"
+has "$out" "nothing is written" "…and that nothing is written"
+[[ -e "$(macos_boot_record_file)" ]] && fail "…but a record was re-created" "$(cat "$(macos_boot_record_file)")" || ok "…and no record is re-created"
+eval "$verify_real"
+# The mode comes from the record, not from this command.
+record on; no_pass
+( egress_off; macos_record_egress_verified "$PV" "$(macos_vm_run_id "$PV")" ) >/dev/null 2>&1
+eq "on" "$(mode_of)" "a recorded pass keeps the record's own mode"
+# On a boot whose pass cannot be recorded, the record function alone deals with the pass: the
+# teardown that follows leaves the record alone.
+VM_UP=0; rm -f "$RUN_ID_FILE"
+_drops="$TMPD/drops"; : > "$_drops"
+eval "_real_drop() $(declare -f macos_drop_egress_pass | tail -n +2)"
+macos_drop_egress_pass() { echo drop >> "$_drops"; _real_drop; }
+run_cmd cmd_up_macos
+no_run_id "boot, no run id (the pass's one owner)" boot
+eq 1 "$(wc -l < "$_drops" | tr -d ' ')" "…the pass is dropped once, by macos_record_egress_verified, not again by the teardown"
+eval "macos_drop_egress_pass() $(declare -f _real_drop | tail -n +2)"
+VM_UP=1; boot_id "$BOOT1"
 # The pass is recorded under the run id read before the self-test: cmd_up_macos reads it first.
 fn="$(declare -f cmd_up_macos)"
-eq 2 "$(grep -c '_rid="$(macos_vm_run_id "$project_vm")"' <<<"$fn")" "both self-tests in cmd_up_macos read the run id first"
-eq 2 "$(grep -c 'macos_record_egress_verified "$project_vm" "$_rid"' <<<"$fn")" "…and record the pass against it"
+eq 2 "$(grep -c 'macos_selftest_and_record "$project_vm"' <<<"$fn")" "both self-tests in cmd_up_macos go through macos_selftest_and_record"
+hasnt "$fn" 'verify_macos_egress_locked' "…and cmd_up_macos runs no self-test outside it"
+_sr="$(declare -f macos_selftest_and_record)"
+_r_at="$(grep -n 'rid="$(macos_vm_run_id "$1")"' <<<"$_sr" | head -n1 | cut -d: -f1)"
+_v_at="$(grep -n 'verify_macos_egress_locked "$1"' <<<"$_sr" | head -n1 | cut -d: -f1)"
+_p_at="$(grep -n 'macos_record_egress_verified "$1" "$rid"' <<<"$_sr" | head -n1 | cut -d: -f1)"
+if [[ -n "$_r_at" && -n "$_v_at" && -n "$_p_at" && "$_r_at" -lt "$_v_at" && "$_v_at" -lt "$_p_at" ]]; then
+  ok "macos_selftest_and_record reads the run id, then runs the self-test, then records against that id"
+else fail "macos_selftest_and_record's order is wrong" "read@$_r_at test@$_v_at record@$_p_at"; fi
 # …after which a session refuses the VM, and the next `up` records the pass again.
 run_cmd cmd_claude_macos
 unverified "after the unrecordable pass: cmd_claude_macos"
@@ -494,9 +546,9 @@ eq "$(macos_vm_run_id "$PV")" "$(pass_of)" "boot: the pass is recorded with this
 fn="$(declare -f cmd_up_macos)"
 rm_at="$(grep -n 'macos_record_egress_mode' <<<"$fn" | head -n1 | cut -d: -f1)"
 run_at="$(grep -n '"\$VM_CLI" run' <<<"$fn" | head -n1 | cut -d: -f1)"
-st_at="$(grep -n 'verify_macos_egress_locked' <<<"$fn" | tail -n1 | cut -d: -f1)"
-rec_at="$(grep -n 'macos_record_egress_verified' <<<"$fn" | tail -n1 | cut -d: -f1)"
-if [[ -n "$rm_at" && -n "$run_at" && -n "$st_at" && -n "$rec_at" && "$rm_at" -lt "$run_at" && "$st_at" -lt "$rec_at" ]]; then
+st_at="$(grep -n 'macos_selftest_and_record' <<<"$fn" | tail -n1 | cut -d: -f1)"
+rec_at="$st_at"   # the pass is recorded inside macos_selftest_and_record, after its self-test (checked above)
+if [[ -n "$rm_at" && -n "$run_at" && -n "$st_at" && -n "$rec_at" && "$rm_at" -lt "$run_at" && "$run_at" -lt "$st_at" ]]; then
   ok "boot: the record is dropped before 'augur-vm run' and written after the self-test"
 else fail "boot: the record's place in cmd_up_macos is wrong" "rm@$rm_at run@$run_at self-test@$st_at record@$rec_at"; fi
 # Interrupted before the self-test (here: the SSH wait never ends well): nothing is recorded.

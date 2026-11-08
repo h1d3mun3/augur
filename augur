@@ -2360,16 +2360,35 @@ macos_vm_run_id() {
     printf '%s %s\n' "$id" "${_w[*]}"
 }
 # Record in the boot record that running VM $1 just passed its egress self-test, which started while
-# the VM's run id was $2 (macos_vm_run_id, read by the caller before the self-test). The id is read
-# again here and the pass is recorded only when both reads agree: a VM booted again between the
-# probes and now would otherwise get a pass no probe tested. With no run id on either read, two
-# that differ, or a record that cannot be written, this returns 1, after an error, and leaves no
-# pass recorded (one recorded earlier in this boot is dropped too), so every session refuses the
-# VM until a later `up` records a pass. The caller decides what happens to the VM: cmd_up_macos's
-# boot path stops the VM it just booted, and its already-running branch leaves running a VM that
-# may be serving live sessions.
+# the VM's run id was $2 (macos_vm_run_id, read before the self-test by macos_selftest_and_record).
+# The id is read again here, and the pass is recorded only when both reads agree: a VM booted again
+# between the probes and now would otherwise get a pass no probe tested. The mode is taken from the
+# existing record, never from this command: a `down` / `destroy` that removed the record while the
+# self-test ran is not undone by writing a new one.
+#
+# Returns 1, after an error, when the pass cannot be recorded: no boot record (nothing is written);
+# no run id on either read; two that differ; or a record that cannot be written. This function is
+# the one owner of the pass then. It drops any pass already recorded (so every session refuses the
+# VM until a later `up` records one), except when the first read failed but the record already holds
+# a pass for the run id read now: that boot passed an earlier self-test, and it is still the boot
+# running, so its pass stands and this returns 0, with a warning, rather than refuse a VM a passing
+# read would have kept. The caller decides what happens to the VM: cmd_up_macos's boot path stops
+# the VM it just booted, and its already-running branch leaves running a VM that may be serving live
+# sessions.
 macos_record_egress_verified() {
-    local before="${2:-}" id; id="$(macos_vm_run_id "$1")"
+    local before="${2:-}" id _mode _pass
+    id="$(macos_vm_run_id "$1")"
+    macos_read_boot_record
+    if [[ -z "$_mode" ]]; then
+        error "VM '$1' has no boot record ($(macos_boot_record_file)), so its passed egress self-test cannot be"
+        error "  recorded; nothing is written (a ${BOLD}augur down --macos${RESET} or ${BOLD}destroy${RESET} may have removed it meanwhile)."
+        return 1
+    fi
+    if [[ -z "$before" && -n "$id" && "$_pass" == "$id" ]]; then
+        warn "Could not read VM '$1''s run id as its egress self-test started, so this pass is not recorded;"
+        warn "  the pass recorded earlier for the same boot, which is still running, stands."
+        return 0
+    fi
     if [[ -z "$before" || -z "$id" ]]; then
         macos_drop_egress_pass
         error "Could not read VM '$1''s run id ($AUGUR_DIR/vms/$1/run.id, which augur-vm writes for each boot,"
@@ -2384,9 +2403,18 @@ macos_record_egress_verified() {
         error "  belongs to a boot no probe tested and cannot be recorded for its sessions."
         return 1
     fi
-    macos_write_boot_record "$(requested_egress_mode)" "$id" && return 0
+    macos_write_boot_record "$_mode" "$id" && return 0
     error "Could not write $(macos_boot_record_file), so VM '$1''s passed egress self-test cannot be recorded for its sessions."
     return 1
+}
+# Run the egress self-test (verify_macos_egress_locked) on running VM $1 and record its pass, tied
+# to the run id read just before the self-test starts (macos_record_egress_verified). The one way
+# cmd_up_macos runs the self-test, so the first read cannot drift away from it. A self-test that
+# fails stops the VM and exits; otherwise this returns macos_record_egress_verified's status.
+macos_selftest_and_record() {
+    local rid; rid="$(macos_vm_run_id "$1")"
+    verify_macos_egress_locked "$1"
+    macos_record_egress_verified "$1" "$rid"
 }
 # Refuse running VM $1, leaving it running: rewrite its ~/.augur-env (push_macos_guest_env
 # --refusing, whose failure only adds its own warning), print each further argument as an error
@@ -4961,18 +4989,24 @@ macos_boot_ssh_failed() {
     exit 1
 }
 
-# Stop VM $1 and the gvproxy and proxy serving it, and drop the passed egress self-test from its
-# boot record (macos_drop_egress_pass), for a VM whose containment is unproven or disproven: a
-# boot that failed before or in its self-test, a running VM whose self-test failed, and a boot whose
-# pass cannot be recorded (macos_record_egress_verified). A VM left running there would be attached
-# to by the next `claude` / `shell --macos`, or refused by every one. Prints nothing; the
-# caller has said why. Deliberately keeps the VM itself: removing a project VM's clone is the
-# operator's call (`augur destroy --macos`), and setup-token deletes its throwaway clone itself.
+# Stop VM $1 and the gvproxy and proxy serving it (stop_macos_vm_and_egress), and drop the passed
+# egress self-test from its boot record (macos_drop_egress_pass), for a VM whose containment is
+# unproven or disproven: a boot that failed before or in its self-test, and a running VM whose
+# self-test failed. A VM left running there would be attached to by the next `claude` /
+# `shell --macos`, or refused by every one. Prints nothing; the caller has said why.
 stop_unverified_macos_vm() {
+    stop_macos_vm_and_egress "$1"
+    macos_drop_egress_pass
+}
+# Stop VM $1 and the gvproxy and proxy serving it, leaving its boot record alone: the teardown of
+# stop_unverified_macos_vm, and of a boot whose pass could not be recorded, where
+# macos_record_egress_verified owns the record. Deliberately keeps the VM itself: removing a
+# project VM's clone is the operator's call (`augur destroy --macos`), and setup-token deletes its
+# throwaway clone itself.
+stop_macos_vm_and_egress() {
     "$VM_CLI" stop "$1" 2>/dev/null || true
     stop_gvproxy
     stop_proxy
-    macos_drop_egress_pass
 }
 
 cmd_up_macos() {
@@ -5037,10 +5071,7 @@ cmd_up_macos() {
         # just passed its self-test and may be serving live sessions, and the cause can be as
         # transient as a read of its run id that failed once.
         if egress_enabled; then
-            # The run id as the self-test starts (see macos_record_egress_verified).
-            local _rid; _rid="$(macos_vm_run_id "$project_vm")"
-            verify_macos_egress_locked "$project_vm"
-            macos_record_egress_verified "$project_vm" "$_rid" || refuse_running_macos_vm "$project_vm" \
+            macos_selftest_and_record "$project_vm" || refuse_running_macos_vm "$project_vm" \
                 "VM '${project_vm}' is left running, but no new session will attach to it until a passed self-test is" \
                 "  recorded. Run ${BOLD}augur up --macos${RESET} again; if this keeps failing, restart the VM:" \
                 "  ${BOLD}augur down --macos && augur up --macos${RESET}"
@@ -5188,12 +5219,10 @@ cmd_up_macos() {
     # to this running VM (macos_boot_record_file). A pass that cannot be recorded stops the VM
     # just booted (the clone kept): left running, it would be refused by every session.
     if egress_enabled; then
-        # The run id as the self-test starts (see macos_record_egress_verified).
-        local _rid; _rid="$(macos_vm_run_id "$project_vm")"
-        verify_macos_egress_locked "$project_vm"
-        if ! macos_record_egress_verified "$project_vm" "$_rid"; then
+        if ! macos_selftest_and_record "$project_vm"; then
             error "Stopping VM '${project_vm}' (its clone is kept). Run ${BOLD}augur up --macos${RESET} to boot it again."
-            stop_unverified_macos_vm "$project_vm"
+            # The pass is macos_record_egress_verified's, and it has already dealt with it.
+            stop_macos_vm_and_egress "$project_vm"
             exit 1
         fi
     fi
