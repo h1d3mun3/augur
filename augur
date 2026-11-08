@@ -271,20 +271,19 @@ sanitize_guest_lines() {
     done
 }
 # Show guest text or a log excerpt from stdin as error lines, each `  | <line>`, sanitised
-# (sanitize_guest_lines). Blank lines (empty or only whitespace) between others are kept, so a multi-line log dump reads as it
-# was written; blank lines before the first non-blank line and after the last are dropped, so input
-# with nothing but blank lines (an empty captured error, say) prints no line at all: a bare `  |`
-# there tells the operator nothing.
+# (sanitize_guest_text). Blank lines (empty, or only whitespace: spaces, tabs, a CRLF's CR) between
+# others are kept, so a multi-line log dump reads as it was written; blank lines before the first
+# non-blank line and after the last are dropped, so input with nothing but blank lines (an empty
+# captured error, say) prints no line at all: a bare `  |` there tells the operator nothing.
+# Blankness is decided on the raw line, before sanitising turns a tab or a CR into visible text.
 show_guest_lines() {
-    sanitize_guest_lines | {
-        local _l _lines=() _first=-1 _last=-1 _i
-        while IFS= read -r _l; do
-            if [[ "$_l" == *[![:space:]]* ]]; then (( _first >= 0 )) || _first=${#_lines[@]}; _last=${#_lines[@]}; fi
-            _lines+=("$_l")
-        done
-        (( _first >= 0 )) || exit 0
-        for (( _i = _first; _i <= _last; _i++ )); do error "  | ${_lines[_i]}"; done
-    }
+    local _l _lines=() _first=-1 _last=-1 _i
+    while IFS= read -r _l || [[ -n "$_l" ]]; do
+        if [[ "$_l" == *[![:space:]]* ]]; then (( _first >= 0 )) || _first=${#_lines[@]}; _last=${#_lines[@]}; fi
+        _lines+=("$_l")
+    done
+    (( _first >= 0 )) || return 0
+    for (( _i = _first; _i <= _last; _i++ )); do error "  | $(sanitize_guest_text "${_lines[_i]}")"; done
 }
 
 # ══ Apple Container ══════════════════════════════════════════════════════════════
