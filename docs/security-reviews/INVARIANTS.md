@@ -47,14 +47,17 @@ in time," this **prescribes** "what must never break." It changes rarely.
   attaching to it — so a VM started with `--no-egress` is never silently used by a plain
   `claude --macos` (`tests/51_macos_egress_mode_unit.sh`). `claude`/`shell --macos` also attach to
   a running egress VM only when the same record's pass says its self-test passed during its
-  current boot (tied to the boot by the random run id augur-vm's `run`
-  writes to `run.id` for each boot (`macos_vm_run_id`), so a later boot, a hand-started one
-  included, does not match; checked by `require_macos_egress_verified`, whose refusal makes no guest step but a
+  current boot (tied to the boot by its run id, `macos_vm_run_id`: the random UUID augur-vm's `run`
+  writes to `run.id` for each boot plus the start time of the process in `run.pid`, read in UTC so
+  the id does not depend on `TZ`; a later boot, a hand-started one included, and a pid an unrelated
+  process took after a host crash do not match. The id is read before the self-test and again
+  before the pass is recorded, and the pass is recorded only when both agree; checked by `require_macos_egress_verified`, whose refusal makes no guest step but a
   credential-free push of `~/.augur-env`): the record is rewritten with no pass before every
   `augur-vm run`, its pass is dropped by the teardown (`stop_unverified_macos_vm`), it is removed
   by `down`/`destroy`, and the pass is written only after the self-test passes,
   so an `up --macos` interrupted before its self-test leaves no VM a session trusts (and an `up`
-  that cannot record a pass, its run id unreadable or the write failing, fails and records no
+  that cannot record a pass, its run id unreadable or changed during the self-test or the write
+  failing, fails and records no
   pass: it stops a VM it just booted, and leaves a running one running, refused by every session
   until a pass is recorded; the record is renamed into place, so a session never reads it partial)
   (`tests/51_macos_egress_mode_unit.sh`, `tests/56_macos_session_credentials.sh`). `setup-token --macos` boots its throwaway

@@ -191,15 +191,26 @@ has "$upout" "Egress self-test passed" "the egress self-test passed"
 if record_ok; then ok "the self-test record matches macos_vm_run_id ($(macos_vm_run_id "$vm"))"
 else fail "the self-test record matches macos_vm_run_id" "record [$(cat "$(macos_boot_record_file)" 2>/dev/null)] id [$(macos_vm_run_id "$vm")]"; fi
 
-section "The run id is augur-vm's run.id, stable for one boot"
+section "The run id is augur-vm's run.id plus its process's start time, stable for one boot"
 id1="$(macos_vm_run_id "$vm")"
-if [[ -n "$id1" ]]; then
-    ok "augur-vm wrote a run.id for this boot ($AUGUR_DIR/vms/$vm/run.id)"
-    sleep 3
+uuid="$(tr -d '[:space:]' < "$AUGUR_DIR/vms/$vm/run.id" 2>/dev/null)"
+pid="$(tr -d '[:space:]' < "$AUGUR_DIR/vms/$vm/run.pid" 2>/dev/null)"
+if [[ -n "$id1" && -n "$uuid" && "$pid" =~ ^[0-9]+$ ]]; then
+    ok "augur-vm wrote a run.id ($uuid) and a run.pid for this boot"
+    [[ "$id1" == "$uuid "?* ]] && ok "the run id starts with that UUID" || fail "the run id starts with run.id's UUID" "[$id1]"
+    l1="$(LC_ALL=C TZ=UTC0 ps -o lstart= -p "$pid")"; sleep 3; l2="$(LC_ALL=C TZ=UTC0 ps -o lstart= -p "$pid")"
+    [[ -n "$l1" ]] && eq "$l1" "$l2" "ps -o lstart= of augur-vm's run pid is the same 3 s apart" \
+        || fail "ps -o lstart= of augur-vm's run pid answers" "pid ${pid}"
     eq "$id1" "$(macos_vm_run_id "$vm")" "the run id is the same 3 s apart"
-    [[ -s "$AUGUR_DIR/vms/$vm/run.pid" ]] && ok "run.pid is there beside it" || fail "run.pid is there beside run.id"
+    id_jst="$(TZ=JST-9 macos_vm_run_id "$vm")"; id_utc="$(TZ=UTC macos_vm_run_id "$vm")"
+    id_unset="$(unset TZ; macos_vm_run_id "$vm")"
+    eq "$id_utc" "$id_jst" "macos_vm_run_id is the same under TZ=JST-9 and TZ=UTC"
+    eq "$id_utc" "$id_unset" "macos_vm_run_id is the same with TZ unset"
+    raw_jst="$(LC_ALL=C TZ=JST-9 ps -o lstart= -p "$pid")"; raw_utc="$(LC_ALL=C TZ=UTC ps -o lstart= -p "$pid")"
+    if [[ "$raw_jst" != "$raw_utc" ]]; then ok "control: ps's own lstart differs between TZ=JST-9 and TZ=UTC"
+    else skip "control: ps's own lstart differs by TZ" "it does not on this host, so the TZ checks above prove less"; fi
 else
-    fail "augur-vm wrote a run.id for this boot" "$AUGUR_DIR/vms/$vm/run.id is missing or holds no UUID (an augur-vm older than this augur?)"
+    fail "augur-vm wrote a run.id and a run.pid for this boot" "run id [$id1], run.id [$uuid], run.pid [$pid] (an augur-vm older than this augur writes no run.id)"
 fi
 
 # ── 2. The base's sshd drop-in, and root over stdin ────────────────────────────────────────────

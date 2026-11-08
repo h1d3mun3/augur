@@ -2253,14 +2253,16 @@ macos_vm_log()    { echo "$AUGUR_PROXY_DIR/$(workspace_slug)-$(workspace_path_ha
 macos_boot_record_file() { echo "$AUGUR_PROXY_DIR/$(workspace_slug)-$(workspace_path_hash).boot-record"; }
 requested_egress_mode()  { if egress_enabled; then echo on; else echo off; fi; }
 # Set the caller's `_mode` ("on" or "off") and `_pass` (a run id, or empty) from the record. Both are
-# empty when it is missing or is not one line of a mode and a run id or `-`.
+# empty when it is missing or is not one line of a mode, a space and a pass: `-`, or a run id
+# (macos_vm_run_id: a UUID, a space and a start time).
 macos_read_boot_record() {
-    local _line _m _p _rest
+    local _line _m _p
     _mode=""; _pass=""
     _line="$(cat "$(macos_boot_record_file)" 2>/dev/null)" || return 0
-    [[ "$_line" != *$'\n'* ]] || return 0
-    read -r _m _p _rest <<<"$_line"
-    [[ ( "$_m" == on || "$_m" == off ) && -n "$_p" && -z "$_rest" ]] || return 0
+    [[ "$_line" != *$'\n'* && "$_line" == *" "* ]] || return 0
+    _m="${_line%% *}"; _p="${_line#* }"
+    [[ "$_m" == on || "$_m" == off ]] || return 0
+    [[ "$_p" == - || "$_p" =~ ^${MACOS_UUID_RE}\ [^\ ] ]] || return 0
     _mode="$_m"
     if [[ "$_p" != - ]]; then _pass="$_p"; fi
 }
@@ -2313,35 +2315,60 @@ require_macos_egress_mode_current() {
         "A running VM cannot switch its network datapath: ${BOLD}${remedy}${RESET}"
 }
 
-# The id of VM $1's current boot: the random id (a UUID) augur-vm's `run` writes to the VM's run.id
-# before it writes run.pid (the file augur-vm decides a VM's running state by), and removes with
-# it. Every boot gets a new one, so an `augur-vm run` started by hand after a host crash cannot
-# match a record an earlier boot left. Empty, which matches no record, when the file is missing,
-# unreadable or holds anything but one UUID (an augur-vm older than this augur writes none).
+# A UUID, as augur-vm writes one to run.id.
+MACOS_UUID_RE='[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}'
+# The id of VM $1's current boot, as `<uuid> <start time>`, bound both to the boot and to the live
+# process running it:
+#   • The random id augur-vm's `run` writes to the VM's run.id for each boot, before it writes
+#     run.pid (the file augur-vm decides a VM's running state by), and removes with it. A new boot
+#     gets a new one, even an `augur-vm run` started by hand that gets an earlier boot's pid within
+#     the same second.
+#   • The start time `ps -o lstart` gives for the pid in run.pid. After a host crash run.pid, run.id
+#     and the boot record all survive, and an unrelated process that later takes that pid makes
+#     augur-vm report the VM running; its start time differs, so the old pass no longer matches.
+# Empty, which matches no record, when either part is missing: no run.id, or one that holds anything
+# but one UUID (an augur-vm older than this augur writes none); no run.pid, or one that holds no
+# pid; no process with that pid.
 #
-# Accepted trade-off: after a host crash the old run.pid and run.id both survive, so if an
-# unrelated process later takes that pid, augur-vm reports the VM running and its old id still
-# matches. No VM answers then: the push and the session ssh find no guest, and a guest that did
-# answer at that address would fail the VM's pinned host key.
+# ps prints lstart in the local time zone and the locale's format, so both are pinned (TZ=UTC0,
+# LC_ALL=C): the record is written by one augur run and read by another, whose TZ can differ (a
+# second terminal, a shell that sets TZ), and one process must give one id in all of them.
 macos_vm_run_id() {
-    local id _hex='[0-9A-Fa-f]'
+    local id pid start _w=()
     id="$(cat "$AUGUR_DIR/vms/$1/run.id" 2>/dev/null)" || return 0
-    [[ "$id" =~ ^${_hex}{8}-${_hex}{4}-${_hex}{4}-${_hex}{4}-${_hex}{12}$ ]] || return 0
-    printf '%s\n' "$id"
+    [[ "$id" =~ ^${MACOS_UUID_RE}$ ]] || return 0
+    pid="$(cat "$AUGUR_DIR/vms/$1/run.pid" 2>/dev/null)" || return 0
+    pid="${pid//[[:space:]]/}"
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+    start="$(LC_ALL=C TZ=UTC0 ps -o lstart= -p "$pid" 2>/dev/null)" || return 0
+    # Word-split so ps's column padding (`Nov  8`) cannot make one start time compare unequal.
+    read -r -a _w <<<"$start"
+    (( ${#_w[@]} > 0 )) || return 0
+    printf '%s %s\n' "$id" "${_w[*]}"
 }
-# Record in the boot record that running VM $1 just passed its egress self-test. Without a run id
-# to tie the pass to, or when the record cannot be written, this returns 1, after an error, and
-# leaves no pass recorded (one recorded earlier in this boot is dropped too), so every session
-# refuses the VM until a later `up` records a pass. The caller decides what happens to the VM:
-# cmd_up_macos's boot path stops the VM it just booted, and its already-running branch leaves
-# running a VM that may be serving live sessions.
+# Record in the boot record that running VM $1 just passed its egress self-test, which started while
+# the VM's run id was $2 (macos_vm_run_id, read by the caller before the self-test). The id is read
+# again here and the pass is recorded only when both reads agree: a VM booted again between the
+# probes and now would otherwise get a pass no probe tested. With no run id on either read, two
+# that differ, or a record that cannot be written, this returns 1, after an error, and leaves no
+# pass recorded (one recorded earlier in this boot is dropped too), so every session refuses the
+# VM until a later `up` records a pass. The caller decides what happens to the VM: cmd_up_macos's
+# boot path stops the VM it just booted, and its already-running branch leaves running a VM that
+# may be serving live sessions.
 macos_record_egress_verified() {
-    local id; id="$(macos_vm_run_id "$1")"
-    if [[ -z "$id" ]]; then
+    local before="${2:-}" id; id="$(macos_vm_run_id "$1")"
+    if [[ -z "$before" || -z "$id" ]]; then
         macos_drop_egress_pass
-        error "Could not read VM '$1''s run id ($AUGUR_DIR/vms/$1/run.id, which augur-vm writes for each boot),"
-        error "  so its passed egress self-test cannot be recorded for its sessions. An augur-vm older than"
-        error "  this augur writes none: reinstall augur (${BOLD}bash install${RESET}), then restart the VM."
+        error "Could not read VM '$1''s run id ($AUGUR_DIR/vms/$1/run.id, which augur-vm writes for each boot,"
+        error "  and the start time of the process in its run.pid), so its passed egress self-test"
+        error "  cannot be recorded for its sessions. An augur-vm older than this augur writes no run.id:"
+        error "  reinstall augur (${BOLD}bash install${RESET}), then restart the VM."
+        return 1
+    fi
+    if [[ "$id" != "$before" ]]; then
+        macos_drop_egress_pass
+        error "VM '$1''s run id changed during its egress self-test (the VM was booted again), so the pass"
+        error "  belongs to a boot no probe tested and cannot be recorded for its sessions."
         return 1
     fi
     macos_write_boot_record "$(requested_egress_mode)" "$id" && return 0
@@ -4993,8 +5020,10 @@ cmd_up_macos() {
         # just passed its self-test and may be serving live sessions, and the cause can be as
         # transient as a read of its run id that failed once.
         if egress_enabled; then
+            # The run id as the self-test starts (see macos_record_egress_verified).
+            local _rid; _rid="$(macos_vm_run_id "$project_vm")"
             verify_macos_egress_locked "$project_vm"
-            macos_record_egress_verified "$project_vm" || refuse_running_macos_vm "$project_vm" \
+            macos_record_egress_verified "$project_vm" "$_rid" || refuse_running_macos_vm "$project_vm" \
                 "VM '${project_vm}' is left running, but no new session will attach to it until a passed self-test is" \
                 "  recorded. Run ${BOLD}augur up --macos${RESET} again; if this keeps failing, restart the VM:" \
                 "  ${BOLD}augur down --macos && augur up --macos${RESET}"
@@ -5141,8 +5170,10 @@ cmd_up_macos() {
     # to this running VM (macos_boot_record_file). A pass that cannot be recorded stops the VM
     # just booted (the clone kept): left running, it would be refused by every session.
     if egress_enabled; then
+        # The run id as the self-test starts (see macos_record_egress_verified).
+        local _rid; _rid="$(macos_vm_run_id "$project_vm")"
         verify_macos_egress_locked "$project_vm"
-        if ! macos_record_egress_verified "$project_vm"; then
+        if ! macos_record_egress_verified "$project_vm" "$_rid"; then
             error "Stopping VM '${project_vm}' (its clone is kept). Run ${BOLD}augur up --macos${RESET} to boot it again."
             stop_unverified_macos_vm "$project_vm"
             exit 1

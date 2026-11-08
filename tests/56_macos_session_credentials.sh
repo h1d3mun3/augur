@@ -119,6 +119,18 @@ rc=$?; rm -rf "$home"; exit "$rc"
 EOF
 chmod +x "$SHIMDIR/ssh"
 PATH="$SHIMDIR:$PATH"
+# `ps -o lstart= -p <pid>` (the start time in a VM's run id, macos_vm_run_id) answers a fixed time for
+# a live pid, so the id cannot drift during the run: Linux procps computes a start time from the
+# boot time the kernel reports, which moves whenever the host clock is stepped (a VM's clock
+# resync), shifting every process's start time at once. tests/51 runs the real ps. Any other ps
+# call goes to the real one.
+REAL_PS="$(command -v ps)"
+cat > "$SHIMDIR/ps" <<EOF
+#!/usr/bin/env bash
+if [[ "\$*" == "-o lstart= -p "* ]]; then kill -0 "\${4}" 2>/dev/null || exit 1; echo "Sun Nov  8 10:00:00 2026"; exit 0; fi
+exec "$REAL_PS" "\$@"
+EOF
+chmod +x "$SHIMDIR/ps"
 macos_ssh_host() { echo 127.0.0.1; }
 macos_ssh_port() { echo 2222; }
 
@@ -285,11 +297,13 @@ verify_dropin() {   # sets $out / $rc
 ENV_FILE="$GUEST_HOME/.augur-env"
 # The value git_credential_env gives augur's helper (entry 1), as the session must export it.
 git_credential_env_value_1() { local _creds=(GH_TOKEN=x); git_credential_env | sed -n 's/^GIT_CONFIG_VALUE_1=//p'; }
-# The VM's current boot (the run id augur-vm writes to run.id), and its boot record
+# The VM's current boot (the UUID augur-vm writes to run.id and its run.pid, this test shell's pid,
+# so the process is alive and its start time readable), and its boot record
 # (macos_boot_record_file) with the pass of a self-test during it. A running VM has that pass before
 # each run unless UNVERIFIED=1; tests/51 covers the record itself. no_pass: the record of a boot
 # whose self-test has not passed.
 printf '%s' 0C1D2E3F-4A5B-4C6D-8E7F-901A2B3C4D5E > "$AUGUR_DIR/vms/$(macos_project_vm)/run.id"
+printf '%s' "$$" > "$AUGUR_DIR/vms/$(macos_project_vm)/run.pid"
 BOOT_ID="$(macos_vm_run_id "$(macos_project_vm)")"
 [[ -n "$BOOT_ID" ]] || { echo "cannot read the VM's run id" >&2; exit 1; }
 UNVERIFIED=0
@@ -1268,7 +1282,7 @@ has "$out" "does not accept augur's session credentials" "$_l: reports the old b
 no_cred_push "$_l"
 mv "$TMPD/dropin.saved" "$DROPIN"
 # A record from an earlier boot of the VM is no better: its run id differs.
-printf 'on %s\n' 0C1D2E3F-4A5B-4C6D-8E7F-901A2B3C4D00 > "$(macos_boot_record_file)"; run_cmd claude
+printf 'on %s Sun Nov 8 10:00:00 2026\n' 0C1D2E3F-4A5B-4C6D-8E7F-901A2B3C4D00 > "$(macos_boot_record_file)"; run_cmd claude
 nonzero "a record from an earlier boot: claude --macos"
 eq "0" "$(launches)" "a record from an earlier boot: claude --macos starts no session"
 # `up --macos` on that VM re-runs the self-test, records its pass for this boot, and the next
