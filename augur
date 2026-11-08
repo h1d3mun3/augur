@@ -6139,35 +6139,56 @@ cmd_update_macos() {
         # It runs in /bin/bash, not in this zsh: job control (set -m) is what puts CMD and the
         # watchdog each in a process group of their own, and bash allows it without a terminal
         # (this ssh session has none).
-        # A group signal reaches every descendant, so nothing CMD started, and nothing the
-        # watchdog started, is left holding the stdout/stderr of this ssh session, which would
-        # keep the session, and augur, waiting until it exits.
-        # On timeout the watchdog marks that it fired, sends TERM to the group of CMD, then KILL
-        # once the group is still alive 10 s later. The group id stays unused by anything else
-        # while any member is alive. Accepted trade-off: if CMD exits just as the time runs out,
-        # or every member exits during those 10 s, a signal can name a group that no longer
-        # exists; reaching an unrelated process needs its id to be reused within that moment.
+        # Each group is ended once its part is over: the group of CMD at the timeout, when CMD is
+        # done, and when this helper is stopped by a signal (end_group: TERM, then KILL once still
+        # alive after the grace); the group of the watchdog with KILL straight away, as it has
+        # nothing to clean up and a TERM can arrive before its subshell is ready to die of it.
+        # So nothing CMD or the watchdog started keeps the stdout/stderr of this ssh session,
+        # and with it the session and augur, waiting. The group id cannot be taken by anything
+        # else while a member is alive.
+        # Accepted trade-off: a descendant that moves to a group or session of its own (setsid)
+        # escapes the group kill.
+        # Accepted trade-off: if CMD exits just as the time runs out, the step is reported as
+        # either finished or timed out, and the watchdog only ever signals the group of CMD.
+        # Accepted trade-off: the end of the group after CMD is reaped can name a group that has
+        # no member left; reaching an unrelated process needs its id to be reused in that moment.
         _with_timeout_sh=$(cat <<"EOF"
 secs=$1; shift
-mark=$(mktemp -d) || exit 1
-set -m
-"$@" </dev/null & cpid=$!
-(
-    sleep "$secs"
-    : > "$mark/fired"
-    kill -TERM -- "-$cpid" 2>/dev/null
+cpid=; wpid=
+mark=$(mktemp -d 2>/dev/null) || { echo "augur: ERROR could not create a temp dir for the timeout" >&2; exit 1; }
+end_group() {
+    kill -TERM -- "-$1" || return 0
     n=0
-    while [ "$n" -lt 10 ] && kill -0 -- "-$cpid" 2>/dev/null; do sleep 1; n=$((n + 1)); done
-    kill -KILL -- "-$cpid" 2>/dev/null
-) </dev/null >/dev/null 2>&1 & wpid=$!
+    while [ "$n" -lt "$2" ] && kill -0 -- "-$1"; do sleep 1; n=$((n + 1)); done
+    kill -KILL -- "-$1"
+    return 0
+}
+on_signal() {
+    [ -z "$wpid" ] || kill -KILL -- "-$wpid"
+    [ -z "$cpid" ] || end_group "$cpid" 2
+    exit "$1"
+}
+on_exit() { rm -rf "$mark"; }
+trap on_exit EXIT
+trap "on_signal 130" INT
+trap "on_signal 143" TERM
+trap "on_signal 129" HUP
+# The shell keeps the caller stderr on fd 3 for CMD alone, so no job notice or kill error of
+# its own reaches the caller.
+exec 3>&2 2>/dev/null
+set -m
+"$@" </dev/null 2>&3 3>&- & cpid=$!
+( sleep "$secs"; : > "$mark/fired"; end_group "$cpid" 10 ) </dev/null >/dev/null 3>&- & wpid=$!
 set +m
-wait "$cpid" 2>/dev/null; rc=$?
+wait "$cpid"; rc=$?
 if [ -e "$mark/fired" ]; then
-    wait "$wpid" 2>/dev/null; rc=124
+    wait "$wpid"; rc=124
 else
-    kill -TERM -- "-$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
+    kill -KILL -- "-$wpid"; wait "$wpid"
+    # Deliberately ended, without changing the status: anything CMD left running in its group
+    # (a helper, a daemon) ends with the step.
+    end_group "$cpid" 2
 fi
-rm -rf "$mark"
 exit "$rc"
 EOF
 )
