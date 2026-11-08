@@ -472,7 +472,9 @@ else
   fail "macOS up does not sync the clock between the SSH wait and the self-test" \
        "ssh@${ssh_at:-none} clock@${c_at:-none} test@${v_at:-none} wiring@${env_at:-none} banner@${ban_at:-none}"
 fi
-if printf '%s\n' "$up_macos_body" | sed -n '/already running/,/^    fi$/p' | grep -q '^ *sync_macos_guest_clock '
+# A here-string, not a pipe, into `grep -q` (see tests/36: a writer that outlives the early exit
+# dies of SIGPIPE, and under pipefail the pipeline then fails on a match).
+if grep -q '^ *sync_macos_guest_clock ' <<<"$(sed -n '/already running/,/^    fi$/p' <<<"$up_macos_body")"
 then ok "the already-running branch syncs the clock (the only place a long-lived guest is re-corrected)"
 else fail "the already-running branch skips the clock sync" "a VM kept across \`down --macos\` would drift forever"; fi
 printf '%s\n' "$prep_body" | grep -q '^ *sync_macos_guest_clock ' \
