@@ -1383,7 +1383,7 @@ replace_stale_helper() {
 # Deliberately no override: egress enforcement is augur's core promise, so there is no flag or env
 # var to attach through a helper that cannot be shown to run the installed binary.
 require_fresh_egress_helpers() {
-    local lines="" why bin pf cannot_hash=false guest remedy kept l
+    local lines="" why bin pf cannot_hash=false guest remedy kept l vm=""
     if proxy_running; then
         bin="$(resolve_proxy_cli)"; pf="$(proxy_pidfile)"
         if ! why="$(egress_helper_staleness "$bin" "$pf")"; then
@@ -1400,8 +1400,8 @@ require_fresh_egress_helpers() {
     fi
     [[ -n "$lines" ]] || return 0
     if $MACOS_MODE; then
-        guest="VM '$(macos_project_vm)'"
-        macos_vm_running "$(macos_project_vm)" || return 0
+        vm="$(macos_project_vm)"; guest="VM '${vm}'"
+        macos_vm_running "$vm" || return 0
         remedy="augur down --macos && augur up --macos"; kept="the VM clone"
     else
         guest="container '${CONTAINER_NAME}'"
@@ -1418,9 +1418,12 @@ require_fresh_egress_helpers() {
     _out+=("Restart the guest and its egress helpers from the installed binaries: ${BOLD}${remedy}${RESET}"
         "  \`down\` ends every running $(agent_cli_name)/shell session of this project; the workspace and"
         "  ${kept} are kept.")
-    if $MACOS_MODE; then refuse_running_macos_vm "$(macos_project_vm)" "${_out[@]}"; fi
-    for l in "${_out[@]}"; do error "$l"; done
-    exit 1
+    if $MACOS_MODE; then
+        refuse_running_macos_vm "$vm" "${_out[@]}"
+    else
+        for l in "${_out[@]}"; do error "$l"; done
+        exit 1
+    fi
 }
 
 # Merge the managed baseline + user global + project conf into a host-side runtime
@@ -2285,18 +2288,49 @@ macos_record_egress_verified() {
 # refusal, and the push replaces that file (see push_macos_guest_env). That includes the refusals
 # made before augur's first other connection to the guest (require_fresh_egress_helpers,
 # require_macos_egress_mode_current, require_macos_admin_password --running), whose VM is the
-# likeliest to hold such a file: one started by an older augur. cmd_up_macos's already-running
-# branch also pushes on any other exit before its self-test. Deliberately done on a VM whose
-# containment is unproven, whose egress mode is wrong or whose egress helpers are not verified: the
+# likeliest to hold such a file: one started by an older augur. While arm_macos_push_on_exit is
+# armed, this push is the run's one push: the exit that follows does not push again. Deliberately
+# done on a VM whose containment is unproven, whose egress mode is wrong or whose egress helpers are not verified: the
 # push sends no credential, only the per-VM environment built from host-side constants, and needs
 # only augur's SSH key, never the admin password. The refusals inside a push (the acceptance
 # check) need no call here: that push already rewrote the file.
 refuse_running_macos_vm() {
     local vm="$1" _l; shift
     push_macos_guest_env "$vm" --refusing || true
+    disarm_macos_push_on_exit
     for _l in "$@"; do error "$_l"; done
     exit 1
 }
+
+# Until disarm_macos_push_on_exit, any exit of this augur run rewrites running VM $1's ~/.augur-env
+# first (push_macos_guest_env --refusing): a check, a failing command, an exit during the egress
+# self-test or the clock and timezone fixes, Ctrl-C (INT, TERM and HUP are turned into exits, with
+# the shell's usual 128+N status). This is the one mechanism behind "a running VM never keeps an
+# older augur's credentials": cmd_up_macos's already-running branch and prepare_macos_session arm
+# it as soon as they find the VM running. The boot path never arms it: the VM it booted got its
+# push right after the SSH wait. A VM that is no longer running when the run exits (a failed
+# self-test stops it) is skipped; its next boot's push rewrites the file.
+#
+# Every push of an armed run disarms it once the push has returned, whatever its status, so each
+# run pushes once: refuse_running_macos_vm after its push, and the callers' own final push, which
+# exits on failure. A push cut short (Ctrl-C mid-ssh) has not returned, so the trap pushes again.
+# Accepted trade-off: a kill -9 or a host crash runs no trap at all; the next up or session against
+# the VM pushes before anything else.
+arm_macos_push_on_exit() {
+    _MACOS_PUSH_ON_EXIT_VM="$1"
+    trap macos_push_on_exit EXIT
+    trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP
+}
+# A no-op unless armed, so a refusal outside an armed run leaves any other trap alone.
+disarm_macos_push_on_exit() {
+    [[ -n "$_MACOS_PUSH_ON_EXIT_VM" ]] || return 0
+    trap - EXIT INT TERM HUP; _MACOS_PUSH_ON_EXIT_VM=""
+}
+macos_push_on_exit() {
+    [[ -n "$_MACOS_PUSH_ON_EXIT_VM" ]] && macos_vm_running "$_MACOS_PUSH_ON_EXIT_VM" || return 0
+    push_macos_guest_env "$_MACOS_PUSH_ON_EXIT_VM" --refusing || true
+}
+_MACOS_PUSH_ON_EXIT_VM=""
 
 # Exit 1, leaving the VM running, unless running VM $1 passed its egress self-test during its
 # current boot (macos_egress_verified_file). Nothing to check with egress off.
@@ -4837,6 +4871,8 @@ cmd_up_macos() {
     # whether the guest is contained at all; the rest (sizing, a newly approved domain) is only
     # warned about below.
     if macos_vm_running "$project_vm"; then
+        # Any exit from here to the push at the end pushes first (arm_macos_push_on_exit).
+        arm_macos_push_on_exit "$project_vm"
         # The stopped/fresh path's refusal below, as a refusal of a running VM (it pushes first): a
         # running VM without a stored admin password would otherwise reconcile "successfully"
         # while every sudo into it fails.
@@ -4846,11 +4882,6 @@ cmd_up_macos() {
         # under the operator.
         require_macos_egress_mode_current "$project_vm"
         warn "VM '${project_vm}' is already running — reconciling host-side state and refreshing the guest's environment."
-        # From here to the self-test, any exit (a declined or unapproved ./.augur/allowlist.conf, a
-        # proxy that cannot start, a failing command, Ctrl-C) rewrites the guest's ~/.augur-env
-        # first, as a refusal of a running VM does (refuse_running_macos_vm). Disarmed before the
-        # self-test, which stops the VM when it fails; every refusal after it pushes itself.
-        trap "push_macos_guest_env $(printf '%q' "$project_vm") --refusing || true" EXIT
         if egress_enabled; then
             check_project_conf_approved      # the gate runs wherever policy is written
             # Rewrites the merged allowlist (augur-proxy hot-reloads it) AND revives a proxy that
@@ -4886,7 +4917,6 @@ cmd_up_macos() {
         # sessions refuse the VM. Deliberately does not stop it, unlike the boot path: the VM has
         # just passed its self-test and may be serving live sessions, and the cause can be as
         # transient as a `ps` that failed once.
-        trap - EXIT
         if egress_enabled; then
             verify_macos_egress_locked "$project_vm"
             macos_record_egress_verified "$project_vm" || refuse_running_macos_vm "$project_vm" \
@@ -4902,7 +4932,8 @@ cmd_up_macos() {
         # (see push_macos_guest_env_retrying). The push also refuses a guest that would drop a
         # session's credentials, as the boot path does right after its SSH wait.
         resolve_running_macos_vm_credentials "$project_vm"
-        push_macos_guest_env_retrying "$project_vm" || exit 1
+        local _prc=0; push_macos_guest_env_retrying "$project_vm" || _prc=$?
+        disarm_macos_push_on_exit; (( _prc == 0 )) || exit 1
         return 0
     fi
 
@@ -5104,6 +5135,8 @@ prepare_macos_session() {
         cmd_up_macos
         return 0
     fi
+    # Any exit from here to this session's push pushes first (arm_macos_push_on_exit).
+    arm_macos_push_on_exit "$vm"
     # A running VM is attached to only if it was booted with the egress mode asked for here; without
     # the check `up --macos --no-egress` followed by a plain `claude --macos` would run the agent on
     # an unfiltered network without a word.
@@ -5128,7 +5161,8 @@ prepare_macos_session() {
     # second attempt may fix (a dropped connection, a concurrent session's push) gets one
     # (push_macos_guest_env_retrying). Also where a guest that would drop the credentials is
     # refused, before any is sent.
-    push_macos_guest_env_retrying "$vm" || exit 1
+    local _prc=0; push_macos_guest_env_retrying "$vm" || _prc=$?
+    disarm_macos_push_on_exit; (( _prc == 0 )) || exit 1
     ensure_macos_workspace "$vm"
     ensure_macos_agent_projects "$vm"
     ensure_macos_agent_agents "$vm"

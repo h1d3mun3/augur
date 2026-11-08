@@ -35,9 +35,12 @@
 #     interrupted `up`) is refused with no guest step but the refusal's push of ~/.augur-env, which
 #     removes the credentials an older augur wrote (a push that fails says they may remain), and
 #     `up` on that VM re-runs the self-test and records it;
-#   • every other way a run against a running VM ends before its push (a stale egress helper; on
-#     `up`'s reconcile, an unapproved allowlist, a proxy that cannot start, a failing command)
-#     pushes first, once; a running VM is reconciled without the base VM;
+#   • every other way a run against a running VM ends before its push pushes first, exactly once: a
+#     stale egress helper; on `up`'s reconcile, an unapproved allowlist, a proxy that cannot start, a
+#     failing command, an exit or INT/TERM during or right after the self-test; on a session, an exit
+#     or INT during the clock or timezone fix; a refusal stays the only push; a self-test that stops
+#     the VM gets none after it, the boot path arms nothing, and no trap is left once a run has
+#     pushed; a running VM is reconciled without the base VM;
 #   • a push that fails is fatal on every path, after one more try when the connection dropped or the
 #     write failed (a concurrent push took its temp file), and never retried when the guest was
 #     refused or ~/.zshenv could not be updated;
@@ -301,7 +304,9 @@ UNVERIFIED=0
 run_cmd() {   # run_cmd claude|shell|up — sets $out / $rc; truncates the per-run logs first
     if [[ "$RUNNING" != 0 && "$UNVERIFIED" == 0 ]]; then printf '%s\n' "$BOOT_ID" > "$(macos_egress_verified_file)"; fi
     : > "$SSHLOG"; : > "$PUSHLOG"; : > "$STEPS"; : > "$VMCHECKS"; : > "$VMLOG"; : > "$HOSTLOG"; : > "$GHCALLS"; : > "$SESSLOG"
-    out="$( "cmd_${1}_macos" 2>&1 )"; rc=$?
+    # The INT trap keeps a SIGINT the case sends itself from also ending this script (bash exits
+    # when a child it waits for dies of SIGINT); the code under test sets its own over it.
+    out="$( trap 'exit 130' INT; "cmd_${1}_macos" 2>&1 )"; rc=$?
     # The session ssh's argv joins the whole-file argv log, for the no-value-on-argv check.
     awk '/^ARGV$/{a=1; next} /^ENV$/{a=0} a' "$SESSLOG" >> "$ALL_SSH"
 }
@@ -1127,6 +1132,7 @@ RUNNING=0
 run_cmd claude
 nonzero "leaky guest at boot: claude --macos"
 eq "0" "$(launches)" "leaky guest at boot: claude --macos starts no session"
+eq "1" "$(pushes)" "leaky guest at boot: claude --macos pushes once (the boot path arms no push-on-exit trap)"
 eval "verify_macos_egress_locked() { printf '%s\n' verify_macos_egress_locked >> \"\$STEPS\"; }"
 RUNNING=1
 
@@ -1286,15 +1292,49 @@ old_env; out="$( set -e; cmd_up_macos 2>&1 )"; rc=$?
 nonzero "up --macos on a running VM, a command fails under set -e"
 hasnt "$(cat "$ENV_FILE")" "oldbase" "up --macos on a running VM, a command fails under set -e: the old credentials are removed"
 eval "sync_macos_guest_clock() { printf '%s\n' sync_macos_guest_clock >> \"\$STEPS\"; }"
-# A completed `up` leaves no EXIT trap behind, and a failed self-test (which stops the VM) does not
-# push afterwards.
-old_env; out="$( cmd_up_macos >/dev/null 2>&1; trap -p EXIT )"
-eq "" "$out" "up --macos on a running VM: leaves no EXIT trap set"
-verify_macos_egress_locked() { echo "LEAK" >&2; exit 1; }
-run_cmd up
-nonzero "up --macos on a running VM, the self-test fails"
-eq "0" "$(pushes)" "up --macos on a running VM, the self-test fails: no push after it"
+# A completed `up` or session leaves no trap behind (the push-on-exit trap is disarmed after its push).
+old_env; out="$( cmd_up_macos >/dev/null 2>&1; trap -p EXIT INT TERM HUP )"
+eq "" "$out" "up --macos on a running VM: leaves no EXIT/INT/TERM/HUP trap set"
+old_env; out="$( prepare_macos_session "$(macos_project_vm)" >/dev/null 2>&1; trap -p EXIT INT TERM HUP )"
+eq "" "$out" "a session on a running VM: leaves no trap set once it has pushed"
+# A failed self-test stops the VM, so nothing is pushed after it.
+verify_macos_egress_locked() { RUNNING=0; echo "LEAK" >&2; exit 1; }
+old_env; run_cmd up
+nonzero "up --macos on a running VM, the self-test fails and stops the VM"
+eq "0" "$(pushes)" "up --macos on a running VM, the self-test fails and stops the VM: no push after it"
+# An exit or a Ctrl-C (INT, TERM) during the self-test, on a VM still running, pushes once.
+for _how in exit INT TERM; do
+    if [[ "$_how" == exit ]]; then verify_macos_egress_locked() { exit 1; }
+    else eval "verify_macos_egress_locked() { kill -$_how \$BASHPID; sleep 1; }"; fi
+    old_env; run_cmd up
+    _l="up --macos on a running VM, $_how during the self-test"
+    nonzero "$_l"
+    no_cred_push "$_l"
+    [[ "$_how" == INT ]] && eq "130" "$rc" "$_l: exits 130"
+    [[ "$_how" == TERM ]] && eq "143" "$rc" "$_l: exits 143"
+done
+# …and between the self-test and the push (the credential resolution).
 eval "verify_macos_egress_locked() { printf '%s\n' verify_macos_egress_locked >> \"\$STEPS\"; }"
+macos_record_egress_verified() { kill -INT "$BASHPID"; sleep 1; }
+old_env; run_cmd up
+no_cred_push "up --macos on a running VM, Ctrl-C after the self-test"
+unset -f macos_record_egress_verified; eval "$(sed -n '/^macos_record_egress_verified() {$/,/^}$/p' "$AUGUR")"
+# A session's clock and timezone fixes run before its push: an exit or a Ctrl-C there pushes once.
+for _step in sync_macos_guest_clock sync_macos_guest_timezone; do
+    for _how in exit INT; do
+        if [[ "$_how" == exit ]]; then eval "${_step}() { exit 1; }"; else eval "${_step}() { kill -INT \$BASHPID; sleep 1; }"; fi
+        for _cmd in claude shell; do
+            old_env; run_cmd "$_cmd"
+            _l="$_cmd --macos on a running VM, $_how during $_step"
+            nonzero "$_l"
+            no_cred_push "$_l"
+        done
+    done
+    eval "${_step}() { printf '%s\n' ${_step} >> \"\$STEPS\"; }"
+done
+# A refusal under the armed trap is still the run's only push (the trap does not repeat it).
+old_env; rm -f "$(macos_egress_verified_file)"; UNVERIFIED=1; run_cmd shell; UNVERIFIED=0
+no_cred_push "a refusal while the push-on-exit trap is armed"
 # The base VM is needed only to clone or boot: a running VM is reconciled without it.
 macos_vm_exists() { [[ "$1" != "$MACOS_BASE_VM" ]]; }
 run_cmd up

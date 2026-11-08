@@ -335,7 +335,7 @@ has "$running_branch" 'require_macos_egress_mode_current' "cmd_up_macos's alread
 has "$running_branch" 'resolve_running_macos_vm_credentials "$project_vm"' "cmd_up_macos's already-running path resolves through resolve_running_macos_vm_credentials"
 has "$(fn_body resolve_running_macos_vm_credentials)" 'refuse_running_macos_vm "$1"' "…which is where a credential that cannot be used stops it (refuse_running_macos_vm)"
 has "$(fn_body refuse_running_macos_vm)" 'exit 1' "…which exits"
-if printf '%s\n' "$running_branch" | grep -v 'push_macos_guest_env_retrying "$project_vm" || exit 1' | grep -q 'exit 1'
+if printf '%s\n' "$running_branch" | grep -v 'disarm_macos_push_on_exit; (( _prc == 0 )) || exit 1' | grep -q 'exit 1'
 then fail "cmd_up_macos refuses on some other drift on the already-running path" "only the egress mode is a refusal"
 else ok "cmd_up_macos refuses on no other drift on the already-running path"; fi
 
