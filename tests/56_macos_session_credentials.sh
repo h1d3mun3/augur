@@ -1038,7 +1038,7 @@ no_transport "no SSH transport, unverified VM: shell --macos"
 has "$out" "no egress self-test has passed since it booted" "no SSH transport, unverified VM: still refuses, saying why"
 has "$out" "may still hold credentials an older augur wrote" "no SSH transport, unverified VM: says old credentials may remain"
 # Through the real ssh_macos, whose unresolvable port ends the pipeline's subshell with status 1:
-# without the check first, that read as a failed write and was retried.
+# without the check first, that would read as a failed write and be retried.
 : > "$SSHLOG"; : > "$SESSLOG"
 out="$( unset -f ssh_macos; eval "$(sed -n '/^ssh_macos() {$/,/^}$/p' "$AUGUR")"; macos_ssh_port() { :; }
         push_macos_guest_env_retrying "$(macos_project_vm)" 2>&1 )"; rc=$?
