@@ -15,7 +15,7 @@ WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 helpers="$WORK/helpers.sh"
 grep -E '^(RED|GREEN|YELLOW|CYAN|BOLD|RESET)=' "$AUGUR" >> "$helpers"
 grep -E '^(info|success|warn|error)\(\) ' "$AUGUR" >> "$helpers"
-for f in sanitize_guest_text sanitize_guest_lines clamp_resource_int clamp_container_memory_value; do
+for f in sanitize_guest_text sanitize_guest_lines show_guest_lines clamp_resource_int clamp_container_memory_value; do
   awk -v n="$f" 'index($0, n"()")==1 {f=1} f{print} f&&/^}/{exit}' "$AUGUR" >> "$helpers"
   echo >> "$helpers"
 done
@@ -92,10 +92,16 @@ eq 1 "$(grep -cF "guest's clock (\${drift}s off the host's): \$(sanitize_guest_t
   "sync_macos_guest_clock sanitises the failed sudo's first line"
 eq 1 "$(grep -cF "host is '\${host_tz}'): \$(sanitize_guest_text \"\${setout%%\$'\\n'*}\")\"" "$AUGUR")" \
   "sync_macos_guest_timezone sanitises the failed sudo's first line"
-eq 2 "$(grep -c 'true 2>&1 | head -n 6 | sanitize_guest_lines | while' "$AUGUR")" \
-  "both ssh-probe diagnostics (up --macos, update --macos) sanitise ssh output"
-eq 0 "$(grep -E 'while IFS= read -r _l; do error ' "$AUGUR" | grep -vc 'sanitize_guest_lines |')" \
+eq 2 "$(grep -c 'true 2>&1 | head -n 6 | show_guest_lines' "$AUGUR")" \
+  "both ssh-probe diagnostics (up --macos, update --macos) go through show_guest_lines"
+eq 0 "$(grep -E 'while IFS= read -r _l; do .*error ' "$AUGUR" | grep -vc 'sanitize_guest_lines |')" \
   "every log tail / probe echoed through error() is sanitised"
+eq 1 "$(grep -cE 'while IFS= read -r _l; do .*error ' "$AUGUR")" \
+  "one loop echoes guest lines through error() (show_guest_lines; every site uses it)"
+# show_guest_lines itself: sanitised, one `  | ` line per non-empty line.
+shown="$(printf 'a\033[31m\n\nb\n' | show_guest_lines 2>&1)"
+has "$shown" '  | a\x1b[31m' "show_guest_lines sanitises each line"
+eq 2 "$(grep -c '  | ' <<<"$shown")" "show_guest_lines prints one line per non-empty input line"
 eq 0 "$(grep -E '^(info|success|warn|error)\(\) ' "$AUGUR" | grep -c 'echo -e')" \
   "no log helper interprets escapes (echo -e)"
 

@@ -58,14 +58,18 @@ KEY='credential.https://github.com.helper'
 TOKEN="ghp_hosttoken0123456789"
 
 # Stand-in for the guest: ssh runs its argv joined-and-parsed by the remote shell, so `bash -c` with
-# $HOME redirected at a throwaway guest home (and /Users/<user> mapped onto it) is faithful.
+# $HOME redirected at a throwaway guest home (and /Users/<user> mapped onto it) is faithful. The
+# guest's /etc/ssh maps onto GUEST_ETC, which holds the sshd drop-in a current base VM has, so the
+# push's acceptance check passes (tests/56 owns that check).
 GUEST_HOME=""
+GUEST_ETC="$TMPD/guest-etc"; mkdir -p "$GUEST_ETC/ssh/sshd_config.d"
+macos_session_accept_env_line > "$GUEST_ETC/ssh/sshd_config.d/$(basename "$(macos_session_sshd_dropin)")"
 SSHLOG="$TMPD/sshlog"; ALL_SSH="$TMPD/all-ssh"; : > "$ALL_SSH"
 ssh_macos() {
     local vm="$1"; shift
     local cmd="$*"
     printf '%s\n' "$cmd" | tee -a "$ALL_SSH" >> "$SSHLOG"
-    cmd="${cmd//\/Users\/${MACOS_SSH_USER}/$GUEST_HOME}"
+    cmd="${cmd//\/Users\/${MACOS_SSH_USER}/$GUEST_HOME}"; cmd="${cmd//\/etc\/ssh/$GUEST_ETC/ssh}"
     HOME="$GUEST_HOME" bash -c "$cmd"
 }
 GH_HOST_TOKEN=""
@@ -232,8 +236,9 @@ else fail "macOS: the copied ~/.gitconfig was modified" "$(diff "$TMPD/guest-mac
 hasnt "$(cat "$SSHLOG")" "git config" "macOS: the push sends no git config command"
 
 # A GIT_CONFIG_* set a guest startup file exports replaces augur's, reset included: the login zsh
-# the session starts sources it after augur's exports (the accepted trade-off at
-# git_credential_env).
+# the session starts sources it after augur's exports, and so does every zsh the agent starts for a
+# command (the accepted trade-off at git_credential_env, which says why the exports stay where
+# they are).
 { printf "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0='%s'\n" "$FAKE"
   cat "$GUEST_HOME/.zshenv"; } > "$GUEST_HOME/.zshenv.new" && mv "$GUEST_HOME/.zshenv.new" "$GUEST_HOME/.zshenv"
 probe

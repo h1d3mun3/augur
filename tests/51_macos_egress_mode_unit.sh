@@ -11,9 +11,10 @@
 #
 # The same file pins the second host-side record a running VM is attached by: that the egress
 # self-test passed during the VM's current boot (macos_egress_verified_file, tied to the boot by its
-# run id: augur-vm's pid and that process's start time, so a recycled pid does not match).
-# `claude` / `shell --macos` on a running egress VM without it (an `up` interrupted before its
-# self-test, a record from an earlier boot) refuse before touching the guest, naming `up --macos`;
+# run id: augur-vm's pid and that process's start time, read in UTC so the id does not depend on
+# TZ, and so a recycled pid does not match). `claude` / `shell --macos` on a running egress VM
+# without it (an `up` interrupted before its self-test, a record from an earlier boot) refuse with
+# no guest step but the refusal's push of ~/.augur-env (no credential), naming `up --macos`;
 # `up --macos` on the running VM re-runs the self-test and records it. The boot path drops it before
 # `augur-vm run` and writes it only after the self-test; --no-egress has none; down/destroy and a
 # failing self-test drop it. An `up` that cannot read the run id after a passed self-test fails and
@@ -63,7 +64,8 @@ verify_macos_egress_locked() { echo "selftest" >> "$LOG"; }
 warn_if_macos_egress_pinned() { :; }
 sync_macos_guest_clock() { :; }; sync_macos_guest_timezone() { :; }; configure_macos_guest_session() { :; }
 ensure_macos_workspace() { :; }; ensure_macos_agent_projects() { :; }; ensure_macos_agent_agents() { :; }
-ensure_macos_agent_profile() { :; }; ensure_macos_agent_bin() { :; }; push_macos_guest_env() { :; }
+ensure_macos_agent_profile() { :; }; ensure_macos_agent_bin() { :; }
+push_macos_guest_env() { echo "push $*" >> "$LOG"; }   # the push itself: tests/56
 macos_poweroff_before_teardown() { :; }
 scp_to_macos() { :; }
 ssh_macos() { echo "ssh $*" >> "$LOG"; [[ "$*" == *"cat > "* ]] && cat >/dev/null; [[ "$*" == *" -t "* ]] && echo AGENT_ATTACHED; return 0; }
@@ -73,8 +75,9 @@ egress_off() { AUGUR_EGRESS=0; }
 record() { mkdir -p "$AUGUR_PROXY_DIR"; printf '%s\n' "$1" > "$(macos_egress_mode_file)"; }
 # The VM's current boot: run.pid holds a live pid (this shell's; BOOT2 is a second boot's process),
 # and its id (macos_vm_run_id) adds that process's start time. A `ps` stand-in answers a fixed
-# start time per pid so ids cannot drift mid-file (Linux procps recomputes start times from the
-# clock on each call, which can tick over by a second); the run-id section below uses the real ps.
+# start time per pid so ids cannot drift mid-file (Linux procps computes start times from the
+# kernel's boot time, which moves when the host clock is stepped); the run-id section below uses
+# the real ps.
 SHIMDIR="$TMPD/shim"; mkdir -p "$SHIMDIR"; REAL_PS="$(command -v ps)"
 cat > "$SHIMDIR/ps" <<EOF
 #!/usr/bin/env bash
@@ -175,18 +178,33 @@ done
 
 section "Tier 1 — a VM's run id is its augur-vm pid plus that process's start time (the real ps)"
 export REAL_LSTART=1
+# This shell's start time from the real ps, as the id must carry it: UTC, the C locale, the column
+# padding collapsed.
+lst() { LC_ALL=C TZ=UTC0 "$REAL_PS" -o lstart= -p "$1" | tr -s ' ' | sed 's/^ //; s/ $//'; }
+# Linux procps derives a start time from the boot time the kernel reports, which moves when the
+# host's clock is stepped (a VM's clock resync after its host slept moves every process's start
+# time at once). steady <check...>: run the check (0 = pass) up to three times, again only when this
+# shell's start time changed while it ran, so a step mid-check cannot fail it and a real mismatch
+# still does.
+steady() { local _sb _si; for _si in 1 2 3; do _sb="$(lst $$)"; "$@" && return 0; [[ "$(lst $$)" == "$_sb" ]] && return 1; done; return 1; }
 boot_id "$$"
-id="$(macos_vm_run_id "$PV")"
-want_start="$(LC_ALL=C ps -o lstart= -p "$$" | tr -s ' ' | sed 's/^ //; s/ $//')"
-[[ "$id" == "$$ "* && -n "$want_start" ]] && ok "the id starts with the pid from run.pid" || fail "the id does not start with the pid" "[$id]"
-eq "$$ $want_start" "$id" "the id is '<pid> <start time>', ps's padding collapsed (no double space)"
+c_shape() { id="$(macos_vm_run_id "$PV")"; want="$$ $(lst $$)"; [[ -n "$(lst $$)" && "$id" == "$want" ]]; }
+steady c_shape && ok "the id is '<pid> <start time>', ps's padding collapsed" || fail "the id is not '<pid> <start time>'" "expected [$want], got [$id]"
 hasnt "$id" "  " "the id holds no run of spaces"
-eq "$id" "$(macos_vm_run_id "$PV")" "the id is the same on every read"
-boot_id "$BOOT2"
-[[ "$(macos_vm_run_id "$PV")" == "$BOOT2 "?* && "$(macos_vm_run_id "$PV")" != "$id" ]] \
-  && ok "another process (another boot) has another id" || fail "another boot's id is not its own" "$(macos_vm_run_id "$PV")"
-printf '%s' "$$" > "$RUN_ID_FILE"
-eq "$id" "$(macos_vm_run_id "$PV")" "a pidfile without a trailing newline (augur-vm writes none) gives the same id"
+c_same() { [[ "$(macos_vm_run_id "$PV")" == "$(macos_vm_run_id "$PV")" ]]; }
+steady c_same && ok "the id is the same on every read" || fail "two reads of the id differ"
+# ps prints lstart in local time, so the id is read under a pinned TZ: augur runs that read and
+# write the record may have different ones. POSIX TZ strings, so no zoneinfo files are needed.
+c_tz() { a="$(export TZ=JST-9; macos_vm_run_id "$PV")"; b="$(export TZ=PST8PDT; macos_vm_run_id "$PV")"; c="$(unset TZ; macos_vm_run_id "$PV")"
+         [[ -n "$a" && "$a" == "$b" && "$a" == "$c" ]]; }
+steady c_tz && ok "the id is the same under TZ=JST-9, TZ=PST8PDT and no TZ" || fail "the id depends on TZ" "[$a] [$b] [$c]"
+c_tz_raw() { [[ "$(TZ=JST-9 LC_ALL=C "$REAL_PS" -o lstart= -p $$)" != "$(TZ=PST8PDT LC_ALL=C "$REAL_PS" -o lstart= -p $$)" ]]; }
+steady c_tz_raw && ok "control: ps's own lstart differs between those TZs (the pin is what keeps the id equal)" \
+  || fail "control: ps's lstart does not depend on TZ here (the TZ check above is vacuous)"
+c_other() { boot_id "$BOOT2"; o="$(macos_vm_run_id "$PV")"; boot_id "$$"; [[ "$o" == "$BOOT2 "?* && "$o" != "$(macos_vm_run_id "$PV")" ]]; }
+steady c_other && ok "another process (another boot) has another id" || fail "another boot's id is not its own" "$o"
+c_nonl() { printf '%s' "$$" > "$RUN_ID_FILE"; [[ "$(macos_vm_run_id "$PV")" == "$$ $(lst $$)" ]]; }
+steady c_nonl && ok "a pidfile without a trailing newline (augur-vm writes none) gives the same id" || fail "a pidfile without a trailing newline gives another id"
 sleep 0 & _dead=$!; wait "$_dead"; boot_id "$_dead"
 eq "" "$(macos_vm_run_id "$PV")" "a pid with no process: no id"
 boot_id "not-a-pid"
@@ -197,9 +215,8 @@ eq "" "$(macos_vm_run_id "$PV")" "no pidfile: no id"
 boot_id "$$"; egress_on; verified "$$ Thu Jan 1 00:00:00 1970"
 run_cmd require_macos_egress_verified "$PV"
 [[ "$rc" -ne 0 ]] && ok "a record for the same pid with another start time is refused" || fail "a recycled pid matched the record"
-verified "$id"
-run_cmd require_macos_egress_verified "$PV"
-eq 0 "$rc" "the record of this boot is accepted (control)"
+c_accept() { verified "$(macos_vm_run_id "$PV")"; run_cmd require_macos_egress_verified "$PV"; [[ "$rc" == 0 ]]; }
+steady c_accept && ok "the record of this boot is accepted (control)" || fail "the record of this boot is refused" "$out"
 unset REAL_LSTART
 
 section "Tier 1 — a running VM gets a session only if its current boot passed the self-test"
@@ -211,7 +228,10 @@ unverified() {   # unverified <label>
   has "$out" "to re-run the egress self-test on the running VM" "$1: gives the remedy (up --macos)"
   hasnt "$out" "augur down --macos" "$1: does not send the operator through a restart"
   hasnt "$out" "AGENT_ATTACHED" "$1: nothing is attached"
-  grep -q '^ssh ' "$LOG" && fail "$1: the guest was contacted" "$(cat "$LOG")" || ok "$1: the guest is not contacted at all"
+  grep -q '^ssh ' "$LOG" && fail "$1: the guest got a session or another command" "$(cat "$LOG")" || ok "$1: no session and no other guest command"
+  # The one guest step a refusal makes: the push of ~/.augur-env, which sends no credential and
+  # rewrites one an older augur may have left credentials in.
+  eq "push $PV --refusing" "$(grep '^push ' "$LOG")" "$1: pushes ~/.augur-env once, as a refusal, before refusing"
   if logged "vm stop $PV" || logged stop_gvproxy || logged stop_proxy; then
     fail "$1: the VM or its egress helpers were stopped" "$(cat "$LOG")"
   else ok "$1: the running VM is left alone (nothing stopped)"; fi
