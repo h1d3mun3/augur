@@ -4289,7 +4289,7 @@ warn_if_macos_egress_pinned() {
 # exception is only a warning: the policy is live and checked, and only the removal of the old
 # directory failed.
 install_macos_managed_settings() {
-    local vm="$1" script outf out rc=0 _l discarded="" leftover=""
+    local vm="$1" script outf out rc=0 _l _n discarded="" leftover=""
     info "Installing augur's managed $(agent_display_name) policy into the base VM..."
     script="$(macos_managed_settings_vars_sh)" || return 1
     script+=$'\n'"$(macos_policy_checks_sh)"$'\n'"$(macos_managed_settings_swap_sh)"
@@ -4300,20 +4300,30 @@ install_macos_managed_settings() {
     # no privilege augur's build doesn't already take.
     macos_run_root_script "$vm" "$script" > "$outf" || rc=$?
     out="$(cat "$outf")"; rm -f "$outf"
-    # Success is status 0 AND the script's own report that the policy is live, never a status alone.
-    if (( rc != 0 )) || ! grep -qx 'AUGUR_POLICY_LIVE' <<< "$out"; then
+    # Success is status 0 AND the script's own report that the policy is live as the LAST line of its
+    # output, never a status alone. Each discarded name arrives base64-encoded on its own line, so no
+    # name can forge a report line.
+    if (( rc != 0 )) || [[ "${out##*$'\n'}" != AUGUR_POLICY_LIVE ]]; then
         error "Could not install the managed $(agent_display_name) policy in the VM:"
         printf '%s\n' "$MACOS_ROOT_SCRIPT_ERR" | show_guest_lines
         return 1
     fi
     while IFS= read -r _l; do
         case "$_l" in
-            "AUGUR_POLICY_DISCARDED "*) discarded+="${discarded:+, }${_l#AUGUR_POLICY_DISCARDED }" ;;
+            "AUGUR_POLICY_DISCARDED "*)
+                _l="${_l#AUGUR_POLICY_DISCARDED }"
+                if [[ "$_l" =~ ^[A-Za-z0-9+/]+=*$ ]] && _n="$(printf '%s' "$_l" | base64 --decode 2>/dev/null && printf x)" \
+                        && [[ "$_n" == *x ]]; then
+                    _n="$(sanitize_guest_text "${_n%x}")"
+                else
+                    _n="(a name that cannot be decoded)"
+                fi
+                discarded+="${discarded:+, }${_n}" ;;
             "AUGUR_POLICY_LEFTOVER "*)  leftover="${_l#AUGUR_POLICY_LEFTOVER }" ;;
         esac
     done <<< "$out"
     if [[ -n "$discarded" ]]; then
-        info "Discarded with the old policy directory (custom provisioning must recreate what it owns): $(sanitize_guest_text "$discarded")"
+        info "Discarded with the old policy directory (custom provisioning must recreate what it owns): ${discarded}"
     fi
     if [[ -n "$leftover" ]]; then
         warn "The managed $(agent_display_name) policy is installed, but the old policy directory could not be removed: $(sanitize_guest_text "$leftover")"
@@ -4329,6 +4339,13 @@ install_macos_managed_settings() {
 # may add them). Read-only. cmd_build_macos and cmd_update_macos run it after everything that
 # could change the policy (custom provisioning's root hook, a cask's postinstall), right before
 # the sshd drop-in re-check, and refuse to save the base VM when it fails.
+# A mismatch the check found (its own AUGUR_POLICY_MISMATCH report) and a check that could not run
+# (no stored admin password or SSH transport, a failed ssh or sudo) are reported apart; both fail.
+# Accepted trade-off: this guards against custom provisioning (TOFU-gated, trusted root content)
+# replacing or breaking augur's policy file by accident. It does not try to contain a malicious
+# provisioning step, which runs as root and can do anything, a LaunchDaemon that rewrites the policy
+# at every clone's boot included; so the parent directory and the other files in the policy
+# directory are not re-checked either.
 verify_macos_managed_settings() {
     local vm="$1" script outf out rc=0
     info "Checking that the base VM still holds augur's managed $(agent_display_name) policy..."
@@ -4337,10 +4354,17 @@ verify_macos_managed_settings() {
     outf="$(mktemp)" || { error "Could not create a temporary file."; return 1; }
     macos_run_root_script "$vm" "$script" > "$outf" || rc=$?
     out="$(cat "$outf")"; rm -f "$outf"
-    (( rc == 0 )) && grep -qx 'AUGUR_POLICY_OK' <<< "$out" && return 0
-    error "The base VM no longer holds augur's managed $(agent_display_name) policy as installed:"
+    # As for the install: the report must be the last line of the output, with a matching status.
+    local last="${out##*$'\n'}"
+    (( rc == 0 )) && [[ "$last" == AUGUR_POLICY_OK ]] && return 0
+    if (( rc != 0 )) && [[ "$last" == AUGUR_POLICY_MISMATCH ]]; then
+        error "The base VM no longer holds augur's managed $(agent_display_name) policy as installed:"
+        printf '%s\n' "$MACOS_ROOT_SCRIPT_ERR" | show_guest_lines
+        error "Custom provisioning must not replace or change augur's $(basename "$(agent_macos_managed_settings_path)"); it may add its own files beside it."
+        return 1
+    fi
+    error "Could not check the base VM's managed $(agent_display_name) policy: the check did not run to the end."
     printf '%s\n' "$MACOS_ROOT_SCRIPT_ERR" | show_guest_lines
-    error "Custom provisioning must not replace or change augur's $(basename "$(agent_macos_managed_settings_path)"); it may add its own files beside it."
     return 1
 }
 
@@ -4371,8 +4395,10 @@ macos_managed_settings_vars_sh() {
 #     are also extended attributes). An `ls -le` that fails or prints nothing is refused, never
 #     guessed around.
 #   deny_only LS-LDEN-OUTPUT: every ACL line after the first (` 0: group:everyone deny delete`,
-#     with `inherited` before `deny` when inherited) is a deny entry. An allow entry, or a line of
-#     any other shape, fails.
+#     with `inherited` before `deny` when inherited) is a deny entry that does not deny reading
+#     (read, search, list, readattr, readextattr or readsecurity), which would keep the non-root
+#     agent from reading the policy. An allow entry, such a deny entry, or a line of any other
+#     shape, fails.
 #   policy_file_ok PATH: ls_ok as a root:wheel 644 regular file with no ACL, one hard link (no other
 #     name can change it), and holding exactly the bytes in $b64.
 # Absolute tool paths, because the guest's PATH starts at ~/.local/bin. Deliberately
@@ -4393,6 +4419,9 @@ deny_only() {
             case "$2" in ?*:?*) ;; *) exit 1 ;; esac
             if [ "$3" = inherited ]; then kind="$4"; perms="$5"; else kind="$3"; perms="$4"; fi
             [ "$kind" = deny ] && [ -n "$perms" ] || exit 1
+            case ",$perms," in
+                *,read,*|*,search,*|*,list,*|*,readattr,*|*,readextattr,*|*,readsecurity,*) exit 1 ;;
+            esac
         done
     }
 }
@@ -4419,16 +4448,17 @@ SCRIPT
 }
 
 # Root shell code for verify_macos_managed_settings (after macos_managed_settings_vars_sh and
-# macos_policy_checks_sh): read-only, it names the first thing that differs on stderr and exits 1,
-# or prints AUGUR_POLICY_OK.
+# macos_policy_checks_sh): read-only, it names the first thing that differs on stderr and prints
+# AUGUR_POLICY_MISMATCH, then exits 1, or prints AUGUR_POLICY_OK. Either report is the last line.
 macos_managed_settings_check_sh() {
     cat <<'SCRIPT'
 f="$dir/$name"
-{ [ -e "$dir" ] || [ -L "$dir" ]; } || { echo "$dir is missing" >&2; exit 1; }
-ls_ok "$dir" -d '0:*' drwxr-xr-x deny || { echo "$dir is not a root-owned 755 directory without an ACL that allows anything" >&2; exit 1; }
-{ [ -e "$f" ] || [ -L "$f" ]; } || { echo "$f is missing" >&2; exit 1; }
-ls_ok "$f" -f 0:0 -rw-r--r-- || { echo "$f is not a root:wheel 644 regular file without an ACL" >&2; exit 1; }
-policy_file_ok "$f" || { echo "$f has other hard links or does not hold augur's policy" >&2; exit 1; }
+mismatch() { echo "$1" >&2; echo AUGUR_POLICY_MISMATCH; exit 1; }
+{ [ -e "$dir" ] || [ -L "$dir" ]; } || mismatch "$dir is missing"
+ls_ok "$dir" -d '0:*' drwxr-xr-x deny || mismatch "$dir is not a root-owned 755 directory without an ACL that allows anything or denies reading"
+{ [ -e "$f" ] || [ -L "$f" ]; } || mismatch "$f is missing"
+ls_ok "$f" -f 0:0 -rw-r--r-- || mismatch "$f is not a root:wheel 644 regular file without an ACL"
+policy_file_ok "$f" || mismatch "$f has other hard links or does not hold augur's policy"
 echo AUGUR_POLICY_OK
 SCRIPT
 }
@@ -4447,17 +4477,17 @@ SCRIPT
 #   2. The old $dir, whatever it is (a directory, a file, a symlink, which `mv` moves as a link),
 #      is moved into a fresh 700 quarantine directory under /var/root, which only root can
 #      traverse, so its removal at the end cannot be raced through its path. The names in an old
-#      directory, other than $name, are reported (AUGUR_POLICY_DISCARDED <name> on stdout). The
-#      fresh directory is then renamed to $dir, a free name by then, so `mv` cannot put it inside
+#      directory, other than $name, are reported, each base64-encoded on its own line
+#      (AUGUR_POLICY_DISCARDED <base64>), so no name can forge a report line. The fresh directory is then renamed to $dir, a free name by then, so `mv` cannot put it inside
 #      anything.
 #      Accepted trade-off: a process already holding a directory of the old tree open (its cwd)
 #      can still change that directory during the removal; `rm -rf` does not follow symlinks, so
 #      at worst it removes less.
-#   3. The live $dir and its file are checked again, and only then is AUGUR_POLICY_LIVE printed on
-#      stdout: the host takes nothing else as success. Then the quarantine is removed; when that
-#      fails, the script reports it (AUGUR_POLICY_LEFTOVER <path>) and still exits 0. Deliberately
-#      not a failure: the policy is in place, and the leftover sits under /var/root, which only
-#      root can reach.
+#   3. The live $dir and its file are checked again, then the quarantine is removed; when that
+#      fails, the script reports it (AUGUR_POLICY_LEFTOVER <path>) and goes on. Deliberately not a
+#      failure: the policy is in place, and the leftover sits under /var/root, which only root can
+#      reach. Last of all, it prints AUGUR_POLICY_LIVE on stdout and exits 0: the host takes
+#      nothing else as success.
 # Any other failure exits 1 with the reason on stderr (fail): the fresh directory is removed (after
 # step 2's rename, by moving the new $dir into the quarantine), an old $dir already moved aside is
 # put back, and the quarantine is removed once nothing of the old one is left in it. When either
@@ -4489,14 +4519,20 @@ quar="$(/usr/bin/mktemp -d /var/root/.augur-quarantine.XXXXXX)" || { quar=; fail
 /bin/chmod 700 "$quar" && /bin/chmod -N "$quar" || fail "cannot make $quar 700 without an ACL"
 if [ -e "$dir" ] || [ -L "$dir" ]; then /bin/mv "$dir" "$quar/old" && moved=1 || fail "cannot move the old $dir aside"; fi
 if [ -n "$moved" ] && [ -d "$quar/old" ] && [ ! -L "$quar/old" ]; then
-    /bin/ls -A "$quar/old" | while IFS= read -r e; do [ "$e" = "$name" ] || echo "AUGUR_POLICY_DISCARDED $e"; done
+    set +f
+    for p in "$quar/old"/* "$quar/old"/.[!.]* "$quar/old"/..?*; do
+        { [ -e "$p" ] || [ -L "$p" ]; } || continue
+        e="${p##*/}"
+        [ "$e" = "$name" ] || echo "AUGUR_POLICY_DISCARDED $(printf '%s' "$e" | /usr/bin/base64 | /usr/bin/tr -d '\n')"
+    done
+    set -f
 fi
 /bin/mv "$fresh" "$dir" || fail "cannot move the new policy directory to $dir"
 fresh=; live=1
 ls_ok "$dir" -d 0:0 drwxr-xr-x && policy_file_ok "$dir/$name" && [ "$(/bin/ls -A "$dir")" = "$name" ] \
     || fail "$dir is not exactly the new policy after the swap"
-echo AUGUR_POLICY_LIVE
 /bin/rm -rf "$quar" || { echo "cannot remove the old policy directory, left in $quar" >&2; echo "AUGUR_POLICY_LEFTOVER $quar"; }
+echo AUGUR_POLICY_LIVE
 exit 0
 SCRIPT
 }

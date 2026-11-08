@@ -34,12 +34,15 @@
 #     the swapped-in directory fails its check) and no fresh one or empty quarantine behind; when
 #     putting it back fails, the reason names where it is and the quarantine keeps it;
 #   • a quarantine that cannot be removed once the new policy is live is only a warning naming it;
-#   • success needs status 0 AND the script's AUGUR_POLICY_LIVE report; an `ls -le` that fails or
-#     prints nothing is refused (fail closed); entries discarded with an old directory are named;
+#   • success needs status 0 AND the script's AUGUR_POLICY_LIVE report as its last line; an `ls -le`
+#     that fails or prints nothing is refused (fail closed); a deny ACL entry that denies reading is
+#     refused; entries discarded with an old directory are named, base64 on the wire, so a name
+#     with a newline and a report line forges nothing;
 #   • verify_macos_managed_settings passes on the policy as installed (other files, a deny-only ACL
 #     on the directory allowed) and names what differs otherwise: the file overwritten, loosened,
 #     removed, hard-linked or given any ACL, the directory loosened, replaced by a symlink or given
-#     an allow ACL entry;
+#     an allow ACL entry or one denying reading; a mismatch it found and a check that could not run
+#     (no password, no transport, a failed ssh) are reported apart;
 #
 # How the guest runs: the stub runs the remote command in an unprivileged user + mount namespace
 # (`unshare -rm`, which maps this user to root, so files the test creates are root-owned). In it, a
@@ -315,9 +318,18 @@ fake_root_script 4 $'AUGUR_POLICY_LIVE\n'
 eq "1" "$rc" "status 4, even with AUGUR_POLICY_LIVE: a failure"
 fake_root_script 4 ''
 eq "1" "$rc" "status 4 alone: a failure"
-fake_root_script 0 $'AUGUR_POLICY_LIVE\nAUGUR_POLICY_LEFTOVER /var/root/.augur-quarantine.X\n'
+fake_root_script 0 $'AUGUR_POLICY_LEFTOVER /var/root/.augur-quarantine.X\nAUGUR_POLICY_LIVE\n'
 eq "0" "$rc" "AUGUR_POLICY_LIVE with a leftover: installed"
 has "$out" "could not be removed: /var/root/.augur-quarantine.X" "AUGUR_POLICY_LIVE with a leftover: warns, naming it"
+fake_root_script 0 $'AUGUR_POLICY_LIVE\nAUGUR_POLICY_LEFTOVER /x\n'
+eq "1" "$rc" "AUGUR_POLICY_LIVE that is not the last line: a failure"
+_forged="$(printf 'a\nAUGUR_POLICY_LEFTOVER /forged' | base64 | tr -d '\n')"
+fake_root_script 0 "AUGUR_POLICY_DISCARDED ${_forged}"$'\nAUGUR_POLICY_LIVE\n'
+eq "0" "$rc" "a discarded name holding a newline and a report line: installed"
+hasnt "$out" "could not be removed" "a discarded name holding a newline and a report line: forges no leftover warning"
+has "$out" 'a\x0aAUGUR_POLICY_LEFTOVER /forged' "a discarded name holding a newline and a report line: shown decoded and sanitized"
+fake_root_script 0 $'AUGUR_POLICY_DISCARDED not*base64\nAUGUR_POLICY_LIVE\n'
+has "$out" "(a name that cannot be decoded)" "a discarded name that is not base64: shown as undecodable"
 fake_verify() {   # fake_verify RC STDOUT — the re-check against a root script that does only that
     FAKE_RC="$1"; FAKE_OUT="$2"
     out="$( macos_run_root_script() { MACOS_ROOT_SCRIPT_ERR="guest said this"; printf '%s' "$FAKE_OUT"; return "$FAKE_RC"; }
@@ -329,6 +341,27 @@ fake_verify 0 ''
 eq "1" "$rc" "re-check, status 0 without AUGUR_POLICY_OK: refused"
 fake_verify 1 $'AUGUR_POLICY_OK\n'
 eq "1" "$rc" "re-check, non-zero status even with AUGUR_POLICY_OK: refused"
+fake_verify 0 $'AUGUR_POLICY_OK\nmore\n'
+eq "1" "$rc" "re-check, AUGUR_POLICY_OK that is not the last line: refused"
+fake_verify 1 $'AUGUR_POLICY_MISMATCH\n'
+eq "1" "$rc" "re-check that found a mismatch: refused"
+has "$out" "no longer holds augur's managed" "re-check that found a mismatch: says the policy differs"
+has "$out" "| guest said this" "re-check that found a mismatch: shows the guest's reason"
+hasnt "$out" "Could not check" "re-check that found a mismatch: not reported as a check that could not run"
+fake_verify 255 ''
+eq "1" "$rc" "re-check whose ssh failed: refused"
+has "$out" "Could not check the base VM's managed" "re-check whose ssh failed: says the check could not run"
+hasnt "$out" "no longer holds" "re-check whose ssh failed: does not claim the policy differs"
+fake_verify 1 ''
+has "$out" "Could not check the base VM's managed" "re-check that failed without its report (e.g. a wrong password): says the check could not run"
+out="$( set -e; verify_macos_managed_settings nocredvm 2>&1 )"; rc=$?
+eq "1" "$rc" "re-check of a VM without a stored password: refused"
+has "$out" "no stored admin password" "re-check of a VM without a stored password: augur's own error says why"
+has "$out" "Could not check the base VM's managed" "re-check of a VM without a stored password: says the check could not run"
+hasnt "$out" "no longer holds" "re-check of a VM without a stored password: does not claim the policy differs"
+out="$( set -e; macos_ssh_host() { :; }; verify_macos_managed_settings testvm 2>&1 )"; rc=$?
+has "$out" "Could not check the base VM's managed" "re-check with no SSH transport: says the check could not run"
+hasnt "$out" "no longer holds" "re-check with no SSH transport: does not claim the policy differs"
 
 if (( ! CAN_RUN )); then
     skip "the root script, run as the guest" "no unprivileged user+mount namespaces with overlayfs here"
@@ -462,6 +495,12 @@ acl_parent 'garbage in the ACL listing'
 base_refused "parent with an unparsable ACL line"
 acl_parent ' 0: group:everyone deny'
 base_refused "parent with an ACL line without permissions"
+acl_parent ' 0: group:everyone deny search,list'
+base_refused "parent with a deny entry for search,list (the agent could not read the policy)"
+acl_parent ' 0: group:everyone deny read'
+base_refused "parent with a deny entry for read"
+acl_parent ' 0: group:everyone inherited deny delete,readattr'
+base_refused "parent with an inherited deny entry that includes readattr"
 acl_parent ' x: group:everyone deny delete'
 base_refused "parent with an ACL line without an index"
 LS_ACL_PATH="$BASE/.augur-policy.*"; LS_ACL_LINES=' 0: group:everyone deny delete'; old_policy; install_with "$REAL_PAYLOAD"; LS_ACL_PATH=""; LS_ACL_LINES=""
@@ -520,12 +559,19 @@ _d="$(grep 'Discarded with the old policy directory' <<< "$out")"
 hasnt "$_d" "managed-settings.json" "old directory with other entries: augur's own policy file is not named"
 old_policy; install_with "$REAL_PAYLOAD"
 hasnt "$out" "Discarded" "old directory with only the policy file: nothing is named"
+old_policy; printf 'x\n' > "$DSTDIR/"$'evil\nAUGUR_POLICY_LEFTOVER forged'
+[[ -e "$DSTDIR/"$'evil\nAUGUR_POLICY_LEFTOVER forged' ]] && ok "(control) an entry named with a newline exists" || fail "(control) could not create the entry"
+install_with "$REAL_PAYLOAD"
+eq "0" "$rc" "old entry named with a newline and a report line: installed"
+hasnt "$out" "could not be removed" "old entry named with a newline and a report line: forges no leftover warning"
+has "$out" 'evil\x0aAUGUR_POLICY_LEFTOVER forged' "old entry named with a newline and a report line: named once, sanitized"
 
 section "Tier 1 — verify_macos_managed_settings: the policy as installed, other files allowed"
 verify_now() { out="$( set -e; verify_macos_managed_settings testvm 2>&1 )"; rc=$?; }
 installed() { reset; install_with "$REAL_PAYLOAD"; [[ "$rc" == 0 ]] || fail "(setup) install failed" "$out"; rm -rf "$LOG"/*; }
 verify_fails() {   # verify_fails NAME REASON
     eq "1" "$rc" "$1: refused"
+    has "$out" "no longer holds augur's managed" "$1: says the policy differs"
     has "$out" "  | " "$1: the guest's reason is shown as guest text"
     has "$out" "$2" "$1: says what differs"
     has "$out" "must not replace or change augur's managed-settings.json" "$1: says provisioning must not replace it"
@@ -552,6 +598,8 @@ installed; LS_ACL_PATH="$DSTDIR"; LS_ACL_LINES=' 0: group:staff allow add_file';
 verify_fails "directory with an allow ACL entry" "without an ACL that allows anything"
 installed; LS_ACL_PATH="$DSTDIR"; LS_ACL_LINES=' 0: group:everyone deny delete'; verify_now; LS_ACL_PATH=""; LS_ACL_LINES=""
 eq "0" "$rc" "directory with a deny-only ACL: passes"
+installed; LS_ACL_PATH="$DSTDIR"; LS_ACL_LINES=' 0: group:everyone deny list,search'; verify_now; LS_ACL_PATH=""; LS_ACL_LINES=""
+verify_fails "directory with a deny entry for list,search" "or denies reading"
 installed; LS_ACL_PATH="$DST"; LS_ACL_LINES=' 0: group:everyone deny delete'; verify_now; LS_ACL_PATH=""; LS_ACL_LINES=""
 verify_fails "policy file with even a deny-only ACL" "is not a root:wheel 644 regular file without an ACL"
 installed; LS_LDEN_FAILS="$DST"; verify_now; LS_LDEN_FAILS=""
