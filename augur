@@ -6153,43 +6153,43 @@ cmd_update_macos() {
         # Accepted trade-off: the end of the group after CMD is reaped can name a group that has
         # no member left; reaching an unrelated process needs its id to be reused in that moment.
         _with_timeout_sh=$(cat <<"EOF"
-secs=$1; shift
-cpid=; wpid=
-mark=$(mktemp -d 2>/dev/null) || { echo "augur: ERROR could not create a temp dir for the timeout" >&2; exit 1; }
-end_group() {
-    kill -TERM -- "-$1" || return 0
-    n=0
-    while [ "$n" -lt "$2" ] && kill -0 -- "-$1"; do sleep 1; n=$((n + 1)); done
-    kill -KILL -- "-$1"
-    return 0
-}
-on_signal() {
-    [ -z "$wpid" ] || kill -KILL -- "-$wpid"
-    [ -z "$cpid" ] || end_group "$cpid" 2
-    exit "$1"
-}
-on_exit() { rm -rf "$mark"; }
-trap on_exit EXIT
-trap "on_signal 130" INT
-trap "on_signal 143" TERM
-trap "on_signal 129" HUP
-# The shell keeps the caller stderr on fd 3 for CMD alone, so no job notice or kill error of
-# its own reaches the caller.
-exec 3>&2 2>/dev/null
-set -m
-"$@" </dev/null 2>&3 3>&- & cpid=$!
-( sleep "$secs"; : > "$mark/fired"; end_group "$cpid" 10 ) </dev/null >/dev/null 3>&- & wpid=$!
-set +m
-wait "$cpid"; rc=$?
-if [ -e "$mark/fired" ]; then
-    wait "$wpid"; rc=124
-else
-    kill -KILL -- "-$wpid"; wait "$wpid"
-    # Deliberately ended, without changing the status: anything CMD left running in its group
-    # (a helper, a daemon) ends with the step.
-    end_group "$cpid" 2
-fi
-exit "$rc"
+        secs=$1; shift
+        cpid=; wpid=
+        mark=$(mktemp -d 2>/dev/null) || { echo "augur: ERROR could not create a temp dir for the timeout" >&2; exit 1; }
+        end_group() {
+            kill -TERM -- "-$1" || return 0
+            n=0
+            while [ "$n" -lt "$2" ] && kill -0 -- "-$1"; do sleep 1; n=$((n + 1)); done
+            kill -KILL -- "-$1"
+            return 0
+        }
+        on_signal() {
+            [ -z "$wpid" ] || kill -KILL -- "-$wpid"
+            [ -z "$cpid" ] || end_group "$cpid" 2
+            exit "$1"
+        }
+        on_exit() { rm -rf "$mark"; }
+        trap on_exit EXIT
+        trap "on_signal 130" INT
+        trap "on_signal 143" TERM
+        trap "on_signal 129" HUP
+        # The shell keeps the caller stderr on fd 3 for CMD alone, so no job notice or kill error of
+        # its own reaches the caller.
+        exec 3>&2 2>/dev/null
+        set -m
+        "$@" </dev/null 2>&3 3>&- & cpid=$!
+        ( sleep "$secs"; : > "$mark/fired"; end_group "$cpid" 10 ) </dev/null >/dev/null 3>&- & wpid=$!
+        set +m
+        wait "$cpid"; rc=$?
+        if [ -e "$mark/fired" ]; then
+            wait "$wpid"; rc=124
+        else
+            kill -KILL -- "-$wpid"; wait "$wpid"
+            # Deliberately ended, without changing the status: anything CMD left running in its
+            # group (a helper, a daemon) ends with the step.
+            end_group "$cpid" 2
+        fi
+        exit "$rc"
 EOF
 )
         _with_timeout() { /bin/bash -c "$_with_timeout_sh" _with_timeout "$@"; }
