@@ -167,8 +167,9 @@ operator for host privilege.
 Inside the guest, augur already takes exactly this privilege by exactly this mechanism.
 `install_macos_managed_settings` writes into root-owned `/Library` as root, through `sudo -S` fed
 the base VM's admin password on ssh's stdin. It sends the password line, a marker line and a root
-script carrying the policy over one ssh connection (`macos_run_root_script`), so nothing is staged
-in the guest user's home for another process of that user to swap before root installs it.
+script carrying the policy, base64-encoded, over one ssh connection (`macos_run_root_script`), so
+nothing is staged in the guest user's home for another process of that user to swap before root
+installs it.
 
 `sudo -S` fed the documented fixed password (ADR-0007) — which works *whether or not* the build-time
 `NOPASSWD` grant is present, and it is not: `cmd_build_macos` removes `/etc/sudoers.d/augur` before
