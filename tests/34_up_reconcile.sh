@@ -133,11 +133,13 @@ stop_gvproxy()      { :; }
 stop_proxy()        { :; }
 wait_for_macos_ssh() { return 1; }   # would fail loudly if the branch ever fell through
 ssh_macos()         { echo "ssh_macos" >> "$LOG"; return 0; }
+macos_ssh_transport_ok() { return 0; }   # the stub ssh_macos above needs no host or port
 # The macOS boot self-test, recorded rather than run: it probes the guest over ssh_macos, and the
 # blanket stub above answers every probe with success — i.e. a screaming leak — which would tear the
 # VM down mid-reconcile. tests/36_macos_egress_selftest.sh owns its behaviour; here we only assert
 # that this path reaches it, exactly as the container half asserts it reaches finish_up.
 verify_macos_egress_locked() { echo "verify_macos_egress_locked" >> "$LOG"; }
+macos_record_egress_verified() { :; }   # the record of that pass: tests/51 owns it
 scp_to_macos()      { :; }
 # Recorder standing in for the augur-vm CLI. $VM_CLI is invoked as "$VM_CLI" <subcmd>, so a function
 # name works — and unlike a stub that silently succeeds, this makes "run was never invoked" a real
@@ -212,19 +214,18 @@ pin_out="$(pinned_run)"
 has "$pin_out" "changed since VM 'testvm' booted"          "policy newer than gvproxy's snapshot → warns, naming the VM"
 has "$pin_out" "gvproxy snapshots its DNS allowlist ONCE"   "…names gvproxy's read-once DNS allowlist (thing 1)"
 has "$pin_out" "VM sizing (cpu/memory)"                     "…names VM sizing (thing 2)"
-hasnt "$pin_out" ".augur-env"                               "…does not name the ~/.augur-env credentials (each session pushes them)"
+hasnt "$pin_out" ".augur-env"                               "…does not name ~/.augur-env (each session pushes it again)"
 has "$pin_out" "augur down --macos && augur up --macos"     "…and states the same remedy as its profile-stale peer"
 has "$pin_out" "newly APPROVED domain stays unresolvable"   "…is honest that only WIDENING is blocked (DNS is the first gate)"
 
 section "Tier 1 — macOS: a credential that cannot be injected fails BEFORE anything is created"
 
 # Same asymmetry, other half. Container mode resolves and validates every credential before
-# `container run`, and macOS mode must too. Checked only at the ~/.augur-env writer — after
-# `augur-vm clone`, `augur-vm set`, `augur-vm run` and the SSH wait — that `exit 1` would tear
-# NOTHING down (unlike the SSH-timeout path right above it, which stops the VM, gvproxy and the
-# proxy). The operator would fix the value, re-run `up --macos`, and land on the already-running
-# branch tested above: a VM cloned, sized and booted for an `up` that failed, running with no
-# credentials until the fixed value is pushed.
+# `container run`, and macOS mode must too. Checked only after `augur-vm clone`, `augur-vm set`,
+# `augur-vm run` and the SSH wait, that `exit 1` would tear NOTHING down (unlike the SSH-timeout
+# path right above it, which stops the VM, gvproxy and the proxy). The operator would fix the
+# value, re-run `up --macos`, and land on the already-running branch tested above: a VM cloned,
+# sized and booted for an `up` that failed.
 #
 # The load-bearing assertion is therefore NOT the exit code — it is that the augur-vm CLI was never
 # invoked. Nothing was cloned, nothing was resized, nothing was booted.
@@ -327,8 +328,14 @@ has   "$current_body"   'exit 1' "container up's running path can refuse on drif
 running_branch="$(printf '%s\n' "$up_macos_body" | sed -n '/if macos_vm_running "\$project_vm"; then/,/^    fi$/p')"
 has "$running_branch" 'require_macos_egress_mode_current' "cmd_up_macos's already-running path refuses an egress-mode mismatch"
 # A credential that cannot be injected, or that cannot be delivered, is not a drift refusal: it
-# stops every path, running or not.
-if printf '%s\n' "$running_branch" | grep -v 'resolve_session_credentials || exit 1' | grep -v 'push_macos_guest_env "$project_vm" || exit 1' | grep -q 'exit 1'
+# stops every path, running or not. On this branch that is resolve_running_macos_vm_credentials
+# (which exits itself, from no line of the branch) and the push; so is a passed self-test that
+# cannot be recorded (refuse_running_macos_vm, which also exits itself). Any other `exit 1` would
+# be a drift refusal.
+has "$running_branch" 'resolve_running_macos_vm_credentials "$project_vm"' "cmd_up_macos's already-running path resolves through resolve_running_macos_vm_credentials"
+has "$(fn_body resolve_running_macos_vm_credentials)" 'refuse_running_macos_vm "$1"' "…which is where a credential that cannot be used stops it (refuse_running_macos_vm)"
+has "$(fn_body refuse_running_macos_vm)" 'exit 1' "…which exits"
+if printf '%s\n' "$running_branch" | grep -v 'disarm_macos_push_on_exit; (( _prc == 0 )) || exit 1' | grep -q 'exit 1'
 then fail "cmd_up_macos refuses on some other drift on the already-running path" "only the egress mode is a refusal"
 else ok "cmd_up_macos refuses on no other drift on the already-running path"; fi
 

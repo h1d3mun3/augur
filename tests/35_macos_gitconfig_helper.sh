@@ -4,8 +4,9 @@
 #
 # git_credential_env is the one definition of augur's helper: GIT_CONFIG_* env config holding an
 # empty helper value (which resets git's helper chain) and then augur's helper, which answers with
-# the REFERENCE `$GH_TOKEN`. macOS writes it into the guest's ~/.augur-env (push_macos_guest_env),
-# Container passes it as `container exec -e` (_add_session_exec_env). Pinned here, against REAL git:
+# the REFERENCE `$GH_TOKEN`. macOS exports it in the remote command of a session that sends GH_TOKEN
+# (macos_session_git_env_cmd, which ssh_macos_session puts in front of the shell), Container passes
+# it as `container exec -e` (_add_session_exec_env). Pinned here, against REAL git:
 #
 #   • git asks EVERY configured helper on `get` and calls `store` on every one after a successful
 #     push: macOS's system-level osxkeychain ("failed to store: -25308" over SSH, and a GH_TOKEN copy
@@ -14,12 +15,15 @@
 #     after the github.com section, an unconditional [include], an [includeIf "gitdir:"] matching the
 #     repository, and the repository's own .git/config. It must never be called while augur's helper
 #     answers with the token.
-#   • the guest sees the value literally: `$GH_TOKEN` survives the ~/.augur-env quoting and is only
+#   • the guest sees the value literally: `$GH_TOKEN` survives the export's quoting and is only
 #     expanded by the helper's shell, so the token is on no ssh argv and in no GIT_CONFIG_* value.
+#   • ~/.augur-env carries none of the set: a guest shell augur did not open (GUI Terminal, a
+#     hand-run ssh) has no GIT_CONFIG_*, even with a GH_TOKEN of its own, and git runs its own
+#     helpers there.
 #   • a github.com section an older augur wrote into the guest's ~/.gitconfig is harmless.
 #   • no host gh token → nothing is emitted in either mode, and ~/.gitconfig is never touched.
 #   • deliberately broken variants (no reset, reset after the helper, `$GH_TOKEN` expanded when the
-#     file is written or sourced) are each caught by the same probe, so the probe is not vacuous.
+#     export is built or run) are each caught by the same probe, so the probe is not vacuous.
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/.." && pwd)"
 source "$HERE/lib.sh"
 AUGUR="$REPO/augur"
@@ -54,23 +58,35 @@ KEY='credential.https://github.com.helper'
 TOKEN="ghp_hosttoken0123456789"
 
 # Stand-in for the guest: ssh runs its argv joined-and-parsed by the remote shell, so `bash -c` with
-# $HOME redirected at a throwaway guest home (and /Users/<user> mapped onto it) is faithful.
+# $HOME redirected at a throwaway guest home (and /Users/<user> mapped onto it) is faithful. The
+# guest's /etc/ssh maps onto GUEST_ETC, which holds the sshd drop-in a current base VM has, so the
+# push's acceptance check passes (tests/56 owns that check).
 GUEST_HOME=""
+GUEST_ETC="$TMPD/guest-etc"; mkdir -p "$GUEST_ETC/ssh/sshd_config.d"
+macos_session_accept_env_line "$(macos_session_env_names)" > "$GUEST_ETC/ssh/sshd_config.d/$(basename "$(macos_session_sshd_dropin)")"
 SSHLOG="$TMPD/sshlog"; ALL_SSH="$TMPD/all-ssh"; : > "$ALL_SSH"
+macos_ssh_transport_ok() { return 0; }   # the stub ssh_macos below needs no host or port
 ssh_macos() {
     local vm="$1"; shift
     local cmd="$*"
     printf '%s\n' "$cmd" | tee -a "$ALL_SSH" >> "$SSHLOG"
-    cmd="${cmd//\/Users\/${MACOS_SSH_USER}/$GUEST_HOME}"
+    cmd="${cmd//\/Users\/${MACOS_SSH_USER}/$GUEST_HOME}"; cmd="${cmd//\/etc\/ssh/$GUEST_ETC/ssh}"
     HOME="$GUEST_HOME" bash -c "$cmd"
 }
 GH_HOST_TOKEN=""
 gh() { [[ -n "$GH_HOST_TOKEN" ]] || return 1; printf '%s\n' "$GH_HOST_TOKEN"; }
 
-# Resolve the credentials and run the REAL push the way its callers do: inside `set -e`.
-wire() {   # wire <host gh token> — sets $out / $rc
-    : > "$SSHLOG"; GH_HOST_TOKEN="$1"
-    out="$( set -e; _creds=(); resolve_session_credentials; push_macos_guest_env testvm 2>&1 )"; rc=$?
+# Resolve the credentials and run the REAL push the way its callers do: inside `set -e`. Also sets
+# SESSION_ENV to what the session ssh then sends (ssh_macos_session): GH_TOKEN, when there is one;
+# and SESSION_PREFIX to git's helper exports the session's remote command carries
+# (macos_session_git_env_cmd), built from the same resolved credentials.
+wire() {   # wire <host gh token> — sets $out / $rc / SESSION_ENV / SESSION_PREFIX
+    : > "$SSHLOG"; : > "$TMPD/prefix"; GH_HOST_TOKEN="$1"
+    SESSION_ENV=(); [[ -n "$1" ]] && SESSION_ENV=("GH_TOKEN=$1")
+    out="$( set -e; _creds=(); resolve_session_credentials; push_macos_guest_env testvm 2>&1
+            macos_session_git_env_cmd 2>&1 > "$TMPD/prefix" )"; rc=$?
+    SESSION_PREFIX="$(cat "$TMPD/prefix")"
+    printf '%s\n' "$SESSION_PREFIX" >> "$ALL_SSH"     # it rides on the session ssh's argv
 }
 
 # A stand-in for osxkeychain or a host-path gh helper: answers nothing, logs every call.
@@ -110,13 +126,16 @@ EOF
     cp "$GUEST_HOME/.gitconfig" "$TMPD/guest-$1.gitconfig.orig"
 }
 
-# guest_sh <cmd> — a guest shell in the repository with the env exactly as a guest zsh gets it:
-# nothing inherited (env -i) except what ~/.zshenv sources, i.e. augur's ~/.augur-env. (bash stands
-# in for zsh: the file is plain `export NAME='value'` lines.) The system config is the fake-helper
-# file; GIT_TERMINAL_PROMPT=0 turns a would-be prompt into a failure.
+# guest_sh <cmd> — a guest shell in the repository with the env exactly as an augur session's gets
+# it: nothing inherited (env -i) except the session's GH_TOKEN, which sshd sets before the shell
+# starts (SESSION_ENV). sshd's shell sources ~/.zshenv (and through it augur's ~/.augur-env), runs
+# the session's remote command, whose exports (SESSION_PREFIX) come first, and the login zsh that
+# command starts sources ~/.zshenv again. (bash stands in for zsh: these are plain `export
+# NAME='value'` lines.) The system config is the fake-helper file; GIT_TERMINAL_PROMPT=0 turns a
+# would-be prompt into a failure.
 guest_sh() {
     env -i PATH="$PATH" HOME="$GUEST_HOME" GIT_CONFIG_SYSTEM="$SYSCONF" GIT_TERMINAL_PROMPT=0 \
-        bash -c 'source "$HOME/.zshenv" 2>/dev/null; cd "$1" && eval "$2"' _ "$REPO_DIR" "$1"
+        ${SESSION_ENV[@]+"${SESSION_ENV[@]}"} bash -c 'source "$HOME/.zshenv" 2>/dev/null; eval "$3"; source "$HOME/.zshenv" 2>/dev/null; cd "$1" && eval "$2"' _ "$REPO_DIR" "$1" "$SESSION_PREFIX"
 }
 cred_fill()    { guest_sh "printf 'protocol=https\nhost=github.com\n\n' | git credential fill" 2>&1; }
 cred_approve() {
@@ -144,7 +163,7 @@ probe_ok() {
     [[ "$P_FILL" == *"password=$TOKEN"* ]] || { echo "no-token-answer"; return; }
     [[ -z "$P_FAKE" ]]                     || { echo "fake-called"; return; }
     [[ "$P_VALUE1" == "${WANT_HELPER}" ]]  || { echo "value-not-literal"; return; }
-    grep -E '^export GIT_CONFIG_' "$GUEST_HOME/.augur-env" | grep -qF "$TOKEN" && { echo "token-in-git-config"; return; }
+    grep -qF "$TOKEN" <<<"$SESSION_PREFIX" && { echo "token-in-git-config"; return; }
     echo ok
 }
 
@@ -170,17 +189,18 @@ for _f in "$SYSCONF" "$GUEST_HOME/.config/git/config" "$GUEST_HOME/.gitconfig-in
 done
 eq "6" "$(store_calls "$GUEST_HOME")" "control: outside the repository the includeIf and repo helpers drop out (the gitdir: match is real)"
 
-section "Tier 1 — macOS: ~/.augur-env carries the reset and the helper, and git obeys it"
+section "Tier 1 — macOS: the session exports the reset and the helper, and git obeys it"
 
 mk_guest macos
 wire "$TOKEN"
-eq "0" "$rc" "the push returns 0"
+eq "0" "$rc" "the push and the session's exports are built"
 envf="$(cat "$GUEST_HOME/.augur-env")"
-has "$envf" "export GIT_CONFIG_COUNT='2'"                        "~/.augur-env exports GIT_CONFIG_COUNT=2"
-has "$envf" "export GIT_CONFIG_KEY_0='${KEY}'"                    "~/.augur-env: entry 0 is the github.com helper key"
-has "$envf" "export GIT_CONFIG_VALUE_0=''"                        "~/.augur-env: entry 0's value is the empty reset"
-has "$envf" "export GIT_CONFIG_KEY_1='${KEY}'"                    "~/.augur-env: entry 1 is the github.com helper key"
-has "$envf" "export GIT_CONFIG_VALUE_1='${WANT_HELPER}'"          "~/.augur-env: entry 1 is augur's helper, single-quoted"
+hasnt "$envf" "GIT_CONFIG_"                                         "~/.augur-env carries none of the GIT_CONFIG_* set"
+has "$SESSION_PREFIX" "export GIT_CONFIG_COUNT='2'; "               "the session exports GIT_CONFIG_COUNT=2"
+has "$SESSION_PREFIX" "export GIT_CONFIG_KEY_0='${KEY}'; "          "the session: entry 0 is the github.com helper key"
+has "$SESSION_PREFIX" "export GIT_CONFIG_VALUE_0=''; "              "the session: entry 0's value is the empty reset"
+has "$SESSION_PREFIX" "export GIT_CONFIG_KEY_1='${KEY}'; "          "the session: entry 1 is the github.com helper key"
+has "$SESSION_PREFIX" "export GIT_CONFIG_VALUE_1='${WANT_HELPER}'; " "the session: entry 1 is augur's helper, single-quoted"
 probe
 has "$P_FILL" "password=$TOKEN"         "macOS: augur's helper answers get with the token (from \$GH_TOKEN)"
 has "$P_FILL" "username=x-access-token" "macOS: …with the x-access-token username"
@@ -188,25 +208,42 @@ eq  "" "$P_FAKE"                        "macOS: the fake helper is called on nei
 eq  "$WANT_HELPER" "$P_VALUE1"          "macOS: the guest shell sees GIT_CONFIG_VALUE_1 literally (\$GH_TOKEN unexpanded)"
 eq  "1" "$(helper_runs)"                "macOS: git runs exactly one helper for get"
 eq  "ok" "$(probe_ok)"                  "macOS: the probe's verdict is ok"
+eq  "2" "$(guest_sh 'printf %s "${GIT_CONFIG_COUNT-}"')" "macOS: the session's shell has the GIT_CONFIG_* set"
+# A guest shell augur did not open (the VM's GUI Terminal, a hand-run ssh) runs no session exports:
+# it has none of the GIT_CONFIG_* set even with a GH_TOKEN of its own, so git keeps its own helpers
+# there instead of being reset.
+_saved_prefix="$SESSION_PREFIX"; SESSION_PREFIX=""
+eq "" "$(guest_sh 'env | grep -E "^GIT_CONFIG_(COUNT|KEY_|VALUE_)"')" "macOS: a shell augur did not open has no GIT_CONFIG_*, GH_TOKEN or not"
+_saved_session_env=("${SESSION_ENV[@]}"); SESSION_ENV=()
+probe
+hasnt "$P_FILL" "password=$TOKEN"       "macOS: such a shell without GH_TOKEN has no token to answer with"
+hasnt "$P_FILL" "username=x-access-token" "macOS: …and augur's helper does not answer at all (no empty password)"
+has "$P_FAKE" "get"                     "macOS: …so git asks the guest's own helpers"
+has "$P_FAKE" "store"                   "macOS: …and stores through them, as without augur"
+SESSION_ENV=("${_saved_session_env[@]}"); SESSION_PREFIX="$_saved_prefix"
 
-# The token: in ~/.augur-env only on its own GH_TOKEN line, and on no argv.
-eq "1" "$(grep -cF "$TOKEN" "$GUEST_HOME/.augur-env")" "the token appears once in ~/.augur-env…"
-eq "export GH_TOKEN='$TOKEN'" "$(grep -F "$TOKEN" "$GUEST_HOME/.augur-env")" "…on the GH_TOKEN line, never in a GIT_CONFIG_* value"
+# The token: nowhere in ~/.augur-env or the session's exports (the helper gets it from the session's
+# environment), and on no argv.
+hasnt "$envf" "$TOKEN" "the token is nowhere in ~/.augur-env"
+hasnt "$SESSION_PREFIX" "$TOKEN" "the token is in no GIT_CONFIG_* value the session exports"
+hasnt "$envf" "export GH_TOKEN=" "~/.augur-env exports no GH_TOKEN"
 if grep -qF "$TOKEN" "$ALL_SSH"; then fail "the token is on an ssh argv" "$(cat "$ALL_SSH")"
 else ok "the token is on no ssh argv"; fi
 [[ -s "$ALL_SSH" ]] && ok "control: the argv log is not empty" || fail "control: no ssh call was recorded"
-# augur leaves the copied ~/.gitconfig byte-identical: the helper lives only in ~/.augur-env.
+# augur leaves the copied ~/.gitconfig byte-identical: the helper lives only in the session's env.
 if cmp -s "$GUEST_HOME/.gitconfig" "$TMPD/guest-macos.gitconfig.orig"; then
     ok "macOS: the copied ~/.gitconfig is left byte-identical"
 else fail "macOS: the copied ~/.gitconfig was modified" "$(diff "$TMPD/guest-macos.gitconfig.orig" "$GUEST_HOME/.gitconfig")"; fi
 hasnt "$(cat "$SSHLOG")" "git config" "macOS: the push sends no git config command"
 
-# A GIT_CONFIG_* set the operator exports BEFORE augur's source line is replaced (the accepted
-# trade-off at git_credential_env).
+# A GIT_CONFIG_* set a guest startup file exports replaces augur's, reset included: the login zsh
+# the session starts sources it after augur's exports, and so does every zsh the agent starts for a
+# command (the accepted trade-off at git_credential_env, which says why the exports stay where
+# they are).
 { printf "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0='%s'\n" "$FAKE"
   cat "$GUEST_HOME/.zshenv"; } > "$GUEST_HOME/.zshenv.new" && mv "$GUEST_HOME/.zshenv.new" "$GUEST_HOME/.zshenv"
 probe
-eq "ok" "$(probe_ok)" "an operator GIT_CONFIG_* set exported before ~/.augur-env is replaced by augur's"
+eq "no-token-answer" "$(probe_ok)" "an operator GIT_CONFIG_* set in a guest startup file wins over augur's"
 
 section "Tier 1 — macOS: a github.com section an older augur left in ~/.gitconfig is harmless"
 
@@ -228,6 +265,7 @@ section "Tier 1 — no host gh token: nothing is emitted in either mode"
 mk_guest notoken
 wire ""
 eq "0" "$rc" "no gh token: the push returns 0"
+eq "" "$SESSION_PREFIX" "no gh token: the session exports no GIT_CONFIG_*"
 hasnt "$(cat "$GUEST_HOME/.augur-env")" "GIT_CONFIG_" "no gh token: ~/.augur-env carries no GIT_CONFIG_*"
 hasnt "$(cat "$GUEST_HOME/.augur-env")" "GH_TOKEN"    "no gh token: …and no GH_TOKEN"
 if cmp -s "$GUEST_HOME/.gitconfig" "$TMPD/guest-notoken.gitconfig.orig"; then
@@ -299,34 +337,35 @@ git_credential_env() {
     printf '%s\n' 'GIT_CONFIG_COUNT=2' "GIT_CONFIG_KEY_0=$KEY" 'GIT_CONFIG_VALUE_0=' "GIT_CONFIG_KEY_1=$KEY" \
         "GIT_CONFIG_VALUE_1=!f() { test \"\${1-}\" = get && echo username=x-access-token && echo \"password=$GH_TOKEN\"; }; f"
 }
-GH_TOKEN="$TOKEN" broken hostexp "\$GH_TOKEN expanded when ~/.augur-env is written" value-not-literal
-grep -E '^export GIT_CONFIG_' "$TMPD/guest-broken-hostexp/.augur-env" 2>/dev/null \
-    | grep -qF "$TOKEN" && ok "…and the token value did land in a GIT_CONFIG_* line (the hazard is real)" \
-    || fail "…the host-expansion variant did not put the token in ~/.augur-env (fixture is vacuous)"
+GH_TOKEN="$TOKEN" broken hostexp "\$GH_TOKEN expanded when the session's exports are built" value-not-literal
+grep -qF "$TOKEN" <<<"$SESSION_PREFIX" && ok "…and the token value did land in a GIT_CONFIG_* export (the hazard is real)" \
+    || fail "…the host-expansion variant did not put the token in the session's exports (fixture is vacuous)"
 
-# 4. `$GH_TOKEN` expanded when the guest SOURCES ~/.augur-env: the writer double-quotes the value.
+# 4. `$GH_TOKEN` expanded when the guest shell RUNS the export: the writer double-quotes the value.
 eval "$(printf '%s\n' "$real_export" | sed 's/='"'"'\${value}'"'"'/=\\"${value}\\"/')"
 [[ "$(declare -f macos_env_add_export)" != "$real_export" ]] \
     && ok "control: the writer was really mutated to double quotes" || fail "control: the sed did not change the writer"
-broken sourceexp "\$GH_TOKEN expanded when ~/.augur-env is sourced" no-token-answer
+broken runexp "\$GH_TOKEN expanded when the guest shell runs the export" no-token-answer
 
 eq "$real_gce" "$(declare -f git_credential_env)" "control: the real git_credential_env is restored"
-eq "$real_export" "$(declare -f macos_env_add_export)" "control: the real ~/.augur-env line writer is restored"
+eq "$real_export" "$(declare -f macos_env_add_export)" "control: the real export line writer is restored"
 
-section "Tier 1 — macOS: a value the single-quoted export cannot hold aborts the push before ssh"
+section "Tier 1 — macOS: a value the single-quoted export cannot hold stops the session before ssh"
 
-# refused <slug> <label> — wire with the current (unsafe) git_credential_env; the push must fail
-# with nothing sent and the guest's existing ~/.augur-env untouched.
+# refused <slug> <label> — wire with the current (unsafe) git_credential_env; building the session's
+# exports must fail, and the real ssh_macos_session must then return before it connects.
 refused() {
     mk_guest "refused-$1"; shift
-    printf '%s\n' 'export OLD=1' '# augur-env: end' > "$GUEST_HOME/.augur-env"
-    cp "$GUEST_HOME/.augur-env" "$TMPD/refused.orig"
     wire "$TOKEN"
-    [[ "$rc" != 0 ]] && ok "$1: the push fails" || fail "$1: the push returned 0" "$out"
+    [[ "$rc" != 0 ]] && ok "$1: building the session's exports fails" || fail "$1: building the session's exports returned 0" "$out"
     has "$out" "Refusing to" "$1: it says why"
-    [[ -s "$SSHLOG" ]] && fail "$1: an ssh call was made" "$(cat "$SSHLOG")" || ok "$1: no ssh call was made"
-    cmp -s "$GUEST_HOME/.augur-env" "$TMPD/refused.orig" && ok "$1: the guest's ~/.augur-env is unchanged" \
-        || fail "$1: the guest's ~/.augur-env changed"
+    eq "" "$SESSION_PREFIX" "$1: nothing is exported"
+    : > "$TMPD/connect"
+    ( _creds=("GH_TOKEN=$TOKEN")
+      _macos_ssh_cmd() { echo CONNECT >> "$TMPD/connect"; _ssh=(true); _ssh_dest=x; }
+      ssh_macos_session testvm -t "exec zsh -l" ) >/dev/null 2>&1
+    [[ "$?" != 0 ]] && ok "$1: the session fails" || fail "$1: the session returned 0"
+    eq "" "$(cat "$TMPD/connect")" "$1: the session ssh is never started"
     eval "$real_gce"
 }
 git_credential_env() {
@@ -351,9 +390,12 @@ section "Tier 1 — source guards"
 fn_body() { awk -v n="$1" '$0 ~ "^"n"\\(\\) \\{"{f=1} f{print} f&&/^}/{exit}' "$AUGUR"; }
 host_config_body="$(fn_body _add_host_config_run_args)"
 has   "$(fn_body _add_session_exec_env)" '< <(git_credential_env)'  "container sessions take the helper from git_credential_env"
-has   "$(fn_body push_macos_guest_env)"  '< <(git_credential_env)'  "the macOS ~/.augur-env push takes it from git_credential_env"
-eq    "3" "$(fn_body push_macos_guest_env | grep -c 'macos_env_add_export "$_kv" || return 1')" \
-      "the push writes the fixed env, the credentials and the git helper through macos_env_add_export, aborting on refusal"
+has   "$(fn_body macos_session_git_env_cmd)" '< <(git_credential_env)' "macOS sessions take it from git_credential_env"
+has   "$(fn_body macos_session_git_env_cmd)" 'macos_env_add_export "$_kv" || return 1' \
+      "…through macos_env_add_export, aborting on refusal"
+hasnt "$(fn_body macos_session_git_env_cmd)" '${_kv#*=}'  "…formatting no NAME=value pair itself"
+has   "$(fn_body ssh_macos_session)" '_git="$(macos_session_git_env_cmd)" || return 1' "a macOS session that cannot build them does not start"
+hasnt "$(fn_body push_macos_guest_env)" 'git_credential_env' "the macOS ~/.augur-env push writes no git helper"
 hasnt "$(fn_body push_macos_guest_env)"  '${_kv#*=}'  "the push formats no NAME=value pair itself"
 hasnt "$host_config_body" 'GIT_CONFIG_' "container \`run\` bakes no GIT_CONFIG_* (the helper is per session)"
 has   "$host_config_body" '.gitconfig:/home/dev/.gitconfig:ro' "container up mounts ~/.gitconfig READ-ONLY"

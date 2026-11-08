@@ -128,7 +128,7 @@ ssh_macos() {
         *"curl "*)                                     # everything else curl'd is an IP literal
             [[ "$G_IPLIT" == 1 ]] && return 0
             return 28 ;;
-        *"cat > "*".augur-env"*)                       # the credential push, which IS piped:
+        *"cat > "*".augur-env"*)                       # the ~/.augur-env push, which IS piped:
             cat >/dev/null; return 0 ;;                #   { … } | ssh_macos … "cat > ~/.augur-env"
         *".augur-env"*)                                # ANY OTHER command that merely NAMES it —
             return 0 ;;                                # notably `grep -q '.augur-env' ~/.zshenv ||
@@ -258,7 +258,7 @@ leak_case "guest unreachable over SSH" "egress cannot be VERIFIED"
 # The transport check must short-circuit: probing on regardless would report an isolated guest.
 eq "1" "$(wc -l < "$SSHLOG" | tr -d ' ')" "guest unreachable: exactly one attempt (the liveness check), then stop"
 
-section "Tier 1 — call site: the FRESH bring-up path (before the credentials, before the banner)"
+section "Tier 1 — call site: the FRESH bring-up path (before the guest wiring, before the banner)"
 
 require_vz()                    { :; }
 macos_vm_running()              { return 1; }                                  # take the bring-up path
@@ -270,7 +270,8 @@ start_gvproxy()                 { echo "start_gvproxy" >> "$LOG"; }
 resolve_macos_vm_cpu()          { echo 4; }
 resolve_macos_vm_memory_mb()    { echo 8192; }
 wait_for_macos_ssh()            { return 0; }
-ensure_macos_workspace()        { echo "wire:workspace" >> "$LOG"; }
+ensure_macos_workspace()        { echo "wire:workspace" >> "$LOG"; echo "MARK:wire" >> "$SSHLOG"; }
+macos_record_egress_verified()  { echo "record-verified $1" >> "$LOG"; }   # the record itself: tests/51
 ensure_macos_agent_projects()  { :; }
 ensure_macos_agent_agents()    { :; }
 ensure_macos_agent_profile()   { :; }
@@ -297,16 +298,22 @@ if [[ -n "$_st_at" && -n "$_up_at" && "$_st_at" -lt "$_up_at" ]]; then
 else
   fail "locked guest: the self-test does not precede the banner" "self-test@${_st_at:-none} banner@${_up_at:-none}"
 fi
-# …and before the credential injection. Both go through ssh_macos, so their ORDER in SSHLOG is the
-# assertion: a guest whose egress is not contained must not be handed an Anthropic or gh token.
+# …and before the guest wiring (ensure_macos_workspace first, marked in SSHLOG so the probes and it
+# are one ordering). The boot path's one ~/.augur-env push, the acceptance check's right after the
+# SSH wait, holds no credential and no GIT_CONFIG_* helper lines (tests/56 owns it), and there is no
+# other. (A session that boots the VM launches only after all of this, so its credentials follow the
+# self-test too; tests/56 asserts that a leaky guest gets no launch.)
+wiring_pushes() { grep -n ".augur-env" "$SSHLOG" | grep -v 'sshd_config\.d'; }
 _probe_at="$(grep -n "ping -c 1" "$SSHLOG" | head -n1 | cut -d: -f1)"
-_cred_at="$( grep -n ".augur-env" "$SSHLOG" | head -n1 | cut -d: -f1)"
-if [[ -n "$_probe_at" && -n "$_cred_at" && "$_probe_at" -lt "$_cred_at" ]]; then
-  ok "locked guest: every probe precedes the ~/.augur-env push (probe@$_probe_at < credentials@$_cred_at)"
+_wire_at="$(grep -nx "MARK:wire" "$SSHLOG" | head -n1 | cut -d: -f1)"
+if [[ -n "$_probe_at" && -n "$_wire_at" && "$_probe_at" -lt "$_wire_at" ]]; then
+  ok "locked guest: every probe precedes the guest wiring (probe@$_probe_at < wiring@$_wire_at)"
 else
-  fail "locked guest: the self-test does not precede the credential push" \
-       "probe@${_probe_at:-none} credentials@${_cred_at:-none}"
+  fail "locked guest: the self-test does not precede the guest wiring" \
+       "probe@${_probe_at:-none} wiring@${_wire_at:-none}"
 fi
+eq "" "$(wiring_pushes)" "locked guest: no ~/.augur-env push besides the acceptance check's"
+logged "record-verified $PV" && ok "locked guest: the pass is recorded" || fail "locked guest: the pass is not recorded"
 
 reset_guest; G_BADDNS=1
 up_macos
@@ -315,12 +322,10 @@ else fail "leaky guest: \`up --macos\` exited 0" "the bring-up continued past a 
 hasnt "$out" "is up." "leaky guest: the success banner is NEVER printed (this is the new failure mode)"
 if teardown_ran "$PV"; then ok "leaky guest: the VM, gvproxy AND the proxy are torn down (nothing stranded)"
 else fail "leaky guest: the teardown did not run" "log: [$(tr '\n' ' ' < "$LOG")]"; fi
-# The security point of running the self-test where it runs: no token ever reaches a leaky guest.
-if grep -q ".augur-env" "$SSHLOG"; then
-  fail "leaky guest: credentials were pushed anyway" "$(cat "$SSHLOG")"
-else
-  ok "leaky guest: ~/.augur-env is never written (no token enters an uncontained guest)"
-fi
+# The self-test ends the bring-up before any of the guest wiring, and records no pass.
+logged "wire:workspace" && fail "leaky guest: the guest wiring ran anyway" "$(cat "$LOG")" \
+  || ok "leaky guest: the guest wiring never runs (the bring-up ends at the self-test)"
+logged "record-verified $PV" && fail "leaky guest: a pass was recorded" || ok "leaky guest: no pass is recorded"
 
 # --no-egress has no allowlist to be locked to, so the self-test must not run — and must not be
 # able to fail a bring-up that never started gvproxy or the proxy.
@@ -340,7 +345,7 @@ macos_record_egress_mode       # booted with egress on (the --no-egress run abov
 reset_guest
 up_macos
 eq "0" "$rc" "already-running + locked: still returns 0 (same egress mode ⇒ no refusal)"
-has "$out" "reconciling host-side state and refreshing credentials" "already-running: the reconcile branch was taken (control)"
+has "$out" "reconciling host-side state and refreshing the guest's environment" "already-running: the reconcile branch was taken (control)"
 has "$out" "Egress self-test passed"          "already-running: I1's tripwire fires on this path too"
 if logged "start_proxy 127.0.0.1"; then ok "already-running: the proxy is still revived first (the self-test verifies THAT)"
 else fail "already-running: start_proxy was not called" "log: [$(tr '\n' ' ' < "$LOG")]"; fi
@@ -362,31 +367,37 @@ section "Tier 1 — source guards: the wiring is pinned where behaviour cannot s
 up_macos_body="$(awk '/^cmd_up_macos\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
 selftest_fn="$(awk '/^verify_macos_egress_locked\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
 
-# Position in the source, not just its effect: an edit that moves the call below the credential
-# writer or the banner must fail here too. (grep -n indexes within the extracted function body.)
+# Position in the source, not just its effect: an edit that moves the call below the guest wiring
+# or the banner must fail here too. (grep -n indexes within the extracted function body.)
 v_at="$(printf  '%s\n' "$up_macos_body" | grep -n 'verify_macos_egress_locked "\$project_vm"' | tail -n1 | cut -d: -f1)"
-env_at="$(printf '%s\n' "$up_macos_body" | grep -n 'push_macos_guest_env "\$project_vm"' | tail -n1 | cut -d: -f1)"
+env_at="$(printf '%s\n' "$up_macos_body" | grep -n '^    ensure_macos_workspace "\$project_vm"' | head -n1 | cut -d: -f1)"
 ban_at="$(printf '%s\n' "$up_macos_body" | grep -n "success \"VM '"           | head -n1 | cut -d: -f1)"
 ssh_at="$(printf '%s\n' "$up_macos_body" | grep -n '^ *wait_for_macos_ssh '   | head -n1 | cut -d: -f1)"
 if [[ -n "$v_at" && -n "$env_at" && -n "$ban_at" && -n "$ssh_at" \
       && "$ssh_at" -lt "$v_at" && "$v_at" -lt "$env_at" && "$v_at" -lt "$ban_at" ]]; then
-  ok "macOS up self-tests AFTER the SSH wait and BEFORE the credentials/banner (ssh@$ssh_at < test@$v_at < env@$env_at, banner@$ban_at)"
+  ok "macOS up self-tests AFTER the SSH wait and BEFORE the guest wiring/banner (ssh@$ssh_at < test@$v_at < wiring@$env_at, banner@$ban_at)"
 else
-  fail "macOS up does not self-test between the SSH wait and the credential push" \
-       "ssh@${ssh_at:-none} test@${v_at:-none} env@${env_at:-none} banner@${ban_at:-none}"
+  fail "macOS up does not self-test between the SSH wait and the guest wiring" \
+       "ssh@${ssh_at:-none} test@${v_at:-none} wiring@${env_at:-none} banner@${ban_at:-none}"
 fi
 if printf '%s\n' "$up_macos_body" | sed -n '/already running/,/^    fi$/p' | grep -q 'verify_macos_egress_locked'; then
   ok "the already-running branch calls the self-test (I1 says every \`up\`, and container mode does)"
 else
   fail "the already-running branch skips the self-test" "I1's tripwire would not fire on that path"
 fi
-# The teardown must name all three, in the shape the SSH-timeout path above it already uses.
-printf '%s\n' "$selftest_fn" | grep -q '"\$VM_CLI" stop "\$vm"' \
-  && ok "the self-test's teardown stops the VM"    || fail "the self-test's teardown does not stop the VM"
-printf '%s\n' "$selftest_fn" | grep -q '^ *stop_gvproxy$' \
-  && ok "the self-test's teardown stops gvproxy"   || fail "the self-test's teardown does not stop gvproxy"
-printf '%s\n' "$selftest_fn" | grep -q '^ *stop_proxy$' \
-  && ok "the self-test's teardown stops the proxy" || fail "the self-test's teardown does not stop the proxy"
+# The teardown goes through stop_unverified_macos_vm, the one teardown for a VM whose containment
+# is unproven, and that must name all three.
+stop_fn="$(awk '/^stop_unverified_macos_vm\(\) \{/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
+printf '%s\n' "$selftest_fn" | grep -q '^ *stop_unverified_macos_vm "\$vm"$' \
+  && ok "the self-test's teardown is stop_unverified_macos_vm" || fail "the self-test's teardown does not call stop_unverified_macos_vm"
+printf '%s\n' "$stop_fn" | grep -q '"\$VM_CLI" stop "\$1"' \
+  && ok "the teardown stops the VM"    || fail "the teardown does not stop the VM"
+printf '%s\n' "$stop_fn" | grep -q '^ *stop_gvproxy$' \
+  && ok "the teardown stops gvproxy"   || fail "the teardown does not stop gvproxy"
+printf '%s\n' "$stop_fn" | grep -q '^ *stop_proxy$' \
+  && ok "the teardown stops the proxy" || fail "the teardown does not stop the proxy"
+printf '%s\n' "$stop_fn" | grep -qF 'rm -f "$(macos_egress_verified_file)"' \
+  && ok "the teardown drops the record of a passed self-test" || fail "the teardown keeps the record of a passed self-test"
 # The positive half must target a MANAGED-BASELINE domain: the already-running path warns that
 # gvproxy snapshots its DNS allowlist at boot, so a project-conf domain could be allowlisted
 # host-side and still unresolvable in a live guest — a false leak that tears down a working VM.

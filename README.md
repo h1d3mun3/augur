@@ -326,8 +326,18 @@ start it unfiltered).
 ### Authentication
 
 On macOS, Claude Code stores its OAuth login in the Keychain, which is unreadable over SSH and
-absent from a freshly cloned VM. So macOS mode injects a credential through the environment
-on every `augur up --macos`, `augur claude --macos` and `augur shell --macos`, whether it boots the VM or finds it running (the same way it does for the GitHub token), so a changed credential reaches the next session without a VM restart:
+absent from a freshly cloned VM. So macOS mode injects a credential through the environment of
+each `augur claude --macos` / `augur shell --macos` session, resolved afresh every time (the same
+way it does for the GitHub token), so a changed credential reaches the next session without a VM
+restart. The values travel as the session's SSH environment (OpenSSH `SendEnv`, accepted by the
+guest's sshd for exactly these names) and are never written to the guest's disk; `augur up --macos`
+alone hands the guest no credential. A project VM cloned from a base VM built before this needs
+recreating from an updated base: run `augur update --macos` (skip it if the base is already up to
+date), then `augur destroy --macos && augur up --macos` in the project directory. Until then `up`,
+`claude` and `shell --macos` refuse with that remedy rather than start without credentials (a VM
+one of them booted for the refusal is stopped again, its clone kept). A session whose credentials do
+not arrive in the guest (its sshd dropped them) is refused the same way before the agent or shell
+starts:
 
 - `CLAUDE_CODE_OAUTH_TOKEN` — subscription token; either set the env var / save it to
   `~/.claude_code_oauth_token`, or run **`augur setup-token --macos`**: it runs `claude setup-token`
@@ -364,7 +374,7 @@ warning, not a failed `up`. See
 | Path | Description |
 |------|-------------|
 | Current directory | exposed at `~/workspace-<project>` in the VM (read/write, virtiofs auto-mount) |
-| `~/.gitconfig` | **copied** on VM start (unlike container mode, which mounts it read-only). augur does not edit the guest's copy: its GitHub credential helper (which makes HTTPS `git push` work off `GH_TOKEN`) goes into `~/.augur-env` as `GIT_CONFIG_*` env vars, as in container mode, and resets git's helper chain first, so no helper from your file, Apple git's system `osxkeychain` or a repository's own config is asked for `github.com`. Without a host gh token none of this is set. Your host file is never modified. |
+| `~/.gitconfig` | **copied** on VM start (unlike container mode, which mounts it read-only). augur does not edit the guest's copy: its GitHub credential helper (which makes HTTPS `git push` work off `GH_TOKEN`) is exported as `GIT_CONFIG_*` env vars by each `augur claude --macos` / `augur shell --macos` session, as in container mode, and resets git's helper chain first, so no helper from your file, Apple git's system `osxkeychain` or a repository's own config is asked for `github.com`. They exist only in those sessions' shells; the VM's GUI Terminal or an `ssh` you run by hand keeps git's own helpers. Without a host gh token none of this is set. Your host file is never modified. |
 | `~/.config/gh/` | **not shared**, as in Container mode. `gh` works off the injected `GH_TOKEN` alone; see [API keys and authentication](#api-keys-and-authentication) for why the host's gh config stays on the host. (A share would also be inert here: it would land under `/Volumes/My Shared Files/` and nothing wires it to `~/.config/gh` inside the VM.) |
 | Claude history | **only this project's** history is shared, in a per-VM isolated dir (`~/.augur/claude-projects/<vm>`), so other projects' transcripts stay invisible. History is not shared across modes, so a container session can't be resumed in the macOS VM or vice versa. |
 | Claude auth | **not** shared — injected via env (the macOS Keychain is unreadable over SSH; see above) |
@@ -679,10 +689,11 @@ In Container mode, credentials are injected per session: each `augur claude` / `
 resolves them afresh, so a rotated key or token takes effect on the next session with no
 container recreate. A session already running keeps the value it started with. `augur
 setup-token` runs with **no** credentials injected (it exists to mint one), and neither does a
-`container exec` you run by hand outside augur. In macOS VM mode they are rewritten into the
-guest's `~/.augur-env` by every `augur up --macos`, `augur claude --macos` and `augur shell --macos`,
-whether it boots the VM or finds it running, so a rotated key or token likewise reaches the next
-session with no VM restart; a guest shell already open keeps the values it started with.
+`container exec` you run by hand outside augur. macOS VM mode works the same way: each
+`augur claude --macos` / `augur shell --macos` session gets them as its SSH environment, so a
+rotated key or token reaches the next session with no VM restart, a session already open keeps the
+values it started with, and an `ssh` into the guest outside augur gets none. Nothing writes them to
+the guest's disk.
 
 **GitHub CLI:**
 

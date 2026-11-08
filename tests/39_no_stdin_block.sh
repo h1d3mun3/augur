@@ -3,7 +3,7 @@
 #
 # THE BUG THIS EXISTS FOR (measured, not hypothetical):
 #
-# augur pushes credentials by piping into the guest (push_macos_guest_env):
+# augur pushes the guest's ~/.augur-env by piping it into the guest (push_macos_guest_env):
 #     printf '%s\n' "$_content" | ssh_macos "$vm" "… cat > ~/.augur-env.tmp.$$ … mv …"
 # while other guest commands merely NAME that file, unpiped — macos_scrub_augur_credentials'
 #     ssh_macos "$vm" "rm -f ~/.augur-env ~/.gitconfig && …"
@@ -46,7 +46,7 @@ found=0
 for f in "$HERE"/[0-9][0-9]_*.sh; do
     b="$(basename "$f")"
     [[ "$b" == "$SELF" ]] && continue
-    grep -q 'augur-env' "$f" || continue          # not a credential-push stubber; nothing to guard
+    grep -q 'augur-env' "$f" || continue          # not an ~/.augur-env-push stubber; nothing to guard
     found=$((found + 1))
 
     ( AUGUR_TEST_LIVE=0 bash "$f" >/dev/null 2>&1 < "$FIFO_DIR/stdin.fifo" ) &
@@ -68,7 +68,7 @@ if (( found == 0 )); then
     fail "at least one candidate was checked" \
          "no offline test mentions .augur-env — the discovery rule has drifted from the code and this guard is now vacuous"
 else
-    ok "discovery found $found credential-push stubber(s) to check (the guard is not vacuous)"
+    ok "discovery found $found ~/.augur-env-push stubber(s) to check (the guard is not vacuous)"
 fi
 
 finish

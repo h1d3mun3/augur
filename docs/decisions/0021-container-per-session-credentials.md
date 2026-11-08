@@ -3,8 +3,10 @@
 - **Status:** Accepted. Amends [`0010`](./0010-container-persistence.md) — its rationale that
   credentials are baked at `run` and fingerprinted so a rotated token recreates the container.
 - **Date:** 2026-09-24.
-- **Applies to:** Apple Container mode only. macOS VM mode (`~/.augur-env` over SSH stdin) is
-  unchanged.
+- **Applies to:** Apple Container mode only; macOS VM mode is out of scope here (see the
+  amendment below).
+  - *Amendment (2026-11-07):* macOS VM mode now delivers credentials per session too, as the
+    session ssh's environment; see [`0023`](./0023-macos-per-session-credentials.md).
 
 ## Decision
 
@@ -29,6 +31,9 @@ injected per session instead, only on the `container exec` that starts `augur cl
     which macOS VM mode writes into `~/.augur-env` as well. The empty entry relies on the CLI
     passing `-e GIT_CONFIG_VALUE_0=` through as set-and-empty (the explicit-empty `K=` semantics
     cited for the 1.0.0 minimum below); `tests/21_container_live.sh` checks it in a real container.
+    - *Amendment (2026-11-08):* macOS VM mode exports the set in the remote command of each
+      `claude` / `shell --macos` session that sends `GH_TOKEN` instead of writing it into
+      `~/.augur-env`; see [`0023`](./0023-macos-per-session-credentials.md).
 - **Validation** (`validate_resolved_credentials` / `validate_secret_value`) runs at session
   start, before the `exec`.
   - *Amendment (2026-11-07):* resolution and validation now live in `resolve_session_credentials`,

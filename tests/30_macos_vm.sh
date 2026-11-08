@@ -103,7 +103,7 @@ has   "$build_macos_body" "${_devdir}'\\'' >> ~/.zshenv"   "macOS build pins DEV
 hasnt "$build_macos_body" "${_devdir}'\\'' >> ~/.zprofile" "macOS build does not pin DEVELOPER_DIR in ~/.zprofile (login shells only)"
 has   "$push_env_fn"      "_content+='${_devdir}'"            "macOS ~/.augur-env push writes DEVELOPER_DIR (heals clones of an older base VM)"
 has   "$push_env_fn"      'for _kv in $(agent_fixed_env)'   "macOS ~/.augur-env push writes the agent's fixed env (every guest session, not just the launch)"
-has   "$up_macos"         'push_macos_guest_env "$project_vm"' "macOS up pushes ~/.augur-env (push_macos_guest_env)"
+has   "$up_macos"         'push_macos_guest_env_retrying "$project_vm"' "macOS up pushes ~/.augur-env (push_macos_guest_env_retrying)"
 has "$up_macos" 'if $_fresh_clone; then'         "macOS .claude.json seed overwrites unconditionally on a fresh clone"
 
 # Base-VM account-state scrub: the base VM is long-lived and mutable, so a human can

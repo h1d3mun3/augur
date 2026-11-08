@@ -9,7 +9,8 @@
 #   • the password is on no `ssh` argv, and arrives as the first line of ssh's stdin;
 #   • the stdin-forwarding wrappers really forward (no `-n`), and ssh_macos_provision keeps `-n`
 #     (its manifest loop depends on it);
-#   • a source guard: every `sudo -S` in augur is fed by macos_admin_password_stdin, and the
+#   • a source guard: every `sudo -S` in augur is fed by macos_admin_password_stdin (alone, or
+#     followed by a root script in macos_run_root_script), and the
 #     password is never interpolated into anything but the askpass helper file.
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/.." && pwd)"
 source "$HERE/lib.sh"
@@ -55,7 +56,7 @@ ssh() {
     if (( no_stdin )); then : > "$LOG/$n.stdin"; else cat > "$LOG/$n.stdin"; fi
     local cmd="${!#}"
     case "$cmd" in
-        *"sudo -S -p ''"*)
+        *"sudo -S -p ''"* | *"sudo -S -k -p ''"*)
             if [[ "$(head -n1 "$LOG/$n.stdin")" == "$GUEST_PW" ]]; then
                 [[ "$cmd" == *"/bin/date -u"* ]] && : > "$TMPD/clock-set"
                 [[ "$cmd" == *"-settimezone"*  ]] && : > "$TMPD/tz-set"
@@ -68,7 +69,7 @@ ssh() {
 reset_log() { rm -f "$LOG"/* "$TMPD/clock-set" "$TMPD/tz-set"; }
 n_calls()   { find "$LOG" -name '*.argv' | wc -l | tr -d ' '; }
 # The one recorded call whose remote command runs `sudo -S` (its number), or empty.
-sudo_call() { grep -l "sudo -S -p ''" "$LOG"/*.argv 2>/dev/null | head -n1 | sed 's#.*/##; s#\.argv$##'; }
+sudo_call() { grep -lE "sudo -S (-k )?-p ''" "$LOG"/*.argv 2>/dev/null | head -n1 | sed 's#.*/##; s#\.argv$##'; }
 
 # check_site NAME — the recorded `sudo -S` call carried the password on stdin and on no argv.
 check_site() {
@@ -131,6 +132,20 @@ eq "2" "$(n_calls)" "managed policy: stage + privileged move (two calls)"
 has "$(cat "$LOG/1.stdin")" "DISABLE_AUTOUPDATER" "managed policy: the JSON still travels on the staging call's stdin"
 check_site "managed policy"
 
+section "Tier 1 — macos_run_root_script (the session-env sshd drop-in's install and re-check)"
+reset_log
+macos_run_root_script testvm 'echo root-script-ran' >/dev/null 2>&1; rc=$?
+eq "0" "$rc" "root script: succeeded against a sudo that reads stdin"
+eq "1" "$(n_calls)" "root script: one ssh connection, nothing staged first"
+eq "$MACOS_ROOT_SCRIPT_BEGIN" "$(sed -n 2p "$LOG/1.stdin")" "root script: the marker follows the password line"
+eq "echo root-script-ran" "$(sed -n 3p "$LOG/1.stdin")" "root script: the script follows the marker"
+check_site "root script"
+GUEST_PW="some-other-password"; reset_log
+macos_run_root_script testvm 'true' >/dev/null 2>&1; rc=$?
+GUEST_PW="$SECRET"
+if [[ "$rc" -ne 0 ]]; then ok "root script, wrong password: reports failure to the caller"
+else fail "root script, wrong password: returned 0"; fi
+
 section "Tier 1 — select_macos_full_xcode"
 reset_log
 select_macos_full_xcode testvm >/dev/null 2>&1; rc=$?
@@ -167,14 +182,23 @@ _interp="$(printf '%s\n' "$code" | grep -F '$(macos_admin_password ' \
 eq "" "$_interp" "the admin password is read nowhere else"
 # Every `sudo -S` code line is fed by the helper, on the same line or the line before it, for the
 # same VM the ssh wrapper connects to.
+# macos_run_root_script feeds sudo the password and then its script, from one brace group:
+#   { macos_admin_password_stdin "$vm" && printf … ; } \
+#       | ssh_macos "$vm" "sudo -S -k -p '' …"
+feeds_root_script() {   # feeds_root_script <line> <previous line>
+    [[ "$2" =~ ^\ *\{\ macos_admin_password_stdin\ (\"\$[A-Za-z_]+\")\ \&\&\ printf\  ]] || return 1
+    local v="${BASH_REMATCH[1]}"
+    [[ "$1" =~ ^\ *\|\ ssh_macos\ (\"\$[A-Za-z_]+\")\ \"sudo\ -S\  ]] && [[ "${BASH_REMATCH[1]}" == "$v" ]]
+}
 feeds_same_vm() {
     [[ "$1" =~ macos_admin_password_stdin\ (\"\$[A-Za-z_]+\")\ \|\ ssh_macos[a-z_]*\ (\"\$[A-Za-z_]+\") ]] \
         && [[ "${BASH_REMATCH[1]}" == "${BASH_REMATCH[2]}" ]]
 }
 _bad=""; _prev=""; _sites=0
 while IFS= read -r _line; do
-    if feeds_same_vm "$_line"; then _sites=$(( _sites + 1 )); fi
-    if [[ "$_line" == *"sudo -S"* ]] && ! feeds_same_vm "$_line" && ! feeds_same_vm "$_prev"; then
+    if feeds_same_vm "$_line" || feeds_root_script "$_line" "$_prev"; then _sites=$(( _sites + 1 )); fi
+    if [[ "$_line" == *"sudo -S"* ]] && ! feeds_same_vm "$_line" && ! feeds_same_vm "$_prev" \
+          && ! feeds_root_script "$_line" "$_prev"; then
         _bad+="$_line"$'\n'
     fi
     _prev="$_line"
@@ -182,6 +206,6 @@ done <<< "$code"
 eq "" "$_bad" "every \`sudo -S\` is fed by macos_admin_password_stdin for the same VM, piped into an ssh_macos* wrapper"
 eq "0" "$(printf '%s\n' "$code" | grep -cE 'macos_admin_password_stdin "[^"]*" \| ssh_macos_provision "')" \
     "the password is never piped into ssh_macos_provision (its -n would drop it; use ssh_macos_provision_stdin)"
-eq "9" "$_sites" "nine sudo -S call sites use the helper (build sudoers, manual-flow auto-login, provisioning, managed policy, xcode-select, clock, timezone, guest session, guest poweroff)"
+eq "10" "$_sites" "ten sudo -S call sites use the helper (build sudoers, manual-flow auto-login, provisioning, managed policy, session-env sshd drop-in, xcode-select, clock, timezone, guest session, guest poweroff)"
 
 finish
