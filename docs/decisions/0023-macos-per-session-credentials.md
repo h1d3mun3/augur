@@ -78,13 +78,16 @@ That kept them off argv, but:
   script, where an unknown command would print it. The marker is a shell comment. A wrong password
   fails sudo, and no line of the script runs. The password stays on no argv. The base VM's managed
   agent policy (`install_macos_managed_settings`) is installed the same way, for the same reason:
-  its payload travels base64-encoded in a quoted heredoc inside the root script. Root makes the
-  target directory root:wheel 755, removes (and names) every entry in it that is not owned by root,
-  is a symlink, or is writable by group or others, since Claude Code reads other managed files from
-  that directory too, then renames a root-owned temp file over the target. A symlinked directory, or
-  a target that is still not a regular file (a root-owned directory `mv` would put the file inside),
-  is tampering only root could cause: the build or update stops without saving the base VM. Other
-  failures of this install stay best effort. Before connecting, `macos_run_root_script` refuses a
+  its payload travels base64-encoded inside the root script. The policy directory is wholly
+  augur's in the base VM (Claude Code reads other managed files from it), so it is never edited in
+  place: root builds a fresh root:wheel 755 directory next to it, ACL stripped (`chmod -N`), holding
+  only the policy file (root:wheel 644, no ACL), checks both, moves whatever is at the old path (a
+  directory, a file, a symlink) into a 700 quarantine under `/var/root` that no other user can
+  traverse, renames the fresh directory into place, checks it again and removes the quarantine.
+  Nothing a non-root user put in or on the old directory (entries, hard links, ACLs) survives, and
+  anything else there, root's own included, is discarded with it. Any failure of this install is
+  fatal: the build or update stops without saving the base VM, so no clone inherits a missing or
+  old policy. Before connecting, `macos_run_root_script` refuses a
   VM with no stored admin password or no SSH transport, and it keeps the guest's stderr apart from
   augur's own messages, so only guest text is shown as such.
 - **The drop-in is checked again last.** Homebrew, the agent installer and custom provisioning
