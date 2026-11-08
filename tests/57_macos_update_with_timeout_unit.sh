@@ -48,8 +48,9 @@ timed() {
   local p=$!
   while kill -0 "$p" 2>/dev/null && (( $(now_ms) - t0 < cap * 1000 )); do sleep 0.1; done
   dt=$(( $(now_ms) - t0 ))
-  if kill -0 "$p" 2>/dev/null; then kill -KILL "$p" 2>/dev/null; dt=$(( cap * 1000 )); fi
-  wait "$p" 2>/dev/null
+  # A reader still open at CAP means something holds the pipe: cut it off, and kill what is
+  # ours so a broken helper cannot hang this script (the result is a failure either way).
+  if kill -0 "$p" 2>/dev/null; then kill -KILL "$p" 2>/dev/null; dt=$(( cap * 1000 )); reap; fi
   # The helper may still be running when its reader was cut off; wait for its status briefly.
   local i; for i in 1 2 3 4 5 6 7 8 9 10; do [[ -s "$WORK/rc" ]] && break; sleep 0.2; done
   out="$(cat "$WORK/out" 2>/dev/null)"; rc="$(cat "$WORK/rc" 2>/dev/null)"
