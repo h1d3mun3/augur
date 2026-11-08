@@ -133,7 +133,7 @@ hasnt "$bin_fn" "codesign"   "no signature check at plain claude launch (a proje
   ensure_macos_agent_profile() { :; }; warn_if_macos_egress_pinned() { :; }
   # The ~/.augur-env push (its guest command holds a `touch -t`) succeeds; the binary probe says missing.
   ssh_macos() { [[ "$*" == *".augur-env"* ]] && { cat >/dev/null; return 0; }; [[ "$*" == *" -t "* ]] && { echo AGENT_LAUNCHED; return 0; }; echo missing; }
-  macos_ssh_resolve() { _ssh_for="$1"; }   # the stub ssh_macos above needs no host or port
+  macos_ssh_pin() { :; }   # the stub ssh_macos above needs no host or port
   out="$( set -e; cmd_claude_macos 2>&1 )"; rc=$?
   [[ "$rc" -ne 0 ]] && ok "claude --macos with no binary: exits non-zero" || fail "claude --macos with no binary: exit 0"
   hasnt "$out" "AGENT_LAUNCHED" "claude --macos with no binary: nothing is launched"

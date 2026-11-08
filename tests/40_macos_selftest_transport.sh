@@ -201,6 +201,32 @@ if [[ $rc -eq 0 && "$(wc -l < "$TMPD/resolves" | tr -d ' ')" == "1" && "$(wc -l 
   ok "the self-test resolves the transport once for all its probes"
 else fail "the self-test resolves the transport once for all its probes" "rc=$rc resolves=$(wc -l < "$TMPD/resolves") probes=$(wc -l < "$SSHLOG")"; fi
 eval "macos_ssh_host() $(declare -f _real_host | tail -n +2)"
+[[ -z "$_MACOS_SSH_PIN_VM" ]] && ok "the self-test unpins the transport when it is done" || fail "the self-test left a pinned transport" "$_MACOS_SSH_PIN_VM"
+# A failing self-test exits; what is pinned at that exit is what an EXIT trap's push would see.
+( trap 'printf "pin=[%s]" "$_MACOS_SSH_PIN_VM" > "$TMPD/pin-at-exit"' EXIT; G_SSH_OK=0; verify_macos_egress_locked testvm >/dev/null 2>&1 ); _pin_at_exit="$(cat "$TMPD/pin-at-exit")"
+eq "pin=[]" "$_pin_at_exit" "…also when the self-test fails (nothing is pinned at its exit)"
+
+section "The pinned transport is explicit: a caller's own \`_ssh\` cannot redirect ssh_macos"
+G_GVPROXY=1 G_VMIP="" G_SSH_OK=1
+# A helper that declares its own `_ssh` / `_ssh_dest` (as ssh_macos_session does) and calls ssh_macos.
+helper_with_own_ssh() { local _ssh=(false) _ssh_dest="nobody@nowhere"; ssh_macos testvm "${pp_probe} true"; }
+pp_probe='export PATH=/usr/bin:/bin:/usr/sbin:/sbin;'
+: > "$SSHLOG"; ( helper_with_own_ssh ) >/dev/null 2>&1; _hrc=$?
+eq 0 "$_hrc" "unpinned: ssh_macos ignores the caller's own _ssh and resolves its transport"
+eq 1 "$(grep -c ' true$' "$SSHLOG")" "…and runs the command over it"
+: > "$SSHLOG"; ( macos_ssh_pin testvm; G_GVPROXY=0; helper_with_own_ssh ) >/dev/null 2>&1; _hrc=$?
+eq 0 "$_hrc" "pinned: ssh_macos uses the pin, not the caller's _ssh (and resolves nothing, gvproxy gone)"
+eq 1 "$(grep -c ' true$' "$SSHLOG")" "…and runs the command over it"
+: > "$SSHLOG"; ( macos_ssh_pin othervm 2>/dev/null; G_GVPROXY=0; helper_with_own_ssh ) >/dev/null 2>&1; _hrc=$?
+[[ "$_hrc" -ne 0 ]] && ok "a pin for another VM is not used for this one" || fail "a pin for another VM was used"
+
+section "_macos_ssh_cmd fails closed on any status from the transport build"
+: > "$SSHLOG"
+mech4="$( macos_ssh_build() { return 3; }; set -e; ssh_macos testvm true 2>&1; echo REACHED-NEXT-LINE )"
+if [[ "$mech4" == *"Cannot build the SSH transport for 'testvm'"* && "$mech4" != *REACHED-NEXT-LINE* ]]; then
+  ok "an unexpected build status (3) exits with a generic error"
+else fail "an unexpected build status (3) did not exit closed" "got '$mech4'"; fi
+[[ ! -s "$SSHLOG" ]] && ok "…before any ssh" || fail "an ssh ran after a failed transport build" "$(cat "$SSHLOG")"
 
 section "Host resolves but SSH then fails — the older branch, unchanged"
 

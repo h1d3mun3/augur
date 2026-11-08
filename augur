@@ -1000,40 +1000,58 @@ macos_admin_password_stdin() {
     printf '%s\n' "$password"
 }
 
-# Run ssh to VM $1 with the remaining arguments. It uses the transport the caller resolved for that
-# VM (macos_ssh_resolve, which sets `_ssh_for`), and otherwise resolves its own, exiting when it
+# Run ssh to VM $1 with the remaining arguments, over the transport pinned for that VM
+# (macos_ssh_pin) when there is one, and otherwise over one it resolves itself, exiting when it
 # cannot (_macos_ssh_cmd).
 ssh_macos() {
-    local vm="$1"; shift
-    if [[ "${_ssh_for:-}" != "$vm" ]]; then
-        local _ssh=() _ssh_dest="" _ssh_for=""
+    local vm="$1" _ssh=() _ssh_dest=""; shift
+    if [[ -n "$_MACOS_SSH_PIN_VM" && "$_MACOS_SSH_PIN_VM" == "$vm" ]]; then
+        _ssh=("${_MACOS_SSH_PIN_CMD[@]}"); _ssh_dest="$_MACOS_SSH_PIN_DEST"
+    else
         _macos_ssh_cmd "$vm"
     fi
     "${_ssh[@]}" "$_ssh_dest" "$@"
 }
 
-# macos_ssh_resolve for ssh_macos and ssh_macos_session, exiting 1, after an error naming what could
-# not be resolved, before any connection is made. It does not return then, so the augur run ends
-# there. Deliberately an exit: most ssh_macos callers rely on it to abort the operation. Inside
-# `$( … )` or a pipeline, though, that exit ends only the subshell and looks like a remote command's
-# status 1, so a caller that must tell "no way to reach the VM" from a failed remote command calls
-# macos_ssh_resolve itself first, and its ssh_macos calls then reuse that transport. Once both
-# resolve, nothing here exits.
+# macos_ssh_build for ssh_macos and ssh_macos_session, exiting 1, after an error naming what could
+# not be resolved, on any failure, before any connection is made. It does not return then, so the
+# augur run ends there. Deliberately an exit: most ssh_macos callers rely on it to abort the
+# operation. Inside `$( … )` or a pipeline, though, that exit ends only the subshell and looks like
+# a remote command's status 1, so a caller that must tell "no way to reach the VM" from a failed
+# remote command pins the transport first (macos_ssh_pin), and its ssh_macos calls then use it.
+# Once the transport is built, nothing here exits.
 _macos_ssh_cmd() {
     local _r=0
-    macos_ssh_resolve "$1" || _r=$?
-    (( _r != 1 )) || { error "Cannot resolve SSH host for '$1'."; exit 1; }
-    (( _r != 2 )) || { error "Cannot resolve SSH port for '$1': its gvproxy reports no SSH forward port."; exit 1; }
+    macos_ssh_build "$1" || _r=$?
+    case "$_r" in
+        0) ;;
+        1) exit_with_errors "Cannot resolve SSH host for '$1'." ;;
+        2) exit_with_errors "Cannot resolve SSH port for '$1': its gvproxy reports no SSH forward port." ;;
+        *) exit_with_errors "Cannot build the SSH transport for '$1'." ;;
+    esac
 }
 
-# Sets the caller's `_ssh` array to the ssh command and options for VM $1, `_ssh_dest` to its
-# user@host and `_ssh_for` to $1, which tells ssh_macos the transport is resolved. Returns 1 when the
-# VM's SSH host cannot be resolved and 2 when its port cannot, printing nothing and setting nothing.
-# A running egress VM whose gvproxy is down fails it: the fallback to `augur-vm ip` finds no DHCP
-# lease on a vfkit-networked guest. A caller that runs several commands declares
-# `local _ssh=() _ssh_dest="" _ssh_for=""`, calls this once, and every ssh_macos to that VM below
-# it uses the result.
-macos_ssh_resolve() {
+# The transport pinned for one VM: while _MACOS_SSH_PIN_VM names a VM, every ssh_macos to it uses
+# _MACOS_SSH_PIN_CMD and _MACOS_SSH_PIN_DEST instead of resolving its own. Set by macos_ssh_pin,
+# cleared by macos_ssh_unpin; nothing else writes them.
+_MACOS_SSH_PIN_VM=""; _MACOS_SSH_PIN_CMD=(); _MACOS_SSH_PIN_DEST=""
+# Resolve VM $1's transport once (macos_ssh_build) and pin it, for a caller that runs several
+# commands and must tell "no way to reach the VM" from a failed remote command: the push and the
+# self-test. Returns macos_ssh_build's status, pinning nothing, when it cannot be resolved. The
+# caller unpins once its commands have run.
+macos_ssh_pin() {
+    local _ssh=() _ssh_dest="" _r=0
+    macos_ssh_build "$1" || _r=$?
+    (( _r == 0 )) || { macos_ssh_unpin; return "$_r"; }
+    _MACOS_SSH_PIN_VM="$1"; _MACOS_SSH_PIN_CMD=("${_ssh[@]}"); _MACOS_SSH_PIN_DEST="$_ssh_dest"
+}
+macos_ssh_unpin() { _MACOS_SSH_PIN_VM=""; _MACOS_SSH_PIN_CMD=(); _MACOS_SSH_PIN_DEST=""; }
+
+# Sets the caller's `_ssh` array to the ssh command and options for VM $1 and `_ssh_dest` to its
+# user@host. Returns 1 when the VM's SSH host cannot be resolved and 2 when its port cannot,
+# printing nothing and setting nothing. A running egress VM whose gvproxy is down fails it: the
+# fallback to `augur-vm ip` finds no DHCP lease on a vfkit-networked guest.
+macos_ssh_build() {
     local vm="$1" host port
     host="$(macos_ssh_host "$vm")"; port="$(macos_ssh_port "$vm")"
     [[ -n "$host" ]] || return 1
@@ -1065,7 +1083,6 @@ macos_ssh_resolve() {
         -o ServerAliveCountMax=4
         ${key_opts[@]+"${key_opts[@]}"})
     _ssh_dest="${MACOS_SSH_USER}@${host}"
-    _ssh_for="$vm"
 }
 
 # The interactive ssh of an `augur claude --macos` / `augur shell --macos` session: ssh_macos plus
@@ -1114,7 +1131,7 @@ macos_ssh_resolve() {
 # credential helper, which reads $GH_TOKEN when git runs it. Processes started outside the session
 # do not get them.
 ssh_macos_session() {
-    local vm="$1" _ssh=() _ssh_dest="" _ssh_for="" _kv _sendenv=() _check _git _remote _rc=0; shift
+    local vm="$1" _ssh=() _ssh_dest="" _kv _sendenv=() _check _git _remote _rc=0; shift
     _check="$(macos_session_env_delivery_cmd)"
     _git="$(macos_session_git_env_cmd)" || return 1
     _remote="${_check}${_git}${!#}"
@@ -2568,7 +2585,7 @@ stop_gvproxy() {
 # Every probe shape below was measured in a live gvproxy-backed guest, not inferred.
 _SELFTEST_HOST="api.github.com"
 verify_macos_egress_locked() {
-    local vm="$1" _ssh=() _ssh_dest="" _ssh_for=""
+    local vm="$1"
     info "Running egress self-test (in-guest)..."
     local leaked=false
     # PATH pinning, same reason as verify_egress_locked's and the same blast radius: `down --macos`
@@ -2585,8 +2602,8 @@ verify_macos_egress_locked() {
     # isolated. It still fails CLOSED (same teardown) — container mode does the same thing when
     # `eng exec` stops working, because its proxy probe then returns no status either.
     #
-    # The transport is resolved once, before the first probe (macos_ssh_resolve), and every probe
-    # below reuses it. Left to ssh_macos, an unresolvable host or port would not return: the
+    # The transport is resolved and pinned once, before the first probe (macos_ssh_pin), and every
+    # probe below uses it until the unpin after the last. Left to ssh_macos, an unresolvable host or port would not return: the
     # _macos_ssh_cmd it calls `exit 1`s the whole script (see _macos_ssh_cmd). Every probe below
     # runs under `&>/dev/null` or inside `$( … )`, so that exit would be UNOBSERVABLE and, being an
     # exit rather than a non-zero return, it would jump clean over the fail-closed teardown at the
@@ -2595,11 +2612,11 @@ verify_macos_egress_locked() {
     # transport resolved here, no probe resolves it again, so none can take that exit.
     #
     # The state is reachable, not theoretical: a RUNNING VM with gvproxy DOWN (see
-    # macos_ssh_resolve). `cmd_down_macos` stopping gvproxy first leads straight here (see
+    # macos_ssh_build). `cmd_down_macos` stopping gvproxy first leads straight here (see
     # tests/37_macos_down_verify.sh's header), and `make e2e` constructs it on the already-running
     # reconcile branch. An empty port (gvproxy up, forward unreadable; see macos_ssh_port) is the
     # same no-way-in state.
-    if ! macos_ssh_resolve "$vm"; then
+    if ! macos_ssh_pin "$vm"; then
         error "Self-test: no SSH transport to '${vm}' — egress cannot be VERIFIED."
         error "  The VM is running but gvproxy is not (or has no readable SSH forward), so nothing can reach it."
         error "  gvproxy cannot be restarted under a live VM (its unixgram socket IS the guest's"
@@ -2686,6 +2703,7 @@ verify_macos_egress_locked() {
             error "Self-test: allowlisted egress to ${_SELFTEST_HOST} does not work (HTTP '${_pcode:-<none>}')."
         fi
     fi
+    macos_ssh_unpin
 
     if $leaked; then
         error "Egress self-test FAILED — refusing to continue. Tearing down."
@@ -4562,7 +4580,7 @@ macos_env_add_export() {
 # (push_macos_guest_env_retrying):
 #   1  it cannot work: a value cannot be written safely (macos_env_add_export) or a credential name
 #      is not a variable name (nothing is sent to the guest then, because the whole content is
-#      built before the ssh), there is no SSH transport to the VM (macos_ssh_resolve; nothing
+#      built before the ssh), there is no SSH transport to the VM (macos_ssh_pin; nothing
 #      is sent then either), or the guest's ~/.zshenv could not be updated (its new ~/.augur-env
 #      is in place).
 #   2  the guest was refused (MACOS_PUSH_REFUSED_RC), whatever else failed.
@@ -4571,7 +4589,7 @@ macos_env_add_export() {
 #      (MACOS_PUSH_RETRYABLE_RC).
 push_macos_guest_env() {
     # `_refusal`: "caller" for --refusing, "guest" once the guest reports the acceptance check failed.
-    local vm="$1" _refusal="" _kv _content _cmd _names _check _find _out _rc=0 _ssh=() _ssh_dest="" _ssh_for=""
+    local vm="$1" _refusal="" _kv _content _cmd _names _check _find _out _rc=0
     if [[ "${2:-}" == --refusing ]]; then _refusal=caller; fi
     local _env="/Users/${MACOS_SSH_USER}/.augur-env"
     local _tmp="${_env}.tmp.\$\$"
@@ -4626,12 +4644,12 @@ push_macos_guest_env() {
     _cmd+="; else ${_find} -mmin +1 -exec rm -f {} + 2>/dev/null; fi"
     _cmd+="; rm -f ${_tmp} && ( umask 077 && cat > ${_tmp} ) && [ \"\$(tail -n 1 ${_tmp})\" = '${MACOS_AUGUR_ENV_END_LINE}' ] && mv -f ${_tmp} ${_env} || { rm -f ${_tmp}; exit 1; }"
     _cmd+="; { grep -q '.augur-env' ~/.zshenv 2>/dev/null || echo '${MACOS_AUGUR_ENV_SOURCE_LINE}' >> ~/.zshenv; } || exit 4"
-    # Resolved here, and reused by the ssh_macos below, not left to it: its exit on an unresolvable
+    # Resolved and pinned here for the ssh_macos below, not left to it: its exit on an unresolvable
     # host or port would look, inside the command substitution below, like a failed write (see
     # _macos_ssh_cmd).
     # A transport lost between this and the ssh fails the connection, which reads as an unknown
     # outcome, and the retry then stops here.
-    if ! macos_ssh_resolve "$vm"; then
+    if ! macos_ssh_pin "$vm"; then
         warn "No SSH transport to VM '${vm}' (its SSH host or port cannot be resolved; is its gvproxy running?)."
         warn "  Nothing was pushed: the guest's ~/.augur-env is unchanged."
         if [[ -n "$_refusal" ]]; then warn "  It may still hold credentials an older augur wrote into it."; fi
@@ -4643,6 +4661,7 @@ push_macos_guest_env() {
     # file prints cannot hide it by leaving its last line open, and a guest that prints it itself is
     # only refused.
     _out="$(ssh_macos "$vm" "$_cmd" <<<"$_content")" || _rc=$?
+    macos_ssh_unpin
     if [[ "$_out" == *"$MACOS_PUSH_REFUSED_MARKER"* ]]; then _refusal=guest; fi
     local _ret=1
     case "$_rc" in
