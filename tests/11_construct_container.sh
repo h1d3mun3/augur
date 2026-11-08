@@ -96,7 +96,8 @@ fi
 create_trace="$(cat "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null)"
 hasnt "$create_trace" "hasTrustDialogAccepted"                "up: does NOT seed folder-trust in the guest on create"
 hasnt "$create_trace" ".claude.json"                          "up: create path never writes the guest ~/.claude.json (ADR-0012)"
-hasnt "$create_trace" "jq"                                    "up: no jq config merge left on the create path"
+# With the random temp-dir name taken out first: `mktemp -d` can hand back a name holding "jq".
+hasnt "${create_trace//"$work"/<work>}" "jq"                  "up: no jq config merge left on the create path"
 # The execs it DOES issue must be exactly the profile wiring (history restore no-ops with no
 # snapshot). A new exec appearing here should force whoever added it to justify it in this test.
 has   "$create_trace" "AUGUR_PROFILE_SRC=/home/dev/.augur-profile" "up: create path wires the operator profile"
