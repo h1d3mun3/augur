@@ -80,14 +80,18 @@ That kept them off argv, but:
   agent policy (`install_macos_managed_settings`) is installed the same way, for the same reason:
   its payload travels base64-encoded inside the root script. The policy directory is wholly
   augur's in the base VM (Claude Code reads other managed files from it), so it is never edited in
-  place: root builds a fresh root:wheel 755 directory next to it, ACL stripped (`chmod -N`), holding
-  only the policy file (root:wheel 644, no ACL), checks both, moves whatever is at the old path (a
-  directory, a file, a symlink) into a 700 quarantine under `/var/root` that no other user can
-  traverse, renames the fresh directory into place, checks it again and removes the quarantine.
-  Nothing a non-root user put in or on the old directory (entries, hard links, ACLs) survives, and
-  anything else there, root's own included, is discarded with it. Any failure of this install is
-  fatal: the build or update stops without saving the base VM, so no clone inherits a missing or
-  old policy. Before connecting, `macos_run_root_script` refuses a
+  place: after checking that its parent is a real root-owned directory unwritable by group and
+  others, root builds a fresh root:wheel 755 directory next to it, ACL stripped (`chmod -N`),
+  holding only the policy file (root:wheel 644, no ACL), checks both, moves whatever is at the old
+  path (a directory, a file, a symlink) into a 700 quarantine under `/var/root` that no other user
+  can traverse, renames the fresh directory into place, checks it again and removes the
+  quarantine. Nothing a non-root user put in or on the old directory (entries, hard links, ACLs)
+  survives, and anything else there, root's own included, is discarded with it. It runs before
+  custom provisioning in both build and update, so the operator's TOFU-gated provisioning may add
+  its own files to the fresh directory, and nothing replaces it again afterwards. Any failure of
+  this install is fatal (a failure after the old directory was moved aside first puts it back): the
+  build or update stops without saving the base VM, so no clone inherits a missing or old policy.
+  Only a quarantine that cannot be removed once the new policy is live is a warning. Before connecting, `macos_run_root_script` refuses a
   VM with no stored admin password or no SSH transport, and it keeps the guest's stderr apart from
   augur's own messages, so only guest text is shown as such.
 - **The drop-in is checked again last.** Homebrew, the agent installer and custom provisioning
