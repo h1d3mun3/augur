@@ -104,7 +104,11 @@ That kept them off argv, but:
   a push that cannot work (1). Deliberately never retried: a refusal by the acceptance check,
   whatever else that push hit (no second attempt makes the guest accept, and the refusal must
   stop the caller at once); a `~/.zshenv` that could not be updated, which fails the same way every
-  time; and a push that sent nothing (a value or name that cannot be written). The pushes a
+  time; and a push that sent nothing (a value or name that cannot be written, or no SSH transport to
+  the VM). The push resolves the VM's SSH host and port (`macos_ssh_transport_ok`) before its
+  ssh pipeline: `_macos_ssh_cmd` exits rather than returns when they cannot be resolved (a running
+  egress VM whose gvproxy is down), and inside the pipeline that exit would read as a failed write
+  and be retried. Without a transport the push says so, sends nothing and returns 1. The pushes a
   refusal makes (`--refusing`, below) are not retried either: the refusal stands whatever they
   return.
 - **Old bases are refused, not migrated.** `up`, `claude` and `shell --macos` check over ssh that
@@ -172,7 +176,10 @@ That kept them off argv, but:
   A marker rather than a trap on the interrupted `up`: a trap cannot run on a kill or a
   host crash. Deliberately egress-on only: a `--no-egress` boot has no self-test to record, and a
   `--no-egress` session attaches only to a VM booted that way (`require_macos_egress_mode_current`),
-  where there is no containment for the record to vouch for.
+  where there is no containment for the record to vouch for. The record is written to a temp file
+  beside it and renamed into place, so a session reading it at that moment sees the old record or
+  the new one, never an empty file; a failed write also leaves no record and fails `up`, as an
+  unreadable run id does.
 - **Every push removes stale temp files, by age.** A killed push can leave a `~/.augur-env.tmp.*`,
   and one written by an older augur may hold credentials. Every push removes, except its own, each
   one older than a minute (`find -mmin +1`) or dated more than a minute ahead of the guest's clock
@@ -186,7 +193,8 @@ That kept them off argv, but:
   push touched its reference. A stale file less than a minute ahead stays until a later push finds
   it older than a minute. Accepted trade-off: a step of the guest clock between two concurrent
   pushes (or that fallback) can still make one's file look stale to the other, which then fails
-  with the old file in place and is tried once more (above).
+  with the old file in place and is tried once more (above). A guest whose `mktemp` fails gets
+  the age test alone, so old files still go; only the far-future check is skipped then.
 - **Delivery is checked in the guest, not only the drop-in.** The drop-in check reads a file, so it
   still passes when the guest's `sshd_config` has lost its `Include` (a guest macOS update, a hand
   edit) and sshd silently drops every `SendEnv`. So the session's remote command starts with
@@ -217,14 +225,17 @@ That kept them off argv, but:
   (`resolve_running_macos_vm_credentials`), a boot with no passed self-test
   (`require_macos_egress_verified`) and, on `up`'s running branch, a passed self-test that cannot
   be recorded, all go through one helper, `refuse_running_macos_vm`, which pushes with
-  `--refusing`, prints the refusal and exits 1. With `--refusing`, a push that could not rewrite
-  the file, or whose outcome is unknown, says the file may still hold an older augur's
-  credentials, as the old-base refusal does; the refusal stands either way. Deliberately not
-  covered: the egress-mode check (`require_macos_egress_mode_current`) and the stored-admin-password
-  check (`require_macos_admin_password`), which run before augur's first connection to the guest
-  and decide whether it talks to the guest at all; their remedies restart or recreate the VM,
-  whose boot pushes before any session. `refuse_running_macos_vm`'s header is the one place the
-  code explains the rule.
+  `--refusing`, prints the refusal and exits 1. So do the two refusals made before augur's first
+  other connection to the guest: the egress-mode check (`require_macos_egress_mode_current`: a
+  mismatch, or no record at all, which marks a VM started by an older augur, the likeliest to hold
+  such a file) and, on `up`'s running branch, the stored-admin-password check
+  (`require_macos_admin_password --running`). The push needs only augur's SSH key, never the admin
+  password, and sends no credential, so it is acceptable on a VM whose mode is wrong or unknown.
+  With `--refusing`, a push that could not rewrite the file, or whose outcome is unknown (or that
+  found no SSH transport to the VM), says the file may still hold an older augur's credentials, as
+  the old-base refusal does; the refusal stands either way. A stopped VM with no stored admin
+  password is refused before anything touches it. `refuse_running_macos_vm`'s header is the one
+  place the code explains the rule.
 - **Ordering and validation.** Resolve once and validate; `cmd_up_macos` resolves before the clone
   (and, on its already-running branch, after the self-test). On a running VM a value that fails
   still gets the guest its `~/.augur-env` push (`resolve_running_macos_vm_credentials`) before
@@ -346,7 +357,8 @@ point after its startup files at which augur could run a command, short of repla
 - A guest whose sshd stops delivering the values (a lost `Include`) is refused per session, before
   the agent or shell starts, rather than running unauthenticated.
 - A failed `~/.augur-env` push now stops a session instead of warning, after one more try when the
-  failure may pass (a dropped connection, a failed write); a refusal is not retried.
+  failure may pass (a dropped connection, a failed write); a refusal is not retried, nor is a push
+  to a VM with no SSH transport, which says so.
 - A running VM whose `up --macos` was interrupted before the self-test, or one booted outside
   augur, gets no session until an `augur up --macos`, which re-runs the self-test on the running VM
   and records it (a restart works too). Running VMs booted before this record
