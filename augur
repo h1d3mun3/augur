@@ -2261,26 +2261,21 @@ require_macos_egress_mode_current() {
 # for --no-egress attaches only to a VM booted that way (require_macos_egress_mode_current), where
 # there is no containment for a record to vouch for.
 macos_egress_verified_file() { echo "$AUGUR_PROXY_DIR/$(workspace_slug)-$(workspace_path_hash).egress-verified"; }
-# The id of VM $1's current boot, as `<pid> <start time>`: the pid augur-vm's `run` writes to the
-# VM's run.pid for as long as it runs (the file augur-vm decides a VM's running state by), and the
-# start time `ps -o lstart` gives for that process. The start time keeps a recycled pid from
-# matching: after a host crash, an `augur-vm run` started by hand can get the pid an earlier boot's
-# record holds, but not that process's start time too. Empty, which matches no record, when the
-# pidfile is missing or holds no pid, or no process has that pid.
+# The id of VM $1's current boot: the random id (a UUID) augur-vm's `run` writes to the VM's run.id
+# before it writes run.pid (the file augur-vm decides a VM's running state by), and removes with
+# it. Every boot gets a new one, so an `augur-vm run` started by hand after a host crash cannot
+# match a record an earlier boot left. Empty, which matches no record, when the file is missing,
+# unreadable or holds anything but one UUID (an augur-vm older than this augur writes none).
 #
-# ps prints lstart in the local time zone and the locale's format, so both are pinned (TZ=UTC0,
-# LC_ALL=C): the record is written by one augur run and read by another, whose TZ can differ (a
-# second terminal, a shell that sets TZ), and one process must give one id in all of them.
+# Accepted trade-off: after a host crash the old run.pid and run.id both survive, so if an
+# unrelated process later takes that pid, augur-vm reports the VM running and its old id still
+# matches. No VM answers then: the push and the session ssh find no guest, and a guest that did
+# answer at that address would fail the VM's pinned host key.
 macos_vm_run_id() {
-    local pid start _w=()
-    pid="$(cat "$AUGUR_DIR/vms/$1/run.pid" 2>/dev/null)" || return 0
-    pid="${pid//[[:space:]]/}"
-    [[ "$pid" =~ ^[0-9]+$ ]] || return 0
-    start="$(LC_ALL=C TZ=UTC0 ps -o lstart= -p "$pid" 2>/dev/null)" || return 0
-    # Word-split so ps's column padding (`Nov  8`) cannot make one start time compare unequal.
-    read -r -a _w <<<"$start"
-    (( ${#_w[@]} > 0 )) || return 0
-    printf '%s %s\n' "$pid" "${_w[*]}"
+    local id _hex='[0-9A-Fa-f]'
+    id="$(cat "$AUGUR_DIR/vms/$1/run.id" 2>/dev/null)" || return 0
+    [[ "$id" =~ ^${_hex}{8}-${_hex}{4}-${_hex}{4}-${_hex}{4}-${_hex}{12}$ ]] || return 0
+    printf '%s\n' "$id"
 }
 # Record that running VM $1 just passed its egress self-test. Without a run id to tie the pass to,
 # or when the record cannot be written, this returns 1, after an error, and leaves no record at
@@ -2292,8 +2287,9 @@ macos_record_egress_verified() {
     local id; id="$(macos_vm_run_id "$1")"
     if [[ -z "$id" ]]; then
         rm -f "$(macos_egress_verified_file)"
-        error "Could not read VM '$1''s run id (the pid in $AUGUR_DIR/vms/$1/run.pid and that process's"
-        error "  start time), so its passed egress self-test cannot be recorded for its sessions."
+        error "Could not read VM '$1''s run id ($AUGUR_DIR/vms/$1/run.id, which augur-vm writes for each boot),"
+        error "  so its passed egress self-test cannot be recorded for its sessions. An augur-vm older than"
+        error "  this augur writes none: reinstall augur (${BOLD}bash install${RESET}), then restart the VM."
         return 1
     fi
     # Written to a temp file in the same directory and renamed into place, so a session checking the
@@ -4948,7 +4944,7 @@ cmd_up_macos() {
         # A pass that cannot be recorded (an unreadable run id) fails `up` and leaves no record, so
         # sessions refuse the VM. Deliberately does not stop it, unlike the boot path: the VM has
         # just passed its self-test and may be serving live sessions, and the cause can be as
-        # transient as a `ps` that failed once.
+        # transient as a read of its run id that failed once.
         if egress_enabled; then
             verify_macos_egress_locked "$project_vm"
             macos_record_egress_verified "$project_vm" || refuse_running_macos_vm "$project_vm" \

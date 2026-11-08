@@ -13,8 +13,8 @@
 #
 # The same file pins the second host-side record a running VM is attached by: that the egress
 # self-test passed during the VM's current boot (macos_egress_verified_file, tied to the boot by its
-# run id: augur-vm's pid and that process's start time, read in UTC so the id does not depend on
-# TZ, and so a recycled pid does not match). `claude` / `shell --macos` on a running egress VM
+# run id: the random id augur-vm's `run` writes to run.id for each boot). `claude` / `shell --macos`
+# on a running egress VM
 # without it (an `up` interrupted before its self-test, a record from an earlier boot) refuse with
 # no guest step but the refusal's push of ~/.augur-env (no credential), naming `up --macos`;
 # `up --macos` on the running VM re-runs the self-test and records it. The boot path drops it before
@@ -76,28 +76,15 @@ ssh_macos_session() { ssh_macos "$@"; }
 egress_on()  { AUGUR_EGRESS=auto; }
 egress_off() { AUGUR_EGRESS=0; }
 record() { mkdir -p "$AUGUR_PROXY_DIR"; printf '%s\n' "$1" > "$(macos_egress_mode_file)"; }
-# The VM's current boot: run.pid holds a live pid (this shell's; BOOT2 is a second boot's process),
-# and its id (macos_vm_run_id) adds that process's start time. A `ps` stand-in answers a fixed
-# start time per pid so ids cannot drift mid-file (Linux procps computes start times from the
-# kernel's boot time, which moves when the host clock is stepped); the run-id section below uses
-# the real ps.
-SHIMDIR="$TMPD/shim"; mkdir -p "$SHIMDIR"; REAL_PS="$(command -v ps)"
-cat > "$SHIMDIR/ps" <<EOF
-#!/usr/bin/env bash
-if [[ "\${REAL_LSTART:-0}" != 1 && "\$*" == "-o lstart= -p "* ]]; then
-  kill -0 "\$4" 2>/dev/null || exit 1; echo "Sun Nov  8 10:00:\$(( \$4 % 60 )) 2026"; exit 0
-fi
-exec "$REAL_PS" "\$@"
-EOF
-chmod +x "$SHIMDIR/ps"; PATH="$SHIMDIR:$PATH"
-sleep 600 & BOOT2=$!
-trap 'kill "$BOOT2" 2>/dev/null; rm -rf "$TMPD"' EXIT
-RUN_ID_FILE="$AUGUR_DIR/vms/$PV/run.pid"
-boot_id()  { printf '%s\n' "$1" > "$RUN_ID_FILE"; }
+# The VM's current boot: the run id augur-vm's `run` writes to run.id, without a trailing newline
+# (BOOT1; BOOT2 is another boot's).
+BOOT1=1A2B3C4D-5E6F-4A1B-8C2D-3E4F5A6B7C01; BOOT2=1A2B3C4D-5E6F-4A1B-8C2D-3E4F5A6B7C02
+RUN_ID_FILE="$AUGUR_DIR/vms/$PV/run.id"
+boot_id()  { printf '%s' "$1" > "$RUN_ID_FILE"; }
 verified() { mkdir -p "$AUGUR_PROXY_DIR"; printf '%s\n' "$1" > "$(macos_egress_verified_file)"; }
-# The record of a pass during the boot run.pid currently names.
+# The record of a pass during the boot run.id currently names.
 verified_now() { verified "$(macos_vm_run_id "$PV")"; }
-boot_id "$$"
+boot_id "$BOOT1"
 run_cmd() { : > "$LOG"; out="$( set -e; "$@" 2>&1 )"; rc=$?; }
 
 refused() {   # refused <label> <remedy> [<reason the message must give>]
@@ -196,48 +183,37 @@ for c in cmd_claude_macos cmd_shell_macos; do
   eq 0 "$rc" "$c --no-egress on a --no-egress VM: attaches"
 done
 
-section "Tier 1 — a VM's run id is its augur-vm pid plus that process's start time (the real ps)"
-export REAL_LSTART=1
-# This shell's start time from the real ps, as the id must carry it: UTC, the C locale, the column
-# padding collapsed.
-lst() { LC_ALL=C TZ=UTC0 "$REAL_PS" -o lstart= -p "$1" | tr -s ' ' | sed 's/^ //; s/ $//'; }
-# Linux procps derives a start time from the boot time the kernel reports, which moves when the
-# host's clock is stepped (a VM's clock resync after its host slept moves every process's start
-# time at once). steady <check...>: run the check (0 = pass) up to three times, again only when this
-# shell's start time changed while it ran, so a step mid-check cannot fail it and a real mismatch
-# still does.
-steady() { local _sb _si; for _si in 1 2 3; do _sb="$(lst $$)"; "$@" && return 0; [[ "$(lst $$)" == "$_sb" ]] && return 1; done; return 1; }
-boot_id "$$"
-c_shape() { id="$(macos_vm_run_id "$PV")"; want="$$ $(lst $$)"; [[ -n "$(lst $$)" && "$id" == "$want" ]]; }
-steady c_shape && ok "the id is '<pid> <start time>', ps's padding collapsed" || fail "the id is not '<pid> <start time>'" "expected [$want], got [$id]"
-hasnt "$id" "  " "the id holds no run of spaces"
-c_same() { [[ "$(macos_vm_run_id "$PV")" == "$(macos_vm_run_id "$PV")" ]]; }
-steady c_same && ok "the id is the same on every read" || fail "two reads of the id differ"
-# ps prints lstart in local time, so the id is read under a pinned TZ: augur runs that read and
-# write the record may have different ones. POSIX TZ strings, so no zoneinfo files are needed.
-c_tz() { a="$(export TZ=JST-9; macos_vm_run_id "$PV")"; b="$(export TZ=PST8PDT; macos_vm_run_id "$PV")"; c="$(unset TZ; macos_vm_run_id "$PV")"
-         [[ -n "$a" && "$a" == "$b" && "$a" == "$c" ]]; }
-steady c_tz && ok "the id is the same under TZ=JST-9, TZ=PST8PDT and no TZ" || fail "the id depends on TZ" "[$a] [$b] [$c]"
-c_tz_raw() { [[ "$(TZ=JST-9 LC_ALL=C "$REAL_PS" -o lstart= -p $$)" != "$(TZ=PST8PDT LC_ALL=C "$REAL_PS" -o lstart= -p $$)" ]]; }
-steady c_tz_raw && ok "control: ps's own lstart differs between those TZs (the pin is what keeps the id equal)" \
-  || fail "control: ps's lstart does not depend on TZ here (the TZ check above is vacuous)"
-c_other() { boot_id "$BOOT2"; o="$(macos_vm_run_id "$PV")"; boot_id "$$"; [[ "$o" == "$BOOT2 "?* && "$o" != "$(macos_vm_run_id "$PV")" ]]; }
-steady c_other && ok "another process (another boot) has another id" || fail "another boot's id is not its own" "$o"
-c_nonl() { printf '%s' "$$" > "$RUN_ID_FILE"; [[ "$(macos_vm_run_id "$PV")" == "$$ $(lst $$)" ]]; }
-steady c_nonl && ok "a pidfile without a trailing newline (augur-vm writes none) gives the same id" || fail "a pidfile without a trailing newline gives another id"
-sleep 0 & _dead=$!; wait "$_dead"; boot_id "$_dead"
-eq "" "$(macos_vm_run_id "$PV")" "a pid with no process: no id"
-boot_id "not-a-pid"
-eq "" "$(macos_vm_run_id "$PV")" "a pidfile that holds no pid: no id"
+section "Tier 1 — a VM's run id is the id augur-vm writes to run.id for each boot"
+boot_id "$BOOT1"
+eq "$BOOT1" "$(macos_vm_run_id "$PV")" "the id is run.id's UUID (augur-vm writes no trailing newline)"
+printf '%s\n' "$BOOT1" > "$RUN_ID_FILE"
+eq "$BOOT1" "$(macos_vm_run_id "$PV")" "…and the same with a trailing newline"
+boot_id "$BOOT2"
+eq "$BOOT2" "$(macos_vm_run_id "$PV")" "another boot has another id"
+for _bad in "not-a-uuid" "$BOOT1 $BOOT2" "$BOOT1"$'\n'"$BOOT2" "${BOOT1}0" "x${BOOT1}" "$BOOT1;rm"; do
+  boot_id "$_bad"
+  eq "" "$(macos_vm_run_id "$PV")" "a run.id that is not one UUID gives no id: $(printf '%q' "$_bad")"
+done
+boot_id ""
+eq "" "$(macos_vm_run_id "$PV")" "an empty run.id: no id"
 rm -f "$RUN_ID_FILE"
-eq "" "$(macos_vm_run_id "$PV")" "no pidfile: no id"
-# A recycled pid: the record holds this pid with an earlier process's start time.
-boot_id "$$"; egress_on; verified "$$ Thu Jan 1 00:00:00 1970"
+eq "" "$(macos_vm_run_id "$PV")" "no run.id (an augur-vm older than this augur writes none): no id"
+if [[ "$(id -u)" != 0 ]]; then
+  boot_id "$BOOT1"; chmod 000 "$RUN_ID_FILE"
+  eq "" "$(macos_vm_run_id "$PV")" "an unreadable run.id: no id"
+  chmod 600 "$RUN_ID_FILE"
+else skip "an unreadable run.id: no id" "running as root, which reads any file"; fi
+# A record from another boot is refused; this boot's is accepted.
+boot_id "$BOOT1"; egress_on; verified "$BOOT2"
 run_cmd require_macos_egress_verified "$PV"
-[[ "$rc" -ne 0 ]] && ok "a record for the same pid with another start time is refused" || fail "a recycled pid matched the record"
-c_accept() { verified "$(macos_vm_run_id "$PV")"; run_cmd require_macos_egress_verified "$PV"; [[ "$rc" == 0 ]]; }
-steady c_accept && ok "the record of this boot is accepted (control)" || fail "the record of this boot is refused" "$out"
-unset REAL_LSTART
+[[ "$rc" -ne 0 ]] && ok "a record from another boot is refused" || fail "another boot's record matched"
+verified "$BOOT1"
+run_cmd require_macos_egress_verified "$PV"
+eq 0 "$rc" "the record of this boot is accepted (control)"
+rm -f "$RUN_ID_FILE"
+run_cmd require_macos_egress_verified "$PV"
+[[ "$rc" -ne 0 ]] && ok "a record with no run.id to match it against is refused" || fail "a record matched a missing run.id"
+boot_id "$BOOT1"
 
 section "Tier 1 — a running VM gets a session only if its current boot passed the self-test"
 # An `up --macos` interrupted between `augur-vm run` and the self-test leaves a running VM with no
@@ -261,16 +237,13 @@ for c in cmd_claude_macos cmd_shell_macos; do
   egress_on; record on; rm -f "$(macos_egress_verified_file)"
   run_cmd "$c"
   unverified "$c, no record of a passed self-test"
-  egress_on; record on; verified "$(boot_id "$BOOT2"; macos_vm_run_id "$PV")"; boot_id "$$"
+  egress_on; record on; verified "$BOOT2"
   run_cmd "$c"
   unverified "$c, a record from an earlier boot (another run id)"
-  egress_on; record on; verified "$$ Thu Jan 1 00:00:00 1970"
-  run_cmd "$c"
-  unverified "$c, a record for this boot's pid with another start time (a recycled pid)"
   egress_on; record on; verified_now; rm -f "$RUN_ID_FILE"
   run_cmd "$c"
   unverified "$c, no run id to match the record against"
-  boot_id "$$"
+  boot_id "$BOOT1"
   egress_off; record off; rm -f "$(macos_egress_verified_file)"
   run_cmd "$c"
   eq 0 "$rc" "$c --no-egress: attaches with no record (a --no-egress boot has no self-test)"
@@ -292,8 +265,8 @@ run_cmd cmd_up_macos
 [[ -e "$(macos_egress_verified_file)" ]] && fail "self-test fails on a running VM: the record survives" \
   || ok "self-test fails on a running VM: the record is dropped"
 eval "$verify_real"
-# No run id after a passed self-test (no pidfile; a pid with no process; the process's start time
-# unreadable): the pass cannot be recorded, so `up` fails and leaves no record, which every session
+# No run id after a passed self-test (no run.id; one that holds no UUID; one that cannot be read):
+# the pass cannot be recorded, so `up` fails and leaves no record, which every session
 # then refuses. On a boot it also stops the VM it just booted; on a running VM, which may be serving
 # live sessions and whose run id may be unreadable only for a moment, it leaves the VM running and
 # refuses it as every refusal of a running VM does (one push of ~/.augur-env first).
@@ -319,19 +292,20 @@ no_run_id() {   # no_run_id <label> running|boot
   fi
 }
 VM_UP=1; egress_on; record on
-boot_id "$$"; verified_now; rm -f "$RUN_ID_FILE"
-run_cmd cmd_up_macos; no_run_id "running VM, no pidfile (a record of this boot was there)" running
-sleep 0 & _dead=$!; wait "$_dead"; boot_id "$$"; verified_now; boot_id "$_dead"
-run_cmd cmd_up_macos; no_run_id "running VM, a pid with no process (a record of this boot was there)" running
-boot_id "$$"; verified_now; mv "$SHIMDIR/ps" "$SHIMDIR/ps.saved"
-printf '#!/bin/sh\nexit 1\n' > "$SHIMDIR/ps"; chmod +x "$SHIMDIR/ps"
-run_cmd cmd_up_macos; no_run_id "running VM, ps fails once (a record of this boot was there)" running
-mv "$SHIMDIR/ps.saved" "$SHIMDIR/ps"
+boot_id "$BOOT1"; verified_now; rm -f "$RUN_ID_FILE"
+run_cmd cmd_up_macos; no_run_id "running VM, no run.id (a record of this boot was there)" running
+boot_id "$BOOT1"; verified_now; boot_id "not-a-uuid"
+run_cmd cmd_up_macos; no_run_id "running VM, a run.id that holds no UUID (a record of this boot was there)" running
+# A read that fails once: a cat stand-in that fails on run.id only.
+boot_id "$BOOT1"; verified_now
+cat() { [[ "${1:-}" == "$RUN_ID_FILE" ]] && return 1; command cat "$@"; }
+run_cmd cmd_up_macos; no_run_id "running VM, the run.id read fails once (a record of this boot was there)" running
+unset -f cat
 # …after which a session refuses the VM, and the next `up` records the pass again.
 run_cmd cmd_claude_macos
 unverified "after the unrecordable pass: cmd_claude_macos"
 run_cmd cmd_up_macos
-eq 0 "$rc" "…and the next up --macos, with ps working again, reconciles"
+eq 0 "$rc" "…and the next up --macos, with the read working again, reconciles"
 eq "$(macos_vm_run_id "$PV")" "$(cat "$(macos_egress_verified_file)" 2>/dev/null)" "…and records the pass"
 # The record is written to a temp file beside it and renamed into place, so a session reading it at
 # that moment sees the old record or the new one, never an empty or partial file.
@@ -341,7 +315,7 @@ has "$rec_body" 'mv -f "${f}.tmp.$$" "$f"' "…and renamed into place"
 hasnt "$rec_body" '> "$f"' "…never written in place"
 hasnt "$rec_body" '> "$(macos_egress_verified_file)"' "…never written in place (by its path)"
 # A concurrent reader polling the record while passes are recorded never sees it empty.
-boot_id "$$"; verified_now
+boot_id "$BOOT1"; verified_now
 ( for _i in $(seq 1 200); do macos_record_egress_verified "$PV" || exit 1; done ) & _wr=$!
 _empty=0; while kill -0 "$_wr" 2>/dev/null; do [[ -s "$(macos_egress_verified_file)" ]] || _empty=$((_empty + 1)); done; wait "$_wr"
 eq 0 "$_empty" "a reader polling during 200 record writes never finds the record empty or missing"
@@ -354,9 +328,9 @@ has "$(cat "$TMPD/rec.out")" "cannot be recorded for its sessions" "a failed rec
 eq "" "$(find "$AUGUR_PROXY_DIR" -name '*.egress-verified.tmp.*')" "a failed record write: no temp file is left"
 
 VM_UP=0; rm -f "$RUN_ID_FILE"
-run_cmd cmd_up_macos; no_run_id "boot, no pidfile" boot
-hasnt "$out" "is up." "boot, no pidfile: no success banner"
-VM_UP=1; boot_id "$$"
+run_cmd cmd_up_macos; no_run_id "boot, no run.id" boot
+hasnt "$out" "is up." "boot, no run.id: no success banner"
+VM_UP=1; boot_id "$BOOT1"
 
 section "Tier 1 — the boot path drops the record before \`augur-vm run\` and writes it after the self-test"
 VM_UP=0
@@ -390,7 +364,7 @@ egress_off; verified_now
 run_cmd cmd_up_macos
 eq 0 "$rc" "boot --no-egress: completes"
 [[ -e "$(macos_egress_verified_file)" ]] && fail "boot --no-egress: a record exists" || ok "boot --no-egress: no record"
-boot_id "$$"
+boot_id "$BOOT1"
 
 section "Tier 1 — a stopped VM goes through up (which writes a fresh record)"
 VM_UP=0; egress_on; record off

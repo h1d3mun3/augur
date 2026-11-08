@@ -45,9 +45,9 @@ in time," this **prescribes** "what must never break." It changes rarely.
   attaching to it — so a VM started with `--no-egress` is never silently used by a plain
   `claude --macos` (`tests/51_macos_egress_mode_unit.sh`). `claude`/`shell --macos` also attach to
   a running egress VM only when a second host-side record says its self-test passed during its
-  current boot (`macos_egress_verified_file`, tied to the boot by the pid in augur-vm's `run.pid` and that
-  process's start time, read in UTC so the id does not depend on `TZ`, and so a recycled pid does not
-  match; checked by `require_macos_egress_verified`, whose refusal makes no guest step but a
+  current boot (`macos_egress_verified_file`, tied to the boot by the random run id augur-vm's `run`
+  writes to `run.id` for each boot (`macos_vm_run_id`), so a later boot, a hand-started one
+  included, does not match; checked by `require_macos_egress_verified`, whose refusal makes no guest step but a
   credential-free push of `~/.augur-env`): it is dropped before every `augur-vm run`, by `down`/`destroy`
   and by the teardown (`stop_unverified_macos_vm`), and written only after the self-test passes,
   so an `up --macos` interrupted before its self-test leaves no VM a session trusts (and an `up`

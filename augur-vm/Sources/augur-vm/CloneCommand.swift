@@ -53,8 +53,9 @@ struct CloneCommand: ParsableCommand {
         config.macAddress = VZMACAddress.randomLocallyAdministered().string
         try config.save(destination)
 
-        // Drop any stale pidfile inherited from the source so the clone reads as stopped.
+        // Drop any stale pidfile and run id inherited from the source so the clone reads as stopped.
         try? FileManager.default.removeItem(at: Paths.pid(destination))
+        try? FileManager.default.removeItem(at: Paths.runID(destination))
         print("[augur-vm] cloned '\(source)' -> '\(destination)'.")
     }
 }

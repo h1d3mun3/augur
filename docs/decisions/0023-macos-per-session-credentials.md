@@ -155,27 +155,28 @@ That kept them off argv, but:
   `augur-vm run`, by `stop_unverified_macos_vm` and by `down` / `destroy`, and written by
   `cmd_up_macos` only once `verify_macos_egress_locked` has passed: on a boot, and on the
   already-running branch, which re-runs the self-test (so `up --macos` also clears a VM whose boot
-  was interrupted). It holds the VM's run id (`macos_vm_run_id`): the pid augur-vm's `run` writes
-  to the VM's `run.pid`, and that process's start time as `ps -o lstart=` prints it under
-  `TZ=UTC0 LC_ALL=C` (padding collapsed). `lstart` is local time, and the augur run that writes the
-  record and the one that reads it may have different `TZ`s (another terminal, a shell that sets
-  it), so the zone is pinned. `require_macos_egress_verified` accepts the record only when both
-  still match, so a VM booted again by any means does not inherit an old record, and neither does
-  an `augur-vm run` started by hand after a host crash that happens to get the pid the old record
-  holds. A pid alone could match there. `prepare_macos_session` checks it right after the egress-mode check, before
+  was interrupted). It holds the VM's run id (`macos_vm_run_id`): a random UUID augur-vm's `run`
+  writes to the VM's `run.id` before it writes `run.pid`, and removes with it (as do `stop`'s
+  force-kill and `clone`). `require_macos_egress_verified` accepts the record only while it still
+  matches, so a VM booted again by any means does not inherit an old record, and neither does an
+  `augur-vm run` started by hand after a host crash that happens to get the pid the old boot had.
+  Accepted trade-off: after a host crash the old `run.pid` and `run.id` both survive, so an
+  unrelated process that later takes that pid makes augur-vm report the VM running with its old id
+  still matching; no guest answers then, and one that did would fail the VM's pinned host key.
+  `prepare_macos_session` checks it right after the egress-mode check, before
   any other guest step. A refusal first pushes `~/.augur-env`, as every refusal of a running VM
   does (below); deliberately on a VM whose containment is unproven, since the push sends no
   credential. It then refuses, leaving the VM running, with `augur up --macos` as the remedy: on
   the running VM that re-runs the self-test and records it. (On a VM from an old base that `up`
   then refuses with the old-base remedy; the first message promises only the self-test.) When the
-  run id cannot be read after a passed self-test (no `run.pid`, no process with that pid, no start
-  time), the pass cannot be recorded: `macos_record_egress_verified` removes any record (one
+  run id cannot be read after a passed self-test (no `run.id`, as with an augur-vm older than this
+  augur, or one that holds no UUID), the pass cannot be recorded: `macos_record_egress_verified` removes any record (one
   written earlier in the same boot included) and fails, so every session refuses the VM, and `up`
   fails. On a boot `up` then stops the VM it just booted through `stop_unverified_macos_vm`, the
   clone kept. On the already-running branch it deliberately leaves the VM running and refuses it
   as any running VM is refused (the push first), with `augur up --macos` again, then
   `augur down --macos && augur up --macos`, as the remedy: that VM has just passed its self-test
-  and may be serving live sessions, and the cause can be as transient as a `ps` that failed once.
+  and may be serving live sessions, and the cause can be as transient as a read that failed once.
   A marker rather than a trap on the interrupted `up`: a trap cannot run on a kill or a
   host crash. Deliberately egress-on only: a `--no-egress` boot has no self-test to record, and a
   `--no-egress` session attaches only to a VM booted that way (`require_macos_egress_mode_current`),
@@ -305,11 +306,11 @@ That kept them off argv, but:
   the test config's absolute `Include` as described; end-to-end delivery (the session's
   `SendEnv` values and git's `GIT_CONFIG_*` set present in `claude --macos` / `shell --macos`,
   absent from a plain `ssh`); the temp-file cleanup's `mktemp /tmp/…XXXXXX`, `date -r <seconds>`,
-  `touch -t` and `find … \( -mmin +1 -o -newer … \)` under the guest's zsh and BSD userland; that the VM's
-  `run.pid` keeps one value for the whole boot, and that `ps -o lstart=` under `TZ=UTC0` prints the
-  same start time for that process for the whole boot, across host sleep and clock syncs (the
-  record of a passed self-test relies on both; a change would refuse sessions until
-  `up --macos`, never admit one);
+  `touch -t` and `find … \( -mmin +1 -o -newer … \)` under the guest's zsh and BSD userland; that
+  augur-vm's `run` writes the VM's `run.id` before `run.pid` and keeps it unchanged for the whole
+  boot (the record of a passed self-test relies on it; a change would refuse sessions until
+  `up --macos`, never admit one; augur-vm has no test target, so this Swift change is unbuilt
+  and untested off a Mac);
   and that the guest's `sudo -S -k` takes only the password line from the root-script stdin, and
   that the guest's `/bin/sh` `read` loop and `sh -s` leave the rest for the script, with and
   without the build's NOPASSWD grant.
@@ -366,6 +367,10 @@ point after its startup files at which augur could run a command, short of repla
   guest user can replace the file between the two connections and run as root in the future base.
 - **Tie the passed-self-test record to the `run.pid` pid alone.** A recycled pid (a hand-started
   `augur-vm run` after a host crash) would match an old record.
+- **The pid plus that process's start time (`ps -o lstart=`).** Tells a recycled pid apart, but
+  `lstart` is local time in the locale's format, so every reader must pin `TZ` and `LC_ALL`, and it
+  rests on `ps` reporting one start time for the whole boot. A random id augur-vm writes per boot
+  is a plain file read.
 - **Install the drop-in into existing project VMs on `up`** (augur can `sudo -S` there). Rejected as
   migration code for old bases; a base update plus re-clone is the supported path.
 
