@@ -610,6 +610,7 @@ for c in cmd_down_macos cmd_destroy_macos; do
   [[ -e "$(macos_boot_record_file)" ]] && fail "$c leaves the record behind" || ok "$c removes the record"
   [[ -e "$_old.egress-mode" || -e "$_old.egress-verified" ]] && fail "$c leaves an older augur's two record files" \
     || ok "$c removes an older augur's .egress-mode and .egress-verified too"
+  has "$(declare -f "$c")" 'macos_remove_old_records' "$c removes them through macos_remove_old_records"
 done
 macos_vm_exists() { return 1; }
 record on; verified_now

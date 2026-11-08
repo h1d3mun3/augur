@@ -2302,6 +2302,12 @@ macos_record_egress_mode() {
     macos_write_boot_record "$(requested_egress_mode)" - && return 0
     exit_with_errors "Could not write $(macos_boot_record_file), the record of the egress mode the VM boots with."
 }
+# Remove the `.egress-mode` and `.egress-verified` files an older augur kept per project instead of
+# the boot record, for down / destroy: nothing reads them, and nothing else would ever remove them.
+macos_remove_old_records() {
+    local p; p="$AUGUR_PROXY_DIR/$(workspace_slug)-$(workspace_path_hash)"
+    rm -f "${p}.egress-mode" "${p}.egress-verified"
+}
 # Drop the record's pass and keep its mode, so every session refuses the VM as one whose current
 # boot passed no self-test. A record with no mode is removed instead.
 macos_drop_egress_pass() {
@@ -5768,11 +5774,9 @@ cmd_down_macos() {
     stop_gvproxy
     stop_proxy
     # Dropped even if the stop below fails: a VM still running without its boot record is refused
-    # by every attach (require_macos_egress_mode_current) until it is down and booted again. The
-    # `.egress-mode` and `.egress-verified` files an older augur kept instead of the boot record
-    # go too: nothing reads them, and nothing else would ever remove them.
-    rm -f "$(macos_boot_record_file)" "${AUGUR_PROXY_DIR}/$(workspace_slug)-$(workspace_path_hash).egress-mode" \
-        "${AUGUR_PROXY_DIR}/$(workspace_slug)-$(workspace_path_hash).egress-verified"
+    # by every attach (require_macos_egress_mode_current) until it is down and booted again.
+    rm -f "$(macos_boot_record_file)"
+    macos_remove_old_records
     if ! macos_vm_exists "$project_vm"; then
         warn "No VM found for this directory (${project_vm})."
         return 0
@@ -5818,9 +5822,8 @@ cmd_destroy_macos() {
     macos_poweroff_before_teardown "$project_vm"
     stop_gvproxy
     stop_proxy
-    # The boot record and an older augur's two files (see cmd_down_macos).
-    rm -f "$(macos_boot_record_file)" "${AUGUR_PROXY_DIR}/$(workspace_slug)-$(workspace_path_hash).egress-mode" \
-        "${AUGUR_PROXY_DIR}/$(workspace_slug)-$(workspace_path_hash).egress-verified"
+    rm -f "$(macos_boot_record_file)"
+    macos_remove_old_records
     if ! macos_vm_exists "$project_vm"; then
         warn "No VM found for this directory (${project_vm})."
         return 0
