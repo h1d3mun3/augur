@@ -199,6 +199,17 @@ for s in provision managed sessionenv xcode; do
 done
 
 reset_vms; SIG_OK=1
+install_macos_managed_settings() { echo "managed $1" >> "$LOG"; return 1; }
+run_update
+install_macos_managed_settings() { echo "managed $1" >> "$LOG"; }
+[[ "$rc" -ne 0 ]] && ok "tampered managed-policy directory: update exits non-zero" || fail "tampered managed-policy directory: update exited 0"
+has "$out" "The base VM was left as-is." "tampered managed-policy directory: says the base VM was left as-is"
+logged "verify $MACOS_UPDATE_VM" && fail "tampered managed-policy directory: later steps still ran" || ok "tampered managed-policy directory: the update stops there"
+logged "vm delete $MACOS_BASE_VM" && fail "tampered managed-policy directory: the base VM was deleted" || ok "tampered managed-policy directory: the base VM is untouched"
+logged "vm clone $MACOS_UPDATE_VM $MACOS_BASE_VM" && fail "tampered managed-policy directory: the update was saved" || ok "tampered managed-policy directory: nothing is saved as the base VM"
+logged "vm delete $MACOS_UPDATE_VM" && ok "tampered managed-policy directory: the staging copy is discarded" || fail "tampered managed-policy directory: the staging copy is left behind"
+
+reset_vms; SIG_OK=1
 select_macos_full_xcode() { echo "xcode $1" >> "$LOG"; return 1; }
 run_update
 select_macos_full_xcode() { echo "xcode $1" >> "$LOG"; }
@@ -805,6 +816,15 @@ run_build
 has "$out" "no base VM was saved" "build: a failing re-check says no base VM was saved"
 logged "vm clone $MACOS_BUILD_VM $MACOS_BASE_VM" && fail "…but it was saved as the base VM" || ok "…and nothing is saved as the base VM"
 SE_OK=1
+
+: > "$VMS"; : > "$LOG"; : > "$RUNF"
+install_macos_managed_settings() { guest "$1" managed; return 1; }
+run_build
+install_macos_managed_settings() { guest "$1" managed; }
+[[ "$rc" -ne 0 ]] && ok "build: a tampered managed-policy directory aborts" || fail "build: a tampered managed-policy directory was ignored"
+has "$out" "no base VM was saved" "build: a tampered managed-policy directory says no base VM was saved"
+logged "verify $MACOS_BUILD_VM" && fail "…but later steps still ran" || ok "…and the build stops there"
+logged "vm clone $MACOS_BUILD_VM $MACOS_BASE_VM" && fail "…but it was saved as the base VM" || ok "…and nothing is saved as the base VM"
 
 : > "$VMS"; : > "$LOG"; : > "$RUNF"; CLONE_FAIL_TO="$MACOS_BASE_VM"
 run_build

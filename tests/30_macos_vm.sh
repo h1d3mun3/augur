@@ -68,6 +68,8 @@ build_macos_body="$(awk '/^cmd_build_macos\(\)/{f=1} f{print} f&&/^}/{exit}' "$A
 update_macos_body="$(awk '/^cmd_update_macos\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
 has "$build_macos_body"  'install_macos_managed_settings' "macOS build installs the managed policy into the base VM"
 has "$update_macos_body" 'install_macos_managed_settings' "macOS update re-installs it (self-heals a base VM built before this)"
+has "$build_macos_body"  'install_macos_managed_settings "$MACOS_BUILD_VM" || { error' "macOS build stops, saving no base VM, on a tampered managed-policy directory"
+has "$update_macos_body" 'install_macos_managed_settings "$MACOS_UPDATE_VM" || { error' "macOS update stops, leaving the base VM as-is, on a tampered managed-policy directory"
 managed_fn="$(awk '/^install_macos_managed_settings\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
 has "$managed_fn" 'macos_run_root_script "$vm"' "macOS managed policy is one root script over one connection (sudo -S: works with or without the build-time grant)"
 hasnt "$managed_fn" 'macos_admin_password_stdin' "macOS managed policy makes no separate privileged call"
