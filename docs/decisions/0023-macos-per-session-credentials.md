@@ -211,7 +211,13 @@ That kept them off argv, but:
   with 197 does it say to recreate the VM (`augur destroy --macos && augur up --macos`, after
   `augur update --macos` if the base is out of date), since a lost `Include` is not something
   `up` can see or repair. The drop-in check stays: it gates the scrub and fails before the
-  bring-up.
+  bring-up. Accepted trade-off: the check runs where the remote command runs, after zsh has read
+  the guest's startup files (sshd runs it through the login shell's `-c`, and zsh always reads
+  `~/.zshenv` first), so a guest startup file that sets one of the names (augur's `~/.augur-env`
+  never does) hides a credential the sshd dropped, and the session runs with that file's value.
+  No earlier point in an ssh session runs a command, and those files are the guest's own, writable
+  by the agent; moving the check into `~/.zshenv` ahead of its source line would still be a file
+  the guest controls.
 - **git's credential helper rides in the session's remote command.** After the delivery check, and
   only when `GH_TOKEN` is sent, the remote command exports `git_credential_env`'s `GIT_CONFIG_*`
   set (`macos_session_git_env_cmd`: each line through `macos_env_add_export`, so the name is a
@@ -236,6 +242,18 @@ That kept them off argv, but:
   the old-base refusal does; the refusal stands either way. A stopped VM with no stored admin
   password is refused before anything touches it. `refuse_running_macos_vm`'s header is the one
   place the code explains the rule.
+  The exits that are not refusals of the VM itself push too. The stale-egress-helper refusal
+  (`require_fresh_egress_helpers`), which `up`, `claude` and `shell --macos` run first, goes
+  through `refuse_running_macos_vm` when the VM is running (through the gvproxy it does not
+  trust: the push sends no credential). On `up`'s running branch, everything between the
+  egress-mode check and the self-test (the allowlist approval gate, the proxy start, the clock and
+  timezone fixes) runs under an EXIT trap that pushes with `--refusing`, so a declined or
+  unapproved `./.augur/allowlist.conf`, a proxy that cannot start, a command that fails under
+  `set -e` or a Ctrl-C there still removes the old file; the trap is disarmed before the self-test,
+  which stops the VM when it fails, and the refusals after it push themselves. The base-VM check
+  moved below the running branch, which does not use the base. Each such run still pushes once.
+  Not covered: `require_vz` (no VM backend to ask whether the VM runs) and a session's best-effort
+  clock and timezone fixes, which come after its refusals and before its push and do not exit.
 - **Ordering and validation.** Resolve once and validate; `cmd_up_macos` resolves before the clone
   (and, on its already-running branch, after the self-test). On a running VM a value that fails
   still gets the guest its `~/.augur-env` push (`resolve_running_macos_vm_credentials`) before

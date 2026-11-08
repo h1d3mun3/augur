@@ -180,7 +180,9 @@ in time," this **prescribes** "what must never break." It changes rarely.
   The session's remote command starts with a guest-side check that every name sent arrived
   (`macos_session_env_delivery_cmd`, exit 197 otherwise, mapped by `ssh_macos_session` to the
   refusal only when a credential was sent), so a guest sshd that drops them anyway never starts
-  the agent or shell unauthenticated. They are never written to the guest's disk:
+  the agent or shell unauthenticated (unless a guest startup file sets the same name, which the
+  check, running after those files, cannot tell from a delivered value: an accepted trade-off in
+  ADR-0023). They are never written to the guest's disk:
   `~/.augur-env` (`push_macos_guest_env`) holds only non-secret per-VM env and never reads the
   resolved credentials; git's `GIT_CONFIG_*` credential helper, which carries only the `$GH_TOKEN`
   reference, is exported by the session's remote command, and only when it sends `GH_TOKEN`
@@ -194,7 +196,9 @@ in time," this **prescribes** "what must never break." It changes rarely.
   current boot has no passed self-test (`require_macos_egress_verified`), `up` cannot record its
   passed self-test, its egress mode is wrong or unknown (`require_macos_egress_mode_current`) or,
   on `up`, it has no stored admin password, every such refusal going through
-  `refuse_running_macos_vm`. In
+  `refuse_running_macos_vm`, as does the refusal of a running VM whose egress helper is not verified
+  (`require_fresh_egress_helpers`); `up`'s reconcile of a running VM pushes on any other exit before
+  its self-test (an EXIT trap). In
   Container mode credentials are never passed to `container run` at all; they reach only the `container exec`
   that starts `augur claude` / `augur shell`, through `--env-file <(…)` written by the bash builtin `printf`
   (`session_credential_env`). `augur setup-token` and augur's own execs get none. In macOS VM mode
@@ -228,7 +232,8 @@ in time," this **prescribes** "what must never break." It changes rarely.
   remote command exports them, holding no token value, only when `GH_TOKEN` is sent, and that a
   guest without the drop-in gets no session and has an older augur's credential lines removed from
   `~/.augur-env` (also when a later step of that push fails, when a running VM's credentials
-  fail to resolve, and when its current boot has no passed self-test), and
+  fail to resolve, when its current boot has no passed self-test, when an egress helper serving it is
+  not verified, and when `up`'s reconcile exits before its self-test), and
   `tests/51_macos_egress_mode_unit.sh` that a running VM refused for its egress mode or a missing
   admin password gets that push too. With the `ssh` shim playing a
   guest sshd that drops a sent variable, it also
