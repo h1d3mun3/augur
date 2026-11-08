@@ -114,7 +114,7 @@ PLAIN_ABS=(agent_macos_managed_settings_path)
 # Exempt, with the reason:
 EXEMPT=(
   "agent_config_seed_json::JSON written to a file through stdin, never interpolated"
-  "agent_managed_settings_json::JSON carried in a quoted heredoc of a root script on stdin, never on a command line"
+  "agent_managed_settings_json::JSON carried base64-encoded in a single-quoted value of a root script on stdin, never on a command line"
   "agent_auth_specs::parsed field by field (checked below), values reach the guest only via an env file"
   "agent_state_guest_leaf::takes an argument; checked below with a sample slug"
   "agent_token_hint::shown in an operator prompt only; checked below"

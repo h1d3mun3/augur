@@ -727,7 +727,10 @@ run_update() { out="$( exec 2>&1 </dev/null; set -e; cmd_update_macos )"; rc=$?;
 ssh_macos_provision()            { local vm="$1"; shift; guest "$vm" "pssh"; }
 ssh_macos_provision_stdin()      { cat >/dev/null; local vm="$1"; shift; guest "$vm" "pssh"; }
 macos_admin_password_stdin()     { echo pw; }
-install_macos_managed_settings() { guest "$1" managed; }
+# A stand-in for the guest's policy directory: the managed install replaces it whole (as the real
+# one does), and the hook adds the operator's file to it. The file must still be there at the end.
+POLICY_DIR="$TMPD/policy-dir"
+install_macos_managed_settings() { guest "$1" managed && rm -rf "$POLICY_DIR" && mkdir -p "$POLICY_DIR" && : > "$POLICY_DIR/managed-settings.json"; }
 select_macos_full_xcode()        { guest "$1" xcode; }
 agent_verify_integrity_macos()   { guest "$1" verify && [[ "$SIG_OK" == 1 ]]; }
 SE_OK=1
@@ -741,18 +744,22 @@ stop_provision_proxy()           { echo "stop_provision_proxy" >> "$LOG"; }
 stop_provision_gvproxy()         { echo "stop_provision_gvproxy" >> "$LOG"; }
 run_provision_manifest()         { guest "$1" manifest; }
 HOOK_OK=1
-run_provision_hook()             { guest "$1" hook && [[ "$HOOK_OK" == 1 ]]; }
+run_provision_hook()             { guest "$1" hook && : > "$POLICY_DIR/managed-mcp.json" && [[ "$HOOK_OK" == 1 ]]; }
 no_stopped_steps() {   # no_stopped_steps <label>
   grep -q '^STOPPED ' "$LOG" && fail "$1: a step ran against a stopped VM" "$(grep '^STOPPED ' "$LOG")" || ok "$1: no step ran against a stopped VM"
 }
-after_hook() {   # after_hook <label> <vm>: managed, xcode, verify all after the hook, verify last
-  local h m x v
+after_hook() {   # after_hook <label> <vm>: managed before the hook; xcode, verify after it, verify last
+  local h m x v p
   h="$(line_of "hook $2")"; m="$(line_of "managed $2")"; x="$(grep -nx "xcode $2" "$LOG" | tail -n1 | cut -d: -f1)"; v="$(line_of "verify $2")"
-  if [[ -n "$h" && -n "$m" && -n "$x" && -n "$v" && "$h" -lt "$m" && "$m" -lt "$v" && "$x" -lt "$v" ]]; then
-    ok "$1: managed policy, Xcode selection and then the signer check run after the hook (hook@$h verify@$v)"
-  else fail "$1: post-provisioning steps out of order" "hook@$h managed@$m xcode@$x verify@$v"; fi
+  p="$(line_of "boot-filtered $2")"
+  if [[ -n "$h" && -n "$m" && -n "$p" && -n "$x" && -n "$v" && "$m" -lt "$p" && "$p" -lt "$h" && "$h" -lt "$x" && "$x" -lt "$v" ]]; then
+    ok "$1: managed policy before provisioning, then the hook, Xcode selection and the signer check (managed@$m provision@$p hook@$h verify@$v)"
+  else fail "$1: steps around provisioning out of order" "managed@$m provision@$p hook@$h xcode@$x verify@$v"; fi
+  eq "1" "$(grep -cx "managed $2" "$LOG")" "$1: the managed policy is installed once (nothing after provisioning replaces its directory)"
+  [[ -e "$POLICY_DIR/managed-mcp.json" && -e "$POLICY_DIR/managed-settings.json" ]] && ok "$1: a file the provisioning hook adds to the policy directory survives" \
+    || fail "$1: the provisioning hook's file in the policy directory is gone" "$(ls -A "$POLICY_DIR" 2>&1)"
   local b; b="$(grep -n "^boot-nat $2$" "$LOG" | tail -n1 | cut -d: -f1)"
-  [[ -n "$b" && "$h" -lt "$b" && "$b" -lt "$m" ]] && ok "$1: the VM is restarted on NAT after provisioning" || fail "$1: no NAT restart after provisioning" "hook@$h nat@$b managed@$m"
+  [[ -n "$b" && "$h" -lt "$b" && "$b" -lt "$x" ]] && ok "$1: the VM is restarted on NAT after provisioning" || fail "$1: no NAT restart after provisioning" "hook@$h nat@$b xcode@$x"
   local k last; k="$(line_of "sessionenv-check $2")"
   last="$(grep -nE "^[a-z-]+ $2$" "$LOG" | grep -vE ':(boot-nat|boot-filtered) ' | tail -n1 | cut -d: -f1)"
   [[ -n "$k" && "$v" -lt "$k" && "$k" == "$last" ]] && ok "$1: the sshd drop-in is re-checked last, after the signer check (check@$k)" \

@@ -22,15 +22,22 @@
 #   • whatever was at the directory's path is replaced and gone: a 777 directory with entries, a
 #     hard-linked entry, a root-owned `.managed-settings.backup/`, a directory at the target path, a
 #     regular file at the directory's path, a symlink to a directory (whose target is untouched);
-#   • the old one is moved into a 700 quarantine under /var/root, which is then removed;
+#   • the old one is moved into a 700 quarantine under /var/root, which is then removed; nothing
+#     the guest printed is shown on success;
+#   • the parent (/Library/Application Support) must be a real directory owned by root and not
+#     writable by group or others; otherwise nothing is created or moved;
 #   • ANY failure (a failing generator, no stored password or SSH transport, a wrong password, a
-#     failed chown, `chmod -N` or quarantine) returns 1 with the reason, leaves the old directory as
-#     it was and no fresh one behind.
+#     failed chown, `chmod -N`, quarantine or move) returns 1 with the reason, leaves the old
+#     directory as it was (put back from the quarantine when it was already moved aside, also when
+#     the swapped-in directory fails its check) and no fresh one or empty quarantine behind; when
+#     putting it back fails, the reason names where it is and the quarantine keeps it;
+#   • a quarantine that cannot be removed once the new policy is live is only a warning naming it.
 #
 # How the guest runs: the stub runs the remote command in an unprivileged user + mount namespace
 # (`unshare -rm`, which maps this user to root, so files the test creates are root-owned). In it, a
 # recording `chown` is bind-mounted over /usr/sbin (the script's chown path), a recording `chmod` is
-# overlaid on /usr/bin (it plays macOS's `chmod -N` and passes every other call to the real one), a
+# overlaid on /usr/bin (it plays macOS's `chmod -N` and passes every other call to the real one),
+# with `mv` and `rm` that can be made to fail or race (and otherwise run the real ones), a
 # test directory is mounted over /var (so /var/root is the test's), and `bash --posix` over /bin/sh.
 # The script's own absolute tool paths are used and its bytes are never rewritten. `sudo` is a
 # stand-in on PATH that reads the password line one byte at a time and refuses a wrong one
@@ -100,10 +107,44 @@ if [[ "$REAL_CHMOD" == /usr/bin/* ]]; then cp "$REAL_CHMOD" "$TMPD/real-chmod"; 
 cat > "$FAKEUSRBIN/chmod" <<EOF
 #!/bin/sh
 printf '%s\n' "\$*" >> "\$CHMODLOG"
-if [ "\$1" = -N ]; then [ "\$CHMOD_N_FAILS" != 1 ]; exit; fi
+if [ "\$1" = -N ]; then [ -z "\$CHMOD_N_NOISE" ] || echo "chmod: noise on stderr" >&2; [ "\$CHMOD_N_FAILS" != 1 ]; exit; fi
 exec '$REAL_CHMOD' "\$@"
 EOF
+# The real `mv` and `rm` behind the recording ones below (copied out when /usr/bin holds the binary
+# itself, which the overlay hides).
+real_tool() {
+    local t; t="$(readlink -f "/usr/bin/$1" 2>/dev/null)"
+    if [[ "$t" == "/usr/bin/$1" ]]; then cp "$t" "$TMPD/real-$1"; t="$TMPD/real-$1"; fi
+    printf '%s' "$t"
+}
+REAL_MV="$(real_tool mv)"; REAL_RM="$(real_tool rm)"
+# `mv` that fails when its destination matches MV_FAIL_DEST (only the first time if MV_FAIL_ONCE
+# names a flag file), and, after moving the fresh directory to exactly MV_RACE_DEST, drops an
+# intruder in it.
+cat > "$FAKEUSRBIN/mv" <<EOF
+#!/bin/sh
+for d; do :; done
+if [ -n "\$MV_FAIL_DEST" ]; then
+    case "\$d" in \$MV_FAIL_DEST)
+        if [ -z "\$MV_FAIL_ONCE" ] || [ ! -e "\$MV_FAIL_ONCE" ]; then
+            [ -z "\$MV_FAIL_ONCE" ] || : > "\$MV_FAIL_ONCE"; echo "mv: injected failure" >&2; exit 1
+        fi ;;
+    esac
+fi
+'$REAL_MV' "\$@" || exit
+case "\$1" in */.augur-policy.*) ;; *) exit 0 ;; esac
+if [ -n "\$MV_RACE_DEST" ] && [ "\$d" = "\$MV_RACE_DEST" ]; then : > "\$d/intruder"; fi
+EOF
+# `rm` that fails on the quarantine when RM_QUAR_FAILS=1.
+cat > "$FAKEUSRBIN/rm" <<EOF
+#!/bin/sh
+if [ "\$RM_QUAR_FAILS" = 1 ]; then
+    for a; do case "\$a" in /var/root/.augur-quarantine.*) echo "rm: injected failure" >&2; exit 1 ;; esac; done
+fi
+exec '$REAL_RM' "\$@"
+EOF
 chmod +x "$FAKEBIN/sudo" "$FAKESBIN/chown" "$FAKEUSRBIN/chmod"
+chmod +x "$FAKEUSRBIN/mv" "$FAKEUSRBIN/rm"
 BASH_BIN="$(readlink -f "$(command -v bash)")"
 SH_TARGET="$(readlink -f /bin/sh)"; SH_WRAP=""
 if [[ "$SH_TARGET" != "$BASH_BIN" ]]; then
@@ -125,6 +166,7 @@ CAN_RUN=0
 if command -v unshare >/dev/null 2>&1 && [[ -d /usr/sbin && -d /var && -n "$REAL_CHMOD" ]] \
     && in_guest true </dev/null 2>/dev/null; then CAN_RUN=1; fi
 SUDO_NOPASSWD=0; CHOWN_FAILS=0; CHMOD_N_FAILS=0; GUEST_PW="$SECRET"
+MV_FAIL_DEST=""; MV_FAIL_ONCE=""; MV_RACE_DEST=""; RM_QUAR_FAILS=0; CHMOD_N_NOISE=""
 
 # The recording `ssh`: call N leaves its argv in $LOG/N.argv and its stdin in $LOG/N.stdin, then
 # runs the remote command, fed exactly that stdin, as the guest.
@@ -137,10 +179,11 @@ ssh() {
     local cmd="${!#}"
     ( cd "$GUEST_HOME" && HOME="$GUEST_HOME" PATH="$FAKEBIN:$PATH" SUDO_WANT="$GUEST_PW" \
           SUDO_NOPASSWD="$SUDO_NOPASSWD" CHOWNLOG="$CHOWNLOG" CHOWN_FAILS="$CHOWN_FAILS" \
-          CHMODLOG="$CHMODLOG" CHMOD_N_FAILS="$CHMOD_N_FAILS" in_guest "$cmd" ) < "$LOG/$n.stdin"
+          CHMODLOG="$CHMODLOG" CHMOD_N_FAILS="$CHMOD_N_FAILS" CHMOD_N_NOISE="$CHMOD_N_NOISE" MV_FAIL_DEST="$MV_FAIL_DEST" MV_FAIL_ONCE="$MV_FAIL_ONCE" \
+          MV_RACE_DEST="$MV_RACE_DEST" RM_QUAR_FAILS="$RM_QUAR_FAILS" in_guest "$cmd" ) < "$LOG/$n.stdin"
 }
 reset() {
-    rm -rf "$LOG"/* "$CHOWNLOG" "$CHMODLOG" "$TMPD/guest" "$OUTSIDE" "$ROOTHOME"
+    rm -rf "$LOG"/* "$CHOWNLOG" "$CHMODLOG" "$TMPD/guest" "$OUTSIDE" "$ROOTHOME" "$TMPD/mv-once"
     mkdir -p "$LOG" "$BASE" "$OUTSIDE" "$ROOTHOME"
 }
 # has_line TEXT GLOB — some line of TEXT matches GLOB as a whole.
@@ -161,6 +204,7 @@ check_install() {
     local name="$1" pf="$2"
     eq "0" "$rc" "$name: returns 0"
     hasnt "$out" "Could not" "$name: no failure"
+    hasnt "$out" "  | " "$name: no guest output is shown"
     eq "1" "$(n_calls)" "$name: one ssh connection"
     if [[ -f "$DST" && ! -L "$DSTDIR" ]] && cmp -s "$pf" "$DST"; then ok "$name: the payload arrived byte-exact"
     else fail "$name: the installed file differs from the payload" \
@@ -173,11 +217,11 @@ check_install() {
     eq "" "$(ls -A "$GUEST_HOME")" "$name: nothing is staged in the guest user's home"
     local ch cm
     ch="$(cat "$CHOWNLOG" 2>/dev/null)"; cm="$(cat "$CHMODLOG" 2>/dev/null)"
-    [[ "$ch" == "root:wheel $BASE/.augur-policy."*$'\n'"root:wheel $BASE/.augur-policy."*"/.managed-settings.json."* ]] \
-        && ok "$name: chown root:wheel on the fresh directory, then on the temp file in it" \
+    [[ "$ch" == "root:wheel $BASE/.augur-policy."*$'\n'"root:wheel $BASE/.augur-policy."*"/managed-settings.json" ]] \
+        && ok "$name: chown root:wheel on the fresh directory, then on the policy file in it" \
         || fail "$name: chown calls" "[$ch]"
     [[ "$cm" == *"-N $BASE/.augur-policy."* ]] && ok "$name: chmod -N on the fresh directory" || fail "$name: no chmod -N on the fresh directory" "[$cm]"
-    has_line "$cm" "-N $BASE/.augur-policy.*/.managed-settings.json.*" && ok "$name: chmod -N on the policy file" || fail "$name: no chmod -N on the policy file" "[$cm]"
+    has_line "$cm" "-N $BASE/.augur-policy.*/managed-settings.json" && ok "$name: chmod -N on the policy file" || fail "$name: no chmod -N on the policy file" "[$cm]"
     [[ "$cm" == *"700 /var/root/.augur-quarantine."* && "$cm" == *"-N /var/root/.augur-quarantine."* ]] \
         && ok "$name: the quarantine is a 700 directory under /var/root, ACL stripped" || fail "$name: quarantine" "[$cm]"
     if grep -rqF -- "$SECRET" "$LOG"/*.argv; then fail "$name: the admin password is on an ssh argv"
@@ -241,7 +285,10 @@ check_install "real payload" "$REAL_PAYLOAD"
 eq "$SECRET" "$(head -n1 "$LOG/1.stdin")" "real payload: the admin password is the first line of ssh's stdin"
 eq "$MACOS_ROOT_SCRIPT_BEGIN" "$(sed -n 2p "$LOG/1.stdin")" "real payload: the root script's marker follows it"
 hasnt "$(cat "$LOG/1.stdin")" "DISABLE_AUTOUPDATER" "real payload: the JSON is not on the wire as text (base64)"
-hasnt "$out" "The guest printed" "real payload: the guest printed nothing"
+
+CHMOD_N_NOISE=1; reset; install_with "$REAL_PAYLOAD"; CHMOD_N_NOISE=""
+check_install "the guest prints on stderr while succeeding (not shown)" "$REAL_PAYLOAD"
+hasnt "$out" "noise on stderr" "the guest prints on stderr while succeeding: none of it is shown"
 
 section "Tier 1 — a hostile payload"
 H="$TMPD/hostile"
@@ -304,11 +351,69 @@ has "$out" "| cannot make" "failed chown: the guest's reason is shown"
 CHMOD_N_FAILS=1; old_policy; install_with "$REAL_PAYLOAD"; CHMOD_N_FAILS=0
 check_untouched "failed chmod -N"
 has "$out" "without an ACL" "failed chmod -N: the guest's reason is shown"
-NS_ARGS=(-c -m --keep-caps); old_policy; install_with "$REAL_PAYLOAD"; NS_ARGS=(-rm)
-check_untouched "files that do not end up root-owned"
-has "$out" "| the new policy is not root:wheel without an ACL" "files that do not end up root-owned: the check catches it"
 old_policy; rmdir "$ROOTHOME"; install_with "$REAL_PAYLOAD"
 check_untouched "no /var/root for the quarantine"
 has "$out" "| cannot create a quarantine directory in /var/root" "no /var/root: the guest's reason is shown"
+MV_FAIL_DEST="/var/root/.augur-quarantine.*/old"; old_policy; install_with "$REAL_PAYLOAD"; MV_FAIL_DEST=""
+check_untouched "the old directory cannot be moved aside"
+has "$out" "| cannot move the old" "the old directory cannot be moved aside: the guest's reason is shown"
+eq "" "$(ls -A "$ROOTHOME")" "the old directory cannot be moved aside: the empty quarantine is removed"
+
+section "Tier 1 — the parent directory must be root's alone"
+base_refused() {   # base_refused NAME — refused before anything is created, the old policy kept
+    check_untouched "$1"
+    has "$out" "is not a directory owned by root, unwritable by group and others, without an ACL" "$1: the guest's reason is shown"
+    eq "" "$(cat "$CHOWNLOG" 2>/dev/null)" "$1: nothing is chowned"
+    eq "" "$(ls -A "$ROOTHOME")" "$1: no quarantine is made"
+}
+old_policy; chmod 775 "$BASE"; install_with "$REAL_PAYLOAD"
+base_refused "group-writable parent"
+old_policy; chmod 757 "$BASE"; install_with "$REAL_PAYLOAD"
+base_refused "other-writable parent"
+old_policy; chmod 755 "$BASE"; chown "$(id -u):$(id -g)" "$BASE"
+NS_ARGS=(-c -m --keep-caps); install_with "$REAL_PAYLOAD"; NS_ARGS=(-rm)
+base_refused "parent not owned by root"
+reset; mkdir -p "$OUTSIDE/realbase/ClaudeCode"; printf 'old\n' > "$OUTSIDE/realbase/ClaudeCode/managed-settings.json"
+rmdir "$BASE"; ln -s "$OUTSIDE/realbase" "$BASE"
+install_with "$REAL_PAYLOAD"
+eq "1" "$rc" "symlinked parent: returns 1"
+has "$out" "is not a directory owned by root" "symlinked parent: the guest's reason is shown"
+eq "old" "$(cat "$OUTSIDE/realbase/ClaudeCode/managed-settings.json")" "symlinked parent: nothing is changed through it"
+eq "ClaudeCode" "$(ls -A "$OUTSIDE/realbase")" "symlinked parent: nothing is created through it"
+reset; mkdir -p "$BASE"; chmod 755 "$BASE"; install_with "$REAL_PAYLOAD"
+check_install "a stock root-owned 755 parent (control)" "$REAL_PAYLOAD"
+
+section "Tier 1 — a failure after the old directory is moved aside puts it back"
+old_tree() { old_policy; printf 'x\n' > "$DSTDIR/managed-mcp.json"; }
+check_restored() {   # check_restored NAME
+    check_untouched "$1"
+    eq $'managed-mcp.json\nmanaged-settings.json' "$(ls -A "$DSTDIR" | LC_ALL=C sort)" "$1: the old directory is back, whole"
+    eq "" "$(ls -A "$ROOTHOME")" "$1: the quarantine is removed after the restore"
+}
+MV_FAIL_DEST="$DSTDIR"; MV_FAIL_ONCE="$TMPD/mv-once"; old_tree; install_with "$REAL_PAYLOAD"; MV_FAIL_DEST=""; MV_FAIL_ONCE=""
+check_restored "the new directory cannot be moved into place"
+has "$out" "| cannot move the new policy directory to" "the new directory cannot be moved into place: the guest's reason is shown"
+MV_RACE_DEST="$DSTDIR"; old_tree; install_with "$REAL_PAYLOAD"; MV_RACE_DEST=""
+check_restored "the post-swap check fails"
+has "$out" "is not exactly the new policy after the swap" "the post-swap check fails: the guest's reason is shown"
+[[ -e "$DSTDIR/intruder" ]] && fail "the post-swap check fails: the new directory stayed live" || ok "the post-swap check fails: the new directory is not left live"
+MV_RACE_DEST="$DSTDIR"; reset; install_with "$REAL_PAYLOAD"; MV_RACE_DEST=""
+eq "1" "$rc" "the post-swap check fails with no old directory: returns 1"
+[[ -e "$DSTDIR" ]] && fail "the post-swap check fails with no old directory: the new directory stayed live" \
+    || ok "the post-swap check fails with no old directory: nothing is left at the path"
+eq "" "$(ls -A "$ROOTHOME")" "the post-swap check fails with no old directory: the quarantine is removed"
+MV_FAIL_DEST="$DSTDIR"; old_tree; install_with "$REAL_PAYLOAD"; MV_FAIL_DEST=""
+eq "1" "$rc" "the old directory cannot be put back: returns 1"
+has "$out" "| cannot put the old ${DSTDIR} back; it is at /var/root/.augur-quarantine." "the old directory cannot be put back: says so, and where it is"
+_q="$(ls -A "$ROOTHOME")"
+eq $'managed-mcp.json\nmanaged-settings.json' "$(ls -A "$ROOTHOME/$_q/old" 2>/dev/null | LC_ALL=C sort)" "the old directory cannot be put back: it is kept, whole, in the quarantine"
+
+section "Tier 1 — only the cleanup failing is a warning, not a failure"
+RM_QUAR_FAILS=1; old_tree; install_with "$REAL_PAYLOAD"; RM_QUAR_FAILS=0
+eq "0" "$rc" "the quarantine cannot be removed: returns 0 (the policy is live)"
+has "$out" "the old policy directory could not be removed" "the quarantine cannot be removed: the warning says so"
+has "$out" "| cannot remove the old policy directory, left in /var/root/.augur-quarantine." "the quarantine cannot be removed: the leftover is named"
+if cmp -s "$REAL_PAYLOAD" "$DST"; then ok "the quarantine cannot be removed: the new policy is installed"; else fail "the quarantine cannot be removed: no new policy"; fi
+eq "$(basename "$DST")" "$(ls -A "$DSTDIR")" "the quarantine cannot be removed: the live directory holds only the policy"
 
 finish

@@ -83,6 +83,16 @@ has "$swap_sh" '/usr/bin/base64 --decode' "macOS managed policy is decoded by th
 has "$swap_sh" '/usr/sbin/chown root:wheel' "macOS managed policy is root-owned"
 has "$swap_sh" '/bin/chmod -N' "macOS managed policy strips ACLs"
 has "$swap_sh" '/usr/bin/mktemp -d /var/root/' "macOS managed policy quarantines the old directory under /var/root"
+# Before custom provisioning in both, which may add the operator's own files to the directory the
+# install replaces whole.
+for _b in build update; do
+  _body="$build_macos_body"; [[ "$_b" == update ]] && _body="$update_macos_body"
+  _m="$(printf '%s\n' "$_body" | grep -n '^    install_macos_managed_settings ' | head -n1 | cut -d: -f1)"
+  _p="$(printf '%s\n' "$_body" | grep -n '^    run_base_provisioning ' | head -n1 | cut -d: -f1)"
+  if [[ -n "$_m" && -n "$_p" && "$_m" -lt "$_p" ]]; then ok "macOS $_b installs the managed policy before custom provisioning (install@$_m < provisioning@$_p)"
+  else fail "macOS $_b installs the managed policy after custom provisioning" "install@$_m provisioning@$_p"; fi
+  eq "1" "$(printf '%s\n' "$_body" | grep -c '^    install_macos_managed_settings ')" "macOS $_b installs the managed policy exactly once"
+done
 # It must land BEFORE cmd_build_macos revokes the build-time sudo grant, or it silently fails.
 m_at="$(printf '%s\n' "$build_macos_body" | grep -n '^    install_macos_managed_settings ' | head -n1 | cut -d: -f1)"
 r_at="$(printf '%s\n' "$build_macos_body" | grep -n 'sudo rm -f /etc/sudoers.d/augur' | head -n1 | cut -d: -f1)"
