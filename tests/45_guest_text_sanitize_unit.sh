@@ -102,6 +102,7 @@ eq 1 "$(grep -cE 'while IFS= read -r _l; do .*(error|"\$_say") ' "$AUGUR")" \
 shown="$(printf 'a\033[31m\n\nb\n' | show_guest_lines 2>&1)"
 has "$shown" '  | a\x1b[31m' "show_guest_lines sanitises each line"
 eq 2 "$(grep -c '  | ' <<<"$shown")" "show_guest_lines prints one line per non-empty input line"
+eq 0 "$(printf '  \n \n' | show_guest_lines 2>&1 | grep -c '  | ')" "show_guest_lines skips lines of spaces only"
 eq 0 "$(grep -E '^(info|success|warn|error)\(\) ' "$AUGUR" | grep -c 'echo -e')" \
   "no log helper interprets escapes (echo -e)"
 

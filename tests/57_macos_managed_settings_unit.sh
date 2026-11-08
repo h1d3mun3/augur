@@ -51,8 +51,8 @@
 # with `mv` and `rm` that can be made to fail or race (and otherwise run the real ones), a
 # test directory is mounted over /var (so /var/root is the test's), and `bash --posix` over /bin/sh.
 # The script's own absolute tool paths are used and its bytes are never rewritten. `sudo` is a
-# stand-in on PATH that reads the password line one byte at a time and refuses a wrong one
-# (SUDO_NOPASSWD=1: reads nothing, as with a NOPASSWD grant).
+# stand-in at /usr/bin/sudo (in the overlay) that reads the password line one byte at a time and
+# refuses a wrong one (SUDO_NOPASSWD=1: reads nothing, as with a NOPASSWD grant).
 # Accepted trade-off: that is bash 5 in POSIX mode, not macOS's /bin/sh (bash 3.2 in sh mode), GNU
 # ls, mv and base64, not macOS's, and no real ACL (the `ls -le` check is skipped by a GNU ls); the
 # live check on a Mac covers those. Hosts without unprivileged namespaces and overlayfs (macOS
@@ -155,6 +155,7 @@ fi
 exec '$REAL_RM' "\$@"
 EOF
 chmod +x "$FAKEBIN/sudo" "$FAKESBIN/chown" "$FAKEUSRBIN/chmod"
+cp "$FAKEBIN/sudo" "$FAKEUSRBIN/sudo"   # the root script's sudo is /usr/bin/sudo
 # `ls` that plays macOS's `-lden` (GNU ls has no -e): the `-ldn` line, and for a path matching the
 # pattern LS_ACL_PATH, `+` on its mode (in `-ldn` too) and the ACL lines LS_ACL_LINES after it. For a
 # path matching LS_LDEN_FAILS, `-lden` fails; for one matching LS_LDEN_EMPTY, it prints nothing.

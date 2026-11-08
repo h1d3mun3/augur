@@ -10,18 +10,22 @@
 # ssh_macos_provision_stdin:
 #   • one ssh connection, no scp, nothing written by the guest user: the hook travels inside the
 #     root script on that connection's stdin, after the password line and the marker;
-#   • the remote command starts at sudo (no Homebrew code runs first); the root script's tools are
-#     absolute (a bash, base64, mktemp or rm planted early on the guest user's PATH never runs), its
-#     traps and system PATH are set before its directory exists;
-#   • root decodes it into a fresh mode-0700 directory under /var/root, runs it with /bin/bash from
-#     there, and removes the directory afterwards, also when the hook fails;
+#   • the remote command starts at /usr/bin/sudo (no Homebrew code runs first); the root script's
+#     tools are absolute (a bash, base64, mktemp, rm or sudo planted early on the guest user's PATH
+#     never runs for root), its traps and system PATH are set before its directory exists; the
+#     provisioning sudoers grant runs /usr/bin/sudo and /bin/bash;
+#   • root decodes it into a fresh mode-0700 directory under /var/root, runs it there with the first
+#     `bash` on the hook's PATH (a Homebrew bash when there is one), and removes the directory
+#     afterwards, also when the hook fails;
 #   • the hook's exit status is the connection's, and a failing hook fails run_provision_hook;
 #   • its stdin is /dev/null (it cannot read the rest of the root script), its cwd is the guest
 #     user's home, and its stdout and stderr stream to the operator together, in order; what sudo,
 #     the root shell or ssh print on stderr is shown afterwards through show_guest_lines, as
-#     warnings on success and errors on failure; its environment has Homebrew's PATH and variables;
+#     warnings on success and errors on failure, with no header over blank lines; its environment
+#     has Homebrew's PATH (then only the absolute entries of the PATH sudo left) and variables;
 #   • no SSH transport precheck consults the VM's own host/port (which the provisioning network
-#     does not use), and a VM with no stored admin password gets no connection;
+#     does not use), the admin password is checked before any transport is, and a VM with no stored
+#     admin password gets no connection;
 #   • the password is on no argv, in no output and not in the hook's environment, with or without
 #     a NOPASSWD grant, and a wrong password runs nothing;
 #   • a hostile hook body (quotes, `$`, backticks, the marker line, heredoc delimiters, CR, NUL and
@@ -66,11 +70,11 @@ mkdir -p "$FAKEBIN" "$PLANT" "$OVL"
 
 # The real bash, copied out of /usr/bin, which the overlay below hides.
 REALBASH="$TMPD/real-bash"; cp "$(readlink -f "$BASH")" "$REALBASH"
-# `sudo -S [-k] -p '' <cmd…>`: like sudo -S, reads the password line from stdin one byte at a time
-# and refuses a wrong one; SUDO_NOPASSWD=1 reads nothing, as with a NOPASSWD grant. SUDO_WARN=1 prints
-# a line on stderr before running the command. TEST_AS_ROOT=1 in the environment marks what runs
-# "as root".
-cat > "$FAKEBIN/sudo" <<EOF
+# The guest's /usr/bin/sudo, `sudo -S [-k] -p '' <cmd…>`: like sudo -S, reads the password line
+# from stdin one byte at a time and refuses a wrong one; SUDO_NOPASSWD=1 reads nothing, as with a
+# NOPASSWD grant. SUDO_WARN=1 prints a line on stderr before running the command, SUDO_WARN=blank
+# only blank lines (empty or spaces). TEST_AS_ROOT=1 in the environment marks what runs "as root".
+cat > "$OVL/sudo" <<EOF
 #!$REALBASH
 printf '%s\n' "\$@" > "\$EVID/sudo-argv"
 [[ "\$1" == -S ]] || { echo "sudo stand-in: not -S" >&2; exit 1; }
@@ -79,18 +83,21 @@ if [[ "\${SUDO_NOPASSWD:-0}" != 1 ]]; then
     IFS= read -r pw
     [[ "\$pw" == "\$(cat "\$SUDO_WANT_FILE")" ]] || { echo "Sorry, try again." >&2; exit 1; }
 fi
-if [[ "\${SUDO_WARN:-0}" == 1 ]]; then echo "sudo: a warning from the guest" >&2; fi
+case "\${SUDO_WARN:-0}" in 1) echo "sudo: a warning from the guest" >&2 ;; blank) printf '\\n   \\n \\n' >&2 ;; esac
 TEST_AS_ROOT=1 exec "\$@"
 EOF
 # Tools a guest-user process could plant early on that user's PATH: each logs its use and fails.
-for t in bash base64 mktemp rm; do
+for t in bash base64 mktemp rm sudo; do
     printf '#!%s\necho %s >> "$EVID/planted"\nexit 1\n' "$REALBASH" "$t" > "$PLANT/$t"
 done
-# The guest's /bin/bash: records how the hook is run, then runs it with the real bash.
-cat > "$OVL/bash" <<EOF
+# The hook's interpreters: the guest's /bin/bash and a Homebrew bash. Each records how the hook is
+# run (and which of them ran it, in hook-interp), then runs it with the real bash.
+write_recorder() {   # write_recorder FILE LABEL
+    cat > "$1" <<EOF
 #!$REALBASH
 case "\${1:-}" in
     /var/root/augur-provision-hook.*/hook.sh)
+        echo $2 > "\$EVID/hook-interp"
         printf '%s\n' "\$@" > "\$EVID/hook-argv"
         /usr/bin/cp "\$1" "\$EVID/hook-seen"
         /usr/bin/stat -c %a "\${1%/*}" > "\$EVID/hook-dirmode"
@@ -101,17 +108,22 @@ case "\${1:-}" in
 esac
 exec "$REALBASH" "\$@"
 EOF
+    chmod +x "$1"
+}
+OPTDIR="$TMPD/opt"; BREWBASH="$OPTDIR/homebrew/bin/bash"; mkdir -p "$OPTDIR/homebrew/bin" "$OPTDIR/homebrew/sbin"
+write_recorder "$OVL/bash" system
+write_recorder "$BREWBASH" homebrew
 # The guest's /bin/sh: bash in POSIX mode, as macOS's /bin/sh is bash in sh mode.
 SH_NAME="$(basename "$(readlink -f /bin/sh)")"
 [[ "$SH_NAME" == bash ]] || printf '#!%s\nexec -a sh %s --posix "$@"\n' "$REALBASH" "$REALBASH" > "$OVL/$SH_NAME"
-chmod +x "$FAKEBIN"/* "$PLANT"/* "$OVL"/*
+chmod +x "$PLANT"/* "$OVL"/*
 
 # The guest: an unprivileged user + mount namespace (`unshare -rm`) where the test's directory is
 # mounted over /var (so /var/root is the test's) and the overlay above over /usr/bin (which /bin
 # links to), so the root script's absolute paths (/bin/sh, /bin/bash, /usr/bin/mktemp,
 # /usr/bin/base64, /bin/rm) are the guest's own and its bytes are never rewritten.
-GUEST_MOUNTS='mount --bind "$1" /var && mount -t overlay overlay -o lowerdir="$2":/usr/bin /usr/bin && exec "$3" -c "$4"'
-in_guest() { unshare -rm "$REALBASH" -c "$GUEST_MOUNTS" _ "$GUEST_VAR" "$OVL" "$REALBASH" "$1"; }
+GUEST_MOUNTS='mount --bind "$1" /var && mount --bind "$5" /opt && mount -t overlay overlay -o lowerdir="$2":/usr/bin /usr/bin && exec "$3" -c "$4"'
+in_guest() { unshare -rm "$REALBASH" -c "$GUEST_MOUNTS" _ "$GUEST_VAR" "$OVL" "$REALBASH" "$1" "$OPTDIR"; }
 CAN_RUN=0
 if command -v unshare >/dev/null 2>&1 && [[ /bin -ef /usr/bin ]] && in_guest true </dev/null 2>/dev/null; then CAN_RUN=1; fi
 
@@ -120,6 +132,7 @@ if command -v unshare >/dev/null 2>&1 && [[ /bin -ef /usr/bin ]] && in_guest tru
 # Like real ssh it honours -n, and it runs the remote command in the guest user's home, with the
 # planted tools first on PATH.
 LOG="$TMPD/ssh"; mkdir -p "$LOG"
+GUEST_PATH="$PLANT:$FAKEBIN:/usr/bin:/bin"   # the guest user's PATH, which sudo keeps
 SUDO_NOPASSWD=0; SUDO_WARN=0; SUDO_WANT_FILE="$TMPD/sudo-want"; printf '%s' "$SECRET" > "$SUDO_WANT_FILE"
 ssh() {
     local n a no_stdin=0 rc
@@ -128,9 +141,9 @@ ssh() {
     for a in "$@"; do [[ "$a" == "-n" ]] && no_stdin=1; done
     local cmd="${!#}"
     run_guest() {
-        ( cd "$GUEST_HOME" && exec env -i HOME="$GUEST_HOME" TMPDIR="$GUEST_TMP" PATH="$PLANT:$FAKEBIN:/usr/bin:/bin" EVID="$EVID" \
+        ( cd "$GUEST_HOME" && exec env -i HOME="$GUEST_HOME" TMPDIR="$GUEST_TMP" PATH="$GUEST_PATH" EVID="$EVID" \
               SUDO_NOPASSWD="$SUDO_NOPASSWD" SUDO_WARN="$SUDO_WARN" SUDO_WANT_FILE="$SUDO_WANT_FILE" \
-              unshare -rm "$REALBASH" -c "$GUEST_MOUNTS" _ "$GUEST_VAR" "$OVL" "$REALBASH" "$cmd" )
+              unshare -rm "$REALBASH" -c "$GUEST_MOUNTS" _ "$GUEST_VAR" "$OVL" "$REALBASH" "$cmd" "$OPTDIR" )
     }
     if (( no_stdin )); then : > "$LOG/$n.stdin"; run_guest </dev/null; rc=$?
     else tee "$LOG/$n.stdin" | run_guest; rc=${PIPESTATUS[1]}; fi
@@ -168,7 +181,7 @@ else ok "the connection forwards stdin (no -n)"; fi
 has "$(cat "$LOG/1.argv")" "-p
 ${AUGUR_SSH_FWD_PORT_PROVISION}" "it goes over the provisioning network's SSH port"
 _remote="$(tail -n1 "$LOG/1.argv")"
-eq "sudo -S -k -p '' /bin/sh -c " "${_remote:0:28}" "the remote command starts with the root-script sudo: no Homebrew prefix"
+eq "/usr/bin/sudo -S -k -p '' /bin/sh -c " "${_remote:0:37}" "the remote command starts with the root-script sudo: no Homebrew prefix"
 hasnt "$_remote" "brew" "no brew runs before sudo on that connection"
 hasnt "$(cat "$LOG/1.argv")" "cat >" "nothing is written to a file before sudo runs"
 hasnt "$(tail -n1 "$LOG/1.argv")" "/tmp" "no /tmp path on the remote command"
@@ -321,6 +334,34 @@ has "$out" "has no stored admin password" "no stored admin password: says so"
 eq "0" "$(n_calls)" "no stored admin password: nothing connects"
 run_hook
 eq "0" "$rc" "the hook runs again once the password is back (control)"
+
+section "Tier 1 — the hook's interpreter and PATH"
+printf '#!/usr/bin/env bash\ntouch "$EVID/hook-ran"\n' > "$AUGUR_PROVISION_HOOK"
+run_hook
+eq "homebrew" "$(cat "$EVID/hook-interp")" "a Homebrew bash on the hook's PATH runs the hook"
+mv "$BREWBASH" "$TMPD/brewbash.saved"; mv "$PLANT/bash" "$TMPD/plantbash.saved"; run_hook
+eq "system" "$(cat "$EVID/hook-interp")" "control: without one (and without the planted bash), the system bash runs it"
+mv "$TMPD/brewbash.saved" "$BREWBASH"; mv "$TMPD/plantbash.saved" "$PLANT/bash"
+_gp_saved="$GUEST_PATH"; GUEST_PATH=":$PLANT::.:rel/dir:./x:$FAKEBIN:/usr/bin:/bin:"; run_hook; GUEST_PATH="$_gp_saved"
+eq "0" "$rc" "an inherited PATH with empty, '.' and relative entries: the hook succeeds"
+eq "PATH=/opt/homebrew/bin:/opt/homebrew/sbin:$PLANT:$FAKEBIN:/usr/bin:/bin" "$(grep '^PATH=' "$EVID/hook-env")" \
+    "…and its PATH keeps only the absolute entries"
+
+section "Tier 1 — a root-shell report of only empty lines"
+SUDO_WARN=blank; run_hook; SUDO_WARN=0
+eq "0" "$rc" "the hook succeeds"
+hasnt "$out" "reported:" "no header is printed over nothing"
+
+section "Tier 1 — the password is checked before the SSH transport"
+macos_ssh_transport_ok() { echo called >> "$TMPD/transport-calls"; return 0; }
+rm -f "$TMPD/transport-calls"
+mv "$(macos_admin_password_file testvm)" "$TMPD/pw.saved"; reset
+out="$(macos_run_root_script testvm 'true' 2>&1)"; rc=$?
+mv "$TMPD/pw.saved" "$(macos_admin_password_file testvm)"
+if [[ "$rc" -ne 0 ]]; then ok "no stored admin password: macos_run_root_script fails"; else fail "no stored admin password: returned 0"; fi
+has "$out" "has no stored admin password" "…with the password error"
+[[ -e "$TMPD/transport-calls" ]] && fail "…after probing the SSH transport" || ok "…before probing the SSH transport"
+eval "$_real_transport"
 }
 
 if (( CAN_RUN )); then guest_tiers
@@ -346,9 +387,15 @@ done
 has "$_rs" '[ -z "$d" ] || /bin/rm -rf "$d"' "root script: the cleanup runs only once the directory is set"
 has "$_rs" "/usr/bin/mktemp -d /var/root/" "root script: mktemp is /usr/bin/mktemp"
 has "$_rs" "| /usr/bin/base64 --decode >" "root script: base64 is /usr/bin/base64 --decode"
-has "$_rs" ' /bin/bash "$d/hook.sh" </dev/null 2>&1' "root script: the hook runs under /bin/bash"
-_bare="$(printf '%s\n' "$_rs" | grep -nE '(^|[|;&]|\$\()[[:space:]]*(mktemp|base64|bash|rm)[[:space:]]')"
-eq "" "$_bare" "root script: no bare (PATH-resolved) mktemp, base64, bash or rm"
+has "$_rs" '/usr/bin/env PATH="$hook_path" ' "root script: the hook is started by /usr/bin/env with the hook's PATH"
+has "$_rs" $'\n    bash "$d/hook.sh" </dev/null 2>&1' "root script: …which looks up the hook's bash on that PATH"
+_bare="$(printf '%s\n' "$_rs" | grep -vxF '    bash "$d/hook.sh" </dev/null 2>&1' | grep -nE '(^|[|;&]|\$\()[[:space:]]*(mktemp|base64|bash|rm|sudo|env)[[:space:]]')"
+eq "" "$_bare" "root script: no other bare (PATH-resolved) mktemp, base64, bash, rm, sudo or env"
+# Every sudo this change runs with the password on stdin is /usr/bin/sudo, and the grant's shell is /bin/bash.
+eq "1" "$(grep -cF '| "$ssh_fn" "$vm" "/usr/bin/sudo -S -k -p '"''"' /bin/sh -c ' "$AUGUR")" "macos_run_root_script runs /usr/bin/sudo"
+_grant="$(declare -f run_base_provisioning | grep -A3 'ssh_macos_provision_stdin "$vm"')"
+has "$_grant" "\"/usr/bin/sudo -S -p '' /bin/bash -c" "the provisioning sudoers grant runs /usr/bin/sudo and /bin/bash"
+has "$_grant" "/bin/chmod 440 /etc/sudoers.d/augur" "…and /bin/chmod"
 # The provisioning wrapper the root script and the sudo grant use starts the remote command at sudo.
 code="$(declare -f ssh_macos_provision_stdin) $(declare -f _ssh_macos_provision)"
 _argv="$( ssh() { printf '%s\n' "${!#}"; }; ssh_macos_provision_stdin testvm "sudo -S true" )"

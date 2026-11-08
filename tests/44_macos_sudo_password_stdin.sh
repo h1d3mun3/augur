@@ -204,11 +204,11 @@ eq "" "$_interp" "the admin password is read nowhere else"
 # same VM the ssh wrapper connects to.
 # macos_run_root_script feeds sudo the password and then its script, from one brace group:
 #   { macos_admin_password_stdin "$vm" && printf … ; } \
-#       | "$ssh_fn" "$vm" "sudo -S -k -p '' …"    (ssh_fn: ssh_macos or ssh_macos_provision_stdin, checked there)
+#       | "$ssh_fn" "$vm" "/usr/bin/sudo -S -k -p '' …"    (ssh_fn: ssh_macos or ssh_macos_provision_stdin, checked there)
 feeds_root_script() {   # feeds_root_script <line> <previous line>
     [[ "$2" =~ ^\ *\{\ macos_admin_password_stdin\ (\"\$[A-Za-z_]+\")\ \&\&\ printf\  ]] || return 1
     local v="${BASH_REMATCH[1]}"
-    [[ "$1" =~ ^\ *\|\ (ssh_macos|\"\$ssh_fn\")\ (\"\$[A-Za-z_]+\")\ \"sudo\ -S\  ]] && [[ "${BASH_REMATCH[2]}" == "$v" ]]
+    [[ "$1" =~ ^\ *\|\ (ssh_macos|\"\$ssh_fn\")\ (\"\$[A-Za-z_]+\")\ \"(/usr/bin/)?sudo\ -S\  ]] && [[ "${BASH_REMATCH[2]}" == "$v" ]]
 }
 feeds_same_vm() {
     [[ "$1" =~ macos_admin_password_stdin\ (\"\$[A-Za-z_]+\")\ \|\ ssh_macos[a-z_]*\ (\"\$[A-Za-z_]+\") ]] \
