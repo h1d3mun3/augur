@@ -98,7 +98,17 @@ That kept them off argv, but:
   must therefore be idempotent. After everything that could change it (provisioning's root hook, a
   cask's postinstall), `verify_macos_managed_settings` re-checks, with the same checks, that the
   policy file is still augur's exact bytes, root:wheel 644, one link, no ACL, in a root-owned 755
-  directory with no ACL that allows anything; build and update refuse to save otherwise. Before connecting, `macos_run_root_script` refuses a
+  directory with no ACL that allows anything; build and update refuse to save otherwise. A mismatch
+  it found and a check that could not run are reported apart. Deny ACL entries are tolerated on the
+  policy directory and its parent only when they deny nothing the agent needs to read the policy
+  (read, search, list, readattr, readextattr, readsecurity). Discarded names travel base64-encoded
+  and each report must be the last line of the script's output, so no file name can forge one.
+  Accepted trade-off: the re-check guards against the operator's custom provisioning (the
+  manifest, `hook.sh`, casks: TOFU-gated, trusted root content) replacing or breaking augur's
+  `managed-settings.json` by accident. It does not try to contain a malicious provisioning step,
+  which runs as root and can do anything, including a LaunchDaemon that rewrites the policy at
+  every clone's boot; so the parent directory and the other files in the policy directory are not
+  re-checked after provisioning. Before connecting, `macos_run_root_script` refuses a
   VM with no stored admin password or no SSH transport, and it keeps the guest's stderr apart from
   augur's own messages, so only guest text is shown as such.
 - **The drop-in is checked again last.** Homebrew, the agent installer and custom provisioning
