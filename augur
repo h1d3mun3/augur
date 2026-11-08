@@ -6137,12 +6137,17 @@ cmd_update_macos() {
         # backgrounded sleep+kill, and wait on the real PID for its actual exit status — a
         # stalled network call (curl gives no output at all while blocked) cannot hang this
         # step forever.
+        # Once the command is done, the watchdog sleep is killed first (a killed sleep makes the
+        # watchdog skip its kills), then the watchdog itself, in case its sleep had not started.
+        # Killing only the watchdog would leave its sleep running. The watchdog holds none of the
+        # stdout/stderr of this ssh session: any process still holding them keeps the session,
+        # and augur, waiting until it exits.
         _with_timeout() {
             local _secs="$1"; shift
             "$@" & local _cpid=$!
-            ( sleep "$_secs"; pkill -TERM -P "$_cpid" 2>/dev/null; kill -TERM "$_cpid" 2>/dev/null ) & local _wpid=$!
+            ( sleep "$_secs" && { pkill -TERM -P "$_cpid"; kill -TERM "$_cpid"; } ) </dev/null >/dev/null 2>&1 & local _wpid=$!
             wait "$_cpid" 2>/dev/null; local _rc=$?
-            kill "$_wpid" 2>/dev/null; wait "$_wpid" 2>/dev/null
+            pkill -TERM -P "$_wpid" 2>/dev/null; kill "$_wpid" 2>/dev/null; wait "$_wpid" 2>/dev/null
             return $_rc
         }
         _installer=$(mktemp)
