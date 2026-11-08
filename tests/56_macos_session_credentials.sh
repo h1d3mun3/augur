@@ -466,25 +466,42 @@ guest_run "$(macos_session_env_check_cmd "$(macos_session_env_names)")" && fail 
 cp "$TMPD/dropin.saved" "$DROPIN"
 verify_dropin
 eq "0" "$rc" "the re-check passes again with augur's own drop-in (control)"
-# The drop-in must hold exactly augur's line: a line appended to it, even a comment, or no line at
-# all, is refused by the clones' check and so by the re-check before the save.
+# Comment and blank lines in the drop-in are ignored, and what remains must be exactly augur's line:
+# a drop-in an earlier install wrote (a comment line above the line) passes, and one with any other
+# directive, or no line at all, is refused by the clones' check and so by the re-check before the
+# save.
 _al="$(macos_session_accept_env_line "$(macos_session_env_names)")"
 dropin_variants() {   # dropin_variants <name>: writes that variant of the drop-in
   case "$1" in
+    earlier-install) printf '%s\n%s\n' '# augur: the credential names an augur claude/shell session sends.' "$_al" > "$DROPIN" ;;
+    comments-blanks) printf '\n  # one\n\n%s\n# two\n   \n' "$_al" > "$DROPIN" ;;
     extra-acceptenv) printf '%s\nAcceptEnv FOO\n' "$_al" > "$DROPIN" ;;
-    extra-comment)   printf '%s\n# added later\n' "$_al" > "$DROPIN" ;;
-    comment-first)   printf '# augur\n%s\n' "$_al" > "$DROPIN" ;;
+    extra-before)    printf '# augur\nAcceptEnv FOO\n%s\n' "$_al" > "$DROPIN" ;;
     other-directive) printf '%s\nPermitUserEnvironment yes\n' "$_al" > "$DROPIN" ;;
+    commented-line)  printf '# %s\n' "$_al" > "$DROPIN" ;;
+    comments-only)   printf '# augur\n# nothing else\n' > "$DROPIN" ;;
     empty)           : > "$DROPIN" ;;
   esac
 }
-for _v in extra-acceptenv extra-comment comment-first other-directive empty; do
+for _v in earlier-install comments-blanks; do
+  dropin_variants "$_v"
+  guest_run "$(macos_session_env_check_cmd "$(macos_session_env_names)")" && ok "the clones' check accepts a drop-in with $_v" \
+    || fail "the clones' check refuses a drop-in with $_v"
+  verify_dropin
+  eq "0" "$rc" "the re-check before the save passes a drop-in with $_v"
+done
+for _v in extra-acceptenv extra-before other-directive commented-line comments-only empty; do
   dropin_variants "$_v"
   guest_run "$(macos_session_env_check_cmd "$(macos_session_env_names)")" && fail "the clones' check accepts a drop-in with $_v" \
     || ok "the clones' check refuses a drop-in with $_v"
   verify_dropin
   nonzero "the re-check before the save on a drop-in with $_v"
+  hasnt "$out" "No such file" "…with no raw error ($_v)"
 done
+rm -f "$DROPIN"
+guest_run "$(macos_session_env_check_cmd "$(macos_session_env_names)")" 2>"$TMPD/chk.err" && fail "the clones' check accepts a missing drop-in" \
+  || ok "the clones' check refuses a missing drop-in"
+eq "" "$(cat "$TMPD/chk.err")" "…without printing an error"
 printf '%s' "$_al" > "$DROPIN"
 guest_run "$(macos_session_env_check_cmd "$(macos_session_env_names)")" && ok "the clones' check accepts the exact line without its trailing newline" \
   || fail "the clones' check refuses the exact line without a trailing newline"
@@ -806,14 +823,18 @@ RUNNING=1
 printf '# augur\nAcceptEnv ANTHROPIC_API_KEY GH_TOKEN\n' > "$DROPIN"
 old_env; run_cmd shell
 refused "a drop-in for other names: shell --macos"
-# A drop-in with augur's line plus another (an appended AcceptEnv), or with no line: the push's check
-# refuses the session.
-printf '%s\nAcceptEnv FOO\n' "$(macos_session_accept_env_line "$(macos_session_env_names)")" > "$DROPIN"
-old_env; run_cmd shell
-refused "a drop-in with an extra AcceptEnv line: shell --macos"
-: > "$DROPIN"
-old_env; run_cmd shell
-refused "an empty drop-in: shell --macos"
+# The push's check, on the same variants: a drop-in an earlier install wrote takes a session; one
+# with another directive, comments only or no line is refused.
+_al="$(macos_session_accept_env_line "$(macos_session_env_names)")"
+for _v in extra-acceptenv other-directive comments-only empty; do
+  dropin_variants "$_v"
+  old_env; run_cmd shell
+  refused "a drop-in with $_v: shell --macos"
+done
+dropin_variants earlier-install
+run_cmd shell
+eq "0" "$rc" "a drop-in an earlier install wrote (comment line, then the line): shell --macos completes"
+eq "1" "$(launches)" "…and starts its session"
 mv "$TMPD/dropin.saved" "$DROPIN"
 # With the drop-in, a boot checks once, in its only push, which writes no GIT_CONFIG_* helper lines:
 # the session that follows exports them itself. No guest command checks on its own.

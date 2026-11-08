@@ -5302,19 +5302,24 @@ prepare_macos_session() {
 # credentials to send, so an affected VM is refused from the start rather than from the first
 # session after a `gh auth login`.
 #
-# Reads the drop-in file, which only root can write, and requires its whole content to be exactly
-# the one line augur writes (install_macos_session_env_acceptance), so a change to the credential
-# names refuses a VM built for the old ones, and so does a drop-in that has gained any other line
-# (another AcceptEnv, any other directive, even a comment). Command substitution strips the file's
+# Reads the drop-in file, which only root can write. Comment lines (first non-blank character `#`)
+# and blank lines are ignored, and what remains must be exactly the one line augur writes
+# (install_macos_session_env_acceptance), so a change to the credential names refuses a VM built
+# for the old ones, and so does a drop-in that has gained any other directive (another AcceptEnv,
+# anything else sshd would read). Deliberately comment-tolerant: base VMs built before the install
+# wrote the line alone carry a comment line above it, and must not need another update. A file
+# with no line left (missing, empty, comments only) leaves `grep -v` printing nothing, which
+# compares unequal and is refused; its status is not read. Command substitution strips the
 # trailing newline before the compare. A guest that lies here gains nothing: its sshd decides what
 # it accepts, and a session whose credentials it drops is refused by the delivery check
 # (macos_session_env_delivery_cmd). The base VM build and update run this same command before they
 # save the base (verify_macos_session_env_acceptance). `2>/dev/null`: a guest with no drop-in (an
-# old base) fails the check without cat's own "No such file" on the operator's terminal; the
+# old base) fails the check without grep's own "No such file" on the operator's terminal; the
 # refusal says what is wrong. A single `=` inside `[ ]`, which zsh (the push's guest shell) and sh
-# both take as string equality.
+# both take as string equality; `[[:space:]]` and repeated `-e` are BSD grep's as well as GNU's.
 macos_session_env_check_cmd() {
-    printf "[ \"\$(cat %s 2>/dev/null)\" = '%s' ]" "$(macos_session_sshd_dropin)" "$(macos_session_accept_env_line "$1")"
+    printf "[ \"\$(grep -v -e '^[[:space:]]*#' -e '^[[:space:]]*\$' %s 2>/dev/null)\" = '%s' ]" \
+        "$(macos_session_sshd_dropin)" "$(macos_session_accept_env_line "$1")"
 }
 
 # Say that VM $1 was refused, and how to fix it. With `delivery` as $2: a session that sent

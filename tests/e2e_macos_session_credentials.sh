@@ -217,8 +217,10 @@ fi
 section "The sshd drop-in"
 dout="$(gssh "cat '${DROPIN}'; stat -f 'owner=%Su:%Sg mode=%Lp' '${DROPIN}'" 2>&1)"
 dcontent="$(gssh "cat '${DROPIN}'" 2>&1)"
-if [[ "$dcontent" == "$LINE" ]]; then ok "${DROPIN} holds exactly the one line, and nothing else: ${LINE}"
-else fail "${DROPIN} holds exactly the one line, and nothing else: ${LINE}" "$(redact "$dcontent")"; fi
+# Comment and blank lines aside (a base an earlier install built has a comment line above it).
+dlines="$(grep -v -e '^[[:space:]]*#' -e '^[[:space:]]*$' <<<"$dcontent" || true)"
+if [[ "$dlines" == "$LINE" ]]; then ok "${DROPIN} holds exactly the one line, and no other directive: ${LINE}"
+else fail "${DROPIN} holds exactly the one line, and no other directive: ${LINE}" "$(redact "$dcontent")"; fi
 if gssh "$(macos_session_env_check_cmd "$NAMES")"; then ok "the clones' check (macos_session_env_check_cmd) passes on this guest"
 else fail "the clones' check (macos_session_env_check_cmd) passes on this guest"; fi
 has "$dout" "owner=root:wheel mode=644" "the drop-in is root:wheel, mode 644"
