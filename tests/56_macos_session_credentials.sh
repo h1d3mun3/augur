@@ -158,7 +158,14 @@ gh() {
 GUEST_HOME="$TMPD/guest"; mkdir -p "$GUEST_HOME"
 GUEST_ETC="$TMPD/guest-etc"; mkdir -p "$GUEST_ETC/ssh/sshd_config.d"
 FAIL_PUSH=0; FAIL_CHECK=0; FAIL_STEP=""
-guest_map() { local c="${1//\/Users\/${MACOS_SSH_USER}/$GUEST_HOME}"; printf '%s' "${c//\/etc\/ssh/$GUEST_ETC/ssh}"; }
+# The guest's /tmp reference file for the push's cleanup lands in GUEST_TMP, this run's own, so a
+# concurrent run of this file (or anything else using the host's /tmp) cannot change its count.
+GUEST_TMP="$TMPD/guest-tmp"; mkdir -p "$GUEST_TMP"
+guest_map() {
+    local c="${1//\/Users\/${MACOS_SSH_USER}/$GUEST_HOME}"
+    c="${c//\/tmp\/augur-env-ref/$GUEST_TMP/augur-env-ref}"
+    printf '%s' "${c//\/etc\/ssh/$GUEST_ETC/ssh}"
+}
 guest_run() { HOME="$GUEST_HOME" bash -c "$(guest_map "$1")"; }
 ssh_macos() {
     local vm="$1"; shift
@@ -743,7 +750,7 @@ stale_cleaned() {
 }
 # Every push (every session, `up` on a running VM, the boot's only push) carries the acceptance
 # check and the cleanup.
-stale_fixture; ref_files() { find /tmp -maxdepth 1 -name 'augur-env-ref.*' 2>/dev/null | wc -l | tr -d ' '; }; refs_before="$(ref_files)"
+stale_fixture; ref_files() { find "$GUEST_TMP" -maxdepth 1 -name 'augur-env-ref.*' 2>/dev/null | wc -l | tr -d ' '; }; refs_before="$(ref_files)"
 run_cmd shell
 eq "0" "$rc" "stale temp files: shell --macos completes"
 stale_cleaned "checked push"
@@ -751,6 +758,7 @@ has "$(pushcmd)" "! -name .augur-env.tmp.\$\$" "checked push: the push's own tem
 has "$(pushcmd)" '\( -mmin +1 -o -newer "$_ref" \)' "checked push: the age test is the BSD-find-safe -mmin / -newer pair"
 has "$(pushcmd)" 'date -r "$_t" +%Y%m%d%H%M.%S' "checked push: the reference time is formatted the macOS (BSD date) way first"
 eq "$refs_before" "$(ref_files)" "checked push: its reference file in /tmp is removed again"
+has "$(pushcmd)" "mktemp /tmp/augur-env-ref." "checked push: the reference file is made in the guest's /tmp (mapped to this run's own directory here)"
 # On a refused guest too.
 mv "$DROPIN" "$TMPD/dropin.saved"
 stale_fixture
