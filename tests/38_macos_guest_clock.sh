@@ -416,6 +416,8 @@ section "Tier 1 — call sites: \`claude --macos\` and \`shell --macos\` attach 
 # sites: on a running VM they skip cmd_up_macos entirely. `claude` is the highest-impact case — the
 # launch below hands a JWT to the agent.
 macos_vm_running() { return 0; }
+# Its boot passed a self-test (macos_egress_verified_file; tests/51 covers the refusal without one).
+require_macos_egress_verified() { :; }
 
 reset_guest; g_offset -5733
 : > "$SSHLOG"; out="$( cmd_claude_macos 2>&1 )"; rc=$?

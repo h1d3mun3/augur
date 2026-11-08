@@ -230,6 +230,7 @@ reconcile_running_container() { echo "RECONCILE_CALLED"; }
 verify_macos_egress_locked() { echo "SELFTEST_CALLED"; }
 agent_verify_integrity_engine() { return 1; }   # setup-token stops right after the gate, before any tty read
 require_macos_egress_mode_current() { :; }   # its refusal is covered by 51_macos_egress_mode_unit.sh
+require_macos_egress_verified() { :; }       # likewise (its passed-self-test record)
 GUEST_UP=1
 container_running() { [[ "$GUEST_UP" == 1 ]]; }; macos_vm_running() { [[ "$GUEST_UP" == 1 ]]; }
 container_exists() { [[ "$GUEST_UP" == 1 ]]; }

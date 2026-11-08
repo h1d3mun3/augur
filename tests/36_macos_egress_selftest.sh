@@ -384,13 +384,19 @@ if printf '%s\n' "$up_macos_body" | sed -n '/already running/,/^    fi$/p' | gre
 else
   fail "the already-running branch skips the self-test" "I1's tripwire would not fire on that path"
 fi
-# The teardown must name all three, in the shape the SSH-timeout path above it already uses.
-printf '%s\n' "$selftest_fn" | grep -q '"\$VM_CLI" stop "\$vm"' \
-  && ok "the self-test's teardown stops the VM"    || fail "the self-test's teardown does not stop the VM"
-printf '%s\n' "$selftest_fn" | grep -q '^ *stop_gvproxy$' \
-  && ok "the self-test's teardown stops gvproxy"   || fail "the self-test's teardown does not stop gvproxy"
-printf '%s\n' "$selftest_fn" | grep -q '^ *stop_proxy$' \
-  && ok "the self-test's teardown stops the proxy" || fail "the self-test's teardown does not stop the proxy"
+# The teardown goes through stop_unverified_macos_vm, the one teardown for a VM whose containment
+# is unproven, and that must name all three.
+stop_fn="$(awk '/^stop_unverified_macos_vm\(\) \{/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
+printf '%s\n' "$selftest_fn" | grep -q '^ *stop_unverified_macos_vm "\$vm"$' \
+  && ok "the self-test's teardown is stop_unverified_macos_vm" || fail "the self-test's teardown does not call stop_unverified_macos_vm"
+printf '%s\n' "$stop_fn" | grep -q '"\$VM_CLI" stop "\$1"' \
+  && ok "the teardown stops the VM"    || fail "the teardown does not stop the VM"
+printf '%s\n' "$stop_fn" | grep -q '^ *stop_gvproxy$' \
+  && ok "the teardown stops gvproxy"   || fail "the teardown does not stop gvproxy"
+printf '%s\n' "$stop_fn" | grep -q '^ *stop_proxy$' \
+  && ok "the teardown stops the proxy" || fail "the teardown does not stop the proxy"
+printf '%s\n' "$stop_fn" | grep -qF 'rm -f "$(macos_egress_verified_file)"' \
+  && ok "the teardown drops the record of a passed self-test" || fail "the teardown keeps the record of a passed self-test"
 # The positive half must target a MANAGED-BASELINE domain: the already-running path warns that
 # gvproxy snapshots its DNS allowlist at boot, so a project-conf domain could be allowlisted
 # host-side and still unresolvable in a live guest — a false leak that tears down a working VM.
