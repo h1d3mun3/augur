@@ -105,10 +105,11 @@ That kept them off argv, but:
   whatever else that push hit (no second attempt makes the guest accept, and the refusal must
   stop the caller at once); a `~/.zshenv` that could not be updated, which fails the same way every
   time; and a push that sent nothing (a value or name that cannot be written, or no SSH transport to
-  the VM). The push resolves the VM's SSH host and port (`macos_ssh_transport_ok`) before its
-  ssh pipeline: `_macos_ssh_cmd` exits rather than returns when they cannot be resolved (a running
-  egress VM whose gvproxy is down), and inside the pipeline that exit would read as a failed write
-  and be retried. Without a transport the push says so, sends nothing and returns 1. The pushes a
+  the VM). The push resolves the VM's SSH transport once (`macos_ssh_resolve`), before its ssh
+  pipeline, which reuses it: `_macos_ssh_cmd` exits rather than returns when the host or port cannot
+  be resolved (a running egress VM whose gvproxy is down), and inside the pipeline that exit would
+  read as a failed write and be retried. The boot self-test resolves it once for all its probes the
+  same way. Without a transport the push says so, sends nothing and returns 1. The pushes a
   refusal makes (`--refusing`, below) are not retried either: the refusal stands whatever they
   return.
 - **Old bases are refused, not migrated.** `up`, `claude` and `shell --macos` check over ssh that

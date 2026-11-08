@@ -384,7 +384,7 @@ else
     GVPROXY_STOPPED=1
     stop_gvproxy >/dev/null 2>&1
     if gvproxy_running; then fail "stop gvproxy" "it is still running"
-    elif macos_ssh_transport_ok "$vm"; then
+    elif ( macos_ssh_resolve "$vm" ); then
         skip "no-transport checks" "the VM still resolves an SSH host and port without gvproxy ('augur-vm ip' answered)"
     else
         ok "gvproxy stopped; the VM has no SSH transport"

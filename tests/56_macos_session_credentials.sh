@@ -1066,6 +1066,15 @@ has "$out" "No SSH transport to VM" "$_l: says there is no SSH transport"
 hasnt "$out" "Could not write ~/.augur-env" "$_l: does not call it a failed write"
 hasnt "$out" "once more" "$_l: does not retry"
 eq "0" "$(launches)" "$_l: no ssh process is started"
+# With a transport, the push resolves it once and its ssh reuses it.
+: > "$SESSLOG"; : > "$TMPD/resolves"
+out="$( unset -f ssh_macos; eval "$(sed -n '/^ssh_macos() {$/,/^}$/p' "$AUGUR")"
+        macos_ssh_port() { echo resolve >> "$TMPD/resolves"; echo 2222; }
+        push_macos_guest_env "$(macos_project_vm)" 2>&1 )"; rc=$?
+eq "0" "$rc" "the real ssh_macos with a transport: the push succeeds"
+eq "1" "$(wc -l < "$TMPD/resolves" | tr -d ' ')" "…resolving the VM's SSH transport once"
+eq "1" "$(launches)" "…for its one ssh"
+has "$(sed -n '/^ARGV$/,/^ENV$/p' "$SESSLOG")" "2222" "…which uses the resolved port"
 
 section "Tier 1 — a session checks in the guest that every credential it sent arrived"
 

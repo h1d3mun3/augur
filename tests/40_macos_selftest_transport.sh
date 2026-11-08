@@ -192,6 +192,15 @@ for _shape in " true" "https://1.1.1.1" "dscacheutil -q host -a name 'example.co
   if probed "$_shape"; then ok "probe still issued: ${_shape}"
   else fail "probe still issued: ${_shape}" "issued: $(tr '\n' ' ' < "$SSHLOG")"; fi
 done
+# The transport is resolved once, before the first probe, and every probe reuses it: a probe that
+# resolved again could take ssh_macos's exit from inside its suppressed context.
+eval "_real_host() $(declare -f macos_ssh_host | tail -n +2)"
+macos_ssh_host() { echo resolve >> "$TMPD/resolves"; _real_host "$@"; }
+: > "$TMPD/resolves"; selftest
+if [[ $rc -eq 0 && "$(wc -l < "$TMPD/resolves" | tr -d ' ')" == "1" && "$(wc -l < "$SSHLOG" | tr -d ' ')" -gt 1 ]]; then
+  ok "the self-test resolves the transport once for all its probes"
+else fail "the self-test resolves the transport once for all its probes" "rc=$rc resolves=$(wc -l < "$TMPD/resolves") probes=$(wc -l < "$SSHLOG")"; fi
+eval "macos_ssh_host() $(declare -f _real_host | tail -n +2)"
 
 section "Host resolves but SSH then fails — the older branch, unchanged"
 
