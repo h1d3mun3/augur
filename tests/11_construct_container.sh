@@ -210,7 +210,7 @@ if [[ -f "$ex" && -n "$launch_line" ]]; then
   has   "$body" "GIT_CONFIG_KEY_1=credential.https://github.com.helper -e GIT_CONFIG_VALUE_1=!f() " "claude: augur's helper is the last entry, after the reset"
   has   "$body" 'password=$GH_TOKEN'                   "claude: the helper carries only the \$GH_TOKEN reference"
   # augur's own non-interactive execs (profile wiring, history snapshot) get no credentials.
-  if printf '%s\n' "$full_trace" | grep '^container exec ' | grep -v '^container exec -it ' | grep -q -- '--env-file'
+  if grep -q -- '--env-file' <<<"$(grep '^container exec ' <<<"$full_trace" | grep -v '^container exec -it ')"
   then fail "claude: a non-interactive exec carries --env-file" "only the session launch may"
   else ok "claude: profile-wiring / history execs carry no --env-file"; fi
 else

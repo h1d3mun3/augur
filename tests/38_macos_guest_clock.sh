@@ -477,7 +477,7 @@ fi
 if grep -q '^ *sync_macos_guest_clock ' <<<"$(sed -n '/already running/,/^    fi$/p' <<<"$up_macos_body")"
 then ok "the already-running branch syncs the clock (the only place a long-lived guest is re-corrected)"
 else fail "the already-running branch skips the clock sync" "a VM kept across \`down --macos\` would drift forever"; fi
-printf '%s\n' "$prep_body" | grep -q '^ *sync_macos_guest_clock ' \
+grep -q '^ *sync_macos_guest_clock ' <<<"$prep_body" \
   && ok "prepare_macos_session syncs the clock (claude/shell attach without going through up)" \
   || fail "prepare_macos_session does not sync the clock"
 has "$claude_body" 'prepare_macos_session "$project_vm"' "cmd_claude_macos goes through prepare_macos_session"

@@ -310,10 +310,10 @@ pinned_fn="$(awk '/^warn_if_macos_egress_pinned\(\)/{f=1} f{print} f&&/^}/{exit}
 
 # `claude`/`shell` attach to a running VM WITHOUT going through cmd_up_macos, so they must warn
 # themselves — exactly why warn_if_macos_profile_stale is called from those same two sites.
-if printf '%s\n' "$claude_macos_body" | grep -q '^ *warn_if_macos_egress_pinned '
+if grep -q '^ *warn_if_macos_egress_pinned ' <<<"$claude_macos_body"
 then ok "macOS claude warns about pinned egress state (it attaches without going through up)"
 else fail "macOS claude does not call warn_if_macos_egress_pinned"; fi
-if printf '%s\n' "$shell_macos_body" | grep -q '^ *warn_if_macos_egress_pinned '
+if grep -q '^ *warn_if_macos_egress_pinned ' <<<"$shell_macos_body"
 then ok "macOS shell warns about pinned egress state"
 else fail "macOS shell does not call warn_if_macos_egress_pinned"; fi
 # Host-side only, like its peer: the thing being reported must not be asked to judge itself.
@@ -336,7 +336,7 @@ has "$running_branch" 'resolve_running_macos_vm_credentials "$project_vm"' "cmd_
 has "$(fn_body resolve_running_macos_vm_credentials)" 'refuse_running_macos_vm "$1"' "…which is where a credential that cannot be used stops it (refuse_running_macos_vm)"
 has "$(fn_body refuse_running_macos_vm)" 'exit_with_errors "$@"' "…which exits (exit_with_errors)"
 has "$(fn_body exit_with_errors)" 'exit 1' "…with status 1"
-if printf '%s\n' "$running_branch" | grep -v 'disarm_macos_push_on_exit; (( _prc == 0 )) || exit 1' | grep -q 'exit 1'
+if grep -q 'exit 1' <<<"$(grep -v 'disarm_macos_push_on_exit; (( _prc == 0 )) || exit 1' <<<"$running_branch")"
 then fail "cmd_up_macos refuses on some other drift on the already-running path" "only the egress mode is a refusal"
 else ok "cmd_up_macos refuses on no other drift on the already-running path"; fi
 
