@@ -153,6 +153,8 @@ gh() {
 # rest of the push (the acceptance check included) run for real. FAIL_STEP=vanish removes, in the
 # run's first push only, its temp file between the write and the rename, as a concurrent push's
 # cleanup would. FAIL_STEP=mktemp makes the guest's mktemp of the cleanup's reference file fail.
+# FAIL_STEP=drop runs the whole push, then drops the connection (255) as it closes. FAIL_STEP=noise
+# has the guest print a line with no newline before the push's own output.
 GUEST_HOME="$TMPD/guest"; mkdir -p "$GUEST_HOME"
 GUEST_ETC="$TMPD/guest-etc"; mkdir -p "$GUEST_ETC/ssh/sshd_config.d"
 FAIL_PUSH=0; FAIL_CHECK=0; FAIL_STEP=""
@@ -176,8 +178,10 @@ ssh_macos() {
                 vanish) $first && c="${c//&& mv -f /&& find ~ -maxdepth 1 -name '.augur-env.tmp.*' -exec rm -f {} + && mv -f }" ;;
                 zshenv) c="${c//"~/.zshenv"/"/nonexistent-augur-test/zshenv"}" ;;
                 mktemp) c="${c//mktemp \/tmp\/augur-env-ref/false \/tmp\/augur-env-ref}" ;;
+                noise)  c="printf 'guest startup noise'; $c" ;;
             esac
-            printf '%s' "$in" | guest_run "$c" ;;
+            printf '%s' "$in" | guest_run "$c" || return
+            [[ "$FAIL_STEP" != drop ]] || return 255 ;;
         *) echo "UNEXPECTED GUEST COMMAND: $*" >&2; return 1 ;;
     esac
 }
@@ -574,7 +578,7 @@ eq "" "$(src_git_env GH_TOKEN=ghp_session)" "…not even with a GH_TOKEN of its 
 grep -q sync_macos_guest_clock "$STEPS" && ok "shell --macos: the clock is synced on this path (control)" \
     || fail "shell --macos: the clock sync did not run" "steps: $(tr '\n' ' ' < "$STEPS")"
 pc="$(pushcmd)"
-if [[ "$pc" == "_acc=0; grep -sqxF '$(macos_session_accept_env_line "$(macos_session_env_names)")' "* ]]; then ok "shell --macos: the acceptance check is the push's first step"
+if [[ "$pc" == "grep -sqxF '$(macos_session_accept_env_line "$(macos_session_env_names)")' $(macos_session_sshd_dropin) || echo $MACOS_PUSH_REFUSED_MARKER; "* ]]; then ok "shell --macos: the acceptance check is the push's first step, its failure printing the refusal marker"
 else fail "shell --macos: the acceptance check is not the push's first step" "$pc"; fi
 
 # The shape that makes the write atomic and private.
@@ -812,6 +816,31 @@ FAIL_STEP=env; run_cmd shell; FAIL_STEP=""
 nonzero "the ~/.augur-env write fails on a current guest: shell --macos"
 hasnt "$out" "does not accept augur's session credentials" "the ~/.augur-env write fails on a current guest: no refusal is claimed"
 hasnt "$out" "may still hold credentials" "the ~/.augur-env write fails on a current guest: no old-credential warning"
+# The refusal is a marker on the guest's stdout, apart from the exit status: a connection that drops
+# once the guest has refused still refuses (no retry), and the same drop on a guest that accepts is
+# an unknown outcome, tried once more.
+mv "$DROPIN" "$TMPD/dropin.saved"
+old_env; : > "$SSHLOG"; FAIL_STEP=drop
+out="$( push_macos_guest_env_retrying "$(macos_project_vm)" 2>&1 )"; rc=$?; FAIL_STEP=""
+_l="no drop-in, the connection drops after the push"
+eq "$MACOS_PUSH_REFUSED_RC" "$rc" "$_l: refused"
+has "$out" "unknown outcome (ssh exit 255)" "$_l: says the outcome of the write is unknown"
+has "$out" "does not accept augur's session credentials" "$_l: reports the refusal"
+eq "1" "$(pushes)" "$_l: not retried"
+old_env; : > "$SSHLOG"; FAIL_STEP=noise
+out="$( push_macos_guest_env "$(macos_project_vm)" 2>&1 )"; rc=$?; FAIL_STEP=""
+eq "$MACOS_PUSH_REFUSED_RC" "$rc" "no drop-in, a guest startup file prints an open line first: still refused"
+mv "$TMPD/dropin.saved" "$DROPIN"
+: > "$SSHLOG"; FAIL_STEP=drop
+out="$( push_macos_guest_env_retrying "$(macos_project_vm)" 2>&1 )"; rc=$?; FAIL_STEP=""
+_l="drop-in present, the connection drops after the push"
+eq "$MACOS_PUSH_RETRYABLE_RC" "$rc" "$_l: an unknown outcome, twice"
+hasnt "$out" "does not accept augur's session credentials" "$_l: no refusal is claimed"
+eq "2" "$(pushes)" "$_l: tried once more"
+: > "$SSHLOG"; FAIL_STEP=noise
+out="$( push_macos_guest_env "$(macos_project_vm)" 2>&1 )"; rc=$?; FAIL_STEP=""
+eq "0" "$rc" "drop-in present, a guest startup file prints first: the push succeeds"
+hasnt "$(pushcmd)" "_acc" "the push's exit status carries no refusal offset"
 
 section "Tier 1 — a credential that cannot be injected aborts, after only the push of ~/.augur-env"
 

@@ -131,7 +131,9 @@ That kept them off argv, but:
   the base VM is already up to date, and `augur update --macos` first otherwise (augur does not
   detect the base's version).
   The refusal and its remedy are reported even when a later step of that push (the `~/.augur-env`
-  write, the `~/.zshenv` line) fails, together with that step.
+  write, the `~/.zshenv` line) fails, together with that step: the guest reports the refusal as a
+  marker line on the push's stdout (`MACOS_PUSH_REFUSED_MARKER`), apart from the later steps' exit
+  status, so it also stands when the connection drops after the check has run.
   There is deliberately no fallback to writing credentials to disk, and no in-place patching of
   project VMs. Without the check the guest's sshd would silently drop the values and the agent
   would start unauthenticated. A guest that lies to the check gains nothing: its sshd decides what

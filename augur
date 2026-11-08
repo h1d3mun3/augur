@@ -4546,8 +4546,9 @@ macos_env_add_export() {
 #      gone before its rename), or the outcome is unknown (ssh failure)
 #      (MACOS_PUSH_RETRYABLE_RC).
 push_macos_guest_env() {
-    local vm="$1" _refusing=false _kv _content _cmd _names _check _find _rc=0 _ssh=() _ssh_dest="" _ssh_for=""
-    [[ "${2:-}" == --refusing ]] && _refusing=true
+    # `_refusal`: "caller" for --refusing, "guest" once the guest reports the acceptance check failed.
+    local vm="$1" _refusal="" _kv _content _cmd _names _check _find _out _rc=0 _ssh=() _ssh_dest="" _ssh_for=""
+    if [[ "${2:-}" == --refusing ]]; then _refusal=caller; fi
     local _env="/Users/${MACOS_SSH_USER}/.augur-env"
     local _tmp="${_env}.tmp.\$\$"
     _content='# augur (rewritten on every up and session; local edits are lost)'$'\n'
@@ -4562,8 +4563,9 @@ push_macos_guest_env() {
     _content+="$MACOS_AUGUR_ENV_END_LINE"
 
     # Guest side, in one ssh session:
-    #   0. The acceptance check. A refusal adds 10 to the exit status of a failing step 2 or 3
-    #      below (11, 14), and is acted on after step 3 (exit 10).
+    #   0. The acceptance check. A refusal prints MACOS_PUSH_REFUSED_MARKER on a line of its own and
+    #      the push goes on, so the steps below still run and the exit status stays theirs; the
+    #      host acts on the marker after them, whatever that status is.
     #   1. Remove temp files left by an earlier push whose ssh was killed mid-write (see above for
     #      an older augur's): every `.augur-env.tmp.*` but this push's own that is older than a
     #      minute, or whose mtime is more than a minute ahead of the guest's clock (newer than a
@@ -4588,45 +4590,48 @@ push_macos_guest_env() {
     #      racing here can both append it; a repeated line only sources the same file twice, and
     #      macos_scrub_augur_credentials removes every copy.
     # Any other status (ssh's own 255 when the connection drops) leaves the outcome unknown: the drop
-    # may have come before or after the rename, and before or after the check.
+    # may have come before or after the rename, and, without the marker, before or after the check.
     _names="$(macos_session_env_names)" || return 1
     _check="$(macos_session_env_check_cmd "$_names")"
-    _cmd="_acc=0; ${_check} || _acc=10"
+    _cmd="${_check} || echo ${MACOS_PUSH_REFUSED_MARKER}"
     _find="find /Users/${MACOS_SSH_USER} -maxdepth 1 -name '.augur-env.tmp.*' ! -name ${_tmp##*/}"
     _cmd+="; _ref=\$(mktemp /tmp/augur-env-ref.XXXXXX 2>/dev/null) || _ref=''"
     _cmd+="; if [ -n \"\$_ref\" ]; then _t=\$(( \$(date +%s) + 60 ))"
     _cmd+="; touch -t \"\$(date -r \"\$_t\" +%Y%m%d%H%M.%S 2>/dev/null || date -d \"@\$_t\" +%Y%m%d%H%M.%S 2>/dev/null)\" \"\$_ref\" 2>/dev/null"
     _cmd+="; ${_find} \\( -mmin +1 -o -newer \"\$_ref\" \\) -exec rm -f {} + 2>/dev/null; rm -f \"\$_ref\""
     _cmd+="; else ${_find} -mmin +1 -exec rm -f {} + 2>/dev/null; fi"
-    _cmd+="; rm -f ${_tmp} && ( umask 077 && cat > ${_tmp} ) && [ \"\$(tail -n 1 ${_tmp})\" = '${MACOS_AUGUR_ENV_END_LINE}' ] && mv -f ${_tmp} ${_env} || { rm -f ${_tmp}; exit \$((1 + _acc)); }"
-    _cmd+="; { grep -q '.augur-env' ~/.zshenv 2>/dev/null || echo '${MACOS_AUGUR_ENV_SOURCE_LINE}' >> ~/.zshenv; } || exit \$((4 + _acc))"
-    _cmd+="; [ \$_acc = 0 ] || exit 10"
+    _cmd+="; rm -f ${_tmp} && ( umask 077 && cat > ${_tmp} ) && [ \"\$(tail -n 1 ${_tmp})\" = '${MACOS_AUGUR_ENV_END_LINE}' ] && mv -f ${_tmp} ${_env} || { rm -f ${_tmp}; exit 1; }"
+    _cmd+="; { grep -q '.augur-env' ~/.zshenv 2>/dev/null || echo '${MACOS_AUGUR_ENV_SOURCE_LINE}' >> ~/.zshenv; } || exit 4"
     # Resolved here, and reused by the ssh_macos below, not left to it: its exit on an unresolvable
-    # host or port would look, inside the pipeline below, like a failed write (see _macos_ssh_cmd).
+    # host or port would look, inside the command substitution below, like a failed write (see
+    # _macos_ssh_cmd).
     # A transport lost between this and the ssh fails the connection, which reads as an unknown
     # outcome, and the retry then stops here.
     if ! macos_ssh_resolve "$vm"; then
         warn "No SSH transport to VM '${vm}' (its SSH host or port cannot be resolved; is its gvproxy running?)."
         warn "  Nothing was pushed: the guest's ~/.augur-env is unchanged."
-        if $_refusing; then warn "  It may still hold credentials an older augur wrote into it."; fi
+        if [[ -n "$_refusal" ]]; then warn "  It may still hold credentials an older augur wrote into it."; fi
         return 1
     fi
-    # Only ssh's status counts: the guest checked the end marker, so a printf cut short by an early
-    # close cannot have installed anything.
-    printf '%s\n' "$_content" | ssh_macos "$vm" "$_cmd" || _rc="${PIPESTATUS[1]}"
-    local _refused=false _ret=1
-    case "$_rc" in 10|11|14) _refused=true; _refusing=true; _rc=$(( _rc - 10 )) ;; esac
+    # The content goes on ssh's stdin from a here-string, so ssh's status is the only one; the guest
+    # checks the end marker anyway, so content cut short in transit installs nothing. Of the guest's
+    # stdout augur reads only the acceptance check's marker, anywhere in it: output a guest startup
+    # file prints cannot hide it by leaving its last line open, and a guest that prints it itself is
+    # only refused.
+    _out="$(ssh_macos "$vm" "$_cmd" <<<"$_content")" || _rc=$?
+    if [[ "$_out" == *"$MACOS_PUSH_REFUSED_MARKER"* ]]; then _refusal=guest; fi
+    local _ret=1
     case "$_rc" in
         0) _ret=0 ;;
         4) warn "VM '${vm}' got its new ~/.augur-env, but ~/.zshenv could not be updated to source it." ;;
         1) _ret="$MACOS_PUSH_RETRYABLE_RC"
            warn "Could not write ~/.augur-env in VM '${vm}'; the guest's ~/.augur-env is unchanged."
-           if $_refusing; then warn "  It may still hold credentials an older augur wrote into it."; fi ;;
+           if [[ -n "$_refusal" ]]; then warn "  It may still hold credentials an older augur wrote into it."; fi ;;
         *) _ret="$MACOS_PUSH_RETRYABLE_RC"
            warn "The ~/.augur-env push to VM '${vm}' has an unknown outcome (ssh exit ${_rc}); the guest may hold the old or the new file."
-           if $_refusing; then warn "  The old one may still hold credentials an older augur wrote into it."; fi ;;
+           if [[ -n "$_refusal" ]]; then warn "  The old one may still hold credentials an older augur wrote into it."; fi ;;
     esac
-    if $_refused; then
+    if [[ "$_refusal" == guest ]]; then
         macos_session_env_refused "$vm"
         return "$MACOS_PUSH_REFUSED_RC"
     fi
@@ -4635,6 +4640,9 @@ push_macos_guest_env() {
 # push_macos_guest_env's statuses for a refused guest, and for a push a second attempt may fix.
 MACOS_PUSH_REFUSED_RC=2
 MACOS_PUSH_RETRYABLE_RC=3
+# The line push_macos_guest_env's guest side prints when the guest does not accept a session's
+# credentials (macos_session_env_check_cmd fails).
+MACOS_PUSH_REFUSED_MARKER='AUGUR_SESSION_ENV_REFUSED'
 
 # push_macos_guest_env for a push that must succeed (the boot's, `up` on a running VM's, every
 # session's), tried a second time when the first failed in a way that may pass: a dropped or
