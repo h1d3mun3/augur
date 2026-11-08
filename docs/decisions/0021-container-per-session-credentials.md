@@ -31,6 +31,9 @@ injected per session instead, only on the `container exec` that starts `augur cl
     which macOS VM mode writes into `~/.augur-env` as well. The empty entry relies on the CLI
     passing `-e GIT_CONFIG_VALUE_0=` through as set-and-empty (the explicit-empty `K=` semantics
     cited for the 1.0.0 minimum below); `tests/21_container_live.sh` checks it in a real container.
+    - *Amendment (2026-11-08):* macOS VM mode exports the set in the remote command of each
+      `claude` / `shell --macos` session that sends `GH_TOKEN` instead of writing it into
+      `~/.augur-env`; see [`0023`](./0023-macos-per-session-credentials.md).
 - **Validation** (`validate_resolved_credentials` / `validate_secret_value`) runs at session
   start, before the `exec`.
   - *Amendment (2026-11-07):* resolution and validation now live in `resolve_session_credentials`,

@@ -43,7 +43,13 @@ in time," this **prescribes** "what must never break." It changes rarely.
   with is recorded host-side (`macos_egress_mode_file`), and `up`/`claude`/`shell --macos` refuse a
   running VM whose record differs or is missing (`require_macos_egress_mode_current`) instead of
   attaching to it — so a VM started with `--no-egress` is never silently used by a plain
-  `claude --macos` (`tests/51_macos_egress_mode_unit.sh`). `setup-token --macos` boots its throwaway
+  `claude --macos` (`tests/51_macos_egress_mode_unit.sh`). `claude`/`shell --macos` also attach to
+  a running egress VM only when a second host-side record says its self-test passed during its
+  current boot (`macos_egress_verified_file`, tied to the boot by augur-vm's `run.pid`, checked by
+  `require_macos_egress_verified`): it is dropped before every `augur-vm run`, by `down`/`destroy`
+  and by the teardown (`stop_unverified_macos_vm`), and written only after the self-test passes,
+  so an `up --macos` interrupted before its self-test leaves no VM a session trusts
+  (`tests/51_macos_egress_mode_unit.sh`, `tests/56_macos_session_credentials.sh`). `setup-token --macos` boots its throwaway
   VM through the same datapath and self-test (`tests/52_macos_setup_token_unit.sh`). Both self-tests are inherently live (they need a
   booted guest); the *wiring* — invoked on both paths, and a NOT-locked verdict exits non-zero with
   the teardown having run — is covered offline by `tests/36_macos_egress_selftest.sh`; its transport pre-check fails closed too — with the SSH forward port unreadable, teardown runs and no probe is sent (`tests/40_macos_selftest_transport.sh`). `tests/34_up_reconcile.sh` pins the **already-running** path on both engines (container reaches
@@ -166,9 +172,14 @@ in time," this **prescribes** "what must never break." It changes rarely.
   `-o SetEnv=NAME=value`, which would be argv); the guest's sshd accepts exactly those names through
   a root-owned drop-in the base VM build/update writes (`install_macos_session_env_acceptance`), and
   a guest without it is refused before any credential is sent (`macos_session_env_check_cmd`).
-  They are never written to the guest's disk: `~/.augur-env` (`push_macos_guest_env`) holds only
-  non-secret per-VM env (git's `GIT_CONFIG_*` credential helper among it, which carries only the
-  `$GH_TOKEN` reference), and augur's other ssh calls (`ssh_macos`) carry no `SendEnv`. That
+  The session's remote command starts with a guest-side check that every name sent arrived
+  (`macos_session_env_delivery_cmd`, exit 197 otherwise, mapped by `ssh_macos_session` to the
+  refusal only when a credential was sent), so a guest sshd that drops them anyway never starts
+  the agent or shell unauthenticated. They are never written to the guest's disk:
+  `~/.augur-env` (`push_macos_guest_env`) holds only non-secret per-VM env and never reads the
+  resolved credentials; git's `GIT_CONFIG_*` credential helper, which carries only the `$GH_TOKEN`
+  reference, is exported by the session's remote command, and only when it sends `GH_TOKEN`
+  (`macos_session_git_env_cmd`); augur's other ssh calls (`ssh_macos`) carry no `SendEnv`. That
   helper's first entry resets git's helper chain (`git_credential_env`), so after a push git hands
   `GH_TOKEN` to no other helper's `store`, such as the guest's `osxkeychain`, which could write it
   into the login keychain on disk. A `~/.augur-env` an older augur wrote with credentials in it
@@ -198,13 +209,18 @@ in time," this **prescribes** "what must never break." It changes rarely.
   carries `-o SendEnv=` for exactly the resolved names with the values only in its own environment,
   that no value is on any ssh/scp argv, in any guest file (`~/.augur-env` included) or (for
   file- and `gh`-sourced values) in any other ssh call's environment, that the build/update write
-  the `AcceptEnv` drop-in, that the `GIT_CONFIG_*` lines in `~/.augur-env` hold no token value,
-  and that a guest without the drop-in gets no session (on a boot, no `GIT_CONFIG_*` lines either)
-  and has an older augur's credential lines removed from `~/.augur-env` (also when a later step of
-  that push fails, and when a running VM's credentials fail to resolve). That the real guest sshd honours the
-  drop-in, the guest's process list and the host-side environment visibility stay ⚠ review-only
-  (Mac-only). `tests/35_macos_gitconfig_helper.sh` drives real `git credential fill/approve` with
-  the env a session's shell gets and asserts no other configured helper is called.
+  the `AcceptEnv` drop-in, that `~/.augur-env` holds no `GIT_CONFIG_*` line and the session's
+  remote command exports them, holding no token value, only when `GH_TOKEN` is sent, and that a
+  guest without the drop-in gets no session and has an older augur's credential lines removed from
+  `~/.augur-env` (also when a later step of that push fails, and when a running VM's credentials
+  fail to resolve). With the `ssh` shim playing a guest sshd that drops a sent variable, it also
+  asserts the delivery check stops the session before the agent or shell starts, prints no value,
+  and is reported as the refusal only when a credential was sent. A real guest sshd honouring the
+  drop-in end to end, the guest's process list and the host-side environment visibility stay
+  ⚠ review-only (Mac-only). `tests/35_macos_gitconfig_helper.sh` drives real
+  `git credential fill/approve` with the env a session's shell gets (the remote command's exports
+  included) and asserts no other configured helper is called, and that a shell augur did not open
+  has no `GIT_CONFIG_*`.
   `tests/52_macos_setup_token_unit.sh` asserts that no credential value (API key, OAuth token file,
   gh token) and no `~/.augur-env` / `~/.gitconfig` reaches the throwaway VM of `setup-token --macos`.
 - **Note:** The rule does not cover the macOS guest's admin password (`macos_admin_password`),
@@ -223,8 +239,9 @@ in time," this **prescribes** "what must never break." It changes rarely.
 > partial (Container mode test-enforced, plus the macOS session ssh's argv and environment and
 > `setup-token --macos`'s credential-free throwaway VM).
 > The remaining review-only surface is the rest of the macOS half of I10 (a real guest sshd
-> honouring the `AcceptEnv` drop-in, a real guest's process list, and the host-side environment
-> visibility the Rule relies on), the hardware-dependent part of I9 (the live NIC count — the gvproxy UDP/ICMP drop is now probed
+> honouring the `AcceptEnv` drop-in end to end, though a guest whose sshd drops a sent credential
+> is refused at runtime by the session's delivery check; a real guest's process list; and the
+> host-side environment visibility the Rule relies on), the hardware-dependent part of I9 (the live NIC count — the gvproxy UDP/ICMP drop is now probed
 > live on every `up --macos`), and two gaps inside I7 (the TOFU gate's interactive and no-sha256
 > branches, and the approval record's full-path keying). Note that "enforced by tests" does not extend to augur's own
 > argv for I5 and I8: see their notes. For background on each item, see the newest
