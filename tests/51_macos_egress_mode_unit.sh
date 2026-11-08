@@ -18,7 +18,7 @@
 # `up --macos` on the running VM re-runs the self-test and records it. The boot path drops it before
 # `augur-vm run` and writes it only after the self-test; --no-egress has none; down/destroy and a
 # failing self-test drop it. An `up` that cannot read the run id after a passed self-test fails and
-# stops the VM.
+# leaves no record; on a boot it stops the VM, on a running VM it leaves the VM running.
 #
 # Nothing is cloned, booted or SSH'd: the real cmd_* functions run against recorder stubs.
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/.." && pwd)"
@@ -273,29 +273,48 @@ run_cmd cmd_up_macos
   || ok "self-test fails on a running VM: the record is dropped"
 eval "$verify_real"
 # No run id after a passed self-test (no pidfile; a pid with no process; the process's start time
-# unreadable): the pass cannot be recorded, so `up` fails and stops the VM it cannot vouch for, on
-# the running VM and on a boot alike, rather than leave one every session refuses.
-no_run_id() {   # no_run_id <label>
+# unreadable): the pass cannot be recorded, so `up` fails and leaves no record, which every session
+# then refuses. On a boot it also stops the VM it just booted; on a running VM, which may be serving
+# live sessions and whose run id may be unreadable only for a moment, it leaves the VM running and
+# refuses it as every refusal of a running VM does (one push of ~/.augur-env first).
+no_run_id() {   # no_run_id <label> running|boot
   [[ "$rc" -ne 0 ]] && ok "$1: up --macos exits non-zero" || fail "$1: up --macos exited 0"
   has "$out" "Could not read VM '$PV''s run id" "$1: says the run id is unreadable"
   has "$out" "cannot be recorded" "$1: says the pass cannot be recorded"
   logged selftest && ok "$1: the self-test ran first (control)" || fail "$1: no self-test ran"
-  logged "vm stop $PV" && ok "$1: the VM is stopped" || fail "$1: the VM was left running" "$(cat "$LOG")"
-  logged stop_gvproxy && logged stop_proxy && ok "$1: its gvproxy and proxy are stopped" || fail "$1: egress helpers left running"
   logged "vm delete $PV" && fail "$1: the clone was deleted" || ok "$1: the clone is kept"
-  [[ -e "$(macos_egress_verified_file)" ]] && fail "$1: a record was written" || ok "$1: nothing is recorded"
+  [[ -e "$(macos_egress_verified_file)" ]] && fail "$1: a record is left (sessions would attach)" || ok "$1: no record is left"
+  if [[ "$2" == boot ]]; then
+    logged "vm stop $PV" && ok "$1: the VM is stopped" || fail "$1: the VM was left running" "$(cat "$LOG")"
+    logged stop_gvproxy && logged stop_proxy && ok "$1: its gvproxy and proxy are stopped" || fail "$1: egress helpers left running"
+    has "$out" "Stopping VM '$PV' (its clone is kept)" "$1: says it stops the VM"
+  else
+    if logged "vm stop $PV" || logged stop_gvproxy || logged stop_proxy; then
+      fail "$1: the running VM or its egress helpers were stopped" "$(cat "$LOG")"
+    else ok "$1: the running VM and its egress helpers are left running"; fi
+    has "$out" "is left running, but no new session will attach to it" "$1: says the VM keeps running, without sessions"
+    has "$out" "Run ${BOLD}augur up --macos${RESET} again" "$1: names the retry"
+    has "$out" "augur down --macos && augur up --macos" "$1: names the restart if it keeps failing"
+    eq "push $PV --refusing" "$(grep '^push ' "$LOG")" "$1: pushes ~/.augur-env once, as a refusal, and nothing else"
+  fi
 }
 VM_UP=1; egress_on; record on
-rm -f "$RUN_ID_FILE" "$(macos_egress_verified_file)"
-run_cmd cmd_up_macos; no_run_id "running VM, no pidfile"
-sleep 0 & _dead=$!; wait "$_dead"; boot_id "$_dead"; verified_now
-run_cmd cmd_up_macos; no_run_id "running VM, a pid with no process"
-boot_id "$$"; mv "$SHIMDIR/ps" "$SHIMDIR/ps.saved"
+boot_id "$$"; verified_now; rm -f "$RUN_ID_FILE"
+run_cmd cmd_up_macos; no_run_id "running VM, no pidfile (a record of this boot was there)" running
+sleep 0 & _dead=$!; wait "$_dead"; boot_id "$$"; verified_now; boot_id "$_dead"
+run_cmd cmd_up_macos; no_run_id "running VM, a pid with no process (a record of this boot was there)" running
+boot_id "$$"; verified_now; mv "$SHIMDIR/ps" "$SHIMDIR/ps.saved"
 printf '#!/bin/sh\nexit 1\n' > "$SHIMDIR/ps"; chmod +x "$SHIMDIR/ps"
-run_cmd cmd_up_macos; no_run_id "running VM, ps cannot read the start time"
+run_cmd cmd_up_macos; no_run_id "running VM, ps fails once (a record of this boot was there)" running
 mv "$SHIMDIR/ps.saved" "$SHIMDIR/ps"
+# …after which a session refuses the VM, and the next `up` records the pass again.
+run_cmd cmd_claude_macos
+unverified "after the unrecordable pass: cmd_claude_macos"
+run_cmd cmd_up_macos
+eq 0 "$rc" "…and the next up --macos, with ps working again, reconciles"
+eq "$(macos_vm_run_id "$PV")" "$(cat "$(macos_egress_verified_file)" 2>/dev/null)" "…and records the pass"
 VM_UP=0; rm -f "$RUN_ID_FILE"
-run_cmd cmd_up_macos; no_run_id "boot, no pidfile"
+run_cmd cmd_up_macos; no_run_id "boot, no pidfile" boot
 hasnt "$out" "is up." "boot, no pidfile: no success banner"
 VM_UP=1; boot_id "$$"
 

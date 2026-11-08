@@ -127,13 +127,16 @@ hasnt "$bin_fn" "codesign"   "no signature check at plain claude launch (a proje
 # claude --macos refuses when the binary is missing.
 (
   require_vz() { :; }; require_fresh_egress_helpers() { :; }; macos_vm_running() { return 0; }
-  require_macos_egress_mode_current() { :; }; sync_macos_guest_clock() { :; }; sync_macos_guest_timezone() { :; }
+  require_macos_egress_mode_current() { :; }; require_macos_egress_verified() { :; }
+  sync_macos_guest_clock() { :; }; sync_macos_guest_timezone() { :; }
   ensure_macos_workspace() { :; }; ensure_macos_agent_projects() { :; }; ensure_macos_agent_agents() { :; }
   ensure_macos_agent_profile() { :; }; warn_if_macos_egress_pinned() { :; }
-  ssh_macos() { [[ "$*" == *" -t "* ]] && { echo AGENT_LAUNCHED; return 0; }; echo missing; }
+  # The ~/.augur-env push (its guest command holds a `touch -t`) succeeds; the binary probe says missing.
+  ssh_macos() { [[ "$*" == *".augur-env"* ]] && { cat >/dev/null; return 0; }; [[ "$*" == *" -t "* ]] && { echo AGENT_LAUNCHED; return 0; }; echo missing; }
   out="$( set -e; cmd_claude_macos 2>&1 )"; rc=$?
   [[ "$rc" -ne 0 ]] && ok "claude --macos with no binary: exits non-zero" || fail "claude --macos with no binary: exit 0"
   hasnt "$out" "AGENT_LAUNCHED" "claude --macos with no binary: nothing is launched"
+  has "$out" "is not installed in VM" "claude --macos with no binary: refused for the missing binary (not some earlier step)"
   finish >/dev/null; exit "$_T_FAIL"
 ); _sub=$?
 (( _sub == 0 )) || fail "the claude --macos subtest reported $_sub failure(s)"

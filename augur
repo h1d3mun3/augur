@@ -1036,12 +1036,16 @@ _macos_ssh_cmd() {
 # the value on ssh's argv. The ssh options are resolved before the subshell, so the commands that
 # resolve the VM's host and port never see the values either.
 #
-# For a value read from a host file or from `gh`, that ssh is the only process that holds it:
-# augur's own shell and its other children never do. Accepted trade-off: a credential the operator
-# exported into augur's environment (ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN) is already held
-# by augur and inherited by every child it starts, as with any other variable of the operator's
-# shell. Those processes run as the operator and none of them forwards it: ssh_macos is hermetic
-# and sends no env, so this ssh is still the only way the value reaches the guest.
+# For a value read from a host file or from `gh`, this ssh is the only process whose environment
+# holds it: no other child augur starts gets it in its environment, and it is on no argv and in no
+# file. augur's own bash does hold it, as a shell variable (`_creds`) in its memory, and so does
+# every subshell it forks while `_creds` is set (this one included), since a fork copies the
+# shell's memory; a command those subshells exec gets only their exported environment, which does
+# not hold it. Accepted trade-off: a credential the operator exported into augur's environment
+# (ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN) is already in augur's environment and inherited by
+# every child it starts, as with any other variable of the operator's shell. Those processes run
+# as the operator and none of them forwards it: ssh_macos is hermetic and sends no env, so this
+# ssh is still the only way the value reaches the guest.
 #
 # Do not trust the guest's sshd to have set them: its drop-in only says what it should accept, and
 # a guest sshd_config that has lost its Include (a guest macOS update, a hand edit) drops them
@@ -2222,36 +2226,52 @@ macos_vm_run_id() {
     printf '%s %s\n' "$pid" "${_w[*]}"
 }
 # Record that running VM $1 just passed its egress self-test. Without a run id to tie the pass to,
-# no session would ever attach to the VM, so it is stopped instead (stop_unverified_macos_vm, the
-# clone kept) and this exits 1.
+# this returns 1, after an error, and leaves no record at all (one written earlier in this boot is
+# removed too), so every session refuses the VM until a later `up` records a pass. The caller
+# decides what happens to the VM: cmd_up_macos's boot path stops the VM it just booted, and its
+# already-running branch leaves running a VM that may be serving live sessions.
 macos_record_egress_verified() {
     local id; id="$(macos_vm_run_id "$1")"
     if [[ -z "$id" ]]; then
+        rm -f "$(macos_egress_verified_file)"
         error "Could not read VM '$1''s run id (the pid in $AUGUR_DIR/vms/$1/run.pid and that process's"
         error "  start time), so its passed egress self-test cannot be recorded for its sessions."
-        error "Stopping VM '$1' (its clone is kept). Run ${BOLD}augur up --macos${RESET} to boot it again."
-        stop_unverified_macos_vm "$1"
-        exit 1
+        return 1
     fi
     mkdir -p "$AUGUR_PROXY_DIR"
     printf '%s\n' "$id" > "$(macos_egress_verified_file)"
 }
+# Refuse running VM $1, leaving it running: rewrite its ~/.augur-env (push_macos_guest_env
+# --refusing, whose failure only adds its own warning), print each further argument as an error
+# line, and exit 1.
+#
+# Every refusal of a running VM goes through here once augur may talk to the guest, so a refused
+# guest never keeps credentials augur could have removed: a ~/.augur-env an older augur wrote holds
+# them, the VM stays up after the refusal, and the push replaces that file (see
+# push_macos_guest_env). Deliberately done on a VM whose containment is unproven: the push sends no
+# credential, only the per-VM environment built from host-side constants. The refusals inside a
+# push (the acceptance check) need no call here: that push already rewrote the file. Deliberately
+# not used by require_macos_egress_mode_current and require_macos_admin_password, which run before
+# augur's first connection to the guest: they decide whether augur talks to it at all, and their
+# remedies restart or recreate the VM, whose boot pushes before any session.
+refuse_running_macos_vm() {
+    local vm="$1" _l; shift
+    push_macos_guest_env "$vm" --refusing || true
+    for _l in "$@"; do error "$_l"; done
+    exit 1
+}
+
 # Exit 1, leaving the VM running, unless running VM $1 passed its egress self-test during its
 # current boot (macos_egress_verified_file). Nothing to check with egress off.
-#
-# A refusal first pushes ~/.augur-env, as every refusal of a running VM does (see
-# push_macos_guest_env). Deliberately done on a VM whose containment is unproven: the push sends no
-# credential, only the per-VM environment built from host-side constants.
 require_macos_egress_verified() {
     local vm="$1" have
     egress_enabled || return 0
     have="$(cat "$(macos_egress_verified_file)" 2>/dev/null || true)"
     [[ -n "$have" && "$have" == "$(macos_vm_run_id "$vm")" ]] && return 0
-    push_macos_guest_env "$vm" --refusing || true
-    error "VM '${vm}' is running, but no egress self-test has passed since it booted (its ${BOLD}augur up --macos${RESET}"
-    error "  was interrupted, or the VM was started some other way). Refusing to send it credentials."
-    error "  Run ${BOLD}augur up --macos${RESET} to re-run the egress self-test on the running VM."
-    exit 1
+    refuse_running_macos_vm "$vm" \
+        "VM '${vm}' is running, but no egress self-test has passed since it booted (its ${BOLD}augur up --macos${RESET}" \
+        "  was interrupted, or the VM was started some other way). Refusing to send it credentials." \
+        "  Run ${BOLD}augur up --macos${RESET} to re-run the egress self-test on the running VM."
 }
 
 # Fail closed on a socket path that cannot fit in sun_path. Without this, gvproxy's
@@ -4207,12 +4227,8 @@ install_macos_managed_settings() {
 # names are exact, never patterns: the guest accepts the credentials augur sends and nothing else
 # a client might.
 macos_session_sshd_dropin() { echo "/etc/ssh/sshd_config.d/200-augur-session-env.conf"; }
-# Fails, after macos_session_env_names' error, on a credential name that is not a shell variable
-# name.
-macos_session_accept_env_line() {
-    local _names; _names="$(macos_session_env_names)" || return 1
-    printf 'AcceptEnv %s' "$_names"
-}
+# The drop-in's line for the names $1 (macos_session_env_names).
+macos_session_accept_env_line() { printf 'AcceptEnv %s' "$1"; }
 
 # The marker line between the admin password and the script on macos_run_root_script's stdin. A
 # shell comment, so a password that happened to equal it would still run nothing.
@@ -4239,8 +4255,9 @@ macos_run_root_script() {
 }
 
 # The credential names of an augur session (session_credential_names) on one line, space-separated,
-# for a root shell script and sshd's configuration. Fails, after an error, on a name that is not a
-# shell variable name.
+# for a root shell script, the drop-in's line (macos_session_accept_env_line) and the session check
+# (macos_session_env_check_cmd), which take this output and validate nothing themselves. Fails,
+# after an error, on a name that is not a shell variable name.
 macos_session_env_names() {
     local _n _names=""
     while IFS= read -r _n; do
@@ -4293,7 +4310,7 @@ install_macos_session_env_acceptance() {
     local vm="$1" dst _line _names _script _err _rc=0
     dst="$(macos_session_sshd_dropin)"
     _names="$(macos_session_env_names)" || return 1
-    _line="$(macos_session_accept_env_line)" || return 1
+    _line="$(macos_session_accept_env_line "$_names")"
     info "Configuring the base VM's sshd to accept augur's session credentials (${_names})..."
     _script="$(macos_session_env_accepts_sh "$_names"; cat <<SCRIPT
 dst='${dst}'; cand=/etc/ssh/augur-session-env.candidate; main=/etc/ssh/augur-session-env.sshd_config
@@ -4330,11 +4347,11 @@ SCRIPT
 verify_macos_session_env_acceptance() {
     local vm="$1" _names _check _script _err _rc=0
     _names="$(macos_session_env_names)" || return 1
-    _check="$(macos_session_env_check_cmd)" || return 1
+    _check="$(macos_session_env_check_cmd "$_names")"
     info "Checking that the base VM's sshd still accepts augur's session credentials..."
     _script="$(macos_session_env_accepts_sh "$_names")"
     _script+=$'\naccepts || { cat "$err" >&2; rm -f "$err"; exit 3; }\nrm -f "$err"'
-    _script+=$'\n'"${_check} || { echo \"$(macos_session_sshd_dropin) does not hold the line every clone checks for: $(macos_session_accept_env_line)\" >&2; exit 5; }"
+    _script+=$'\n'"${_check} || { echo \"$(macos_session_sshd_dropin) does not hold the line every clone checks for: $(macos_session_accept_env_line "$_names")\" >&2; exit 5; }"
     _err="$(macos_run_root_script "$vm" "$_script" 2>&1 >/dev/null)" || _rc=$?
     (( _rc == 0 )) && return 0
     error "The base VM's sshd no longer accepts augur's session credentials ($(macos_session_sshd_dropin)):"
@@ -4412,13 +4429,11 @@ macos_env_add_export() {
 # session, after sshd has set the session's credentials, so its `export` lines would replace them.
 # The file is rewritten whole every time, so it holds only what the latest push wrote: such a
 # guest loses them at its first push. Hence every session pushes before it launches
-# (prepare_macos_session), and every refusal of a VM that may hold such a file pushes before it
-# refuses, so a refused guest never keeps credentials augur could have removed: the acceptance
-# check below refuses inside the push itself, and resolve_running_macos_vm_credentials and
-# require_macos_egress_verified push with `--refusing` before they refuse. Accepted trade-off: the
-# rename frees the old file's blocks without overwriting them, so an older augur's credential bytes
-# may remain in the clone's free disk space; the remedy for such a VM (macos_session_env_refused)
-# deletes the clone. Every line goes through macos_env_add_export.
+# (prepare_macos_session), and every refusal of a running VM pushes before it refuses
+# (refuse_running_macos_vm; the acceptance check below refuses inside the push itself). Accepted
+# trade-off: the rename frees the old file's blocks without overwriting them, so an older augur's
+# credential bytes may remain in the clone's free disk space; the remedy for such a VM
+# (macos_session_env_refused) deletes the clone. Every line goes through macos_env_add_export.
 #
 # The first step of every push, before anything is written, checks that the guest accepts a
 # session's credentials (macos_session_env_check_cmd). A guest that does not still gets its new
@@ -4430,12 +4445,19 @@ macos_env_add_export() {
 # that could not rewrite ~/.augur-env, or whose outcome is unknown, also says that the file may
 # still hold an older augur's credentials, as a refusal by the check does.
 #
-# Returns non-zero, after saying what happened, when a value cannot be written safely
-# (macos_env_add_export; nothing is sent to the guest then, because the whole content is built
-# before the ssh), when the install failed or its outcome is unknown (ssh failure, a full disk, an
-# unwritable ~/.zshenv), or when the guest was refused. Callers decide whether that is fatal.
+# Returns non-zero, after saying what happened, when the push did not install everything; callers
+# decide whether that is fatal. The status says what a second attempt could change
+# (push_macos_guest_env_retrying):
+#   1  it cannot work: a value cannot be written safely (macos_env_add_export) or a credential name
+#      is not a variable name (nothing is sent to the guest then, because the whole content is
+#      built before the ssh), or the guest's ~/.zshenv could not be updated (its new ~/.augur-env
+#      is in place).
+#   2  the guest was refused (MACOS_PUSH_REFUSED_RC), whatever else failed.
+#   3  the guest kept its old ~/.augur-env (a failed write: a full disk, or this push's temp file
+#      gone before its rename), or the outcome is unknown (ssh failure)
+#      (MACOS_PUSH_RETRYABLE_RC).
 push_macos_guest_env() {
-    local vm="$1" _refusing=false _kv _content _cmd _check _rc=0
+    local vm="$1" _refusing=false _kv _content _cmd _names _check _rc=0
     [[ "${2:-}" == --refusing ]] && _refusing=true
     local _env="/Users/${MACOS_SSH_USER}/.augur-env"
     local _tmp="${_env}.tmp.\$\$"
@@ -4454,14 +4476,18 @@ push_macos_guest_env() {
     #   0. The acceptance check. A refusal adds 10 to the exit status of a failing step 2 or 3
     #      below (11, 14), and is acted on after step 3 (exit 10).
     #   1. Remove temp files left by an earlier push whose ssh was killed mid-write (see above for
-    #      an older augur's): every `.augur-env.tmp.*` but this push's own that
-    #      is older than a minute, or whose mtime is ahead of the guest's clock (newer than a file
-    #      touched just now). A file written before a reboot looks that way while the guest clock
-    #      lags right after a boot, which a plain age test would take for a fresh one. A concurrent
-    #      push finishes well within the minute, so it keeps its own file. Accepted trade-off: a
-    #      concurrent push that creates its file in the instant between this push's reference
-    #      touch and its find loses it and fails. Best-effort: a failed cleanup does not stop the
-    #      install.
+    #      an older augur's): every `.augur-env.tmp.*` but this push's own that is older than a
+    #      minute, or whose mtime is more than a minute ahead of the guest's clock (newer than a
+    #      reference file touched to a minute from now). A file written before a reboot looks that
+    #      way while the guest clock lags right after a boot, which a plain age test would take for
+    #      a fresh one. A concurrent push finishes well within the minute and dates its file by the
+    #      same clock, so it keeps its file. A file less than a minute ahead stays until a later push
+    #      finds it older than a minute. `date -r <seconds>` is macOS's form and `date -d @<seconds>`
+    #      GNU's; when neither works, the reference keeps its mtime of now, the plain "ahead of the
+    #      clock" test. Accepted trade-off: a step of the guest clock between two concurrent pushes
+    #      (or that fallback) can still make one's file look stale to the other, which then loses
+    #      its file and fails with the old file in place (exit 1); its caller tries once more
+    #      (push_macos_guest_env_retrying). Best-effort: a failed cleanup does not stop the install.
     #   2. ~/.augur-env, atomically: the content goes to this session's temp file, created under
     #      umask 077 (mode 600), and is renamed over ~/.augur-env only if its last line is the end
     #      marker. A zsh starting at the same moment (a second `augur shell --macos`) sources either
@@ -4472,9 +4498,12 @@ push_macos_guest_env() {
     #      macos_scrub_augur_credentials removes every copy.
     # Any other status (ssh's own 255 when the connection drops) leaves the outcome unknown: the drop
     # may have come before or after the rename, and before or after the check.
-    _check="$(macos_session_env_check_cmd)" || return 1
+    _names="$(macos_session_env_names)" || return 1
+    _check="$(macos_session_env_check_cmd "$_names")"
     _cmd="_acc=0; ${_check} || _acc=10"
-    _cmd+="; _now=\$(mktemp /tmp/augur-env-now.XXXXXX 2>/dev/null) && find /Users/${MACOS_SSH_USER} -maxdepth 1 -name '.augur-env.tmp.*' ! -name ${_tmp##*/} \\( -mmin +1 -o -newer \"\$_now\" \\) -exec rm -f {} + 2>/dev/null; rm -f \"\$_now\""
+    _cmd+="; _ref=\$(mktemp /tmp/augur-env-ref.XXXXXX 2>/dev/null) && { _t=\$(( \$(date +%s) + 60 ))"
+    _cmd+="; touch -t \"\$(date -r \"\$_t\" +%Y%m%d%H%M.%S 2>/dev/null || date -d \"@\$_t\" +%Y%m%d%H%M.%S 2>/dev/null)\" \"\$_ref\" 2>/dev/null"
+    _cmd+="; find /Users/${MACOS_SSH_USER} -maxdepth 1 -name '.augur-env.tmp.*' ! -name ${_tmp##*/} \\( -mmin +1 -o -newer \"\$_ref\" \\) -exec rm -f {} + 2>/dev/null; rm -f \"\$_ref\"; }"
     _cmd+="; rm -f ${_tmp} && ( umask 077 && cat > ${_tmp} ) && [ \"\$(tail -n 1 ${_tmp})\" = '${MACOS_AUGUR_ENV_END_LINE}' ] && mv -f ${_tmp} ${_env} || { rm -f ${_tmp}; exit \$((1 + _acc)); }"
     _cmd+="; { grep -q '.augur-env' ~/.zshenv 2>/dev/null || echo '${MACOS_AUGUR_ENV_SOURCE_LINE}' >> ~/.zshenv; } || exit \$((4 + _acc))"
     _cmd+="; [ \$_acc = 0 ] || exit 10"
@@ -4486,16 +4515,40 @@ push_macos_guest_env() {
     case "$_rc" in
         0) _ret=0 ;;
         4) warn "VM '${vm}' got its new ~/.augur-env, but ~/.zshenv could not be updated to source it." ;;
-        1) warn "Could not write ~/.augur-env in VM '${vm}'; the guest's ~/.augur-env is unchanged."
+        1) _ret="$MACOS_PUSH_RETRYABLE_RC"
+           warn "Could not write ~/.augur-env in VM '${vm}'; the guest's ~/.augur-env is unchanged."
            if $_refusing; then warn "  It may still hold credentials an older augur wrote into it."; fi ;;
-        *) warn "The ~/.augur-env push to VM '${vm}' has an unknown outcome (ssh exit ${_rc}); the guest may hold the old or the new file."
+        *) _ret="$MACOS_PUSH_RETRYABLE_RC"
+           warn "The ~/.augur-env push to VM '${vm}' has an unknown outcome (ssh exit ${_rc}); the guest may hold the old or the new file."
            if $_refusing; then warn "  The old one may still hold credentials an older augur wrote into it."; fi ;;
     esac
     if $_refused; then
         macos_session_env_refused "$vm"
-        return 1
+        return "$MACOS_PUSH_REFUSED_RC"
     fi
     return "$_ret"
+}
+# push_macos_guest_env's statuses for a refused guest, and for a push a second attempt may fix.
+MACOS_PUSH_REFUSED_RC=2
+MACOS_PUSH_RETRYABLE_RC=3
+
+# push_macos_guest_env for a push that must succeed (the boot's, `up` on a running VM's, every
+# session's), tried a second time when the first failed in a way that may pass: a dropped or
+# failed ssh connection, or a write that failed with the old file in place, which is also how a
+# push fails whose temp file a concurrent push removed (see push_macos_guest_env). Once only, and
+# at once: a guest that fails twice in a row is not having a passing hiccup. Returns the status of
+# the last attempt.
+#
+# Deliberately never retries a refusal: the guest does not accept a session's credentials, which no
+# second attempt changes, and the refusal must stop the caller at once. Deliberately not retried
+# either: a ~/.zshenv that could not be updated (status 1), which fails the same way every time,
+# and a push that sent nothing.
+push_macos_guest_env_retrying() {
+    local _rc=0
+    push_macos_guest_env "$1" || _rc=$?
+    (( _rc == MACOS_PUSH_RETRYABLE_RC )) || return "$_rc"
+    warn "Trying the ~/.augur-env push to VM '$1' once more..."
+    push_macos_guest_env "$1"
 }
 
 # Tolerance, in seconds, for both the "is it worth correcting" test and the read-back after
@@ -4711,7 +4764,7 @@ macos_boot_ssh_failed() {
 
 # Stop VM $1 and the gvproxy and proxy serving it, and remove its record of a passed egress
 # self-test (macos_egress_verified_file), for a VM whose containment is unproven or disproven: a
-# boot that failed before or in its self-test, a running VM whose self-test failed, and one whose
+# boot that failed before or in its self-test, a running VM whose self-test failed, and a boot whose
 # pass cannot be recorded (macos_record_egress_verified). A VM left running there would be attached
 # to by the next `claude` / `shell --macos`, or refused by every one. Prints nothing; the
 # caller has said why. Deliberately keeps the VM itself: removing a project VM's clone is the
@@ -4781,19 +4834,27 @@ cmd_up_macos() {
         # booted that way. A pass is recorded as on the boot path (macos_egress_verified_file), so a
         # running VM whose boot was interrupted before its self-test takes sessions again after it:
         # the remedy require_macos_egress_verified names.
+        #
+        # A pass that cannot be recorded (an unreadable run id) fails `up` and leaves no record, so
+        # sessions refuse the VM. Deliberately does not stop it, unlike the boot path: the VM has
+        # just passed its self-test and may be serving live sessions, and the cause can be as
+        # transient as a `ps` that failed once.
         if egress_enabled; then
             verify_macos_egress_locked "$project_vm"
-            macos_record_egress_verified "$project_vm"
+            macos_record_egress_verified "$project_vm" || refuse_running_macos_vm "$project_vm" \
+                "VM '${project_vm}' is left running, but no new session will attach to it until a passed self-test is" \
+                "  recorded. Run ${BOLD}augur up --macos${RESET} again; if this keeps failing, restart the VM:" \
+                "  ${BOLD}augur down --macos && augur up --macos${RESET}"
         fi
         # After the self-test, as on the boot path: a session that attaches through here sends its
         # credentials only to a guest just proven contained. Resolved only now, so a bad or
         # unreadable credential cannot cancel the reconcile, the clock fix or the self-test above;
         # it still stops `up` and any session (fail closed), after the push of ~/.augur-env (see
         # resolve_running_macos_vm_credentials). A failed push is fatal here as on the boot path
-        # (see push_macos_guest_env). The push also refuses a guest that would drop a session's
-        # credentials, as the boot path does right after its SSH wait.
+        # (see push_macos_guest_env_retrying). The push also refuses a guest that would drop a
+        # session's credentials, as the boot path does right after its SSH wait.
         resolve_running_macos_vm_credentials "$project_vm"
-        push_macos_guest_env "$project_vm" || exit 1
+        push_macos_guest_env_retrying "$project_vm" || exit 1
         return 0
     fi
 
@@ -4915,10 +4976,15 @@ cmd_up_macos() {
     # above the success banner. Skipped entirely with --no-egress, like container mode's (finish_up
     # guards verify_egress_locked the same way): with filtering off there is no allowlist to be
     # locked to, and the warning above already said so. Its pass is what lets a later session attach
-    # to this running VM (macos_egress_verified_file).
+    # to this running VM (macos_egress_verified_file). A pass that cannot be recorded stops the VM
+    # just booted (the clone kept): left running, it would be refused by every session.
     if egress_enabled; then
         verify_macos_egress_locked "$project_vm"
-        macos_record_egress_verified "$project_vm"
+        if ! macos_record_egress_verified "$project_vm"; then
+            error "Stopping VM '${project_vm}' (its clone is kept). Run ${BOLD}augur up --macos${RESET} to boot it again."
+            stop_unverified_macos_vm "$project_vm"
+            exit 1
+        fi
     fi
 
     # Unlike the clock, not a security-relevant read (nothing here judges a validity window by
@@ -5002,9 +5068,11 @@ prepare_macos_session() {
     # Accepted trade-off: no egress self-test before this session. Like Container mode's
     # per-session `exec`, it hands credentials to a guest whose containment was proven during its
     # current boot (require_macos_egress_verified). Fatal, unlike a helper failure: the session must
-    # not start before ~/.augur-env is rewritten (see push_macos_guest_env). Also where a guest that
-    # would drop the credentials is refused, before any is sent.
-    push_macos_guest_env "$vm" || exit 1
+    # not start before ~/.augur-env is rewritten (see push_macos_guest_env), though a failure a
+    # second attempt may fix (a dropped connection, a concurrent session's push) gets one
+    # (push_macos_guest_env_retrying). Also where a guest that would drop the credentials is
+    # refused, before any is sent.
+    push_macos_guest_env_retrying "$vm" || exit 1
     ensure_macos_workspace "$vm"
     ensure_macos_agent_projects "$vm"
     ensure_macos_agent_agents "$vm"
@@ -5013,22 +5081,22 @@ prepare_macos_session() {
 }
 
 # The guest command that succeeds only if the guest's sshd accepts every credential name a session
-# sends. The base VM build writes that acceptance (install_macos_session_env_acceptance), and a
-# project VM has it only if its base did. Without it the guest's sshd silently drops the session's
-# credentials, and the agent would start unauthenticated with no sign of why. Checked on every
-# `up` and every session, with or without credentials to send, so an affected VM is refused from
-# the start rather than from the first session after a `gh auth login`.
+# sends, for the names $1 (macos_session_env_names). The base VM build writes that acceptance
+# (install_macos_session_env_acceptance), and a project VM has it only if its base did. Without it
+# the guest's sshd silently drops the session's credentials, and the agent would start
+# unauthenticated with no sign of why. Checked on every `up` and every session, with or without
+# credentials to send, so an affected VM is refused from the start rather than from the first
+# session after a `gh auth login`.
 #
 # Reads the drop-in file, which only root can write, and compares the exact line augur writes, so a
 # change to the credential names refuses a VM built for the old ones. A guest that lies here gains
 # nothing: its sshd decides what it accepts, and a session whose credentials it drops is refused
 # by the delivery check (macos_session_env_delivery_cmd). The base VM build and update run this
-# same command before they save the base (verify_macos_session_env_acceptance).
-#
-# Fails, after an error, on a credential name that is not a shell variable name.
+# same command before they save the base (verify_macos_session_env_acceptance). `-s`: a guest with
+# no drop-in (an old base) fails the check without grep's own "No such file" on the operator's
+# terminal; the refusal says what is wrong.
 macos_session_env_check_cmd() {
-    local _line; _line="$(macos_session_accept_env_line)" || return 1
-    printf "grep -qxF '%s' %s" "$_line" "$(macos_session_sshd_dropin)"
+    printf "grep -sqxF '%s' %s" "$(macos_session_accept_env_line "$1")" "$(macos_session_sshd_dropin)"
 }
 
 # Say that VM $1 was refused, and how to fix it. With `delivery` as $2: a session that sent
@@ -5061,28 +5129,26 @@ macos_session_env_refused() {
 
 # Exit 1 unless VM $1 passes macos_session_env_check_cmd, for cmd_up_macos's boot path, which checks
 # right after the SSH wait, before the boot self-test. The check is the first step of the push of
-# the non-secret ~/.augur-env (push_macos_guest_env), the same code path that refuses a running VM.
-# It is also the boot's only push of ~/.augur-env.
+# the non-secret ~/.augur-env (push_macos_guest_env_retrying), the same code path that refuses a
+# running VM. It is also the boot's only push of ~/.augur-env.
 #
-# Any failure of the push (a transport error, a full disk, a refusal) stops the VM, the clone kept
+# A push that still fails after its one retry (a refusal gets none) stops the VM, the clone kept
 # (stop_unverified_macos_vm): the boot cannot go on, and a refused VM is of no use anyway.
 require_macos_session_env_accepted() {
-    push_macos_guest_env "$1" && return 0
+    push_macos_guest_env_retrying "$1" && return 0
     error "Stopping VM '$1' (its clone is kept): its boot cannot go on."
     stop_unverified_macos_vm "$1"
     exit 1
 }
 
 # resolve_session_credentials for a session or `up` against RUNNING VM $1. When resolution fails,
-# the guest still gets its push before the exit, as every refusal of a running VM does (see
-# push_macos_guest_env), and an old-base VM is named with its remedy, next to the resolution
-# error. A stopped VM is not booted for this: cmd_up_macos resolves before it touches the VM at
-# all.
+# the VM is refused (refuse_running_macos_vm), so it still gets its push before the exit, and an
+# old-base VM is named with its remedy, next to the resolution error. A stopped VM is not booted
+# for this: cmd_up_macos resolves before it touches the VM at all.
 resolve_running_macos_vm_credentials() {
     resolve_session_credentials && return 0
-    push_macos_guest_env "$1" --refusing || true
-    error "Stopping: a credential could not be used (see above); no credential was sent to VM '$1'."
-    exit 1
+    refuse_running_macos_vm "$1" \
+        "Stopping: a credential could not be used (see above); no credential was sent to VM '$1'."
 }
 
 cmd_claude_macos() {

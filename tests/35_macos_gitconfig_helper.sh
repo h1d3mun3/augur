@@ -63,7 +63,7 @@ TOKEN="ghp_hosttoken0123456789"
 # push's acceptance check passes (tests/56 owns that check).
 GUEST_HOME=""
 GUEST_ETC="$TMPD/guest-etc"; mkdir -p "$GUEST_ETC/ssh/sshd_config.d"
-macos_session_accept_env_line > "$GUEST_ETC/ssh/sshd_config.d/$(basename "$(macos_session_sshd_dropin)")"
+macos_session_accept_env_line "$(macos_session_env_names)" > "$GUEST_ETC/ssh/sshd_config.d/$(basename "$(macos_session_sshd_dropin)")"
 SSHLOG="$TMPD/sshlog"; ALL_SSH="$TMPD/all-ssh"; : > "$ALL_SSH"
 ssh_macos() {
     local vm="$1"; shift
