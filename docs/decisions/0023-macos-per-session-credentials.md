@@ -156,7 +156,8 @@ That kept them off argv, but:
   `<egress mode> <pass>`: the egress mode the VM was booted with (the mode check, below) and the
   run id of the boot during which the self-test passed, or `-` while none has. One write and one
   file cover both mode drift and an interrupted boot. It is written whole, with no pass
-  (`macos_record_egress_mode`), just before every `augur-vm run`, and rewritten with the pass by
+  (`macos_record_egress_mode`) on every boot before the proxy, gvproxy and `augur-vm run` start (a
+  record that cannot be written stops the boot with nothing started), and rewritten with the pass by
   `cmd_up_macos` only once `verify_macos_egress_locked` has passed (`macos_record_egress_verified`):
   on a boot, and on the already-running branch, which re-runs the self-test (so `up --macos` also
   clears a VM whose boot was interrupted). `stop_unverified_macos_vm` drops the pass and keeps the

@@ -2286,8 +2286,7 @@ macos_write_boot_record() {
 # 1, after an error, when it cannot be written: every command would refuse the VM booted without it.
 macos_record_egress_mode() {
     macos_write_boot_record "$(requested_egress_mode)" - && return 0
-    error "Could not write $(macos_boot_record_file), the record of the egress mode the VM boots with."
-    exit 1
+    exit_with_errors "Could not write $(macos_boot_record_file), the record of the egress mode the VM boots with."
 }
 # Drop the record's pass and keep its mode, so every session refuses the VM as one whose current
 # boot passed no self-test. A record with no mode is removed instead.
@@ -5107,6 +5106,10 @@ cmd_up_macos() {
     # Egress allowlist: replace NAT with the vfkit/file-handle datapath so all guest
     # traffic flows through the host proxy. The proxy's SOCKS5 is the decision point;
     # gvproxy provides the guest netstack and forwards to it. No host sudo required.
+    # The boot's record (macos_boot_record_file) comes first: this boot's egress mode, and no passed
+    # self-test until the one below passes. Before the proxy and gvproxy, so a record that cannot be
+    # written stops the boot with nothing started, and still before `augur-vm run`.
+    macos_record_egress_mode
     local net_args=()
     if egress_enabled; then
         start_proxy "127.0.0.1"          # SOCKS5 reachable locally by gvproxy
@@ -5126,9 +5129,6 @@ cmd_up_macos() {
     # inert: it lands at /Volumes/My Shared Files/gh-config and nothing wires it to ~/.config/gh, so
     # it would carry the host's real config.yml and hosts.yml into the guest without gh ever reading
     # them. gh still works: GH_TOKEN is the auth path.
-    # The boot's record (macos_boot_record_file): this boot's egress mode, and no passed self-test
-    # until the one below passes.
-    macos_record_egress_mode
     "$VM_CLI" run $graphics_flag \
         ${net_args[@]+"${net_args[@]}"} \
         --dir="${MACOS_SHARE}:${WORKSPACE_DIR}" \

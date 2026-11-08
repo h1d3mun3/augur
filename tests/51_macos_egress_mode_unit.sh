@@ -466,6 +466,15 @@ VM_UP=0
 [[ "$rc" -ne 0 ]] && ok "boot record unwritable: up --macos fails" || fail "boot record unwritable: up --macos exited 0"
 has "$out" "Could not write $(macos_boot_record_file)" "boot record unwritable: says so"
 grep -q '^vm run' "$LOG" && fail "boot record unwritable: the VM was booted" "$(cat "$LOG")" || ok "boot record unwritable: the VM is not booted"
+if logged start_proxy || logged start_gvproxy; then fail "boot record unwritable: the proxy or gvproxy was started and left behind" "$(cat "$LOG")"
+else ok "boot record unwritable: no proxy or gvproxy is started"; fi
+fn="$(declare -f cmd_up_macos)"
+rec_at="$(grep -n 'macos_record_egress_mode' <<<"$fn" | head -n1 | cut -d: -f1)"
+sp_at="$(grep -n 'start_proxy "127.0.0.1"' <<<"$fn" | tail -n1 | cut -d: -f1)"
+sg_at="$(grep -n '^ *start_gvproxy;$' <<<"$fn" | tail -n1 | cut -d: -f1)"
+if [[ -n "$rec_at" && -n "$sp_at" && -n "$sg_at" && "$rec_at" -lt "$sp_at" && "$rec_at" -lt "$sg_at" ]]; then
+  ok "the boot's record is written before the boot path starts the proxy and gvproxy"
+else fail "the boot's record is not written before the proxy and gvproxy" "record@$rec_at proxy@$sp_at gvproxy@$sg_at"; fi
 VM_UP=1
 
 VM_UP=0; rm -f "$RUN_ID_FILE"
