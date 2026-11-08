@@ -10,7 +10,9 @@
 #
 # Environment:
 #   AUGUR_TEST_LIVE=1        required: it talks to a real VM.
-#   AUGUR_E2E_PROJECT=<dir>  the project whose VM is used (default: this checkout).
+#   AUGUR_E2E_PROJECT=<dir>  the project whose VM is used (default: this checkout). Any other
+#                            directory also needs AUGUR_E2E_ANY_PROJECT=1, because the script's
+#                            `augur up --macos` auto-approves that project's ./.augur/allowlist.conf.
 #   AUGUR_E2E_BOOT=1         allow booting the project VM when it is stopped.
 #   AUGUR_E2E_DESTRUCTIVE=1  also run the steps that change the VM: move the sshd drop-in away and
 #                            back, and stop gvproxy under the live VM (which stops and reboots it).
@@ -18,9 +20,13 @@
 #   AUGUR_E2E_SKIP_GVPROXY=1 with AUGUR_E2E_DESTRUCTIVE=1, leave gvproxy alone.
 #   AUGUR_E2E_RESTORE=1      only put the drop-in back (after an interrupted run) and exit.
 #
-# Only a dummy credential (augur-e2e-dummy-<random>) is ever sent; the operator's own credentials
-# are never resolved by this script. No credential value or admin password is printed. The VM is
-# left running and usable at the end.
+# The script's own sessions send only a dummy credential (augur-e2e-dummy-<random>). The real
+# `augur up --macos` it runs resolves and validates the operator's own credentials as every `up`
+# does (reading their token files and `gh auth token`, which may raise a keychain prompt), and
+# sends none of them to the guest. It runs with AUGUR_ACCEPT_PROJECT_CONF=1, which approves the
+# project's ./.augur/allowlist.conf and records that approval. No credential value or admin
+# password is printed. An interrupted run exits non-zero. The VM is left running and usable at
+# the end.
 #
 # shellcheck disable=SC2016,SC2088  # remote commands are single-quoted on purpose: the guest expands them
 # shellcheck disable=SC2034,SC2154  # _creds, MACOS_* and AUGUR_DIR are shared with the sourced augur
@@ -45,6 +51,10 @@ cat <<EOF
               guest; sessions are refused meanwhile);
             — $(on "$SKIP_GVPROXY" && echo "skipped (AUGUR_E2E_SKIP_GVPROXY=1):" || echo "")stops gvproxy under the live VM: ends every session of this project, and
               recovery stops and reboots the VM (2–4 min).
+  Its 'augur up --macos' runs with AUGUR_ACCEPT_PROJECT_CONF=1: it approves this project's
+            ./.augur/allowlist.conf, if any, and records the approval. It also resolves and validates
+            your own credentials as every 'up' does (token files, 'gh auth token'; this may raise a
+            keychain prompt) without sending them anywhere; the script's own sessions send only a dummy.
   If a restore fails, the summary at the end prints the command that finishes it.
 EOF
 
@@ -59,6 +69,10 @@ if [[ "${AUGUR_TEST_LIVE:-0}" != "1" ]]; then
     skip "macOS session credentials e2e" "set AUGUR_TEST_LIVE=1 — this talks to a real VM"; finish; exit $?
 fi
 cd "$PROJECT" || { fail "cd into project '$PROJECT'"; finish; exit $?; }
+if [[ "$(pwd -P)" != "$(cd "$REPO" && pwd -P)" && "${AUGUR_E2E_ANY_PROJECT:-0}" != 1 ]]; then
+    fail "run against the augur checkout" "'${PROJECT}' is another project: its ./.augur/allowlist.conf would be auto-approved; set AUGUR_E2E_ANY_PROJECT=1 to allow that"
+    finish; exit $?
+fi
 
 # augur's own helpers (the AUGUR_SOURCE_ONLY seam), so every name, path, message and ssh option
 # here is the one augur uses. cd first: the VM name, gvproxy forward and record path derive from it.
@@ -92,6 +106,10 @@ MSG_RETRY="once more..."
 
 # Never echo a value: every guest output shown in a failure goes through this.
 redact() { local s="$1"; s="${s//$DUMMY/<dummy>}"; printf '%s' "${s//$DUMMY_OLD/<dummy>}"; }
+# lib.sh's eq/has/hasnt, with what they print on a failure redacted.
+eq()    { if [[ "$1" == "$2" ]]; then ok "$3"; else fail "$3" "expected [$(redact "$1")], got [$(redact "$2")]"; fi; }
+has()   { case "$1" in *"$2"*) ok "$3" ;; *) fail "$3" "[$(redact "$2")] not found in: $(redact "$1")" ;; esac; }
+hasnt() { case "$1" in *"$2"*) fail "$3" "[$(redact "$2")] unexpectedly present in: $(redact "$1")" ;; *) ok "$3" ;; esac; }
 # The real CLI, for the steps augur itself must take (boot, reconcile, self-test).
 augur_up() { AUGUR_ACCEPT_PROJECT_CONF=1 bash "$AUGUR" up --macos 2>&1; }
 # prepare_macos_session (the guest work of `augur claude/shell --macos` before the session) with the
@@ -116,31 +134,40 @@ lacks_dummy() { if [[ "$1" == *"$DUMMY"* || "$1" == *"$DUMMY_OLD"* ]]; then fail
 record_ok() { [[ -n "$(macos_vm_run_id "$vm")" && "$(cat "$(macos_egress_verified_file)" 2>/dev/null)" == "$(macos_vm_run_id "$vm")" ]]; }
 
 # ── Restores (also on Ctrl-C) ──────────────────────────────────────────────────────────────────
-DROPIN_MOVED=0; RECORD_REMOVED=0; GVPROXY_STOPPED=0; RESTORE_FAILED=()
+DROPIN_MOVED=0; RECORD_REMOVED=0; GVPROXY_STOPPED=0; RESTORE_FAILED=(); E2E_SIGNAL=0
+RESTORE_DROPIN_HOW="AUGUR_TEST_LIVE=1 AUGUR_E2E_RESTORE=1 bash tests/e2e_macos_session_credentials.sh  (or, in the VM's own Terminal: sudo mv ${SAVED} ${DROPIN})"
+RESTORE_VM_HOW="cd '${PROJECT}' && augur up --macos  (run it twice if the first one stops the VM)"
 restore_dropin() {
     macos_run_root_script "$vm" "if [ -e '${SAVED}' ]; then mv -f '${SAVED}' '${DROPIN}'; fi; grep -qxF '${LINE}' '${DROPIN}'" >/dev/null 2>&1
 }
+# The EXIT trap. INT/TERM/HUP are ignored while it runs (augur_up inherits that, so a second Ctrl-C
+# cannot cut a restore short), the drop-in goes back first, and each slow step prints its by-hand
+# command before it starts. An interrupted run keeps its signal's exit status.
 e2e_restore() {
-    trap - EXIT INT TERM HUP
+    trap - EXIT; trap '' INT TERM HUP
     if on "$DROPIN_MOVED"; then
         if restore_dropin; then DROPIN_MOVED=0; echo "  restored: ${DROPIN}"
-        else RESTORE_FAILED+=("the sshd drop-in: AUGUR_TEST_LIVE=1 AUGUR_E2E_RESTORE=1 bash tests/e2e_macos_session_credentials.sh  (or, in the VM's own Terminal: sudo mv ${SAVED} ${DROPIN})"); fi
+        else RESTORE_FAILED+=("the sshd drop-in: ${RESTORE_DROPIN_HOW}"); fi
     fi
     if on "$GVPROXY_STOPPED" || on "$RECORD_REMOVED"; then
         if ! { macos_vm_running "$vm" && gvproxy_running && record_ok; }; then
+            echo "  restoring the VM with augur up --macos (if this is cut short: ${RESTORE_VM_HOW})"
             augur_up >/dev/null; macos_vm_running "$vm" || augur_up >/dev/null
         fi
         if macos_vm_running "$vm" && record_ok; then echo "  restored: VM '${vm}' running with a passed self-test"
-        else RESTORE_FAILED+=("the VM and its self-test record: cd '${PROJECT}' && augur up --macos  (run it twice if the first one stops the VM)"); fi
+        else RESTORE_FAILED+=("the VM and its self-test record: ${RESTORE_VM_HOW}"); fi
     fi
     if (( ${#RESTORE_FAILED[@]} > 0 )); then
         fail "restore everything this run changed"
         for _r in "${RESTORE_FAILED[@]}"; do echo "         ↳ restore by hand: ${_r}"; done
     fi
-    finish; exit $?
+    (( E2E_SIGNAL == 0 )) || fail "the run finished" "interrupted (exit ${E2E_SIGNAL}); the checks after that point did not run"
+    finish; local _rc=$?
+    (( E2E_SIGNAL == 0 )) || exit "$E2E_SIGNAL"
+    exit "$_rc"
 }
 trap e2e_restore EXIT
-trap 'exit 130' INT TERM HUP
+trap 'E2E_SIGNAL=130; exit 130' INT; trap 'E2E_SIGNAL=143; exit 143' TERM; trap 'E2E_SIGNAL=129; exit 129' HUP
 
 if [[ "${AUGUR_E2E_RESTORE:-0}" == 1 ]]; then
     section "Restore only"

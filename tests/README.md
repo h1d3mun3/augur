@@ -47,15 +47,19 @@ AUGUR_TEST_LIVE=1 bash tests/e2e_macos_session_credentials.sh                   
 AUGUR_TEST_LIVE=1 AUGUR_E2E_DESTRUCTIVE=1 bash tests/e2e_macos_session_credentials.sh  # +4–6 min
 ```
 
-It sends only a random dummy credential and never resolves the operator's own. `AUGUR_E2E_BOOT=1`
-lets it boot a stopped project VM (`AUGUR_E2E_PROJECT=<dir>` picks the project; default this
-checkout). `AUGUR_E2E_DESTRUCTIVE=1` adds the steps that change the VM: the drop-in moved away and
-back (the old-base refusal and the delivery check's exit 197), and gvproxy stopped under the live
-VM (no SSH transport; recovery stops and reboots the VM, ending this project's sessions;
-`AUGUR_E2E_SKIP_GVPROXY=1` leaves it out). An EXIT trap restores what it changed and leaves the VM
-running; if a restore fails, the summary prints the command to finish it
+Its own sessions send only a random dummy credential. The real `augur up --macos` it runs resolves
+and validates the operator's credentials as every `up` does (which may raise a keychain prompt) and
+sends none to the guest; like `make e2e`, it runs with `AUGUR_ACCEPT_PROJECT_CONF=1`, which approves
+the project's `./.augur/allowlist.conf` and records the approval. `AUGUR_E2E_BOOT=1` lets it boot a
+stopped project VM. `AUGUR_E2E_PROJECT=<dir>` picks the project (default this checkout); any other
+directory also needs `AUGUR_E2E_ANY_PROJECT=1`. `AUGUR_E2E_DESTRUCTIVE=1` adds the steps that change
+the VM: the drop-in moved away and back (the old-base refusal and the delivery check's exit 197),
+and gvproxy stopped under the live VM (no SSH transport; recovery stops and reboots the VM, ending
+this project's sessions; `AUGUR_E2E_SKIP_GVPROXY=1` leaves it out). An EXIT trap restores what it
+changed and leaves the VM running, ignoring a second Ctrl-C meanwhile; an interrupted run exits
+non-zero. If a restore fails, the summary prints the command to finish it
 (`AUGUR_TEST_LIVE=1 AUGUR_E2E_RESTORE=1 bash tests/e2e_macos_session_credentials.sh` puts the
-drop-in back). Like `make e2e`, its `up --macos` runs with `AUGUR_ACCEPT_PROJECT_CONF=1`.
+drop-in back).
 
 ## How the offline construction test works
 
