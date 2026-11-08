@@ -118,8 +118,10 @@ That kept them off argv, but:
   the drop-in holds exactly the line augur would write (`macos_session_env_check_cmd`), always as
   the first step of every `~/.augur-env` push (`push_macos_guest_env`), so every refusal takes one
   code path and costs no extra connection. The line is built from `macos_session_env_names`, the
-  validated names, the same way the drop-in's is: `macos_session_env_names` is the one place the
-  names are checked, each caller (the install, the re-check, the push) computes them once, and
+  validated names, the same way the drop-in's is: the names are checked where they are listed
+  (`session_credential_names`, and `resolve_session_credentials` for `_creds`) and again where they
+  are written into guest shell code (`macos_session_env_names`, `macos_session_env_delivery_cmd`,
+  whose failure stops the session before any ssh), each caller (the install, the re-check, the push) computes them once, and
   `macos_session_accept_env_line` and `macos_session_env_check_cmd` take them as an argument. The
   check is `grep -sqxF`, so an old base with no drop-in is refused without grep's own "No such
   file" on the operator's terminal. On a boot that push runs right after

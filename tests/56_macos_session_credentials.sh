@@ -483,9 +483,13 @@ has "$(macos_session_env_names 2>&1)" "Refusing to use the credential name 'BAD*
 out="$( BAD_HOST_VAR=value; _creds=(); resolve_session_credentials 2>&1; echo "rc=$? n=${#_creds[@]}" )"
 has "$out" "rc=1 n=0" "resolution refuses a credential name that is a pattern, with no credential resolved"
 has "$out" "Refusing to use the credential name 'BAD*NAME'" "…with the one name check's error"
-eq "1" "$(grep -c 'valid_env_name "\$_genv"' "$AUGUR")" "the credential names are checked in one place"
-hasnt "$(declare -f macos_session_env_names macos_session_env_delivery_cmd ssh_macos_session)" 'valid_env_name' \
-    "…and not again by the drop-in's names, the delivery check or the session ssh"
+# Resolution checks each name in the loop that builds `_creds`, reading agent_auth_specs once.
+eq "1" "$(declare -f resolve_session_credentials | grep -c 'agent_auth_specs')" "resolution reads agent_auth_specs once"
+has "$(declare -f resolve_session_credentials)" 'credential_name_ok "$_genv" || return 1' "…and checks each name in that loop"
+# The writers check again, whatever they were handed (see the hostile `_creds` cases below).
+for _w in macos_session_env_names macos_session_env_delivery_cmd; do
+  has "$(declare -f "$_w")" 'credential_name_ok' "$_w checks each name it writes into guest shell code"
+done
 : > "$SSHLOG"; out="$( push_macos_guest_env "$(macos_project_vm)" 2>&1 )"; rc=$?
 eq "1" "$rc" "a push with a pattern credential name fails as one that cannot work (no retry)"
 eq "" "$(cat "$SSHLOG")" "a push with a pattern credential name: nothing reaches the guest"
@@ -493,6 +497,18 @@ eq "" "$(cat "$SSHLOG")" "a push with a pattern credential name: nothing reaches
 nonzero "a retried push with a pattern credential name"
 eq "" "$(cat "$SSHLOG")" "a retried push with a pattern credential name: nothing reaches the guest, twice or once"
 eval "$real_names"
+# A hostile name put straight into `_creds` (as no resolution produces it): the session's own check
+# refuses it, and nothing reaches the guest.
+for _bad in 'X;touch /tmp/augur-pwn' 'A B' '$(id)' '1BAD' "NL"$'\n'"X"; do
+  : > "$SESSLOG"
+  out="$( _creds=("${_bad}=value" "GH_TOKEN=ghp_x"); ssh_macos_session "$(macos_project_vm)" -t "true" 2>&1 )"; rc=$?
+  _l="a hostile credential name in _creds ($(printf '%q' "$_bad"))"
+  nonzero "$_l"
+  has "$out" "Refusing to use the credential name" "$_l: says so"
+  eq "0" "$(launches)" "$_l: no ssh is started (nothing reaches the guest)"
+  _dc="$( _creds=("${_bad}=value"); macos_session_env_delivery_cmd 2>/dev/null )"; _drc=$?
+  [[ "$_drc" -ne 0 ]] && ok "$_l: the delivery check refuses to build" || fail "$_l: the delivery check built guest code" "$_dc"
+done
 # The names come from the canonical list, not from the display line.
 _line_real="$(declare -f macos_session_accept_env_line)"
 macos_session_accept_env_line() { printf 'AcceptEnv X_DISPLAY_ONLY'; }
