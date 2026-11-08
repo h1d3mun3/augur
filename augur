@@ -4489,7 +4489,7 @@ install_macos_session_env_acceptance() {
     _script="$(macos_session_env_accepts_sh "$_names"; cat <<SCRIPT
 dst='${dst}'; cand=/etc/ssh/augur-session-env.candidate; main=/etc/ssh/augur-session-env.sshd_config
 cleanup() { rm -f "\$cand" "\$main" "\$err"; }
-printf '%s\n' '# augur: the credential names an augur claude/shell session sends.' '${_line}' > "\$cand" \
+printf '%s\n' '${_line}' > "\$cand" \
     && chown root:wheel "\$cand" && chmod 644 "\$cand" \
     && { printf 'Include %s\n' "\$cand"; cat /etc/ssh/sshd_config; } > "\$main" || { cleanup; exit 1; }
 accepts -f "\$main" || { cat "\$err" >&2; cleanup; exit 2; }
@@ -5302,15 +5302,19 @@ prepare_macos_session() {
 # credentials to send, so an affected VM is refused from the start rather than from the first
 # session after a `gh auth login`.
 #
-# Reads the drop-in file, which only root can write, and compares the exact line augur writes, so a
-# change to the credential names refuses a VM built for the old ones. A guest that lies here gains
-# nothing: its sshd decides what it accepts, and a session whose credentials it drops is refused
-# by the delivery check (macos_session_env_delivery_cmd). The base VM build and update run this
-# same command before they save the base (verify_macos_session_env_acceptance). `-s`: a guest with
-# no drop-in (an old base) fails the check without grep's own "No such file" on the operator's
-# terminal; the refusal says what is wrong.
+# Reads the drop-in file, which only root can write, and requires its whole content to be exactly
+# the one line augur writes (install_macos_session_env_acceptance), so a change to the credential
+# names refuses a VM built for the old ones, and so does a drop-in that has gained any other line
+# (another AcceptEnv, any other directive, even a comment). Command substitution strips the file's
+# trailing newline before the compare. A guest that lies here gains nothing: its sshd decides what
+# it accepts, and a session whose credentials it drops is refused by the delivery check
+# (macos_session_env_delivery_cmd). The base VM build and update run this same command before they
+# save the base (verify_macos_session_env_acceptance). `2>/dev/null`: a guest with no drop-in (an
+# old base) fails the check without cat's own "No such file" on the operator's terminal; the
+# refusal says what is wrong. A single `=` inside `[ ]`, which zsh (the push's guest shell) and sh
+# both take as string equality.
 macos_session_env_check_cmd() {
-    printf "grep -sqxF '%s' %s" "$(macos_session_accept_env_line "$1")" "$(macos_session_sshd_dropin)"
+    printf "[ \"\$(cat %s 2>/dev/null)\" = '%s' ]" "$(macos_session_sshd_dropin)" "$(macos_session_accept_env_line "$1")"
 }
 
 # Say that VM $1 was refused, and how to fix it. With `delivery` as $2: a session that sent

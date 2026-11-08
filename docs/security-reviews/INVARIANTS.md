@@ -182,7 +182,8 @@ in time," this **prescribes** "what must never break." It changes rarely.
   `ssh`, which names exactly the resolved variables with `-o SendEnv=<NAME>` (never
   `-o SetEnv=NAME=value`, which would be argv); the guest's sshd accepts exactly those names through
   a root-owned drop-in the base VM build/update writes (`install_macos_session_env_acceptance`), and
-  a guest without it is refused before any credential is sent (`macos_session_env_check_cmd`).
+  a guest without it, or whose drop-in holds anything but exactly that one line, is refused
+  before any credential is sent (`macos_session_env_check_cmd`).
   The session's remote command starts with a guest-side check that every name sent arrived
   (`macos_session_env_delivery_cmd`, exit 197 otherwise, mapped by `ssh_macos_session` to the
   refusal only when a credential was sent), so a guest sshd that drops them anyway never starts
@@ -233,7 +234,8 @@ in time," this **prescribes** "what must never break." It changes rarely.
   file- and `gh`-sourced values) in any other ssh call's environment, that the build/update write
   the `AcceptEnv` drop-in (its root script over one connection, nothing staged, the password on no
   argv and never printed, NOPASSWD sudo or not) and re-check it last before the save, also with the
-  clones' own check of the drop-in's exact line (with `tests/52_macos_setup_token_unit.sh` for the
+  clones' own check that the drop-in holds exactly augur's line and nothing else (an appended
+  `AcceptEnv`, comment or other line refused) (with `tests/52_macos_setup_token_unit.sh` for the
   order), that `~/.augur-env` holds no
   `GIT_CONFIG_*` line and the session's
   remote command exports them, holding no token value, only when `GH_TOKEN` is sent, and that a

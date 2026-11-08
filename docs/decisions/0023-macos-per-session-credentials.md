@@ -47,7 +47,7 @@ That kept them off argv, but:
   no credential.
 - **Guest side.** The base VM build and `update --macos` write
   `/etc/ssh/sshd_config.d/200-augur-session-env.conf` as root (`install_macos_session_env_acceptance`):
-  one `AcceptEnv` line naming exactly `session_credential_names` (the `agent_auth_specs` guest
+  a file holding exactly one line, with its newline and nothing else: the `AcceptEnv` line naming exactly `session_credential_names` (the `agent_auth_specs` guest
   variables plus `GH_TOKEN`; exact names, no patterns, charset-checked before they reach a root
   script; `macos_session_env_names` reads them from that list, not back out of the `AcceptEnv`
   line). macOS's `sshd_config` includes `sshd_config.d/*`, and `AcceptEnv` patterns add up across
@@ -83,8 +83,8 @@ That kept them off argv, but:
   `sshd -T` test against the live configuration (`verify_macos_session_env_acceptance`, the shared
   `macos_session_env_accepts_sh`, over `macos_run_root_script`) as their last guest step, after the
   signature check and right before the VM is stopped and saved, and in the same root script the
-  very check every clone runs (`macos_session_env_check_cmd`, the exact `AcceptEnv` line in the
-  drop-in). The two can disagree: sshd may accept the names from another file while the drop-in has
+  very check every clone runs (`macos_session_env_check_cmd`, the drop-in holding exactly the `AcceptEnv` line and
+  nothing else). The two can disagree: sshd may accept the names from another file while the drop-in has
   changed or gone, and every clone of that base would be refused. A failure of either saves
   nothing.
 - **`~/.augur-env` stays, without credentials and without git's helper set.** It still carries the
@@ -115,7 +115,8 @@ That kept them off argv, but:
   refusal makes (`--refusing`, below) are not retried either: the refusal stands whatever they
   return.
 - **Old bases are refused, not migrated.** `up`, `claude` and `shell --macos` check over ssh that
-  the drop-in holds exactly the line augur would write (`macos_session_env_check_cmd`), always as
+  the drop-in's whole content is exactly the line augur would write (`macos_session_env_check_cmd`:
+  a line appended to it, another `AcceptEnv` or any other directive or comment, refuses it), always as
   the first step of every `~/.augur-env` push (`push_macos_guest_env`), so every refusal takes one
   code path and costs no extra connection. The line is built from `macos_session_env_names`, the
   validated names, the same way the drop-in's is: the names are checked where they are listed
@@ -123,8 +124,9 @@ That kept them off argv, but:
   are written into guest shell code (`macos_session_env_names`, `macos_session_env_delivery_cmd`,
   whose failure stops the session before any ssh), each caller (the install, the re-check, the push) computes them once, and
   `macos_session_accept_env_line` and `macos_session_env_check_cmd` take them as an argument. The
-  check is `grep -sqxF`, so an old base with no drop-in is refused without grep's own "No such
-  file" on the operator's terminal. On a boot that push runs right after
+  check compares `"$(cat <drop-in> 2>/dev/null)"` with the line inside `[ … = … ]`, which zsh and
+  sh both read as string equality (command substitution strips the file's trailing newline), so an
+  old base with no drop-in is refused without cat's own "No such file" on the operator's terminal. On a boot that push runs right after
   the SSH wait (before the clock, the self-test and the rest of the bring-up) and is the boot's
   only push: its content is built from host-side constants and nothing later in the bring-up
   writes `~/.augur-env` or `~/.zshenv`. On a running VM it is the session's or `up`'s one push. A

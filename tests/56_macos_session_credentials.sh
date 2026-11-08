@@ -341,7 +341,8 @@ section "Tier 1 — the base VM build writes the sshd drop-in that accepts the s
 
 install_dropin
 eq "0" "$rc" "the drop-in install succeeds when sshd confirms it"
-eq "$(macos_session_accept_env_line "$(macos_session_env_names)")" "$(grep -v '^#' "$DROPIN")" "the drop-in holds exactly one AcceptEnv line"
+eq "$(macos_session_accept_env_line "$(macos_session_env_names)")" "$(cat "$DROPIN")" "the drop-in holds exactly one AcceptEnv line and nothing else"
+[[ "$(tail -c 1 "$DROPIN" | od -An -c | tr -d ' ')" == '\n' ]] && ok "…which ends in a newline" || fail "the drop-in does not end in a newline"
 eq "AcceptEnv ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN GH_TOKEN" "$(macos_session_accept_env_line "$(macos_session_env_names)")" \
    "it names exactly the agent's credentials and GH_TOKEN, no patterns"
 eq "644" "$(mode_of "$DROPIN")" "the drop-in is mode 644"
@@ -465,6 +466,31 @@ guest_run "$(macos_session_env_check_cmd "$(macos_session_env_names)")" && fail 
 cp "$TMPD/dropin.saved" "$DROPIN"
 verify_dropin
 eq "0" "$rc" "the re-check passes again with augur's own drop-in (control)"
+# The drop-in must hold exactly augur's line: a line appended to it, even a comment, or no line at
+# all, is refused by the clones' check and so by the re-check before the save.
+_al="$(macos_session_accept_env_line "$(macos_session_env_names)")"
+dropin_variants() {   # dropin_variants <name>: writes that variant of the drop-in
+  case "$1" in
+    extra-acceptenv) printf '%s\nAcceptEnv FOO\n' "$_al" > "$DROPIN" ;;
+    extra-comment)   printf '%s\n# added later\n' "$_al" > "$DROPIN" ;;
+    comment-first)   printf '# augur\n%s\n' "$_al" > "$DROPIN" ;;
+    other-directive) printf '%s\nPermitUserEnvironment yes\n' "$_al" > "$DROPIN" ;;
+    empty)           : > "$DROPIN" ;;
+  esac
+}
+for _v in extra-acceptenv extra-comment comment-first other-directive empty; do
+  dropin_variants "$_v"
+  guest_run "$(macos_session_env_check_cmd "$(macos_session_env_names)")" && fail "the clones' check accepts a drop-in with $_v" \
+    || ok "the clones' check refuses a drop-in with $_v"
+  verify_dropin
+  nonzero "the re-check before the save on a drop-in with $_v"
+done
+printf '%s' "$_al" > "$DROPIN"
+guest_run "$(macos_session_env_check_cmd "$(macos_session_env_names)")" && ok "the clones' check accepts the exact line without its trailing newline" \
+  || fail "the clones' check refuses the exact line without a trailing newline"
+cp "$TMPD/dropin.saved" "$DROPIN"
+guest_run "$(macos_session_env_check_cmd "$(macos_session_env_names)")" && ok "the clones' check accepts augur's own drop-in (control)" \
+  || fail "the clones' check refuses augur's own drop-in"
 agent_auth_specs() { echo 'BAD*NAME|BAD_HOST_VAR|/nonexistent|'; }
 verify_dropin
 nonzero "the re-check with a credential name that is a pattern"
@@ -597,7 +623,7 @@ eq "" "$(src_git_env GH_TOKEN=ghp_session)" "…not even with a GH_TOKEN of its 
 grep -q sync_macos_guest_clock "$STEPS" && ok "shell --macos: the clock is synced on this path (control)" \
     || fail "shell --macos: the clock sync did not run" "steps: $(tr '\n' ' ' < "$STEPS")"
 pc="$(pushcmd)"
-if [[ "$pc" == "grep -sqxF '$(macos_session_accept_env_line "$(macos_session_env_names)")' $(macos_session_sshd_dropin) || echo $MACOS_PUSH_REFUSED_MARKER; "* ]]; then ok "shell --macos: the acceptance check is the push's first step, its failure printing the refusal marker"
+if [[ "$pc" == "$(macos_session_env_check_cmd "$(macos_session_env_names)") || echo $MACOS_PUSH_REFUSED_MARKER; "* ]]; then ok "shell --macos: the acceptance check is the push's first step, its failure printing the refusal marker"
 else fail "shell --macos: the acceptance check is not the push's first step" "$pc"; fi
 
 # The shape that makes the write atomic and private.
@@ -780,6 +806,14 @@ RUNNING=1
 printf '# augur\nAcceptEnv ANTHROPIC_API_KEY GH_TOKEN\n' > "$DROPIN"
 old_env; run_cmd shell
 refused "a drop-in for other names: shell --macos"
+# A drop-in with augur's line plus another (an appended AcceptEnv), or with no line: the push's check
+# refuses the session.
+printf '%s\nAcceptEnv FOO\n' "$(macos_session_accept_env_line "$(macos_session_env_names)")" > "$DROPIN"
+old_env; run_cmd shell
+refused "a drop-in with an extra AcceptEnv line: shell --macos"
+: > "$DROPIN"
+old_env; run_cmd shell
+refused "an empty drop-in: shell --macos"
 mv "$TMPD/dropin.saved" "$DROPIN"
 # With the drop-in, a boot checks once, in its only push, which writes no GIT_CONFIG_* helper lines:
 # the session that follows exports them itself. No guest command checks on its own.
