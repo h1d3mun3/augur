@@ -76,7 +76,9 @@ That kept them off argv, but:
   NOPASSWD grant (a build holds one until it revokes it) still skips it, which is what the marker
   is for: whether or not sudo read the line, the password never reaches the shell running the
   script, where an unknown command would print it. The marker is a shell comment. A wrong password
-  fails sudo, and no line of the script runs. The password stays on no argv.
+  fails sudo, and no line of the script runs. The password stays on no argv. The base VM's managed
+  agent policy (`install_macos_managed_settings`) is installed the same way, its payload in a
+  quoted heredoc inside the root script, for the same reason.
 - **The drop-in is checked again last.** Homebrew, the agent installer and custom provisioning
   (which runs a root hook) all run after `update --macos` installs the drop-in, and the build's
   Xcode selection, sudo revoke and signature check run after its install. So both re-run the same
