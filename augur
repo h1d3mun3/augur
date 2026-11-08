@@ -2338,7 +2338,7 @@ MACOS_UUID_RE='[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A
 #     the same second.
 #   • The start time `ps -o lstart` gives for the pid in run.pid. After a host crash run.pid, run.id
 #     and the boot record all survive, and an unrelated process that later takes that pid makes
-#     augur-vm report the VM running; its start time differs, so the old pass no longer matches.
+#     augur-vm report the VM running; its start time differs, so the old pass does not match.
 # Empty, which matches no record, when either part is missing: no run.id, or one that holds anything
 # but one UUID (an augur-vm older than this augur writes none); no run.pid, or one that holds no
 # pid; no process with that pid.
