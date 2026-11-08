@@ -420,7 +420,7 @@ torn_down() {   # torn_down <label>
   logged stop_gvproxy && logged stop_proxy && ok "$1: its gvproxy and proxy are stopped" || fail "$1: its egress helpers are left running"
   [[ -L "$(host_lock_path "$MACOS_SETUP_TOKEN_LOCK")" ]] && fail "$1: the lock is left behind" || ok "$1: the lock is released"
   [[ -L "$(host_lock_path "$MACOS_BASE_WRITER_LOCK")" ]] && fail "$1: the base-writer lock is left behind" || ok "$1: the base-writer lock is released"
-  ( adopt_setup_token_identity; [[ -e "$(macos_egress_mode_file)" ]] ) && fail "$1: an egress-mode record was written (nothing reads it)" || ok "$1: no egress-mode record"
+  ( adopt_setup_token_identity; [[ -e "$(macos_boot_record_file)" ]] ) && fail "$1: a boot record was written (nothing reads it)" || ok "$1: no boot record"
   grep -q "^poweroff " "$LOG" && fail "$1: the guest was asked to shut down before its disk is deleted" || ok "$1: stopped directly, no in-guest poweroff"
 }
 

@@ -2210,57 +2210,92 @@ gvproxy_pidfile() { echo "$AUGUR_PROXY_DIR/$(workspace_slug)-$(workspace_path_ha
 gvproxy_log()     { echo "$AUGUR_PROXY_DIR/$(workspace_slug)-$(workspace_path_hash).gvproxy.log"; }
 macos_vm_log()    { echo "$AUGUR_PROXY_DIR/$(workspace_slug)-$(workspace_path_hash).vm.log"; }
 
-# Host-side record of the egress mode ("on" or "off") the project VM was BOOTED with. Written just
-# before `augur-vm run` (macos_record_egress_mode), removed by down/destroy. A running VM cannot
-# change its datapath — under egress gvproxy's socket IS its NIC, otherwise it is on NAT — so every
-# command that attaches to a running VM compares this with the mode it was asked for
-# (require_macos_egress_mode_current). Deliberately not inferred from the gvproxy pidfile: that is
-# just as absent for a --no-egress boot as for an egress VM whose gvproxy died.
-macos_egress_mode_file() { echo "$AUGUR_PROXY_DIR/$(workspace_slug)-$(workspace_path_hash).egress-mode"; }
+# Host-side record of the project VM's current boot, one line: `<egress mode> <pass>`.
+#   • The egress mode ("on" or "off") the VM was BOOTED with. A running VM cannot change its
+#     datapath — under egress gvproxy's socket IS its NIC, otherwise it is on NAT — so every command
+#     that attaches to a running VM compares it with the mode it was asked for
+#     (require_macos_egress_mode_current). Deliberately not inferred from the gvproxy pidfile: that
+#     is just as absent for a --no-egress boot as for an egress VM whose gvproxy died.
+#   • The run id (macos_vm_run_id) of the boot during which the egress self-test
+#     (verify_macos_egress_locked) passed, or `-` while none has. A session that attaches to a
+#     running VM sends it credentials with no self-test of its own (prepare_macos_session), so it
+#     first requires a pass for the current run id (require_macos_egress_verified): without one, an
+#     `up --macos` interrupted between `augur-vm run` and the self-test (Ctrl-C, a kill, a host
+#     crash) would leave a running VM that the next session trusts. The run id ties the pass to
+#     that boot: a VM booted again by any means, augur-vm by hand included, has a new id and does
+#     not match even if a record survived (a host crash removes nothing). Deliberately egress-on
+#     only: a --no-egress boot has no self-test to record, and a session asking for --no-egress
+#     attaches only to a VM booted that way, where there is no containment for a pass to vouch for.
+# Written whole just before every `augur-vm run`, with no pass (macos_record_egress_mode), so a boot
+# interrupted before its self-test leaves a record every session refuses; rewritten with the pass by
+# cmd_up_macos only once the self-test has passed (macos_record_egress_verified), on a boot and on
+# the already-running branch, which re-runs it; its pass dropped by stop_unverified_macos_vm; removed
+# by down/destroy. A missing record, or one that does not parse (a VM started some other way, or by
+# an older augur, which kept other files), gives no mode, so the VM is refused as one of unknown
+# egress mode.
+macos_boot_record_file() { echo "$AUGUR_PROXY_DIR/$(workspace_slug)-$(workspace_path_hash).boot-record"; }
 requested_egress_mode()  { if egress_enabled; then echo on; else echo off; fi; }
+# Set the caller's `_mode` ("on" or "off") and `_pass` (a run id, or empty) from the record. Both are
+# empty when it is missing or is not one line of a mode and a run id or `-`.
+macos_read_boot_record() {
+    local _line _m _p _rest
+    _mode=""; _pass=""
+    _line="$(cat "$(macos_boot_record_file)" 2>/dev/null)" || return 0
+    [[ "$_line" != *$'\n'* ]] || return 0
+    read -r _m _p _rest <<<"$_line"
+    [[ ( "$_m" == on || "$_m" == off ) && -n "$_p" && -z "$_rest" ]] || return 0
+    _mode="$_m"
+    if [[ "$_p" != - ]]; then _pass="$_p"; fi
+}
+# Write the record as mode $1 and pass $2 (a run id, or `-`), to a temp file in the same directory
+# renamed into place, so a command reading it at that moment sees the old record or the new one,
+# never an empty or partial file. Returns 1 when it cannot be written, and then removes the record,
+# so none is left that vouches for an earlier pass; the VM is then refused as one of unknown egress
+# mode.
+#
 # Accepted trade-off: two `up --macos` racing for the same project can leave a record that does not
 # match the VM that won. Concurrent runs for the same project are not supported anyway (nothing
 # serializes cmd_up_macos), the same as in Container mode.
+macos_write_boot_record() {
+    local f; f="$(macos_boot_record_file)"
+    if ! { mkdir -p "$AUGUR_PROXY_DIR" && printf '%s %s\n' "$1" "$2" > "${f}.tmp.$$" && mv -f "${f}.tmp.$$" "$f"; } 2>/dev/null; then
+        rm -f "${f}.tmp.$$" "$f"
+        return 1
+    fi
+}
+# The boot's record, just before `augur-vm run`: the egress mode asked for, and no pass yet. Exits
+# 1, after an error, when it cannot be written: every command would refuse the VM booted without it.
 macos_record_egress_mode() {
-    mkdir -p "$AUGUR_PROXY_DIR"
-    requested_egress_mode > "$(macos_egress_mode_file)"
+    macos_write_boot_record "$(requested_egress_mode)" - && return 0
+    error "Could not write $(macos_boot_record_file), the record of the egress mode the VM boots with."
+    exit 1
+}
+# Drop the record's pass and keep its mode, so every session refuses the VM as one whose current
+# boot passed no self-test. A record with no mode is removed instead.
+macos_drop_egress_pass() {
+    local _mode _pass
+    macos_read_boot_record
+    if [[ -n "$_mode" ]]; then macos_write_boot_record "$_mode" - || true; else rm -f "$(macos_boot_record_file)"; fi
 }
 # Refuse running VM $1 (refuse_running_macos_vm) unless it was booted with the egress mode this
 # invocation asks for. A missing record (a VM booted some other way) refuses too: the mode it runs
 # under is then unknown. The macOS peer of require_running_container_current.
 require_macos_egress_mode_current() {
-    local vm="$1" want have remedy="augur down --macos && augur up --macos"
+    local vm="$1" want _mode _pass remedy="augur down --macos && augur up --macos"
     want="$(requested_egress_mode)"
-    have="$(cat "$(macos_egress_mode_file)" 2>/dev/null || true)"
-    [[ "$have" == "$want" ]] && return 0
+    macos_read_boot_record
+    [[ "$_mode" == "$want" ]] && return 0
     [[ "$want" == off ]] && remedy+=" --no-egress"
-    if [[ -z "$have" ]]; then
+    if [[ -z "$_mode" ]]; then
         refuse_running_macos_vm "$vm" \
             "VM '${vm}' is running with an unknown egress mode (e.g. it was started by an older augur)." \
             "Restart it once: ${BOLD}${remedy}${RESET}"
     fi
     refuse_running_macos_vm "$vm" \
-        "VM '${vm}' was started with a different config (egress ${have}; this command asks for egress ${want})." \
+        "VM '${vm}' was started with a different config (egress ${_mode}; this command asks for egress ${want})." \
         "A running VM cannot switch its network datapath: ${BOLD}${remedy}${RESET}"
 }
 
-# Host-side record that the egress self-test (verify_macos_egress_locked) passed during the project
-# VM's current boot. A session that attaches to a running VM sends it credentials with no self-test
-# of its own (prepare_macos_session), so it first requires this record
-# (require_macos_egress_verified): without it, an `up --macos` interrupted between `augur-vm run`
-# and the self-test (Ctrl-C, a kill, a host crash) would leave a running VM that the next session
-# trusts. Removed just before every `augur-vm run`, by stop_unverified_macos_vm and by
-# down/destroy; written by cmd_up_macos only once the self-test has passed, on a boot and on the
-# already-running branch, which re-runs it.
-#
-# It holds the VM's run id (macos_vm_run_id) at the moment the self-test passed, which ties it to
-# that boot: a VM booted again by any means, augur-vm by hand included, has a new id and does not
-# match even if a record survived (a host crash removes nothing).
-#
-# Deliberately egress-on only: a --no-egress boot has no self-test to record, and a session asking
-# for --no-egress attaches only to a VM booted that way (require_macos_egress_mode_current), where
-# there is no containment for a record to vouch for.
-macos_egress_verified_file() { echo "$AUGUR_PROXY_DIR/$(workspace_slug)-$(workspace_path_hash).egress-verified"; }
 # The id of VM $1's current boot: the random id (a UUID) augur-vm's `run` writes to the VM's run.id
 # before it writes run.pid (the file augur-vm decides a VM's running state by), and removes with
 # it. Every boot gets a new one, so an `augur-vm run` started by hand after a host crash cannot
@@ -2277,31 +2312,24 @@ macos_vm_run_id() {
     [[ "$id" =~ ^${_hex}{8}-${_hex}{4}-${_hex}{4}-${_hex}{4}-${_hex}{12}$ ]] || return 0
     printf '%s\n' "$id"
 }
-# Record that running VM $1 just passed its egress self-test. Without a run id to tie the pass to,
-# or when the record cannot be written, this returns 1, after an error, and leaves no record at
-# all (one written earlier in this boot is removed too), so every session refuses the VM until a
-# later `up` records a pass. The caller
-# decides what happens to the VM: cmd_up_macos's boot path stops the VM it just booted, and its
-# already-running branch leaves running a VM that may be serving live sessions.
+# Record in the boot record that running VM $1 just passed its egress self-test. Without a run id
+# to tie the pass to, or when the record cannot be written, this returns 1, after an error, and
+# leaves no pass recorded (one recorded earlier in this boot is dropped too), so every session
+# refuses the VM until a later `up` records a pass. The caller decides what happens to the VM:
+# cmd_up_macos's boot path stops the VM it just booted, and its already-running branch leaves
+# running a VM that may be serving live sessions.
 macos_record_egress_verified() {
     local id; id="$(macos_vm_run_id "$1")"
     if [[ -z "$id" ]]; then
-        rm -f "$(macos_egress_verified_file)"
+        macos_drop_egress_pass
         error "Could not read VM '$1''s run id ($AUGUR_DIR/vms/$1/run.id, which augur-vm writes for each boot),"
         error "  so its passed egress self-test cannot be recorded for its sessions. An augur-vm older than"
         error "  this augur writes none: reinstall augur (${BOLD}bash install${RESET}), then restart the VM."
         return 1
     fi
-    # Written to a temp file in the same directory and renamed into place, so a session checking the
-    # record at the same moment (require_macos_egress_verified) reads the old record or the new one,
-    # never an empty or partial file. A failed write leaves no record either.
-    local f; f="$(macos_egress_verified_file)"
-    mkdir -p "$AUGUR_PROXY_DIR"
-    if ! { printf '%s\n' "$id" > "${f}.tmp.$$" && mv -f "${f}.tmp.$$" "$f"; } 2>/dev/null; then
-        rm -f "${f}.tmp.$$" "$f"
-        error "Could not write $f, so VM '$1''s passed egress self-test cannot be recorded for its sessions."
-        return 1
-    fi
+    macos_write_boot_record "$(requested_egress_mode)" "$id" && return 0
+    error "Could not write $(macos_boot_record_file), so VM '$1''s passed egress self-test cannot be recorded for its sessions."
+    return 1
 }
 # Refuse running VM $1, leaving it running: rewrite its ~/.augur-env (push_macos_guest_env
 # --refusing, whose failure only adds its own warning), print each further argument as an error
@@ -2356,12 +2384,12 @@ macos_push_on_exit() {
 _MACOS_PUSH_ON_EXIT_VM=""
 
 # Exit 1, leaving the VM running, unless running VM $1 passed its egress self-test during its
-# current boot (macos_egress_verified_file). Nothing to check with egress off.
+# current boot (the boot record's pass, macos_boot_record_file). Nothing to check with egress off.
 require_macos_egress_verified() {
-    local vm="$1" have
+    local vm="$1" _mode _pass
     egress_enabled || return 0
-    have="$(cat "$(macos_egress_verified_file)" 2>/dev/null || true)"
-    [[ -n "$have" && "$have" == "$(macos_vm_run_id "$vm")" ]] && return 0
+    macos_read_boot_record
+    [[ -n "$_pass" && "$_pass" == "$(macos_vm_run_id "$vm")" ]] && return 0
     refuse_running_macos_vm "$vm" \
         "VM '${vm}' is running, but no egress self-test has passed since it booted (its ${BOLD}augur up --macos${RESET}" \
         "  was interrupted, or the VM was started some other way). Refusing to send it credentials." \
@@ -4870,8 +4898,8 @@ macos_boot_ssh_failed() {
     exit 1
 }
 
-# Stop VM $1 and the gvproxy and proxy serving it, and remove its record of a passed egress
-# self-test (macos_egress_verified_file), for a VM whose containment is unproven or disproven: a
+# Stop VM $1 and the gvproxy and proxy serving it, and drop the passed egress self-test from its
+# boot record (macos_drop_egress_pass), for a VM whose containment is unproven or disproven: a
 # boot that failed before or in its self-test, a running VM whose self-test failed, and a boot whose
 # pass cannot be recorded (macos_record_egress_verified). A VM left running there would be attached
 # to by the next `claude` / `shell --macos`, or refused by every one. Prints nothing; the
@@ -4881,7 +4909,7 @@ stop_unverified_macos_vm() {
     "$VM_CLI" stop "$1" 2>/dev/null || true
     stop_gvproxy
     stop_proxy
-    rm -f "$(macos_egress_verified_file)"
+    macos_drop_egress_pass
 }
 
 cmd_up_macos() {
@@ -4937,11 +4965,11 @@ cmd_up_macos() {
         # revived, and the self-test is what proves that revival actually restored enforcement. It
         # runs after the pinned-state warning so that warning is still printed if it ends the run.
         # Skipped with --no-egress, as on the boot path; the mode check above guarantees the VM was
-        # booted that way. A pass is recorded as on the boot path (macos_egress_verified_file), so a
+        # booted that way. A pass is recorded as on the boot path (macos_boot_record_file), so a
         # running VM whose boot was interrupted before its self-test takes sessions again after it:
         # the remedy require_macos_egress_verified names.
         #
-        # A pass that cannot be recorded (an unreadable run id) fails `up` and leaves no record, so
+        # A pass that cannot be recorded (an unreadable run id) fails `up` and records no pass, so
         # sessions refuse the VM. Deliberately does not stop it, unlike the boot path: the VM has
         # just passed its self-test and may be serving live sessions, and the cause can be as
         # transient as a read of its run id that failed once.
@@ -5045,13 +5073,13 @@ cmd_up_macos() {
         warn "Egress filtering OFF — guest has unrestricted network access (NAT)."
     fi
 
-    # This boot has passed no self-test yet; the record is written again only once it has.
-    rm -f "$(macos_egress_verified_file)"
     # Deliberately NOT shared: ~/.config/gh, same as Container mode (see _add_host_config_run_args
     # for why neither engine hands the guest the host's gh config). Here a share would also be
     # inert: it lands at /Volumes/My Shared Files/gh-config and nothing wires it to ~/.config/gh, so
     # it would carry the host's real config.yml and hosts.yml into the guest without gh ever reading
     # them. gh still works: GH_TOKEN is the auth path.
+    # The boot's record (macos_boot_record_file): this boot's egress mode, and no passed self-test
+    # until the one below passes.
     macos_record_egress_mode
     "$VM_CLI" run $graphics_flag \
         ${net_args[@]+"${net_args[@]}"} \
@@ -5091,7 +5119,7 @@ cmd_up_macos() {
     # above the success banner. Skipped entirely with --no-egress, like container mode's (finish_up
     # guards verify_egress_locked the same way): with filtering off there is no allowlist to be
     # locked to, and the warning above already said so. Its pass is what lets a later session attach
-    # to this running VM (macos_egress_verified_file). A pass that cannot be recorded stops the VM
+    # to this running VM (macos_boot_record_file). A pass that cannot be recorded stops the VM
     # just booted (the clone kept): left running, it would be refused by every session.
     if egress_enabled; then
         verify_macos_egress_locked "$project_vm"
@@ -5379,7 +5407,7 @@ host_lock_release() {
 # that every normal `up` honours too, so this allowlist is never wider than a normal `up`'s.
 
 # Point every per-VM helper (macos_project_vm, the proxy/gvproxy pidfiles, logs, socket and merged
-# allowlist, the egress-mode record, the SSH forward) at the throwaway VM instead of the current
+# allowlist, the boot record, the SSH forward) at the throwaway VM instead of the current
 # project. Same override `destroy <name>` uses (TARGET_SLUG/TARGET_HASH), with a slug no workspace can
 # produce (workspace_slug never emits "_", and target_name_re never matches it, so `destroy <name>`
 # and its completion never offer this VM) and the fixed *_SETUP_TOKEN ports. Clearing
@@ -5633,10 +5661,9 @@ cmd_down_macos() {
     # crashed VM is cleaned up, even if the VM clone itself is already gone.
     stop_gvproxy
     stop_proxy
-    # Dropped even if the stop below fails: a VM still running without these records is refused by
-    # every attach (require_macos_egress_mode_current, require_macos_egress_verified) until it is
-    # down and booted again.
-    rm -f "$(macos_egress_mode_file)" "$(macos_egress_verified_file)"
+    # Dropped even if the stop below fails: a VM still running without its boot record is refused
+    # by every attach (require_macos_egress_mode_current) until it is down and booted again.
+    rm -f "$(macos_boot_record_file)"
     if ! macos_vm_exists "$project_vm"; then
         warn "No VM found for this directory (${project_vm})."
         return 0
@@ -5682,7 +5709,7 @@ cmd_destroy_macos() {
     macos_poweroff_before_teardown "$project_vm"
     stop_gvproxy
     stop_proxy
-    rm -f "$(macos_egress_mode_file)" "$(macos_egress_verified_file)"
+    rm -f "$(macos_boot_record_file)"
     if ! macos_vm_exists "$project_vm"; then
         warn "No VM found for this directory (${project_vm})."
         return 0

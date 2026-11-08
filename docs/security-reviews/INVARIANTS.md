@@ -40,19 +40,22 @@ in time," this **prescribes** "what must never break." It changes rarely.
   runs on **both** `up --macos` paths (fresh boot and the already-running reconcile) and tears the
   VM, gvproxy and the proxy down on a failure. On the already-running path it runs only when the VM
   was booted with egress on and this invocation asks for egress too: the egress mode a VM was booted
-  with is recorded host-side (`macos_egress_mode_file`), and `up`/`claude`/`shell --macos` refuse a
-  running VM whose record differs or is missing (`require_macos_egress_mode_current`) instead of
+  with is recorded host-side in the VM's boot record (`macos_boot_record_file`, one line
+  `<egress mode> <pass>`), and `up`/`claude`/`shell --macos` refuse a
+  running VM whose recorded mode differs or is missing, the record absent or unparseable
+  (`require_macos_egress_mode_current`), instead of
   attaching to it — so a VM started with `--no-egress` is never silently used by a plain
   `claude --macos` (`tests/51_macos_egress_mode_unit.sh`). `claude`/`shell --macos` also attach to
-  a running egress VM only when a second host-side record says its self-test passed during its
-  current boot (`macos_egress_verified_file`, tied to the boot by the random run id augur-vm's `run`
+  a running egress VM only when the same record's pass says its self-test passed during its
+  current boot (tied to the boot by the random run id augur-vm's `run`
   writes to `run.id` for each boot (`macos_vm_run_id`), so a later boot, a hand-started one
   included, does not match; checked by `require_macos_egress_verified`, whose refusal makes no guest step but a
-  credential-free push of `~/.augur-env`): it is dropped before every `augur-vm run`, by `down`/`destroy`
-  and by the teardown (`stop_unverified_macos_vm`), and written only after the self-test passes,
+  credential-free push of `~/.augur-env`): the record is rewritten with no pass before every
+  `augur-vm run`, its pass is dropped by the teardown (`stop_unverified_macos_vm`), it is removed
+  by `down`/`destroy`, and the pass is written only after the self-test passes,
   so an `up --macos` interrupted before its self-test leaves no VM a session trusts (and an `up`
-  that cannot record a pass, its run id unreadable or the write failing, fails and leaves no
-  record: it stops a VM it just booted, and leaves a running one running, refused by every session
+  that cannot record a pass, its run id unreadable or the write failing, fails and records no
+  pass: it stops a VM it just booted, and leaves a running one running, refused by every session
   until a pass is recorded; the record is renamed into place, so a session never reads it partial)
   (`tests/51_macos_egress_mode_unit.sh`, `tests/56_macos_session_credentials.sh`). `setup-token --macos` boots its throwaway
   VM through the same datapath and self-test (`tests/52_macos_setup_token_unit.sh`). Both self-tests are inherently live (they need a

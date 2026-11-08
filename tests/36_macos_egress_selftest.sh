@@ -396,8 +396,8 @@ printf '%s\n' "$stop_fn" | grep -q '^ *stop_gvproxy$' \
   && ok "the teardown stops gvproxy"   || fail "the teardown does not stop gvproxy"
 printf '%s\n' "$stop_fn" | grep -q '^ *stop_proxy$' \
   && ok "the teardown stops the proxy" || fail "the teardown does not stop the proxy"
-printf '%s\n' "$stop_fn" | grep -qF 'rm -f "$(macos_egress_verified_file)"' \
-  && ok "the teardown drops the record of a passed self-test" || fail "the teardown keeps the record of a passed self-test"
+printf '%s\n' "$stop_fn" | grep -q '^ *macos_drop_egress_pass$' \
+  && ok "the teardown drops the passed self-test from the boot record" || fail "the teardown keeps the passed self-test in the boot record"
 # The positive half must target a MANAGED-BASELINE domain: the already-running path warns that
 # gvproxy snapshots its DNS allowlist at boot, so a project-conf domain could be allowlisted
 # host-side and still unresolvable in a live guest — a false leak that tears down a working VM.

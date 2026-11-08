@@ -142,23 +142,31 @@ That kept them off argv, but:
   once; a transport error or a failed write after its one retry, above), the SSH-wait timeout, a
   failing self-test and, on a boot, a passed one that cannot be recorded (below) all stop the VM,
   its gvproxy and its proxy through one teardown, `stop_unverified_macos_vm`, which
-  also drops the record below and keeps the clone (`destroy` stays the operator's call;
+  also drops the pass from the boot record below and keeps the clone (`destroy` stays the operator's call;
   `setup-token --macos` deletes its throwaway clone itself). A VM left running there would be
   attached to by the next `claude` / `shell --macos`. A refused VM is of no use anyway. Under
   `--no-egress` the same boot failures stop the VM too; only the self-test is skipped.
 - **A running VM gets a session only if its current boot passed the self-test.** A session that
   attaches to a running VM runs no self-test of its own, so an `up --macos` interrupted between
   `augur-vm run` and the self-test (Ctrl-C, a kill, a host crash) would otherwise leave a VM that
-  the next `claude` / `shell --macos` trusts. A host-side record, `macos_egress_verified_file`
-  (`<slug>-<hash>.egress-verified` in the proxy directory, beside the egress-mode record), says
-  that the self-test passed during the VM's current boot. It is removed just before every
-  `augur-vm run`, by `stop_unverified_macos_vm` and by `down` / `destroy`, and written by
-  `cmd_up_macos` only once `verify_macos_egress_locked` has passed: on a boot, and on the
-  already-running branch, which re-runs the self-test (so `up --macos` also clears a VM whose boot
-  was interrupted). It holds the VM's run id (`macos_vm_run_id`): a random UUID augur-vm's `run`
+  the next `claude` / `shell --macos` trusts. One host-side record per boot,
+  `macos_boot_record_file` (`<slug>-<hash>.boot-record` in the proxy directory), holds one line,
+  `<egress mode> <pass>`: the egress mode the VM was booted with (the mode check, below) and the
+  run id of the boot during which the self-test passed, or `-` while none has. One write and one
+  file cover both mode drift and an interrupted boot. It is written whole, with no pass
+  (`macos_record_egress_mode`), just before every `augur-vm run`, and rewritten with the pass by
+  `cmd_up_macos` only once `verify_macos_egress_locked` has passed (`macos_record_egress_verified`):
+  on a boot, and on the already-running branch, which re-runs the self-test (so `up --macos` also
+  clears a VM whose boot was interrupted). `stop_unverified_macos_vm` drops the pass and keeps the
+  mode (`macos_drop_egress_pass`); `down` / `destroy` remove the file. A record that is missing or
+  does not parse (one line of `on`/`off` and a run id or `-`) is no record: the VM is refused as
+  one of unknown egress mode, with the "started by an older augur" remedy. An older augur kept the
+  mode and the pass in two other files (`.egress-mode`, `.egress-verified`), which this augur does
+  not read, so a VM it started is refused that way once; there is no migration. The pass holds the
+  VM's run id (`macos_vm_run_id`): a random UUID augur-vm's `run`
   writes to the VM's `run.id` before it writes `run.pid`, and removes with it (as do `stop`'s
-  force-kill and `clone`). `require_macos_egress_verified` accepts the record only while it still
-  matches, so a VM booted again by any means does not inherit an old record, and neither does an
+  force-kill and `clone`). `require_macos_egress_verified` accepts the pass only while it still
+  matches, so a VM booted again by any means does not inherit an old pass, and neither does an
   `augur-vm run` started by hand after a host crash that happens to get the pid the old boot had.
   Accepted trade-off: after a host crash the old `run.pid` and `run.id` both survive, so an
   unrelated process that later takes that pid makes augur-vm report the VM running with its old id
@@ -170,8 +178,9 @@ That kept them off argv, but:
   the running VM that re-runs the self-test and records it. (On a VM from an old base that `up`
   then refuses with the old-base remedy; the first message promises only the self-test.) When the
   run id cannot be read after a passed self-test (no `run.id`, as with an augur-vm older than this
-  augur, or one that holds no UUID), the pass cannot be recorded: `macos_record_egress_verified` removes any record (one
-  written earlier in the same boot included) and fails, so every session refuses the VM, and `up`
+  augur, or one that holds no UUID), the pass cannot be recorded: `macos_record_egress_verified`
+  drops any pass (one recorded earlier in the same boot included) and fails, so every session
+  refuses the VM, and `up`
   fails. On a boot `up` then stops the VM it just booted through `stop_unverified_macos_vm`, the
   clone kept. On the already-running branch it deliberately leaves the VM running and refuses it
   as any running VM is refused (the push first), with `augur up --macos` again, then
@@ -180,10 +189,11 @@ That kept them off argv, but:
   A marker rather than a trap on the interrupted `up`: a trap cannot run on a kill or a
   host crash. Deliberately egress-on only: a `--no-egress` boot has no self-test to record, and a
   `--no-egress` session attaches only to a VM booted that way (`require_macos_egress_mode_current`),
-  where there is no containment for the record to vouch for. The record is written to a temp file
-  beside it and renamed into place, so a session reading it at that moment sees the old record or
-  the new one, never an empty file; a failed write also leaves no record and fails `up`, as an
-  unreadable run id does.
+  where there is no containment for a pass to vouch for. The record is written to a temp file
+  beside it and renamed into place (`macos_write_boot_record`), so a command reading it at that
+  moment sees the old record or the new one, never an empty file. A write that fails removes the
+  record and fails `up` (or, on a boot, stops before `augur-vm run`); the VM is then refused as one
+  of unknown egress mode, whose remedy, a restart, also fixes it.
 - **Every push removes stale temp files, by age.** A killed push can leave a `~/.augur-env.tmp.*`,
   and one written by an older augur may hold credentials. Every push removes, except its own, each
   one older than a minute (`find -mmin +1`) or dated more than a minute ahead of the guest's clock
@@ -392,10 +402,11 @@ point after its startup files at which augur could run a command, short of repla
   to a VM with no SSH transport, which says so.
 - A running VM whose `up --macos` was interrupted before the self-test, or one booted outside
   augur, gets no session until an `augur up --macos`, which re-runs the self-test on the running VM
-  and records it (a restart works too). Running VMs booted before this record
-  existed are refused once the same way. An `up --macos` that cannot read the VM's run id after a
-  passed self-test fails and leaves no record; on a boot it also stops the VM (clone kept), on a
-  running VM it leaves the VM running.
+  and records it (a restart works too). A running VM booted by an augur that kept its egress mode
+  and pass in two separate records has no boot record, and is refused once as one of unknown
+  egress mode, until `augur down --macos && augur up --macos`. An `up --macos` that cannot read
+  the VM's run id after a passed self-test fails and records no pass; on a boot it also stops the
+  VM (clone kept), on a running VM it leaves the VM running.
 - `build` / `update --macos` fail without saving a base whose sshd no longer accepts the session
   credentials at the end, or whose drop-in no longer holds the line its clones check for, even if
   the drop-in installed earlier in the run.

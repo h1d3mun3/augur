@@ -131,7 +131,7 @@ disk_scan() { printf '%s\n' "$DUMMY" "$DUMMY_OLD" | ssh_macos "$vm" "$GUEST_DISK
 plant_old_env() { printf "export GH_TOKEN='%s'\n" "$DUMMY_OLD" | ssh_macos "$vm" 'umask 077; cat > ~/.augur-env' 2>/dev/null; }
 # Pass/fail on whether $1 holds either dummy value, without showing $1.
 lacks_dummy() { if [[ "$1" == *"$DUMMY"* || "$1" == *"$DUMMY_OLD"* ]]; then fail "$2" "a dummy value is in it"; else ok "$2"; fi; }
-record_ok() { [[ -n "$(macos_vm_run_id "$vm")" && "$(cat "$(macos_egress_verified_file)" 2>/dev/null)" == "$(macos_vm_run_id "$vm")" ]]; }
+record_ok() { local _mode _pass; macos_read_boot_record; [[ -n "$(macos_vm_run_id "$vm")" && "$_mode" == on && "$_pass" == "$(macos_vm_run_id "$vm")" ]]; }
 
 # ── Restores (also on Ctrl-C) ──────────────────────────────────────────────────────────────────
 DROPIN_MOVED=0; RECORD_REMOVED=0; GVPROXY_STOPPED=0; RESTORE_FAILED=(); E2E_SIGNAL=0
@@ -189,7 +189,7 @@ if (( uprc == 0 )); then ok "augur up --macos completes on '${vm}'"
 else fail "augur up --macos completes on '${vm}'" "exit ${uprc}: $(redact "$(printf '%s\n' "$upout" | tail -n 8)")"; exit; fi
 has "$upout" "Egress self-test passed" "the egress self-test passed"
 if record_ok; then ok "the self-test record matches macos_vm_run_id ($(macos_vm_run_id "$vm"))"
-else fail "the self-test record matches macos_vm_run_id" "record [$(cat "$(macos_egress_verified_file)" 2>/dev/null)] id [$(macos_vm_run_id "$vm")]"; fi
+else fail "the self-test record matches macos_vm_run_id" "record [$(cat "$(macos_boot_record_file)" 2>/dev/null)] id [$(macos_vm_run_id "$vm")]"; fi
 
 section "The run id is augur-vm's run.id, stable for one boot"
 id1="$(macos_vm_run_id "$vm")"
@@ -321,7 +321,7 @@ hasnt "$cout" "grep:" "the push printed no raw grep error"
 # ── 5. A running VM with no self-test record for its boot ──────────────────────────────────────
 section "Interrupted boot: no self-test record for the running VM"
 plant_old_env
-RECORD_REMOVED=1; rm -f "$(macos_egress_verified_file)"
+RECORD_REMOVED=1; macos_drop_egress_pass
 rout="$(prepare_with_dummy)"; rrc=$?
 if (( rrc != 0 )); then ok "a session (prepare_macos_session) refuses the VM"; else fail "a session refuses the VM" "exit 0"; fi
 has "$rout" "$MSG_UNVERIFIED" "…saying no self-test has passed since the boot"

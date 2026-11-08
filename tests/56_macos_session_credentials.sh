@@ -285,15 +285,17 @@ verify_dropin() {   # sets $out / $rc
 ENV_FILE="$GUEST_HOME/.augur-env"
 # The value git_credential_env gives augur's helper (entry 1), as the session must export it.
 git_credential_env_value_1() { local _creds=(GH_TOKEN=x); git_credential_env | sed -n 's/^GIT_CONFIG_VALUE_1=//p'; }
-# The VM's current boot (the run id augur-vm writes to run.id), and the record that its self-test
-# passed during it (macos_egress_verified_file). A running VM has that record before each run
-# unless UNVERIFIED=1; tests/51 covers the record itself.
+# The VM's current boot (the run id augur-vm writes to run.id), and its boot record
+# (macos_boot_record_file) with the pass of a self-test during it. A running VM has that pass before
+# each run unless UNVERIFIED=1; tests/51 covers the record itself. no_pass: the record of a boot
+# whose self-test has not passed.
 printf '%s' 0C1D2E3F-4A5B-4C6D-8E7F-901A2B3C4D5E > "$AUGUR_DIR/vms/$(macos_project_vm)/run.id"
 BOOT_ID="$(macos_vm_run_id "$(macos_project_vm)")"
 [[ -n "$BOOT_ID" ]] || { echo "cannot read the VM's run id" >&2; exit 1; }
 UNVERIFIED=0
+no_pass() { printf 'on -\n' > "$(macos_boot_record_file)"; }
 run_cmd() {   # run_cmd claude|shell|up — sets $out / $rc; truncates the per-run logs first
-    if [[ "$RUNNING" != 0 && "$UNVERIFIED" == 0 ]]; then printf '%s\n' "$BOOT_ID" > "$(macos_egress_verified_file)"; fi
+    if [[ "$RUNNING" != 0 && "$UNVERIFIED" == 0 ]]; then printf 'on %s\n' "$BOOT_ID" > "$(macos_boot_record_file)"; fi
     : > "$SSHLOG"; : > "$PUSHLOG"; : > "$STEPS"; : > "$VMCHECKS"; : > "$VMLOG"; : > "$HOSTLOG"; : > "$GHCALLS"; : > "$SESSLOG"
     # The INT trap keeps a SIGINT the case sends itself from also ending this script (bash exits
     # when a child it waits for dies of SIGINT); the code under test sets its own over it.
@@ -1065,7 +1067,7 @@ for _run in "1 shell" "1 up"; do
     no_transport "no SSH transport (running=$RUNNING): $_cmd --macos"
 done
 # As a refusal's push too: it adds that the old file may still hold credentials.
-UNVERIFIED=1; rm -f "$(macos_egress_verified_file)"
+UNVERIFIED=1; no_pass
 out="$( macos_ssh_host() { :; }; run_cmd shell; printf '%s' "$out"; exit "$rc" )"; rc=$?
 UNVERIFIED=0
 no_transport "no SSH transport, unverified VM: shell --macos"
@@ -1230,13 +1232,13 @@ else fail "up --macos on a running VM: the push is not after the self-test" "sel
 section "Tier 1 — a running VM whose boot never passed its self-test gets no credential"
 
 # An `up --macos` interrupted between `augur-vm run` and the self-test leaves the VM running with no
-# record of a passed self-test (macos_egress_verified_file). A session refuses it with no guest step
+# pass in its boot record (macos_boot_record_file). A session refuses it with no guest step
 # but the refusal's push of ~/.augur-env, which sends no credential and removes those an older augur
 # wrote: no session, nothing sent.
 RUNNING=1; UNVERIFIED=1
 eval "verify_macos_egress_locked() { printf '%s\\n' verify_macos_egress_locked >> \"\$STEPS\"; }"
 for _cmd in claude shell; do
-    old_env; rm -f "$(macos_egress_verified_file)"; run_cmd "$_cmd"
+    old_env; no_pass; run_cmd "$_cmd"
     _l="no passed self-test since the boot: $_cmd --macos"
     nonzero "$_l"
     has "$out" "no egress self-test has passed since it booted" "$_l: says why"
@@ -1249,7 +1251,7 @@ for _cmd in claude shell; do
 done
 # A refusal whose push fails still refuses, and says the old file may still hold credentials.
 for FAIL_PUSH in 1 2; do
-    old_env; rm -f "$(macos_egress_verified_file)"; run_cmd shell
+    old_env; no_pass; run_cmd shell
     _l="no passed self-test, the push fails ($FAIL_PUSH): shell --macos"
     nonzero "$_l"
     has "$out" "no egress self-test has passed since it booted" "$_l: still refuses, saying why"
@@ -1259,23 +1261,22 @@ done
 FAIL_PUSH=0
 # On an old base too: both refusals are reported, after the one push.
 mv "$DROPIN" "$TMPD/dropin.saved"
-old_env; rm -f "$(macos_egress_verified_file)"; run_cmd claude
+old_env; no_pass; run_cmd claude
 _l="no passed self-test and no drop-in: claude --macos"
 has "$out" "no egress self-test has passed since it booted" "$_l: reports the missing self-test"
 has "$out" "does not accept augur's session credentials" "$_l: reports the old base"
 no_cred_push "$_l"
 mv "$TMPD/dropin.saved" "$DROPIN"
-# A record from an earlier boot of the VM is no better, even one whose pid was handed to this boot's
-# process (a recycled pid): the start time differs.
-printf '%s Thu Jan 1 00:00:00 1970\n' "$$" > "$(macos_egress_verified_file)"; run_cmd claude
+# A record from an earlier boot of the VM is no better: its run id differs.
+printf 'on %s\n' 0C1D2E3F-4A5B-4C6D-8E7F-901A2B3C4D00 > "$(macos_boot_record_file)"; run_cmd claude
 nonzero "a record from an earlier boot: claude --macos"
 eq "0" "$(launches)" "a record from an earlier boot: claude --macos starts no session"
 # `up --macos` on that VM re-runs the self-test, records its pass for this boot, and the next
 # session goes ahead.
-rm -f "$(macos_egress_verified_file)"; run_cmd up
+no_pass; run_cmd up
 eq "0" "$rc" "up --macos on the unverified running VM: completes"
 has "$(cat "$STEPS")" "verify_macos_egress_locked" "up --macos on the unverified running VM: runs the self-test"
-eq "$BOOT_ID" "$(cat "$(macos_egress_verified_file)" 2>/dev/null)" "up --macos on the unverified running VM: records the pass for this boot"
+eq "on $BOOT_ID" "$(cat "$(macos_boot_record_file)" 2>/dev/null)" "up --macos on the unverified running VM: records the pass for this boot"
 run_cmd claude
 eq "0" "$rc" "…after which claude --macos completes"
 eq "1" "$(launches)" "…and starts its session"
@@ -1368,7 +1369,7 @@ for _step in sync_macos_guest_clock sync_macos_guest_timezone; do
     eval "${_step}() { printf '%s\n' ${_step} >> \"\$STEPS\"; }"
 done
 # A refusal under the armed trap is still the run's only push (the trap does not repeat it).
-old_env; rm -f "$(macos_egress_verified_file)"; UNVERIFIED=1; run_cmd shell; UNVERIFIED=0
+old_env; no_pass; UNVERIFIED=1; run_cmd shell; UNVERIFIED=0
 no_cred_push "a refusal while the push-on-exit trap is armed"
 # The base VM is needed only to clone or boot: a running VM is reconciled without it.
 macos_vm_exists() { [[ "$1" != "$MACOS_BASE_VM" ]]; }
