@@ -146,7 +146,7 @@ gh() {
 # FAIL_STEP=env / =zshenv makes the guest's ~/.augur-env rename / ~/.zshenv write fail, with the
 # rest of the push (the acceptance check included) run for real. FAIL_STEP=vanish removes, in the
 # run's first push only, its temp file between the write and the rename, as a concurrent push's
-# cleanup would.
+# cleanup would. FAIL_STEP=mktemp makes the guest's mktemp of the cleanup's reference file fail.
 GUEST_HOME="$TMPD/guest"; mkdir -p "$GUEST_HOME"
 GUEST_ETC="$TMPD/guest-etc"; mkdir -p "$GUEST_ETC/ssh/sshd_config.d"
 FAIL_PUSH=0; FAIL_CHECK=0; FAIL_STEP=""
@@ -169,6 +169,7 @@ ssh_macos() {
                 env)    c="${c//mv -f /false && mv -f }" ;;
                 vanish) $first && c="${c//&& mv -f /&& find ~ -maxdepth 1 -name '.augur-env.tmp.*' -exec rm -f {} + && mv -f }" ;;
                 zshenv) c="${c//"~/.zshenv"/"/nonexistent-augur-test/zshenv"}" ;;
+                mktemp) c="${c//mktemp \/tmp\/augur-env-ref/false \/tmp\/augur-env-ref}" ;;
             esac
             printf '%s' "$in" | guest_run "$c" ;;
         *) echo "UNEXPECTED GUEST COMMAND: $*" >&2; return 1 ;;
@@ -673,6 +674,21 @@ run_cmd shell
 nonzero "stale temp files, refused guest: shell --macos"
 stale_cleaned "refused guest"
 mv "$TMPD/dropin.saved" "$DROPIN"
+# A guest whose mktemp fails cannot make the reference file: the age test still runs, so an old
+# temp file (which may hold an older augur's credentials) still goes; only the far-future check is
+# skipped.
+stale_fixture
+FAIL_STEP=mktemp; run_cmd shell; FAIL_STEP=""
+eq "0" "$rc" "mktemp fails in the guest: shell --macos completes"
+has "$(pushcmd)" 'augur-env-ref' "mktemp fails in the guest: the push asked for a reference file (control)"
+[[ -e "$GUEST_HOME/.augur-env.tmp.4242" ]] && fail "mktemp fails in the guest: an old temp file survives (it may hold revoked secrets)" \
+    || ok "mktemp fails in the guest: a temp file older than a minute is still removed"
+[[ -e "$GUEST_HOME/.augur-env.tmp.4343" ]] && ok "mktemp fails in the guest: a fresh temp file (a concurrent push) is left alone" \
+    || fail "mktemp fails in the guest: a concurrent push's temp file was removed"
+[[ -e "$GUEST_HOME/.augur-env.bak" ]] && ok "mktemp fails in the guest: a file outside augur's temp-name pattern is left alone" \
+    || fail "mktemp fails in the guest: cleanup removed a file that is not augur's"
+has "$(cat "$ENV_FILE")" "$MACOS_AUGUR_ENV_END_LINE" "mktemp fails in the guest: the new ~/.augur-env is installed"
+rm -f "$GUEST_HOME"/.augur-env.tmp.*
 rm -f "$GUEST_HOME/.augur-env.bak"
 
 section "Tier 1 — a guest whose sshd does not accept the session's credentials is refused"
@@ -997,6 +1013,41 @@ for _run in "1 shell" "1 up" "0 claude"; do
 done
 RUNNING=1
 mv "$TMPD/dropin.saved" "$DROPIN"
+# No SSH transport to the VM (its gvproxy down, or its forward port unreadable): nothing is sent, the
+# push says so rather than calling it a failed write, and it is not retried.
+no_transport() {   # no_transport <label>
+    nonzero "$1"
+    has "$out" "No SSH transport to VM" "$1: says there is no SSH transport"
+    hasnt "$out" "Could not write ~/.augur-env" "$1: does not call it a failed write"
+    hasnt "$out" "once more" "$1: does not retry"
+    eq "0" "$(pushes)" "$1: sends no push"
+    eq "0" "$(launches)" "$1: starts no session"
+}
+for _run in "1 shell" "1 up"; do
+    RUNNING="${_run%% *}"; _cmd="${_run#* }"
+    run_cmd "$_cmd"   # control: the same run with a transport
+    eq "0" "$rc" "control: $_cmd --macos (running=$RUNNING) completes with a transport"
+    out="$( macos_ssh_port() { :; }; run_cmd "$_cmd"; printf '%s' "$out"; exit "$rc" )"; rc=$?
+    no_transport "no SSH transport (running=$RUNNING): $_cmd --macos"
+done
+# As a refusal's push too: it adds that the old file may still hold credentials.
+UNVERIFIED=1; rm -f "$(macos_egress_verified_file)"
+out="$( macos_ssh_host() { :; }; run_cmd shell; printf '%s' "$out"; exit "$rc" )"; rc=$?
+UNVERIFIED=0
+no_transport "no SSH transport, unverified VM: shell --macos"
+has "$out" "no egress self-test has passed since it booted" "no SSH transport, unverified VM: still refuses, saying why"
+has "$out" "may still hold credentials an older augur wrote" "no SSH transport, unverified VM: says old credentials may remain"
+# Through the real ssh_macos, whose unresolvable port ends the pipeline's subshell with status 1:
+# without the check first, that read as a failed write and was retried.
+: > "$SSHLOG"; : > "$SESSLOG"
+out="$( unset -f ssh_macos; eval "$(sed -n '/^ssh_macos() {$/,/^}$/p' "$AUGUR")"; macos_ssh_port() { :; }
+        push_macos_guest_env_retrying "$(macos_project_vm)" 2>&1 )"; rc=$?
+_l="no SSH transport, the real ssh_macos"
+nonzero "$_l"
+has "$out" "No SSH transport to VM" "$_l: says there is no SSH transport"
+hasnt "$out" "Could not write ~/.augur-env" "$_l: does not call it a failed write"
+hasnt "$out" "once more" "$_l: does not retry"
+eq "0" "$(launches)" "$_l: no ssh process is started"
 
 section "Tier 1 — a session checks in the guest that every credential it sent arrived"
 

@@ -6,8 +6,10 @@
 # on an unfiltered NAT network with no word said; and a plain `augur up --macos` on that VM would run
 # the boot self-test against a NAT guest, "detect a leak" and stop the VM under the operator. The
 # fix: the egress mode a VM is booted with is recorded host-side at boot (macos_egress_mode_file),
-# and up/claude/shell on a running VM refuse — without stopping it — when the requested mode
-# differs or the record is missing. down/destroy drop the record.
+# and up/claude/shell on a running VM refuse — without stopping it, after the credential-free push
+# of ~/.augur-env every refusal of a running VM makes — when the requested mode differs or the
+# record is missing (as does `up` on a running VM with no stored admin password). down/destroy drop
+# the record.
 #
 # The same file pins the second host-side record a running VM is attached by: that the egress
 # self-test passed during the VM's current boot (macos_egress_verified_file, tied to the boot by its
@@ -18,7 +20,8 @@
 # `up --macos` on the running VM re-runs the self-test and records it. The boot path drops it before
 # `augur-vm run` and writes it only after the self-test; --no-egress has none; down/destroy and a
 # failing self-test drop it. An `up` that cannot read the run id after a passed self-test fails and
-# leaves no record; on a boot it stops the VM, on a running VM it leaves the VM running.
+# leaves no record; on a boot it stops the VM, on a running VM it leaves the VM running. The record
+# is renamed into place, never written in place.
 #
 # Nothing is cloned, booted or SSH'd: the real cmd_* functions run against recorder stubs.
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/.." && pwd)"
@@ -106,6 +109,10 @@ refused() {   # refused <label> <remedy> [<reason the message must give>]
   else ok "$1: the running VM is left alone (nothing stopped)"; fi
   logged selftest && fail "$1: the self-test ran anyway" || ok "$1: no self-test on a mismatched VM"
   hasnt "$out" "AGENT_ATTACHED" "$1: nothing is attached"
+  # Like every refusal of a running VM: one push of ~/.augur-env (no credential), which rewrites a
+  # file an older augur may have left credentials in, and no other guest command.
+  eq "push $PV --refusing" "$(grep '^push ' "$LOG")" "$1: pushes ~/.augur-env once, as a refusal"
+  grep -q '^ssh ' "$LOG" && fail "$1: the guest got another command" "$(cat "$LOG")" || ok "$1: no other guest command"
 }
 
 section "Tier 1 — the record is written on the boot path, before \`augur-vm run\`"
@@ -141,6 +148,19 @@ egress_on; rm -f "$(macos_egress_mode_file)"
 run_cmd cmd_up_macos
 refused "up --macos on a VM with no record" "augur down --macos && augur up --macos" "unknown egress mode"
 has "$out" "started by an older augur" "no record: names the likely cause"
+
+# A running VM with no stored admin password (cloned from an older base) is refused like the rest:
+# its push uses only the SSH key. A stopped one is refused before anything touches the guest.
+egress_on; record on; mv "$(macos_admin_password_file "$PV")" "$TMPD/pw.saved"
+run_cmd cmd_up_macos
+refused "up --macos on a running VM with no admin password" "augur destroy --macos && augur up --macos" "has no stored admin password"
+VM_UP=0
+run_cmd cmd_up_macos
+[[ "$rc" -ne 0 ]] && ok "up --macos on a stopped VM with no admin password: refused" || fail "stopped VM, no admin password: not refused"
+has "$out" "has no stored admin password" "stopped VM, no admin password: says why"
+grep -q '^push \|^ssh \|^vm run' "$LOG" && fail "stopped VM, no admin password: the guest was touched or booted" "$(cat "$LOG")" \
+  || ok "stopped VM, no admin password: nothing is pushed or booted"
+VM_UP=1; mv "$TMPD/pw.saved" "$(macos_admin_password_file "$PV")"
 
 egress_on; record on
 run_cmd cmd_up_macos
@@ -313,6 +333,26 @@ unverified "after the unrecordable pass: cmd_claude_macos"
 run_cmd cmd_up_macos
 eq 0 "$rc" "…and the next up --macos, with ps working again, reconciles"
 eq "$(macos_vm_run_id "$PV")" "$(cat "$(macos_egress_verified_file)" 2>/dev/null)" "…and records the pass"
+# The record is written to a temp file beside it and renamed into place, so a session reading it at
+# that moment sees the old record or the new one, never an empty or partial file.
+rec_body="$(declare -f macos_record_egress_verified)"
+has "$rec_body" '> "${f}.tmp.$$"' "the record is written to a temp file beside it"
+has "$rec_body" 'mv -f "${f}.tmp.$$" "$f"' "…and renamed into place"
+hasnt "$rec_body" '> "$f"' "…never written in place"
+hasnt "$rec_body" '> "$(macos_egress_verified_file)"' "…never written in place (by its path)"
+# A concurrent reader polling the record while passes are recorded never sees it empty.
+boot_id "$$"; verified_now
+( for _i in $(seq 1 200); do macos_record_egress_verified "$PV" || exit 1; done ) & _wr=$!
+_empty=0; while kill -0 "$_wr" 2>/dev/null; do [[ -s "$(macos_egress_verified_file)" ]] || _empty=$((_empty + 1)); done; wait "$_wr"
+eq 0 "$_empty" "a reader polling during 200 record writes never finds the record empty or missing"
+eq "" "$(find "$AUGUR_PROXY_DIR" -name '*.egress-verified.tmp.*')" "…and no temp file is left"
+# A failed write (the rename fails) leaves no record and no temp file, and fails the record.
+( mv() { return 1; }; macos_record_egress_verified "$PV" ) >"$TMPD/rec.out" 2>&1; _rrc=$?
+[[ "$_rrc" -ne 0 ]] && ok "a failed record write: returns non-zero" || fail "a failed record write returned 0"
+has "$(cat "$TMPD/rec.out")" "cannot be recorded for its sessions" "a failed record write: says the pass cannot be recorded"
+[[ -e "$(macos_egress_verified_file)" ]] && fail "a failed record write: a record is left" || ok "a failed record write: no record is left"
+eq "" "$(find "$AUGUR_PROXY_DIR" -name '*.egress-verified.tmp.*')" "a failed record write: no temp file is left"
+
 VM_UP=0; rm -f "$RUN_ID_FILE"
 run_cmd cmd_up_macos; no_run_id "boot, no pidfile" boot
 hasnt "$out" "is up." "boot, no pidfile: no success banner"

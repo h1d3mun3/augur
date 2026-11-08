@@ -65,6 +65,7 @@ GUEST_HOME=""
 GUEST_ETC="$TMPD/guest-etc"; mkdir -p "$GUEST_ETC/ssh/sshd_config.d"
 macos_session_accept_env_line "$(macos_session_env_names)" > "$GUEST_ETC/ssh/sshd_config.d/$(basename "$(macos_session_sshd_dropin)")"
 SSHLOG="$TMPD/sshlog"; ALL_SSH="$TMPD/all-ssh"; : > "$ALL_SSH"
+macos_ssh_transport_ok() { return 0; }   # the stub ssh_macos below needs no host or port
 ssh_macos() {
     local vm="$1"; shift
     local cmd="$*"

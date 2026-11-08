@@ -133,6 +133,7 @@ stop_gvproxy()      { :; }
 stop_proxy()        { :; }
 wait_for_macos_ssh() { return 1; }   # would fail loudly if the branch ever fell through
 ssh_macos()         { echo "ssh_macos" >> "$LOG"; return 0; }
+macos_ssh_transport_ok() { return 0; }   # the stub ssh_macos above needs no host or port
 # The macOS boot self-test, recorded rather than run: it probes the guest over ssh_macos, and the
 # blanket stub above answers every probe with success — i.e. a screaming leak — which would tear the
 # VM down mid-reconcile. tests/36_macos_egress_selftest.sh owns its behaviour; here we only assert

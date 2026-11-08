@@ -104,6 +104,7 @@ g_offset()     { printf '%s' "$1" > "$OFFSET_FILE"; }
 reset_guest()  { G_READ=1; G_NOISE=0; G_SET_RC=0; G_SET_TO=0; G_SET_BADREASON=0; g_offset 0; }
 reset_guest
 
+macos_ssh_transport_ok() { return 0; }   # the stub ssh_macos below needs no host or port
 ssh_macos() {
     local vm="$1"; shift
     local cmd="$*"
