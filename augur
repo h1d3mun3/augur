@@ -243,6 +243,8 @@ info()    { printf '%s\n' "${CYAN}[augur]${RESET} $*"; }
 success() { printf '%s\n' "${GREEN}[augur]${RESET} $*"; }
 warn()    { printf '%s\n' "${YELLOW}[augur]${RESET} $*"; }
 error()   { printf '%s\n' "${RED}[augur]${RESET} $*" >&2; }
+# Print each argument as an error line, then exit 1.
+exit_with_errors() { local _l; for _l in "$@"; do error "$_l"; done; exit 1; }
 
 # Make text that came from a guest (VM or container) safe to show on the operator's terminal.
 # The guest is untrusted, and a terminal acts on control bytes it prints: an ESC sequence can
@@ -966,8 +968,7 @@ require_macos_admin_password() {
         "  Then recreate each project VM cloned from an older base, in its project directory:"
         "    augur destroy --macos && augur up --macos")
     if [[ "${2:-}" == --running ]]; then refuse_running_macos_vm "$1" "${_lines[@]}"; fi
-    local _l; for _l in "${_lines[@]}"; do error "$_l"; done
-    exit 1
+    exit_with_errors "${_lines[@]}"
 }
 
 # Store $2 as macOS VM $1's admin password (see macos_admin_password()). A shell function's
@@ -2299,11 +2300,10 @@ macos_record_egress_verified() {
 # only augur's SSH key, never the admin password. The refusals inside a push (the acceptance
 # check) need no call here: that push already rewrote the file.
 refuse_running_macos_vm() {
-    local vm="$1" _l; shift
+    local vm="$1"; shift
     push_macos_guest_env "$vm" --refusing || true
     disarm_macos_push_on_exit
-    for _l in "$@"; do error "$_l"; done
-    exit 1
+    exit_with_errors "$@"
 }
 
 # Until disarm_macos_push_on_exit, any exit of this augur run rewrites running VM $1's ~/.augur-env
