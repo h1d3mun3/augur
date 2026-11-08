@@ -6133,23 +6133,45 @@ cmd_update_macos() {
         # The agent via its official installer (see cmd_build_macos for why npm is avoided).
         # The VM has no virtiofs mounts here, so ~/.claude is local and writable.
         # Download to a temp file before executing — avoids piping untrusted content to a shell.
-        # No "timeout" binary on stock macOS: background the command, race it against a
-        # backgrounded sleep+kill, and wait on the real PID for its actual exit status — a
-        # stalled network call (curl gives no output at all while blocked) cannot hang this
-        # step forever.
-        # Once the command is done, the watchdog sleep is killed first (a killed sleep makes the
-        # watchdog skip its kills), then the watchdog itself, in case its sleep had not started.
-        # Killing only the watchdog would leave its sleep running. The watchdog holds none of the
-        # stdout/stderr of this ssh session: any process still holding them keeps the session,
-        # and augur, waiting until it exits.
-        _with_timeout() {
-            local _secs="$1"; shift
-            "$@" & local _cpid=$!
-            ( sleep "$_secs" && { pkill -TERM -P "$_cpid"; kill -TERM "$_cpid"; } ) </dev/null >/dev/null 2>&1 & local _wpid=$!
-            wait "$_cpid" 2>/dev/null; local _rc=$?
-            pkill -TERM -P "$_wpid" 2>/dev/null; kill "$_wpid" 2>/dev/null; wait "$_wpid" 2>/dev/null
-            return $_rc
-        }
+        # _with_timeout SECS CMD...: no "timeout" binary on stock macOS, so a stalled network call
+        # (curl gives no output at all while blocked) cannot hang a step forever. It returns the
+        # status of CMD, or 124 if the time ran out.
+        # It runs in /bin/bash, not in this zsh: job control (set -m) is what puts CMD and the
+        # watchdog each in a process group of their own, and bash allows it without a terminal
+        # (this ssh session has none).
+        # A group signal reaches every descendant, so nothing CMD started, and nothing the
+        # watchdog started, is left holding the stdout/stderr of this ssh session, which would
+        # keep the session, and augur, waiting until it exits.
+        # On timeout the watchdog marks that it fired, sends TERM to the group of CMD, then KILL
+        # once the group is still alive 10 s later. The group id stays unused by anything else
+        # while any member is alive. Accepted trade-off: if CMD exits just as the time runs out,
+        # or every member exits during those 10 s, a signal can name a group that no longer
+        # exists; reaching an unrelated process needs its id to be reused within that moment.
+        _with_timeout_sh=$(cat <<"EOF"
+secs=$1; shift
+mark=$(mktemp -d) || exit 1
+set -m
+"$@" </dev/null & cpid=$!
+(
+    sleep "$secs"
+    : > "$mark/fired"
+    kill -TERM -- "-$cpid" 2>/dev/null
+    n=0
+    while [ "$n" -lt 10 ] && kill -0 -- "-$cpid" 2>/dev/null; do sleep 1; n=$((n + 1)); done
+    kill -KILL -- "-$cpid" 2>/dev/null
+) </dev/null >/dev/null 2>&1 & wpid=$!
+set +m
+wait "$cpid" 2>/dev/null; rc=$?
+if [ -e "$mark/fired" ]; then
+    wait "$wpid" 2>/dev/null; rc=124
+else
+    kill -TERM -- "-$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
+fi
+rm -rf "$mark"
+exit "$rc"
+EOF
+)
+        _with_timeout() { /bin/bash -c "$_with_timeout_sh" _with_timeout "$@"; }
         _installer=$(mktemp)
         curl -fsSL --connect-timeout 10 --max-time 120 "$_agent_url" -o "$_installer" \
             || { echo "augur: ERROR failed to download the $_agent_name installer (timed out or unreachable)" >&2; rm -f "$_installer"; exit 1; }

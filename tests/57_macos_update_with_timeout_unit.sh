@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # Tier 0 — the time bound `update --macos` puts on the agent installer and on Homebrew.
 # _with_timeout lives inside the guest script that cmd_update_macos sends over ssh. It must:
-#   - kill a command (and the command's children) that outlives its time, and fail;
-#   - return the command's own exit status otherwise;
-#   - leave nothing behind once the command is done: no watchdog sleep, and nothing holding the
-#     caller's stdout open. Over ssh, a process still holding the session's output keeps the
-#     session, and augur, waiting until it exits.
+#   - return the command's own exit status when it finishes in time;
+#   - when the time runs out, stop the command and everything it started (TERM, then KILL for
+#     whatever ignores TERM), and return non-zero even if the command exits 0 on TERM;
+#   - leave nothing behind: no watchdog sleep, and nothing holding the caller's stdout open.
+#     Over ssh, a process still holding the session's output keeps the session, and augur,
+#     waiting until it exits.
 # The helper text is extracted from augur itself, so this cannot drift from what the guest runs.
-# It runs under bash and, when installed, zsh (the guest's login shell).
+# The wrapper is sourced under bash and, when installed, zsh (the guest's login shell); the body
+# always runs in /bin/bash, as in the guest.
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/.." && pwd)"
 source "$HERE/lib.sh"
 AUGUR="$REPO/augur"
@@ -15,59 +17,96 @@ AUGUR="$REPO/augur"
 WORK="$(mktemp -d)"
 # Distinctive sleep lengths, so a leftover is ours and can be found and cleaned up.
 WATCH_SECS=61237; CHILD_SECS=31237
-reap() { pkill -f "sleep ($WATCH_SECS|$CHILD_SECS)" 2>/dev/null; return 0; }
+LEFT="sleep ($WATCH_SECS|$CHILD_SECS)"
+reap() { pkill -KILL -f "$LEFT" 2>/dev/null; return 0; }
 trap 'reap; rm -rf "$WORK"' EXIT
 
-helper="$WORK/with_timeout.sh"
-awk '/^        _with_timeout\(\) \{$/ {f=1} f {print} f && /^        \}$/ {exit}' "$AUGUR" > "$helper"
-if ! grep -q '_with_timeout()' "$helper" || ! tail -n1 "$helper" | grep -q '^        }$'; then
-  fail "the _with_timeout helper could not be extracted from augur" "$(cat "$helper")"
+snippet="$WORK/with_timeout.sh"
+awk '/^        _with_timeout_sh=\$\(cat <<"EOF"$/ {f=1} f {print} f && /^        _with_timeout\(\) \{/ {exit}' "$AUGUR" > "$snippet"
+if ! grep -q '^EOF$' "$snippet" || ! tail -n1 "$snippet" | grep -q '_with_timeout() {.*/bin/bash'; then
+  fail "the _with_timeout helper could not be extracted from augur" "$(cat "$snippet")"
   finish; exit
 fi
+[[ -x /bin/bash ]] || { skip "_with_timeout" "no /bin/bash on this host"; finish; exit; }
 
-now_ms() { date +%s%3N; }
-leftover() { pgrep -f "sleep ($WATCH_SECS|$CHILD_SECS)" >/dev/null; }
+# Milliseconds since some fixed point; whole seconds where bash has no EPOCHREALTIME (bash 3.2).
+now_ms() {
+  if [[ -n "${EPOCHREALTIME:-}" ]]; then local t="${EPOCHREALTIME/[.,]/}"; echo "${t:0:${#t}-3}"
+  else echo $(( SECONDS * 1000 )); fi
+}
+leftover() { pgrep -f "$LEFT" >/dev/null; }
+
+# timed CAP ARGS... — run `_with_timeout ARGS...` with its stdout piped to a reader. Sets
+# out (what the reader got), rc (the helper's status) and dt (ms until the reader saw EOF). A
+# reader still open after CAP seconds is killed, and dt is then left at CAP*1000 or more.
+timed() {
+  local cap="$1"; shift
+  rm -f "$WORK/rc" "$WORK/out"
+  local t0; t0="$(now_ms)"
+  { "$sh" -c '. "$1"; shift; _with_timeout "$@"' _ "$snippet" "$@" </dev/null 2>/dev/null; echo "$?" > "$WORK/rc"; } \
+    | cat > "$WORK/out" &
+  local p=$!
+  while kill -0 "$p" 2>/dev/null && (( $(now_ms) - t0 < cap * 1000 )); do sleep 0.1; done
+  dt=$(( $(now_ms) - t0 ))
+  if kill -0 "$p" 2>/dev/null; then kill -KILL "$p" 2>/dev/null; dt=$(( cap * 1000 )); fi
+  wait "$p" 2>/dev/null
+  # The helper may still be running when its reader was cut off; wait for its status briefly.
+  local i; for i in 1 2 3 4 5 6 7 8 9 10; do [[ -s "$WORK/rc" ]] && break; sleep 0.2; done
+  out="$(cat "$WORK/out" 2>/dev/null)"; rc="$(cat "$WORK/rc" 2>/dev/null)"
+}
+# no_leftover NAME — nothing of ours survives (a short pause lets killed processes go).
+no_leftover() {
+  sleep 0.3
+  if leftover; then fail "$1" "$(pgrep -fl "$LEFT" 2>/dev/null || pgrep -f "$LEFT")"; else ok "$1"; fi
+  reap
+}
 
 shells=(bash)
-command -v zsh >/dev/null 2>&1 && shells+=(zsh) || skip "zsh runs of _with_timeout" "zsh not installed"
+if command -v zsh >/dev/null 2>&1; then shells+=(zsh)
+else
+  echo "  NOTE: zsh is not installed here, so the zsh-sourced wrapper (as the guest runs it) is not exercised."
+  skip "zsh runs of _with_timeout" "zsh not installed; the body still runs in /bin/bash under the bash runs"
+fi
 
 for sh in "${shells[@]}"; do
   section "$sh: _with_timeout"
-  run() { "$sh" -c ". '$helper'; $1"; }
+  reap
 
   # (a) A fast command: the reader of the helper's stdout sees EOF at once, and no sleep is left.
-  reap
-  t0="$(now_ms)"
-  out="$(run "_with_timeout $WATCH_SECS echo done" | timeout 10 cat)"
-  dt=$(( $(now_ms) - t0 ))
+  timed 10 "$WATCH_SECS" echo done
   eq "done" "$out" "$sh: a fast command's output comes through"
-  [[ "$dt" -lt 2000 ]] && ok "$sh: the reader of its stdout gets EOF promptly (${dt} ms)" \
+  eq 0 "$rc" "$sh: a fast command's status 0 comes through"
+  (( dt < 2000 )) && ok "$sh: the reader of its stdout gets EOF promptly (${dt} ms)" \
     || fail "$sh: the reader of its stdout waited ${dt} ms for EOF (something still holds it)"
-  sleep 0.3
-  leftover && fail "$sh: the watchdog's sleep outlived a finished command" "$(pgrep -af "sleep $WATCH_SECS")" \
-    || ok "$sh: no watchdog sleep is left once the command is done"
-  reap
+  no_leftover "$sh: no watchdog sleep is left once the command is done"
 
-  # (b) A slow command, with a child of its own: both are killed at the timeout, and it fails.
-  t0="$(now_ms)"
-  run "_with_timeout 1 bash -c 'sleep $CHILD_SECS; :'" </dev/null >/dev/null 2>&1; rc=$?
-  dt=$(( $(now_ms) - t0 ))
-  [[ "$rc" -ne 0 ]] && ok "$sh: a timed-out command fails (rc=$rc)" || fail "$sh: a timed-out command returned 0"
-  [[ "$dt" -lt 5000 ]] && ok "$sh: it is stopped at the timeout (${dt} ms)" || fail "$sh: it ran ${dt} ms past a 1 s timeout"
-  sleep 0.3
-  leftover && fail "$sh: the timed-out command's child survived" "$(pgrep -af "sleep $CHILD_SECS")" \
-    || ok "$sh: the timed-out command's child is killed too"
-  reap
+  # (b) A slow command with a grandchild holding the same stdout: all of it is stopped at the
+  # timeout, the reader sees EOF, and the helper reports the timeout.
+  timed 20 1 bash -c "bash -c \"sleep $CHILD_SECS; :\"; :"
+  [[ "$rc" == 124 ]] && ok "$sh: a timed-out command returns 124" || fail "$sh: a timed-out command returned [$rc]"
+  (( dt < 5000 )) && ok "$sh: the reader sees EOF soon after the 1 s timeout (${dt} ms)" \
+    || fail "$sh: the reader waited ${dt} ms for EOF after a 1 s timeout (a grandchild still holds it)"
+  no_leftover "$sh: the timed-out command's grandchild is killed too"
 
   # (c) A fast failing command: its own exit status is returned, without waiting for the timeout.
-  t0="$(now_ms)"
-  run "_with_timeout $WATCH_SECS sh -c 'exit 7'" </dev/null >/dev/null 2>&1; rc=$?
-  dt=$(( $(now_ms) - t0 ))
+  timed 10 "$WATCH_SECS" sh -c 'exit 7'
   eq 7 "$rc" "$sh: a failing command's exit status is preserved"
-  [[ "$dt" -lt 2000 ]] && ok "$sh: and returned at once (${dt} ms)" || fail "$sh: it took ${dt} ms"
-  sleep 0.3
-  leftover && fail "$sh: the watchdog's sleep outlived a failed command" || ok "$sh: no watchdog sleep is left after a failure"
-  reap
+  (( dt < 2000 )) && ok "$sh: and returned at once (${dt} ms)" || fail "$sh: it took ${dt} ms"
+  no_leftover "$sh: no watchdog sleep is left after a failure"
+
+  # (d) A command that exits 0 on TERM still reports the timeout.
+  timed 20 1 bash -c "trap 'exit 0' TERM; sleep $CHILD_SECS & wait"
+  [[ "$rc" == 124 ]] && ok "$sh: a command that exits 0 on TERM still returns 124" \
+    || fail "$sh: a command that exits 0 on TERM returned [$rc]"
+  (( dt < 5000 )) && ok "$sh: and it is stopped at the timeout (${dt} ms)" || fail "$sh: it took ${dt} ms"
+  no_leftover "$sh: nothing it started is left"
+
+  # (e) A command that ignores TERM (and so do its children) is killed after the grace period.
+  timed 30 1 bash -c "trap '' TERM; bash -c \"sleep $CHILD_SECS; :\"; :"
+  [[ "$rc" == 124 ]] && ok "$sh: a command ignoring TERM returns 124" || fail "$sh: a command ignoring TERM returned [$rc]"
+  (( dt >= 9000 && dt < 16000 )) && ok "$sh: it is killed after the grace period (${dt} ms)" \
+    || fail "$sh: expected a KILL about 11 s in, the reader saw EOF at ${dt} ms"
+  no_leftover "$sh: nothing that ignored TERM is left"
 done
 
 finish
