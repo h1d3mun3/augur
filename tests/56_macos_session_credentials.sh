@@ -370,8 +370,8 @@ nonzero "no fresh connection after the install: the install"
 has "$out" "no new SSH connection is accepted" "no fresh connection after the install: says so"
 FRESH_RC=0
 SSHD_T_FAILS=0
-real_names="$(declare -f session_credential_names)"
-session_credential_names() { echo 'BAD*NAME'; }
+real_names="$(declare -f agent_auth_specs)"
+agent_auth_specs() { echo 'BAD*NAME|BAD_HOST_VAR|/nonexistent|'; }
 install_dropin
 nonzero "a credential name that is a pattern: the install"
 eq "" "$(cat "$BUILDLOG")" "a credential name that is a pattern: nothing reaches the guest"
@@ -458,17 +458,27 @@ guest_run "$(macos_session_env_check_cmd "$(macos_session_env_names)")" && fail 
 cp "$TMPD/dropin.saved" "$DROPIN"
 verify_dropin
 eq "0" "$rc" "the re-check passes again with augur's own drop-in (control)"
-session_credential_names() { echo 'BAD*NAME'; }
+agent_auth_specs() { echo 'BAD*NAME|BAD_HOST_VAR|/nonexistent|'; }
 verify_dropin
 nonzero "the re-check with a credential name that is a pattern"
 eq "" "$(cat "$BUILDLOG")" "the re-check with a pattern name: nothing reaches the guest"
 # The AcceptEnv line, and so the drop-in and the clones' check, is built from the validated names:
-# macos_session_env_names is the one place they are checked, and every caller of the line and the
-# check computes them once, there.
-session_credential_names() { echo 'BAD*NAME'; }
+# session_credential_names is the one place they are checked, and every caller of the line and the
+# check computes them once, through macos_session_env_names.
+agent_auth_specs() { echo 'BAD*NAME|BAD_HOST_VAR|/nonexistent|'; }
 _al="$(macos_session_env_names 2>/dev/null)" && fail "the session's names take a pattern credential name" "[$_al]" \
     || ok "the session's names refuse a credential name that is a pattern"
 eq "" "$_al" "…and give no names for it"
+has "$(macos_session_env_names 2>&1)" "Refusing to use the credential name 'BAD*NAME': not a shell variable name." \
+    "…naming it"
+# The same check covers the names a session sends: resolve_session_credentials, the only producer of
+# `_creds`, runs it first, so a bad name fails resolution, before any value is read.
+out="$( BAD_HOST_VAR=value; _creds=(); resolve_session_credentials 2>&1; echo "rc=$? n=${#_creds[@]}" )"
+has "$out" "rc=1 n=0" "resolution refuses a credential name that is a pattern, with no credential resolved"
+has "$out" "Refusing to use the credential name 'BAD*NAME'" "…with the one name check's error"
+eq "1" "$(grep -c 'valid_env_name "\$_genv"' "$AUGUR")" "the credential names are checked in one place"
+hasnt "$(declare -f macos_session_env_names macos_session_env_delivery_cmd ssh_macos_session)" 'valid_env_name' \
+    "…and not again by the drop-in's names, the delivery check or the session ssh"
 : > "$SSHLOG"; out="$( push_macos_guest_env "$(macos_project_vm)" 2>&1 )"; rc=$?
 eq "1" "$rc" "a push with a pattern credential name fails as one that cannot work (no retry)"
 eq "" "$(cat "$SSHLOG")" "a push with a pattern credential name: nothing reaches the guest"

@@ -474,8 +474,8 @@ resolve_api_key() {
 }
 
 # True iff $1 is a shell variable name. Every name augur interpolates into a guest's shell code or
-# its sshd configuration (macos_env_add_export, macos_session_env_delivery_cmd,
-# macos_session_env_names) must pass it.
+# its sshd configuration must pass it: the credential names once, where they are listed
+# (session_credential_names), and every other name where it is written (macos_env_add_export).
 valid_env_name() { [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; }
 
 # Reject a value that could break out of the single-quoted `export VAR='<value>'` lines macOS mode
@@ -510,7 +510,8 @@ validate_secret_value() {
 # NAME=value entries, non-empty values only: each agent_auth_specs credential (host env var, else its
 # host file), then the host's `gh auth token` as GH_TOKEN. Also checks agent_fixed_env, which macOS
 # mode writes into the guest's sourced ~/.augur-env. Returns 1, after an error naming the variable,
-# when a value fails validate_secret_value or a credential file exists but cannot be read; callers
+# when a value fails validate_secret_value, a credential name is not a shell variable name
+# (session_credential_names) or a credential file exists but cannot be read; callers
 # abort with `|| exit 1`. Must not run inside a subshell or process substitution: `_creds` would not
 # reach the caller there.
 #
@@ -544,6 +545,7 @@ validate_secret_value() {
 resolve_session_credentials() {
     local _genv _henv _hfile _hvalidator _aval _gh _kv
     _creds=()
+    session_credential_names >/dev/null || return 1
     while IFS='|' read -r _genv _henv _hfile _hvalidator; do
         [[ -z "$_genv" ]] && continue
         _aval="$(resolve_api_key "${!_henv:-}" "$_hfile")" || {
@@ -567,11 +569,17 @@ resolve_session_credentials() {
 
 # The name of every credential resolve_session_credentials can produce, one per line: each
 # agent_auth_specs guest variable, then GH_TOKEN. macOS mode's base VM accepts exactly these from a
-# session's ssh (install_macos_session_env_acceptance).
+# session's ssh (install_macos_session_env_acceptance). The one place these names are checked:
+# returns 1, after an error, on one that is not a shell variable name (valid_env_name), so a caller
+# must read it with `$( … ) || return 1`, never through a process substitution, whose status is
+# lost. resolve_session_credentials runs it first, so every name in `_creds` has passed it too, and
+# nothing downstream (the drop-in, its check, the session's SendEnv and delivery check) re-checks.
 session_credential_names() {
     local _genv _rest
     while IFS='|' read -r _genv _rest; do
-        [[ -n "$_genv" ]] && printf '%s\n' "$_genv"
+        [[ -n "$_genv" ]] || continue
+        valid_env_name "$_genv" || { error "Refusing to use the credential name '${_genv}': not a shell variable name."; return 1; }
+        printf '%s\n' "$_genv"
     done < <(agent_auth_specs)
     printf '%s\n' GH_TOKEN
 }
@@ -1091,7 +1099,7 @@ _macos_ssh_cmd() {
 # do not get them.
 ssh_macos_session() {
     local vm="$1" _ssh=() _ssh_dest="" _kv _sendenv=() _check _git _remote _rc=0; shift
-    _check="$(macos_session_env_delivery_cmd)" || return 1
+    _check="$(macos_session_env_delivery_cmd)"
     _git="$(macos_session_git_env_cmd)" || return 1
     _remote="${_check}${_git}${!#}"
     set -- "${@:1:$#-1}"
@@ -1113,8 +1121,8 @@ MACOS_SESSION_ENV_MISSING_RC=197
 
 # The guest commands, ending in `; `, that exit MACOS_SESSION_ENV_MISSING_RC unless every variable
 # the caller's `_creds` names is set and non-empty, for ssh_macos_session to run before its remote
-# command. They name the variables and never print a value. Nothing when `_creds` is empty. Returns
-# 1, after an error, for a name that is not a shell variable name.
+# command. They name the variables and never print a value. Nothing when `_creds` is empty. The
+# names are checked where they are listed (session_credential_names).
 #
 # Accepted trade-off: the guest's sshd runs the remote command through the login shell's `-c`, so
 # zsh has read the guest's startup files (~/.zshenv and what it sources) before the check runs. A
@@ -1125,7 +1133,6 @@ macos_session_env_delivery_cmd() {
     local _kv _n
     for _kv in ${_creds[@]+"${_creds[@]}"}; do
         _n="${_kv%%=*}"
-        valid_env_name "$_n" || { error "Refusing to send '${_n}': not a valid variable name."; return 1; }
         printf '[ -n "${%s:-}" ] || exit %s; ' "$_n" "$MACOS_SESSION_ENV_MISSING_RC"
     done
 }
@@ -4326,13 +4333,11 @@ macos_run_root_script() {
 # The credential names of an augur session (session_credential_names) on one line, space-separated,
 # for a root shell script, the drop-in's line (macos_session_accept_env_line) and the session check
 # (macos_session_env_check_cmd), which take this output and validate nothing themselves. Fails,
-# after an error, on a name that is not a shell variable name.
+# after session_credential_names' error, on a name that is not a shell variable name.
 macos_session_env_names() {
-    local _n _names=""
-    while IFS= read -r _n; do
-        valid_env_name "$_n" || { error "Refusing to write an sshd AcceptEnv for the credential name '${_n}'."; return 1; }
-        _names+="${_names:+ }${_n}"
-    done < <(session_credential_names)
+    local _list _n _names=""
+    _list="$(session_credential_names)" || return 1
+    while IFS= read -r _n; do _names+="${_names:+ }${_n}"; done <<<"$_list"
     printf '%s' "$_names"
 }
 
