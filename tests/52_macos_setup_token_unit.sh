@@ -171,6 +171,8 @@ prov_real="$(declare -f run_base_provisioning)"
 run_base_provisioning()          { echo "provision $1" >> "$LOG"; }
 install_macos_managed_settings() { echo "managed $1" >> "$LOG"; }
 install_macos_session_env_acceptance() { echo "sessionenv $1" >> "$LOG"; }
+SE_OK=1
+verify_macos_session_env_acceptance() { echo "sessionenv-check $1" >> "$LOG"; [[ "$SE_OK" == 1 ]]; }
 select_macos_full_xcode()        { echo "xcode $1" >> "$LOG"; }
 SIG_OK=1
 verify_real="$(declare -f agent_verify_integrity_macos)"
@@ -256,6 +258,27 @@ for s in provision managed sessionenv xcode; do
 done
 macos_vm_exists "$MACOS_BASE_VM" && ok "the base VM exists afterwards" || fail "the base VM is gone"
 macos_vm_exists "$MACOS_UPDATE_VM" && fail "the staging copy is left behind" || ok "the staging copy is gone"
+
+# The sshd drop-in installed first is checked again as the last guest step, right before the save;
+# a failure there saves nothing.
+reset_vms; SIG_OK=1; SE_OK=1
+run_update
+k_at="$(line_of "sessionenv-check $MACOS_UPDATE_VM")"; v_at="$(line_of "verify $MACOS_UPDATE_VM")"
+c_at="$(line_of "vm clone $MACOS_UPDATE_VM $MACOS_BASE_VM")"
+last_guest="$(grep -nE "^(ssh|provision|managed|sessionenv|sessionenv-check|xcode|verify) $MACOS_UPDATE_VM$" "$LOG" | tail -n1 | cut -d: -f1)"
+if [[ -n "$k_at" && -n "$v_at" && -n "$c_at" && "$v_at" -lt "$k_at" && "$k_at" -lt "$c_at" && "$k_at" == "$last_guest" ]]; then
+  ok "update: the drop-in is re-checked as the last guest step, before the save (verify@$v_at check@$k_at save@$c_at)"
+else fail "update: the drop-in re-check is misplaced" "$(cat "$LOG")"; fi
+s_at="$(line_of "sessionenv $MACOS_UPDATE_VM")"
+[[ -n "$s_at" && "$s_at" -lt "$k_at" ]] && ok "update: the install itself still comes first" || fail "update: the install is not before the re-check" "install@$s_at check@$k_at"
+reset_vms; SIG_OK=1; SE_OK=0
+run_update
+[[ "$rc" -ne 0 ]] && ok "drop-in re-check fails: update exits non-zero" || fail "drop-in re-check fails: update exited 0"
+has "$out" "The base VM was left as-is." "drop-in re-check fails: says the base VM was kept"
+logged "vm delete $MACOS_BASE_VM" && fail "drop-in re-check fails: the base VM was deleted" || ok "drop-in re-check fails: the base VM is not deleted"
+logged "vm clone $MACOS_UPDATE_VM $MACOS_BASE_VM" && fail "drop-in re-check fails: the update was saved as the base VM" || ok "drop-in re-check fails: nothing is saved as the base VM"
+logged "vm delete $MACOS_UPDATE_VM" && ok "drop-in re-check fails: the staging copy is discarded" || fail "drop-in re-check fails: the staging copy is left behind"
+SE_OK=1
 
 section "Tier 1 — update --macos: never touches the build VM; serialized with build by the base-writer lock"
 WLOCK="$(host_lock_path "$MACOS_BASE_WRITER_LOCK")"
@@ -692,6 +715,8 @@ macos_admin_password_stdin()     { echo pw; }
 install_macos_managed_settings() { guest "$1" managed; }
 select_macos_full_xcode()        { guest "$1" xcode; }
 agent_verify_integrity_macos()   { guest "$1" verify && [[ "$SIG_OK" == 1 ]]; }
+SE_OK=1
+verify_macos_session_env_acceptance() { guest "$1" sessionenv-check && [[ "$SE_OK" == 1 ]]; }
 provision_files_present()        { return 0; }
 provision_manifest_validate()    { return 0; }
 check_provision_approved()       { return 0; }
@@ -713,6 +738,10 @@ after_hook() {   # after_hook <label> <vm>: managed, xcode, verify all after the
   else fail "$1: post-provisioning steps out of order" "hook@$h managed@$m xcode@$x verify@$v"; fi
   local b; b="$(grep -n "^boot-nat $2$" "$LOG" | tail -n1 | cut -d: -f1)"
   [[ -n "$b" && "$h" -lt "$b" && "$b" -lt "$m" ]] && ok "$1: the VM is restarted on NAT after provisioning" || fail "$1: no NAT restart after provisioning" "hook@$h nat@$b managed@$m"
+  local k last; k="$(line_of "sessionenv-check $2")"
+  last="$(grep -nE "^[a-z-]+ $2$" "$LOG" | grep -vE ':(boot-nat|boot-filtered) ' | tail -n1 | cut -d: -f1)"
+  [[ -n "$k" && "$v" -lt "$k" && "$k" == "$last" ]] && ok "$1: the sshd drop-in is re-checked last, after the signer check (check@$k)" \
+    || fail "$1: the sshd drop-in re-check is not the last guest step" "verify@$v check@$k last@$last"
 }
 
 reset_vms; : > "$RUNF"; SIG_OK=1; HOOK_OK=1
@@ -765,6 +794,13 @@ run_build
 [[ "$rc" -ne 0 ]] && ok "build: a binary failing the final check aborts" || fail "build: the final check passed a bad binary"
 logged "vm clone $MACOS_BUILD_VM $MACOS_BASE_VM" && fail "…but it was saved as the base VM" || ok "…and nothing is saved as the base VM"
 SIG_OK=1
+
+: > "$VMS"; : > "$LOG"; : > "$RUNF"; SE_OK=0
+run_build
+[[ "$rc" -ne 0 ]] && ok "build: a failing sshd drop-in re-check aborts" || fail "build: a failing sshd drop-in re-check was ignored"
+has "$out" "no base VM was saved" "build: a failing re-check says no base VM was saved"
+logged "vm clone $MACOS_BUILD_VM $MACOS_BASE_VM" && fail "…but it was saved as the base VM" || ok "…and nothing is saved as the base VM"
+SE_OK=1
 
 : > "$VMS"; : > "$LOG"; : > "$RUNF"; CLONE_FAIL_TO="$MACOS_BASE_VM"
 run_build

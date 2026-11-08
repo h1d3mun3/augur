@@ -10,12 +10,14 @@
 # differs or the record is missing. down/destroy drop the record.
 #
 # The same file pins the second host-side record a running VM is attached by: that the egress
-# self-test passed during the VM's current boot (macos_egress_verified_file, tied to the boot by
-# augur-vm's run id). `claude` / `shell --macos` on a running egress VM without it (an `up`
-# interrupted before its self-test, a record from an earlier boot) refuse before touching the
-# guest; `up --macos` on the running VM re-runs the self-test and records it. The boot path drops
-# it before `augur-vm run` and writes it only after the self-test; --no-egress has none;
-# down/destroy and a failing self-test drop it.
+# self-test passed during the VM's current boot (macos_egress_verified_file, tied to the boot by its
+# run id: augur-vm's pid and that process's start time, so a recycled pid does not match).
+# `claude` / `shell --macos` on a running egress VM without it (an `up` interrupted before its
+# self-test, a record from an earlier boot) refuse before touching the guest, naming `up --macos`;
+# `up --macos` on the running VM re-runs the self-test and records it. The boot path drops it before
+# `augur-vm run` and writes it only after the self-test; --no-egress has none; down/destroy and a
+# failing self-test drop it. An `up` that cannot read the run id after a passed self-test fails and
+# stops the VM.
 #
 # Nothing is cloned, booted or SSH'd: the real cmd_* functions run against recorder stubs.
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/.." && pwd)"
@@ -69,11 +71,27 @@ ssh_macos_session() { ssh_macos "$@"; }
 egress_on()  { AUGUR_EGRESS=auto; }
 egress_off() { AUGUR_EGRESS=0; }
 record() { mkdir -p "$AUGUR_PROXY_DIR"; printf '%s\n' "$1" > "$(macos_egress_mode_file)"; }
-# The VM's current boot (run.pid), and the record that its self-test passed during it.
+# The VM's current boot: run.pid holds a live pid (this shell's; BOOT2 is a second boot's process),
+# and its id (macos_vm_run_id) adds that process's start time. A `ps` stand-in answers a fixed
+# start time per pid so ids cannot drift mid-file (Linux procps recomputes start times from the
+# clock on each call, which can tick over by a second); the run-id section below uses the real ps.
+SHIMDIR="$TMPD/shim"; mkdir -p "$SHIMDIR"; REAL_PS="$(command -v ps)"
+cat > "$SHIMDIR/ps" <<EOF
+#!/usr/bin/env bash
+if [[ "\${REAL_LSTART:-0}" != 1 && "\$*" == "-o lstart= -p "* ]]; then
+  kill -0 "\$4" 2>/dev/null || exit 1; echo "Sun Nov  8 10:00:\$(( \$4 % 60 )) 2026"; exit 0
+fi
+exec "$REAL_PS" "\$@"
+EOF
+chmod +x "$SHIMDIR/ps"; PATH="$SHIMDIR:$PATH"
+sleep 600 & BOOT2=$!
+trap 'kill "$BOOT2" 2>/dev/null; rm -rf "$TMPD"' EXIT
 RUN_ID_FILE="$AUGUR_DIR/vms/$PV/run.pid"
 boot_id()  { printf '%s\n' "$1" > "$RUN_ID_FILE"; }
 verified() { mkdir -p "$AUGUR_PROXY_DIR"; printf '%s\n' "$1" > "$(macos_egress_verified_file)"; }
-boot_id 4242
+# The record of a pass during the boot run.pid currently names.
+verified_now() { verified "$(macos_vm_run_id "$PV")"; }
+boot_id "$$"
 run_cmd() { : > "$LOG"; out="$( set -e; "$@" 2>&1 )"; rc=$?; }
 
 refused() {   # refused <label> <remedy> [<reason the message must give>]
@@ -146,7 +164,7 @@ for c in cmd_claude_macos cmd_shell_macos; do
   egress_off; record on
   run_cmd "$c"
   refused "$c --no-egress on an egress VM" "--no-egress"
-  egress_on; record on; verified 4242
+  egress_on; record on; verified_now
   run_cmd "$c"
   eq 0 "$rc" "$c on an egress VM: attaches"
   has "$out" "AGENT_ATTACHED" "$c on an egress VM: the session is launched"
@@ -155,13 +173,43 @@ for c in cmd_claude_macos cmd_shell_macos; do
   eq 0 "$rc" "$c --no-egress on a --no-egress VM: attaches"
 done
 
+section "Tier 1 — a VM's run id is its augur-vm pid plus that process's start time (the real ps)"
+export REAL_LSTART=1
+boot_id "$$"
+id="$(macos_vm_run_id "$PV")"
+want_start="$(LC_ALL=C ps -o lstart= -p "$$" | tr -s ' ' | sed 's/^ //; s/ $//')"
+[[ "$id" == "$$ "* && -n "$want_start" ]] && ok "the id starts with the pid from run.pid" || fail "the id does not start with the pid" "[$id]"
+eq "$$ $want_start" "$id" "the id is '<pid> <start time>', ps's padding collapsed (no double space)"
+hasnt "$id" "  " "the id holds no run of spaces"
+eq "$id" "$(macos_vm_run_id "$PV")" "the id is the same on every read"
+boot_id "$BOOT2"
+[[ "$(macos_vm_run_id "$PV")" == "$BOOT2 "?* && "$(macos_vm_run_id "$PV")" != "$id" ]] \
+  && ok "another process (another boot) has another id" || fail "another boot's id is not its own" "$(macos_vm_run_id "$PV")"
+printf '%s' "$$" > "$RUN_ID_FILE"
+eq "$id" "$(macos_vm_run_id "$PV")" "a pidfile without a trailing newline (augur-vm writes none) gives the same id"
+sleep 0 & _dead=$!; wait "$_dead"; boot_id "$_dead"
+eq "" "$(macos_vm_run_id "$PV")" "a pid with no process: no id"
+boot_id "not-a-pid"
+eq "" "$(macos_vm_run_id "$PV")" "a pidfile that holds no pid: no id"
+rm -f "$RUN_ID_FILE"
+eq "" "$(macos_vm_run_id "$PV")" "no pidfile: no id"
+# A recycled pid: the record holds this pid with an earlier process's start time.
+boot_id "$$"; egress_on; verified "$$ Thu Jan 1 00:00:00 1970"
+run_cmd require_macos_egress_verified "$PV"
+[[ "$rc" -ne 0 ]] && ok "a record for the same pid with another start time is refused" || fail "a recycled pid matched the record"
+verified "$id"
+run_cmd require_macos_egress_verified "$PV"
+eq 0 "$rc" "the record of this boot is accepted (control)"
+unset REAL_LSTART
+
 section "Tier 1 — a running VM gets a session only if its current boot passed the self-test"
 # An `up --macos` interrupted between `augur-vm run` and the self-test leaves a running VM with no
 # record of a passed self-test (macos_egress_verified_file); one booted again has a new run id.
 unverified() {   # unverified <label>
   [[ "$rc" -ne 0 ]] && ok "$1: exits non-zero" || fail "$1: was not refused"
   has "$out" "no egress self-test has passed since it booted" "$1: says why"
-  has "$out" "augur down --macos && augur up --macos" "$1: gives the remedy"
+  has "$out" "to re-run the egress self-test on the running VM" "$1: gives the remedy (up --macos)"
+  hasnt "$out" "augur down --macos" "$1: does not send the operator through a restart"
   hasnt "$out" "AGENT_ATTACHED" "$1: nothing is attached"
   grep -q '^ssh ' "$LOG" && fail "$1: the guest was contacted" "$(cat "$LOG")" || ok "$1: the guest is not contacted at all"
   if logged "vm stop $PV" || logged stop_gvproxy || logged stop_proxy; then
@@ -173,13 +221,16 @@ for c in cmd_claude_macos cmd_shell_macos; do
   egress_on; record on; rm -f "$(macos_egress_verified_file)"
   run_cmd "$c"
   unverified "$c, no record of a passed self-test"
-  egress_on; record on; verified 4141
+  egress_on; record on; verified "$(boot_id "$BOOT2"; macos_vm_run_id "$PV")"; boot_id "$$"
   run_cmd "$c"
   unverified "$c, a record from an earlier boot (another run id)"
-  egress_on; record on; verified 4242; rm -f "$RUN_ID_FILE"
+  egress_on; record on; verified "$$ Thu Jan 1 00:00:00 1970"
+  run_cmd "$c"
+  unverified "$c, a record for this boot's pid with another start time (a recycled pid)"
+  egress_on; record on; verified_now; rm -f "$RUN_ID_FILE"
   run_cmd "$c"
   unverified "$c, no run id to match the record against"
-  boot_id 4242
+  boot_id "$$"
   egress_off; record off; rm -f "$(macos_egress_verified_file)"
   run_cmd "$c"
   eq 0 "$rc" "$c --no-egress: attaches with no record (a --no-egress boot has no self-test)"
@@ -189,36 +240,55 @@ egress_on; record on; rm -f "$(macos_egress_verified_file)"
 run_cmd cmd_up_macos
 eq 0 "$rc" "up --macos on an unverified running VM: reconciles"
 logged selftest && ok "up --macos on an unverified running VM: runs the self-test" || fail "up --macos: no self-test"
-eq "4242" "$(cat "$(macos_egress_verified_file)" 2>/dev/null)" "up --macos on a running VM: records the pass with this boot's run id"
+eq "$(macos_vm_run_id "$PV")" "$(cat "$(macos_egress_verified_file)" 2>/dev/null)" "up --macos on a running VM: records the pass with this boot's run id"
 run_cmd cmd_claude_macos
 eq 0 "$rc" "…after which claude --macos attaches"
 # A failing self-test on that path records nothing, and drops a record that was there.
 verify_real="$(declare -f verify_macos_egress_locked)"
 verify_macos_egress_locked() { echo "selftest" >> "$LOG"; stop_unverified_macos_vm "$1"; exit 1; }
-egress_on; record on; verified 4242
+egress_on; record on; verified_now
 run_cmd cmd_up_macos
 [[ "$rc" -ne 0 ]] && ok "self-test fails on a running VM: up exits non-zero" || fail "self-test fails on a running VM: up exited 0"
 [[ -e "$(macos_egress_verified_file)" ]] && fail "self-test fails on a running VM: the record survives" \
   || ok "self-test fails on a running VM: the record is dropped"
 eval "$verify_real"
-# No run id: nothing is recorded, with a warning, so sessions refuse (fail closed).
+# No run id after a passed self-test (no pidfile; a pid with no process; the process's start time
+# unreadable): the pass cannot be recorded, so `up` fails and stops the VM it cannot vouch for, on
+# the running VM and on a boot alike, rather than leave one every session refuses.
+no_run_id() {   # no_run_id <label>
+  [[ "$rc" -ne 0 ]] && ok "$1: up --macos exits non-zero" || fail "$1: up --macos exited 0"
+  has "$out" "Could not read VM '$PV''s run id" "$1: says the run id is unreadable"
+  has "$out" "cannot be recorded" "$1: says the pass cannot be recorded"
+  logged selftest && ok "$1: the self-test ran first (control)" || fail "$1: no self-test ran"
+  logged "vm stop $PV" && ok "$1: the VM is stopped" || fail "$1: the VM was left running" "$(cat "$LOG")"
+  logged stop_gvproxy && logged stop_proxy && ok "$1: its gvproxy and proxy are stopped" || fail "$1: egress helpers left running"
+  logged "vm delete $PV" && fail "$1: the clone was deleted" || ok "$1: the clone is kept"
+  [[ -e "$(macos_egress_verified_file)" ]] && fail "$1: a record was written" || ok "$1: nothing is recorded"
+}
+VM_UP=1; egress_on; record on
 rm -f "$RUN_ID_FILE" "$(macos_egress_verified_file)"
-run_cmd cmd_up_macos
-eq 0 "$rc" "no run id: up --macos still reconciles"
-has "$out" "its passed self-test is not recorded" "no run id: says the pass is not recorded"
-[[ -e "$(macos_egress_verified_file)" ]] && fail "no run id: a record was written" || ok "no run id: nothing is recorded"
-boot_id 4242
+run_cmd cmd_up_macos; no_run_id "running VM, no pidfile"
+sleep 0 & _dead=$!; wait "$_dead"; boot_id "$_dead"; verified_now
+run_cmd cmd_up_macos; no_run_id "running VM, a pid with no process"
+boot_id "$$"; mv "$SHIMDIR/ps" "$SHIMDIR/ps.saved"
+printf '#!/bin/sh\nexit 1\n' > "$SHIMDIR/ps"; chmod +x "$SHIMDIR/ps"
+run_cmd cmd_up_macos; no_run_id "running VM, ps cannot read the start time"
+mv "$SHIMDIR/ps.saved" "$SHIMDIR/ps"
+VM_UP=0; rm -f "$RUN_ID_FILE"
+run_cmd cmd_up_macos; no_run_id "boot, no pidfile"
+hasnt "$out" "is up." "boot, no pidfile: no success banner"
+VM_UP=1; boot_id "$$"
 
 section "Tier 1 — the boot path drops the record before \`augur-vm run\` and writes it after the self-test"
 VM_UP=0
-egress_on; verified 4242; boot_id 4343
+egress_on; verified_now; boot_id "$BOOT2"
 wait_for_macos_ssh() { cp "$(macos_egress_verified_file)" "$TMPD/verified-at-boot" 2>/dev/null; return 0; }
 rm -f "$TMPD/verified-at-boot"
 run_cmd cmd_up_macos
 eq 0 "$rc" "boot: completes"
 [[ -e "$TMPD/verified-at-boot" ]] && fail "boot: a record from an earlier boot is still there while this one boots" \
   || ok "boot: the earlier boot's record is gone before the VM boots"
-eq "4343" "$(cat "$(macos_egress_verified_file)" 2>/dev/null)" "boot: the pass is recorded with this boot's run id"
+eq "$(macos_vm_run_id "$PV")" "$(cat "$(macos_egress_verified_file)" 2>/dev/null)" "boot: the pass is recorded with this boot's run id"
 fn="$(declare -f cmd_up_macos)"
 rm_at="$(grep -n 'rm -f "$(macos_egress_verified_file)"' <<<"$fn" | head -n1 | cut -d: -f1)"
 run_at="$(grep -n '"\$VM_CLI" run' <<<"$fn" | head -n1 | cut -d: -f1)"
@@ -230,18 +300,18 @@ else fail "boot: the record's place in cmd_up_macos is wrong" "rm@$rm_at run@$ru
 # Interrupted before the self-test (here: the SSH wait never ends well): nothing is recorded.
 wait_for_macos_ssh() { return 1; }
 macos_boot_ssh_failed() { stop_unverified_macos_vm "$1"; exit 1; }
-verified 4242
+verified_now
 run_cmd cmd_up_macos
 [[ -e "$(macos_egress_verified_file)" ]] && fail "boot fails before its self-test: a record exists" \
   || ok "boot fails before its self-test: no record"
 unset -f macos_boot_ssh_failed; eval "$(sed -n '/^macos_boot_ssh_failed() {$/,/^}$/p' "$AUGUR")"
 wait_for_macos_ssh() { return 0; }
 # --no-egress: no self-test, so no record.
-egress_off; verified 4242
+egress_off; verified_now
 run_cmd cmd_up_macos
 eq 0 "$rc" "boot --no-egress: completes"
 [[ -e "$(macos_egress_verified_file)" ]] && fail "boot --no-egress: a record exists" || ok "boot --no-egress: no record"
-boot_id 4242
+boot_id "$$"
 
 section "Tier 1 — a stopped VM goes through up (which writes a fresh record)"
 VM_UP=0; egress_on; record off
@@ -279,13 +349,13 @@ WORKSPACE_DIR="$WS_SAVE"
 section "Tier 1 — down / destroy drop the records"
 egress_on
 for c in cmd_down_macos cmd_destroy_macos; do
-  record on; verified 4242
+  record on; verified_now
   run_cmd "$c"
   [[ -e "$(macos_egress_mode_file)" ]] && fail "$c leaves the record behind" || ok "$c removes the record"
   [[ -e "$(macos_egress_verified_file)" ]] && fail "$c leaves the self-test record behind" || ok "$c removes the self-test record"
 done
 macos_vm_exists() { return 1; }
-record on; verified 4242
+record on; verified_now
 run_cmd cmd_down_macos
 [[ -e "$(macos_egress_mode_file)" ]] && fail "down with no VM leaves the record" || ok "down with no VM still removes the record"
 [[ -e "$(macos_egress_verified_file)" ]] && fail "down with no VM leaves the self-test record" || ok "down with no VM still removes the self-test record"

@@ -34,13 +34,15 @@
 #     interrupted `up`) is refused before any guest step, and `up` on that VM re-runs the self-test
 #     and records it;
 #   • a push that fails is fatal on every path;
-#   • every path launches exactly once and pushes exactly once, plus, on a boot, the earlier push
-#     that carries the acceptance check and no credential or GIT_CONFIG_* helper lines: running VM,
-#     boot, a VM that came up in the meantime; `up --macos` launches nothing;
+#   • every path launches exactly once and pushes exactly once, the push carrying the acceptance
+#     check and no credential or GIT_CONFIG_* helper lines (on a boot, right after the SSH wait):
+#     running VM, boot, a VM that came up in the meantime; `up --macos` launches nothing;
 #   • augur's other ssh calls (ssh_macos) carry no SendEnv, and `setup-token --macos` gets nothing;
 #   • the base VM build and update write the sshd AcceptEnv drop-in only after `sshd -T` accepted it
-#     in a test config (one run per check, its error shown), and the session check accepts exactly
-#     what they write.
+#     in a test config (one run per check, its error shown), as root over ONE ssh connection whose
+#     stdin carries the password line, a marker and the script (nothing staged in the guest; the
+#     password never run or printed, NOPASSWD sudo or not), re-check it the same way as their last
+#     guest step before the save, and the session check accepts exactly what they write.
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/.." && pwd)"
 source "$HERE/lib.sh"
 AUGUR="$REPO/augur"
@@ -106,6 +108,17 @@ rc=$?; rm -rf "$home"; exit "$rc"
 EOF
 chmod +x "$SHIMDIR/ssh"
 PATH="$SHIMDIR:$PATH"
+# `ps -o lstart= -p <pid>` (the start time in a VM's run id, macos_vm_run_id) answers a fixed time for
+# a live pid, so the id cannot drift during the run: Linux procps derives start times from a boot
+# time it recomputes on each call, which can tick over by a second mid-file. tests/51 runs the real
+# ps. Any other ps call goes to the real one.
+REAL_PS="$(command -v ps)"
+cat > "$SHIMDIR/ps" <<EOF
+#!/usr/bin/env bash
+if [[ "\$*" == "-o lstart= -p "* ]]; then kill -0 "\${4}" 2>/dev/null || exit 1; echo "Sun Nov  8 10:00:00 2026"; exit 0; fi
+exec "$REAL_PS" "\$@"
+EOF
+chmod +x "$SHIMDIR/ps"
 macos_ssh_host() { echo 127.0.0.1; }
 macos_ssh_port() { echo 2222; }
 
@@ -182,15 +195,17 @@ macos_vm_running() {
     esac
 }
 
-# The base VM build's drop-in install, run for real against GUEST_ETC: the staged script is written
-# into GUEST_HOME, `sudo -S -p ''` reads the password line and runs it with the guest's paths mapped,
+# The base VM build's drop-in install and check, run for real against GUEST_ETC: the remote command
+# runs under bash with a `sudo` stand-in on PATH that, like `sudo -S`, reads the password line from
+# stdin one byte at a time and refuses a wrong one (SUDO_NOPASSWD=1: reads nothing, as with a
+# NOPASSWD grant), and the rest of stdin, the root script, has the guest's paths mapped on the way.
 # `chown root:wheel` is a no-op (no root here), and `sshd -T [-f <config>]` follows Include lines
 # from <config> (default: the guest's sshd_config) and prints one `AcceptEnv <NAME>` line per
 # pattern, the form macOS's sshd -T prints (SSHD_LOWER=1: upstream OpenSSH's lowercase
 # `acceptenv`). Each sshd run is logged with whether the drop-in was live at that moment.
 # SSHD_T_FAILS=1 makes every sshd -T fail with a parse error on stderr; =live only the one without -f.
 # FRESH_RC is what the fresh connection after the install exits with.
-SSHD_T_FAILS=0; FRESH_RC=0
+SSHD_T_FAILS=0; FRESH_RC=0; SUDO_NOPASSWD=0
 SSHDLOG="$TMPD/sshd-calls"
 printf 'Include %s/ssh/sshd_config.d/*\nAcceptEnv LANG LC_*\n' "$GUEST_ETC" > "$GUEST_ETC/ssh/sshd_config"
 cat > "$SHIMDIR/sshd" <<'EOF2'
@@ -216,39 +231,60 @@ parse() {
 echo "port 22"; parse "$cfg"
 EOF2
 chmod +x "$SHIMDIR/sshd"
+ROOTBIN="$TMPD/rootbin"; mkdir -p "$ROOTBIN"
+cat > "$ROOTBIN/sudo" <<'EOF2'
+#!/usr/bin/env bash
+# sudo -S [-k] -p <prompt> <cmd...>
+[[ "$1" == -S ]] || { echo "sudo stand-in: not -S" >&2; exit 1; }
+while [[ "${1:-}" == -* ]]; do case "$1" in -p) shift 2 ;; *) echo "${1}" >> "$SUDO_FLAGLOG"; shift ;; esac; done
+if [[ "$SUDO_NOPASSWD" != 1 ]]; then
+    IFS= read -r pw; printf '%s\n' "$pw" > "$SUDO_PWLOG"
+    [[ "$pw" == "$SUDO_WANT" ]] || { echo "Sorry, try again." >&2; exit 1; }
+fi
+exec "$@"
+EOF2
+chmod +x "$ROOTBIN/sudo"
 BUILDLOG="$TMPD/buildlog"
 build_ssh() {   # an ssh_macos for the build path
     local vm="$1"; shift
     local c="$*" s
     printf '%s\n' "$c" >> "$BUILDLOG"
     case "$c" in
-        "cat > "*) guest_run "$c" ;;
-        "sudo -S -p '' sh "*)
-            IFS= read -r _pw; printf '%s\n' "$_pw" > "$TMPD/build-stdin"
-            s="$(guest_map "$(cat "$GUEST_HOME/.augur-session-env-install.sh")")"
+        "sudo "*)
+            s="$(cat; echo x)"; s="${s%x}"; s="$(guest_map "$s")"
             s="${s//\/usr\/sbin\/sshd/$SHIMDIR/sshd}"; s="${s//chown root:wheel/true}"
-            GUEST_ETC="$GUEST_ETC" DROPIN="$DROPIN" SSHDLOG="$SSHDLOG" SSHD_T_FAILS="$SSHD_T_FAILS" SSHD_LOWER="${SSHD_LOWER:-0}" sh -c "$s"
-            local r=$?; rm -f "$GUEST_HOME/.augur-session-env-install.sh"; return $r ;;
+            printf '%s' "$s" > "$TMPD/build-stdin"
+            printf '%s' "$s" | PATH="$ROOTBIN:$PATH" SUDO_FLAGLOG="$TMPD/sudo-flags" SUDO_PWLOG="$TMPD/sudo-pw" \
+                SUDO_WANT="$TEST_PW" SUDO_NOPASSWD="$SUDO_NOPASSWD" \
+                GUEST_ETC="$GUEST_ETC" DROPIN="$DROPIN" SSHDLOG="$SSHDLOG" SSHD_T_FAILS="$SSHD_T_FAILS" SSHD_LOWER="${SSHD_LOWER:-0}" \
+                bash -c "$c" ;;
         true) return "$FRESH_RC" ;;
         *) echo "UNEXPECTED BUILD COMMAND: $c" >&2; return 1 ;;
     esac
 }
 DROPIN="$GUEST_ETC/ssh/sshd_config.d/$(basename "$(macos_session_sshd_dropin)")"
 install_dropin() {   # sets $out / $rc
-    : > "$BUILDLOG"; : > "$SSHDLOG"
+    : > "$BUILDLOG"; : > "$SSHDLOG"; rm -f "$TMPD/sudo-pw" "$TMPD/sudo-flags"
     out="$( ssh_macos() { build_ssh "$@"; }; install_macos_session_env_acceptance "$(macos_project_vm)" 2>&1 )"; rc=$?
+}
+verify_dropin() {   # sets $out / $rc
+    : > "$BUILDLOG"; : > "$SSHDLOG"; rm -f "$TMPD/sudo-pw" "$TMPD/sudo-flags"
+    out="$( ssh_macos() { build_ssh "$@"; }; verify_macos_session_env_acceptance "$(macos_project_vm)" 2>&1 )"; rc=$?
 }
 
 ENV_FILE="$GUEST_HOME/.augur-env"
 # The value git_credential_env gives augur's helper (entry 1), as the session must export it.
 git_credential_env_value_1() { local _creds=(GH_TOKEN=x); git_credential_env | sed -n 's/^GIT_CONFIG_VALUE_1=//p'; }
 # The VM's current boot (augur-vm's run.pid), and the record that its self-test passed during it
-# (macos_egress_verified_file). A running VM has that record before each run unless UNVERIFIED=1;
-# tests/51 covers the record itself.
-printf '4242\n' > "$AUGUR_DIR/vms/$(macos_project_vm)/run.pid"
+# (macos_egress_verified_file). The boot's pid is this test shell's, so the process is alive and
+# its start time readable, as augur-vm's would be. A running VM has that record before each run
+# unless UNVERIFIED=1; tests/51 covers the record itself.
+printf '%s' "$$" > "$AUGUR_DIR/vms/$(macos_project_vm)/run.pid"
+BOOT_ID="$(macos_vm_run_id "$(macos_project_vm)")"
+[[ "$BOOT_ID" == "$$ "?* ]] || { echo "cannot read this shell's start time for the boot id: '$BOOT_ID'" >&2; exit 1; }
 UNVERIFIED=0
 run_cmd() {   # run_cmd claude|shell|up — sets $out / $rc; truncates the per-run logs first
-    if [[ "$RUNNING" != 0 && "$UNVERIFIED" == 0 ]]; then printf '4242\n' > "$(macos_egress_verified_file)"; fi
+    if [[ "$RUNNING" != 0 && "$UNVERIFIED" == 0 ]]; then printf '%s\n' "$BOOT_ID" > "$(macos_egress_verified_file)"; fi
     : > "$SSHLOG"; : > "$PUSHLOG"; : > "$STEPS"; : > "$VMCHECKS"; : > "$VMLOG"; : > "$HOSTLOG"; : > "$GHCALLS"; : > "$SESSLOG"
     out="$( "cmd_${1}_macos" 2>&1 )"; rc=$?
     # The session ssh's argv joins the whole-file argv log, for the no-value-on-argv check.
@@ -282,7 +318,7 @@ eq "$(macos_session_accept_env_line)" "$(grep -v '^#' "$DROPIN")" "the drop-in h
 eq "AcceptEnv ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN GH_TOKEN" "$(macos_session_accept_env_line)" \
    "it names exactly the agent's credentials and GH_TOKEN, no patterns"
 eq "644" "$(mode_of "$DROPIN")" "the drop-in is mode 644"
-eq "$TEST_PW" "$(cat "$TMPD/build-stdin")" "the sudo password goes on ssh's stdin"
+eq "$TEST_PW" "$(sed -n 1p "$TMPD/build-stdin")" "the sudo password is the first line of ssh's stdin"
 hasnt "$(cat "$BUILDLOG")" "$TEST_PW" "the sudo password is on no ssh argv"
 eq "" "$(ls "$GUEST_ETC/ssh/sshd_config.d" | grep -v '^200-augur-session-env.conf$')" "nothing else lands in sshd_config.d"
 eq $'sshd -f drop-in-live=no\nsshd  drop-in-live=yes' "$(cat "$SSHDLOG")" \
@@ -323,11 +359,83 @@ eval "$real_names"
 install_dropin
 eq "0" "$rc" "reinstall (control)"
 
+# One ssh connection runs the root script, which arrives on its stdin after the password line and
+# the marker; nothing is staged in the guest, so no guest-user process can swap it before root runs
+# it. The fresh connection is the only other one.
+rm -f "$DROPIN"; install_dropin
+eq "0" "$rc" "the install runs over the stdin protocol"
+eq "2" "$(wc -l < "$BUILDLOG" | tr -d ' ')" "the install opens two connections: the root script's and the fresh one"
+eq "1" "$(grep -c '^sudo -S -k -p '"''"' /bin/sh -c ' "$BUILDLOG")" "the root script runs under one sudo -S -k, from stdin"
+hasnt "$(cat "$BUILDLOG")" "cat > " "nothing is written to a file in the guest before sudo runs"
+eq "" "$(find "$GUEST_HOME" -name '*.sh' 2>/dev/null)" "no script is left in (or staged into) the guest user's home"
+eq "$MACOS_ROOT_SCRIPT_BEGIN" "$(sed -n 2p "$TMPD/build-stdin")" "the marker follows the password line on stdin"
+eq "$TEST_PW" "$(cat "$TMPD/sudo-pw")" "sudo -S read exactly the password line"
+has "$(cat "$TMPD/sudo-flags" 2>/dev/null)" "-k" "sudo ignores a cached credential (-k), so it always reads the password line"
+# A NOPASSWD grant (the build has one until it revokes it) leaves the password line unread by sudo:
+# the root shell skips it, so it is never run as a command and never printed.
+rm -f "$DROPIN"; SUDO_NOPASSWD=1; install_dropin; SUDO_NOPASSWD=0
+eq "0" "$rc" "NOPASSWD sudo: the install still succeeds"
+[[ -f "$DROPIN" ]] && ok "NOPASSWD sudo: the drop-in is installed" || fail "NOPASSWD sudo: no drop-in"
+hasnt "$out" "$TEST_PW" "NOPASSWD sudo: the password is not printed (not run as a command)"
+eq $'sshd -f drop-in-live=no\nsshd  drop-in-live=yes' "$(cat "$SSHDLOG")" "NOPASSWD sudo: the whole script ran"
+# A wrong password: sudo refuses, and no line of the script runs as root.
+rm -f "$DROPIN"; _pw_saved="$TEST_PW"; TEST_PW="not-the-password"; install_dropin; TEST_PW="$_pw_saved"
+nonzero "a wrong sudo password: the install"
+eq "" "$(cat "$SSHDLOG")" "a wrong sudo password: no line of the script ran"
+[[ -e "$DROPIN" ]] && fail "a wrong sudo password: a drop-in was installed" || ok "a wrong sudo password: no drop-in"
+hasnt "$out" "$_pw_saved" "a wrong sudo password: the password is not printed"
+# The stream without its marker: the root shell runs nothing.
+_rs_real="$(declare -f macos_run_root_script)"
+eval "$(declare -f macos_run_root_script | sed 's/"\$MACOS_ROOT_SCRIPT_BEGIN" "\$script"/"\$script"/')"
+rm -f "$DROPIN"; install_dropin
+nonzero "no marker on stdin: the install"
+eq "" "$(cat "$SSHDLOG")" "no marker on stdin: the root shell runs nothing"
+eval "$_rs_real"
+install_dropin
+eq "0" "$rc" "reinstall (control)"
+
+# The re-check build and update run last, before the base VM is saved: one root connection, the
+# same sshd -T test against the live configuration, nothing written.
+verify_dropin
+eq "0" "$rc" "the re-check passes on a guest with the drop-in"
+eq "sshd  drop-in-live=yes" "$(cat "$SSHDLOG")" "the re-check runs sshd -T once, on the live configuration"
+eq "1" "$(wc -l < "$BUILDLOG" | tr -d ' ')" "the re-check opens one connection"
+hasnt "$(cat "$BUILDLOG")" "$TEST_PW" "the re-check puts the sudo password on no argv"
+eq "$TEST_PW" "$(cat "$TMPD/sudo-pw")" "the re-check feeds sudo -S the password line"
+SUDO_NOPASSWD=1; verify_dropin; SUDO_NOPASSWD=0
+eq "0" "$rc" "the re-check passes under NOPASSWD sudo too"
+hasnt "$out" "$TEST_PW" "the re-check under NOPASSWD sudo prints no password"
+mv "$DROPIN" "$TMPD/dropin.saved"
+verify_dropin
+nonzero "the re-check on a guest that lost the drop-in"
+has "$out" "no longer accepts augur's session credentials" "the re-check: says so"
+has "$out" "sshd does not accept ANTHROPIC_API_KEY" "the re-check: names what sshd lacks"
+mv "$TMPD/dropin.saved" "$DROPIN"
+SSHD_T_FAILS=1; verify_dropin; SSHD_T_FAILS=0
+nonzero "the re-check when sshd cannot parse its configuration"
+has "$out" "Bad configuration option: AcceptEnvv" "the re-check: sshd's own message is shown"
+session_credential_names() { echo 'BAD*NAME'; }
+verify_dropin
+nonzero "the re-check with a credential name that is a pattern"
+eq "" "$(cat "$BUILDLOG")" "the re-check with a pattern name: nothing reaches the guest"
+eval "$real_names"
+# The names come from the canonical list, not from the display line.
+_line_real="$(declare -f macos_session_accept_env_line)"
+macos_session_accept_env_line() { printf 'AcceptEnv X_DISPLAY_ONLY'; }
+rm -f "$DROPIN"; install_dropin
+has "$(sed -n '3,$p' "$TMPD/build-stdin")" "for n in ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN GH_TOKEN; do" \
+    "the install checks the names session_credential_names gives, not ones parsed from the AcceptEnv line"
+eval "$_line_real"
+rm -f "$DROPIN"; install_dropin
+eq "0" "$rc" "reinstall (control, again)"
+
 # Where the build and update call it: before the base VM is saved, and fatal.
 fn_body() { awk -v n="$1" '$0 ~ "^"n"\\(\\) \\{"{f=1} f{print} f&&/^}/{exit}' "$AUGUR"; }
 build_body="$(fn_body cmd_build_macos)"; update_body="$(fn_body cmd_update_macos)"
 has "$build_body"  'install_macos_session_env_acceptance "$MACOS_BUILD_VM" || exit 1' "build --macos installs the drop-in, fatally"
 has "$update_body" 'install_macos_session_env_acceptance "$MACOS_UPDATE_VM" || {' "update --macos installs the drop-in, fatally"
+has "$build_body"  'verify_macos_session_env_acceptance "$MACOS_BUILD_VM" || {' "build --macos re-checks the drop-in before the save, fatally (tests/52 pins the order)"
+has "$update_body" 'verify_macos_session_env_acceptance "$MACOS_UPDATE_VM" || {' "update --macos re-checks the drop-in before the save, fatally (tests/52 pins the order)"
 for _b in build update; do
     _body="$build_body"; [[ "$_b" == update ]] && _body="$update_body"
     i_at="$(printf '%s\n' "$_body" | grep -n 'install_macos_session_env_acceptance' | head -n1 | cut -d: -f1)"
@@ -490,7 +598,7 @@ stale_cleaned() {
         || fail "$1: cleanup removed a file that is not augur's"
     rm -f "$GUEST_HOME"/.augur-env.tmp.*
 }
-# A push without the acceptance check (the boot path's last one).
+# A push without the acceptance check.
 stale_fixture
 : > "$SSHLOG"
 out="$( push_macos_guest_env "$(macos_project_vm)" 2>&1 )"; rc=$?
@@ -562,22 +670,20 @@ printf '# augur\nAcceptEnv ANTHROPIC_API_KEY GH_TOKEN\n' > "$DROPIN"
 old_env; run_cmd shell
 refused "a drop-in for other names: shell --macos"
 mv "$TMPD/dropin.saved" "$DROPIN"
-# With the drop-in, a boot checks once, in its first push; the second push does not check again.
-# Neither writes GIT_CONFIG_* helper lines: the session that follows exports them itself. No guest
-# command checks on its own.
+# With the drop-in, a boot checks once, in its only push, which writes no GIT_CONFIG_* helper lines:
+# the session that follows exports them itself. No guest command checks on its own.
 RUNNING=0
 run_cmd claude
 eq "0" "$rc" "drop-in present, VM stopped: claude --macos completes"
 eq "1" "$(grep -c 'sshd_config.d' "$SSHLOG")" "drop-in present, VM stopped: the acceptance check runs once"
 eq "" "$(grep 'sshd_config.d' "$SSHLOG" | grep -v 'cat > .*\.augur-env')" \
    "drop-in present, VM stopped: the check rides in a push (no extra connection)"
-first_push="$(grep 'cat > .*\.augur-env' "$SSHLOG" | sed -n 1p)"; second_push="$(grep 'cat > .*\.augur-env' "$SSHLOG" | sed -n 2p)"
-has "$first_push" "sshd_config.d" "drop-in present, VM stopped: the first push carries the check"
-hasnt "$(push_content 1)" "GIT_CONFIG_" "drop-in present, VM stopped: the first push writes no GIT_CONFIG_* helper lines"
-hasnt "$(push_content 2)" "GIT_CONFIG_" "drop-in present, VM stopped: the second push writes none either"
-hasnt "$(push_content 2)" "$GH_HOST_TOKEN" "drop-in present, VM stopped: …and no token value"
+eq "1" "$(pushes)" "drop-in present, VM stopped: claude --macos pushes ~/.augur-env once"
+first_push="$(grep 'cat > .*\.augur-env' "$SSHLOG" | sed -n 1p)"
+has "$first_push" "sshd_config.d" "drop-in present, VM stopped: the push carries the check"
+hasnt "$(push_content 1)" "GIT_CONFIG_" "drop-in present, VM stopped: the push writes no GIT_CONFIG_* helper lines"
+hasnt "$(push_content 1)" "$GH_HOST_TOKEN" "drop-in present, VM stopped: …and no token value"
 has "$(sess_argv | tail -n1)" "export GIT_CONFIG_COUNT='2'; " "drop-in present, VM stopped: the session exports git's helper set (a gh token exists)"
-hasnt "$second_push" "sshd_config.d" "drop-in present, VM stopped: the second push does not check again"
 FAIL_CHECK=1
 run_cmd claude
 nonzero "the acceptance check cannot connect: claude --macos"
@@ -855,7 +961,7 @@ for _cmd in shell claude up; do
     run_cmd "$_cmd"
     eq "0" "$rc" "not running: $_cmd --macos boots and completes"
     has "$out" "is up." "not running: $_cmd --macos went through the boot path (control)"
-    eq "2" "$(pushes)" "not running: $_cmd --macos pushes ~/.augur-env twice (the check's, then the wiring)"
+    eq "1" "$(pushes)" "not running: $_cmd --macos pushes ~/.augur-env once (the one that carries the check)"
     eq "1" "$(gh_calls)" "not running: $_cmd --macos asks gh for the token once"
     eq "1" "$(grep -c '^ensure_macos_workspace$' "$STEPS")" "not running: $_cmd --macos wires the guest once"
     hasnt "$(cat "$VMLOG")" "stop " "not running: $_cmd --macos leaves the booted VM running"
@@ -915,14 +1021,16 @@ for _cmd in claude shell; do
     _l="no passed self-test since the boot: $_cmd --macos"
     nonzero "$_l"
     has "$out" "no egress self-test has passed since it booted" "$_l: says why"
-    has "$out" "augur down --macos && augur up --macos" "$_l: names the restart"
+    has "$out" "to re-run the egress self-test on the running VM" "$_l: names the remedy (up --macos)"
+    hasnt "$out" "augur down --macos" "$_l: does not send the operator through a restart"
     eq "0" "$(launches)" "$_l: starts no session (no credential is sent)"
     eq "0" "$(ssh_calls)" "$_l: makes no guest connection at all"
     eq "0" "$(gh_calls)" "$_l: does not even resolve the gh token"
     hasnt "$(cat "$VMLOG")" "stop" "$_l: leaves the VM running"
 done
-# A record from an earlier boot of the VM (another run id) is no better.
-printf '4141\n' > "$(macos_egress_verified_file)"; run_cmd claude
+# A record from an earlier boot of the VM is no better, even one whose pid was handed to this boot's
+# process (a recycled pid): the start time differs.
+printf '%s Thu Jan 1 00:00:00 1970\n' "$$" > "$(macos_egress_verified_file)"; run_cmd claude
 nonzero "a record from an earlier boot: claude --macos"
 eq "0" "$(launches)" "a record from an earlier boot: claude --macos starts no session"
 # `up --macos` on that VM re-runs the self-test, records its pass for this boot, and the next
@@ -930,7 +1038,7 @@ eq "0" "$(launches)" "a record from an earlier boot: claude --macos starts no se
 rm -f "$(macos_egress_verified_file)"; run_cmd up
 eq "0" "$rc" "up --macos on the unverified running VM: completes"
 has "$(cat "$STEPS")" "verify_macos_egress_locked" "up --macos on the unverified running VM: runs the self-test"
-eq "4242" "$(cat "$(macos_egress_verified_file)" 2>/dev/null)" "up --macos on the unverified running VM: records the pass for this boot"
+eq "$BOOT_ID" "$(cat "$(macos_egress_verified_file)" 2>/dev/null)" "up --macos on the unverified running VM: records the pass for this boot"
 run_cmd claude
 eq "0" "$rc" "…after which claude --macos completes"
 eq "1" "$(launches)" "…and starts its session"

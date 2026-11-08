@@ -31,7 +31,7 @@
 #   • the correction is INVOKED on every path that hands a guest to the agent — the fresh bring-up,
 #     the already-running reconcile, `claude --macos` and `shell --macos`;
 #   • it runs BEFORE the time-dependent steps, asserted on recorded-call ORDER (the clock read
-#     precedes the egress self-test, the ~/.augur-env push and the interactive launch);
+#     precedes the egress self-test, the guest wiring and the interactive launch);
 #   • the command sent is the one intended, down to its shape, AND carries the HOST's current time
 #     (the stamp is bracketed by two host readings, so a constant, the guest's own clock, or a
 #     mis-ordered format all fail);
@@ -155,9 +155,8 @@ sync() {   # sets $out / $rc; truncates the log first
 # Recorded-call helpers. Line NUMBERS, because ORDER is half of what this file proves.
 at()      { grep -nxF "$1" "$SSHLOG" | head -n1 | cut -d: -f1; }   # exact whole-line match
 at_re()   { grep -nE  "$1" "$SSHLOG" | head -n1 | cut -d: -f1; }
-# The ~/.augur-env push that wires the guest. The boot path's first push, right after the SSH wait,
-# carries the session-env acceptance check and no credential or GIT_CONFIG_* helper lines (tests/56
-# owns it); it is not the one the clock must precede.
+# A ~/.augur-env push other than one that carries the session-env acceptance check (which holds no
+# credential or GIT_CONFIG_* helper lines; tests/56 owns it). The boot path makes none.
 at_push() { grep -n '\.augur-env' "$SSHLOG" | grep -v 'sshd_config\.d' | head -n1 | cut -d: -f1; }
 n_calls() { wc -l < "$SSHLOG" | tr -d ' '; }
 SET_RE="^sudo -S -p '' /bin/date -u '[0-9]{12}\.[0-9]{2}'$"
@@ -349,6 +348,7 @@ VM_CLI=vm_cli_rec
 # A marker IN THE SAME LOG as the guest commands, so the clock correction's position relative to the
 # egress self-test is one ordering over one list. (tests/36 owns the self-test's own behaviour.)
 verify_macos_egress_locked()    { printf 'MARK:egress-self-test\n' >> "$SSHLOG"; }
+macos_record_egress_verified()  { :; }   # the record of its pass: tests/51 owns it
 
 up_macos() { : > "$SSHLOG"; out="$( cmd_up_macos 2>&1 )"; rc=$?; }
 
@@ -362,24 +362,25 @@ else fail "fresh bring-up: no clock set was sent" "log: [$(tr '\n' ' ' < "$SSHLO
 
 # THE ordering assertion. Everything after the clock read judges an absolute instant: the
 # self-test's TLS handshakes evaluate certificate windows, and a session hands the agent a JWT whose
-# nbf/exp the agent checks against this clock.
+# nbf/exp the agent checks against this clock. The session launches only after `up` returns, so
+# its token follows all of this.
 _clk_at="$(at "$READ_CMD")"
 _st_at="$(at 'MARK:egress-self-test')"
-_env_at="$(at_push)"
-if [[ -n "$_clk_at" && -n "$_st_at" && -n "$_env_at" && "$_clk_at" -lt "$_st_at" && "$_st_at" -lt "$_env_at" ]]; then
-  ok "fresh bring-up: clock BEFORE the self-test BEFORE the ~/.augur-env push (clock@$_clk_at < self-test@$_st_at < env@$_env_at)"
+if [[ -n "$_clk_at" && -n "$_st_at" && "$_clk_at" -lt "$_st_at" ]]; then
+  ok "fresh bring-up: clock BEFORE the self-test (clock@$_clk_at < self-test@$_st_at)"
 else
-  fail "fresh bring-up: the clock correction is not the first thing done in the guest" \
-       "clock@${_clk_at:-none} self-test@${_st_at:-none} env@${_env_at:-none}; log: [$(tr '\n' ' ' < "$SSHLOG")]"
+  fail "fresh bring-up: the clock correction does not precede the self-test" \
+       "clock@${_clk_at:-none} self-test@${_st_at:-none}; log: [$(tr '\n' ' ' < "$SSHLOG")]"
 fi
-# And the set itself must precede the ~/.augur-env push, not merely the read.
+# And the set itself must precede the self-test, not merely the read.
 _set_at="$(at_re "$SET_RE")"
-if [[ -n "$_set_at" && -n "$_env_at" && "$_set_at" -lt "$_env_at" ]]; then
-  ok "fresh bring-up: the clock is already CORRECT when the token arrives (set@$_set_at < env@$_env_at)"
+if [[ -n "$_set_at" && -n "$_st_at" && "$_set_at" -lt "$_st_at" ]]; then
+  ok "fresh bring-up: the clock is already CORRECT when the self-test runs (set@$_set_at < self-test@$_st_at)"
 else
-  fail "fresh bring-up: the token is pushed before the clock is corrected" \
-       "set@${_set_at:-none} env@${_env_at:-none}"
+  fail "fresh bring-up: the self-test runs before the clock is corrected" \
+       "set@${_set_at:-none} self-test@${_st_at:-none}"
 fi
+eq "" "$(at_push)" "fresh bring-up: no ~/.augur-env push besides the acceptance check's (which carries no token)"
 
 # --no-egress skips the self-test (it has no allowlist to be locked to) but NOT the clock: a wrong
 # clock is wrong in either egress mode.
@@ -453,7 +454,7 @@ shell_body="$(awk   '/^cmd_shell_macos\(\)/{f=1} f{print} f&&/^}/{exit}'    "$AU
 prep_body="$(awk    '/^prepare_macos_session\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
 
 # Position in the source, not just its effect: an edit that moves the call below the self-test, the
-# ~/.augur-env writer or the banner must fail here too. (grep -n indexes within the extracted body.)
+# guest wiring or the banner must fail here too. (grep -n indexes within the extracted body.)
 # The FRESH-path call specifically: cmd_up_macos has two, and the already-running branch's sits one
 # indent level deeper, so the 4-space anchor picks the top-level one. Deleting it makes this empty
 # (or, if the anchor is ever loosened, resolves to the reconcile call at a line before the SSH wait)
@@ -461,14 +462,14 @@ prep_body="$(awk    '/^prepare_macos_session\(\)/{f=1} f{print} f&&/^}/{exit}' "
 c_at="$(printf   '%s\n' "$up_macos_body" | grep -n '^    sync_macos_guest_clock '          | head -n1 | cut -d: -f1)"
 ssh_at="$(printf '%s\n' "$up_macos_body" | grep -n '^ *wait_for_macos_ssh '                | head -n1 | cut -d: -f1)"
 v_at="$(printf   '%s\n' "$up_macos_body" | grep -n 'verify_macos_egress_locked "\$project_vm"' | tail -n1 | cut -d: -f1)"
-env_at="$(printf '%s\n' "$up_macos_body" | grep -n 'push_macos_guest_env "\$project_vm"'   | tail -n1 | cut -d: -f1)"
+env_at="$(printf '%s\n' "$up_macos_body" | grep -n '^    ensure_macos_workspace "\$project_vm"'  | head -n1 | cut -d: -f1)"
 ban_at="$(printf '%s\n' "$up_macos_body" | grep -n "success \"VM '"                        | head -n1 | cut -d: -f1)"
 if [[ -n "$c_at" && -n "$ssh_at" && -n "$v_at" && -n "$env_at" && -n "$ban_at" \
       && "$ssh_at" -lt "$c_at" && "$c_at" -lt "$v_at" && "$c_at" -lt "$env_at" && "$c_at" -lt "$ban_at" ]]; then
-  ok "macOS up syncs the clock AFTER the SSH wait and BEFORE the self-test/~/.augur-env push/banner (ssh@$ssh_at < clock@$c_at < test@$v_at, env@$env_at, banner@$ban_at)"
+  ok "macOS up syncs the clock AFTER the SSH wait and BEFORE the self-test/the wiring/banner (ssh@$ssh_at < clock@$c_at < test@$v_at, wiring@$env_at, banner@$ban_at)"
 else
   fail "macOS up does not sync the clock between the SSH wait and the self-test" \
-       "ssh@${ssh_at:-none} clock@${c_at:-none} test@${v_at:-none} env@${env_at:-none} banner@${ban_at:-none}"
+       "ssh@${ssh_at:-none} clock@${c_at:-none} test@${v_at:-none} wiring@${env_at:-none} banner@${ban_at:-none}"
 fi
 if printf '%s\n' "$up_macos_body" | sed -n '/already running/,/^    fi$/p' | grep -q '^ *sync_macos_guest_clock '
 then ok "the already-running branch syncs the clock (the only place a long-lived guest is re-corrected)"

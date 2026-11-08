@@ -959,7 +959,8 @@ macos_store_admin_password() {
 # ssh forwards its stdin to the remote command, and `sudo -S` reads the password from there.
 # `printf` is a bash builtin, so the password is never on any argv: not the host's `ssh` command
 # line (readable by `ps`) and not the guest's process list. The remote <cmd> must not read stdin;
-# when NOPASSWD sudo is already granted, sudo leaves the line unread and <cmd> would see it.
+# when NOPASSWD sudo is already granted, sudo leaves the line unread and <cmd> would see it. A root
+# script that has to travel on stdin too goes through macos_run_root_script instead.
 # The ssh wrapper must forward stdin: ssh_macos does; ssh_macos_provision passes `-n`, so use
 # ssh_macos_provision_stdin there. Prints nothing and fails if the VM has no stored password, so
 # under `pipefail` the whole sudo pipeline fails with the remedy on stderr.
@@ -2187,16 +2188,34 @@ require_macos_egress_mode_current() {
 # for --no-egress attaches only to a VM booted that way (require_macos_egress_mode_current), where
 # there is no containment for a record to vouch for.
 macos_egress_verified_file() { echo "$AUGUR_PROXY_DIR/$(workspace_slug)-$(workspace_path_hash).egress-verified"; }
-# The id of VM $1's current boot: the pid augur-vm's `run` writes to the VM's run.pid for as long as
-# it runs (the file augur-vm decides a VM's running state by). Empty when the VM is not running.
-macos_vm_run_id() { cat "$AUGUR_DIR/vms/$1/run.pid" 2>/dev/null || true; }
-# Record that running VM $1 just passed its egress self-test. Without a run id to tie it to, it
-# records nothing and warns: sessions then refuse this VM, which is the fail-closed side.
+# The id of VM $1's current boot, as `<pid> <start time>`: the pid augur-vm's `run` writes to the
+# VM's run.pid for as long as it runs (the file augur-vm decides a VM's running state by), and the
+# start time `ps -o lstart` gives for that process. The start time keeps a recycled pid from
+# matching: after a host crash, an `augur-vm run` started by hand can get the pid an earlier boot's
+# record holds, but not that process's start time too. Empty, which matches no record, when the
+# pidfile is missing or holds no pid, or no process has that pid.
+macos_vm_run_id() {
+    local pid start _w=()
+    pid="$(cat "$AUGUR_DIR/vms/$1/run.pid" 2>/dev/null)" || return 0
+    pid="${pid//[[:space:]]/}"
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+    start="$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null)" || return 0
+    # Word-split so ps's column padding (`Nov  8`) cannot make one start time compare unequal.
+    read -r -a _w <<<"$start"
+    (( ${#_w[@]} > 0 )) || return 0
+    printf '%s %s\n' "$pid" "${_w[*]}"
+}
+# Record that running VM $1 just passed its egress self-test. Without a run id to tie the pass to,
+# no session would ever attach to the VM, so it is stopped instead (stop_unverified_macos_vm, the
+# clone kept) and this exits 1.
 macos_record_egress_verified() {
     local id; id="$(macos_vm_run_id "$1")"
     if [[ -z "$id" ]]; then
-        warn "Could not read VM '$1''s run id, so its passed self-test is not recorded; every session will refuse it."
-        return 0
+        error "Could not read VM '$1''s run id (the pid in $AUGUR_DIR/vms/$1/run.pid and that process's"
+        error "  start time), so its passed egress self-test cannot be recorded for its sessions."
+        error "Stopping VM '$1' (its clone is kept). Run ${BOLD}augur up --macos${RESET} to boot it again."
+        stop_unverified_macos_vm "$1"
+        exit 1
     fi
     mkdir -p "$AUGUR_PROXY_DIR"
     printf '%s\n' "$id" > "$(macos_egress_verified_file)"
@@ -2210,7 +2229,7 @@ require_macos_egress_verified() {
     [[ -n "$have" && "$have" == "$(macos_vm_run_id "$vm")" ]] && return 0
     error "VM '${vm}' is running, but no egress self-test has passed since it booted (its ${BOLD}augur up --macos${RESET}"
     error "  was interrupted, or the VM was started some other way). Refusing to send it credentials."
-    error "  Restart it: ${BOLD}augur down --macos && augur up --macos${RESET}"
+    error "  Run ${BOLD}augur up --macos${RESET} to re-run the egress self-test on the running VM."
     exit 1
 }
 
@@ -3910,6 +3929,13 @@ cmd_build_macos() {
         exit 1
     }
 
+    # The last guest step: the drop-in installed above must still be live in the guest saved as the
+    # base (see verify_macos_session_env_acceptance).
+    verify_macos_session_env_acceptance "$MACOS_BUILD_VM" || {
+        error "Aborting the build; no base VM was saved."
+        exit 1
+    }
+
     info "Saving base VM '${MACOS_BASE_VM}'..."
     stop_and_reap_macos_vm "$MACOS_BUILD_VM" "$MACOS_SCRATCH_VM_PID"
     macos_save_scratch_as_base "$MACOS_BUILD_VM" build
@@ -4165,20 +4191,80 @@ macos_session_accept_env_line() {
     printf 'AcceptEnv %s' "${_names% }"
 }
 
+# The marker line between the admin password and the script on macos_run_root_script's stdin. A
+# shell comment, so a password that happened to equal it would still run nothing.
+MACOS_ROOT_SCRIPT_BEGIN='#augur-root-script'
+
+# Run shell script $2 as root in macOS VM $1 over ONE ssh connection, with nothing staged in the
+# guest: a script written to a file first could be swapped by any process of the guest user before
+# root runs it. The connection's stdin carries the VM's admin password line, the marker line
+# (MACOS_ROOT_SCRIPT_BEGIN), then the script, and the guest runs `sudo -S -k -p ''` on a root
+# shell that skips to the marker and runs the rest (`sh -s`):
+#   • `sudo -S` reads the password one byte at a time up to its newline, so it takes that line and
+#     nothing after it. -k makes it ignore a cached credential, which would skip the read.
+#   • A NOPASSWD grant (a build has one until it revokes it) still skips the read. Hence the
+#     marker: whether or not sudo read the password, the root shell discards every line up to the
+#     marker, so the password never reaches the shell that runs the script, where an unknown
+#     command would print it into the output.
+# A wrong password makes sudo fail after taking further lines as retries, so the script never runs.
+# The script must not read stdin itself (it is that stdin). Its output and exit status are the
+# caller's. The password is on no argv (see macos_admin_password_stdin).
+macos_run_root_script() {
+    local vm="$1" script="$2"
+    { macos_admin_password_stdin "$vm" && printf '%s\n' "$MACOS_ROOT_SCRIPT_BEGIN" "$script"; } \
+        | ssh_macos "$vm" "sudo -S -k -p '' /bin/sh -c 'm=; while IFS= read -r l; do if [ \"\$l\" = \"${MACOS_ROOT_SCRIPT_BEGIN}\" ]; then m=1; break; fi; done; [ -n \"\$m\" ] && exec /bin/sh -s; exit 1'"
+}
+
+# The credential names of an augur session (session_credential_names) on one line, space-separated,
+# for a root shell script and sshd's configuration. Fails, after an error, on a name that is not a
+# shell variable name.
+macos_session_env_names() {
+    local _n _names=""
+    while IFS= read -r _n; do
+        valid_env_name "$_n" || { error "Refusing to write an sshd AcceptEnv for the credential name '${_n}'."; return 1; }
+        _names+="${_names:+ }${_n}"
+    done < <(session_credential_names)
+    printf '%s' "$_names"
+}
+
+# Root shell code (for macos_run_root_script) that creates the temp file "$err" and defines
+# `accepts [sshd -T args]`: true iff that sshd configuration parses and accepts every name in $1,
+# from ONE sshd -T run, with sshd's own message (or the name it lacks) in "$err" otherwise. macOS
+# prints `AcceptEnv <NAME>`, one name per line; upstream OpenSSH prints `acceptenv`. The one test of
+# acceptance, for both install_macos_session_env_acceptance and
+# verify_macos_session_env_acceptance.
+macos_session_env_accepts_sh() {
+    cat <<SCRIPT
+err="\$(mktemp)" || exit 1
+accepts() {
+    out="\$(/usr/sbin/sshd -T "\$@" 2>"\$err" </dev/null)" || return 1
+    envs="\$(printf '%s\n' "\$out" | awk 'tolower(\$1) == "acceptenv" { for (i = 2; i <= NF; i++) print \$i }')"
+    for n in $1; do
+        printf '%s\n' "\$envs" | grep -qxF "\$n" || { echo "sshd does not accept \$n" >> "\$err"; return 1; }
+    done
+}
+SCRIPT
+}
+
+# Show the guest's error output $1 for a failed drop-in install or check, one sanitized line each.
+macos_session_env_show_err() {
+    local _l
+    printf '%s\n' "$1" | sanitize_guest_lines | while IFS= read -r _l; do if [[ -n "$_l" ]]; then error "  | ${_l}"; fi; done
+}
+
 # Make base-VM-to-be $1's sshd accept the credential names of an augur session (see
 # ssh_macos_session), and prove it took. Returns non-zero, after an error carrying sshd's own
 # message, when it did not; callers refuse to save the base VM then, since every claude/shell
 # session in its clones would be refused.
 #
 # macOS starts a new sshd for every connection (launchd), so a file in sshd_config.d is live for
-# the very next login: one sshd cannot parse would lock SSH out of the guest at once. So, as root,
-# the candidate is checked BEFORE it goes live: written outside sshd_config.d, then
-# `sshd -T -f <test config>` (a copy of /etc/ssh/sshd_config that also includes the candidate)
-# must parse and accept every name. Only then is it renamed into sshd_config.d, the live
-# configuration is checked the same way (removing the drop-in again if that fails), and one fresh
-# connection proves sshd still lets augur in. The script is staged in the guest user's home and run
-# by `sudo -S`, so the sudo password stays the only thing on its stdin (see
-# macos_admin_password_stdin); `sudo -S` for the same reason as install_macos_managed_settings.
+# the very next login: one sshd cannot parse would lock SSH out of the guest at once. So, as root
+# (macos_run_root_script), the candidate is checked BEFORE it goes live: written outside
+# sshd_config.d, then `sshd -T -f <test config>` (a copy of /etc/ssh/sshd_config that also includes
+# the candidate) must parse and accept every name. Only then is it renamed into sshd_config.d, the
+# live configuration is checked the same way (removing the drop-in again if that fails), and one
+# fresh connection proves sshd still lets augur in. Script exit codes: 2, the candidate is
+# rejected; 3, the live configuration is; 4 (set here), no fresh connection.
 #
 # Accepted trade-off: when that fresh connection fails, the drop-in stays live and nothing rolls it
 # back, so the guest may be locked out of SSH. Only a scratch VM kept with AUGUR_KEEP_BUILD_VM=1 for
@@ -4187,28 +4273,13 @@ macos_session_accept_env_line() {
 # from inside it, would need a detached root process or guest-side SSH credentials, and neither can
 # be verified off a Mac.
 install_macos_session_env_acceptance() {
-    local vm="$1" dst _line _names _n _script _err _rc=0
-    local _staged="/Users/${MACOS_SSH_USER}/.augur-session-env-install.sh"
+    local vm="$1" dst _line _names _script _err _rc=0
     dst="$(macos_session_sshd_dropin)"; _line="$(macos_session_accept_env_line)"
-    _names="${_line#AcceptEnv }"
-    # The names are interpolated into a root shell script and into sshd's configuration.
-    for _n in $_names; do
-        valid_env_name "$_n" || { error "Refusing to write an sshd AcceptEnv for the credential name '${_n}'."; return 1; }
-    done
+    _names="$(macos_session_env_names)" || return 1
     info "Configuring the base VM's sshd to accept augur's session credentials (${_names})..."
-    _script="$(cat <<SCRIPT
+    _script="$(macos_session_env_accepts_sh "$_names"; cat <<SCRIPT
 dst='${dst}'; cand=/etc/ssh/augur-session-env.candidate; main=/etc/ssh/augur-session-env.sshd_config
-err="\$(mktemp)" || exit 1
 cleanup() { rm -f "\$cand" "\$main" "\$err"; }
-# accepts [sshd -T args]: the configuration parses and accepts every name, from ONE sshd -T run.
-# macOS prints `AcceptEnv <NAME>`, one name per line; upstream OpenSSH prints `acceptenv`.
-accepts() {
-    out="\$(/usr/sbin/sshd -T "\$@" 2>"\$err")" || return 1
-    envs="\$(printf '%s\n' "\$out" | awk 'tolower(\$1) == "acceptenv" { for (i = 2; i <= NF; i++) print \$i }')"
-    for n in ${_names}; do
-        printf '%s\n' "\$envs" | grep -qxF "\$n" || { echo "sshd does not accept \$n" >> "\$err"; return 1; }
-    done
-}
 printf '%s\n' '# augur: the credential names an augur claude/shell session sends.' '${_line}' > "\$cand" \
     && chown root:wheel "\$cand" && chmod 644 "\$cand" \
     && { printf 'Include %s\n' "\$cand"; cat /etc/ssh/sshd_config; } > "\$main" || { cleanup; exit 1; }
@@ -4218,17 +4289,33 @@ accepts || { cat "\$err" >&2; rm -f "\$dst"; cleanup; exit 3; }
 cleanup
 SCRIPT
 )"
-    if printf '%s\n' "$_script" | ssh_macos "$vm" "cat > '${_staged}'"; then
-        _err="$(macos_admin_password_stdin "$vm" | ssh_macos "$vm" "sudo -S -p '' sh '${_staged}'; rc=\$?; rm -f '${_staged}'; exit \$rc" 2>&1 >/dev/null)" || _rc=$?
-    else
-        _rc=1; _err="could not stage the install script"
-    fi
+    _err="$(macos_run_root_script "$vm" "$_script" 2>&1 >/dev/null)" || _rc=$?
     if (( _rc == 0 )) && ! ssh_macos "$vm" true </dev/null; then
         _rc=4; _err="no new SSH connection is accepted after installing ${dst}"
     fi
     (( _rc == 0 )) && return 0
     error "Could not make the base VM's sshd accept augur's session credentials (${dst}):"
-    printf '%s\n' "$_err" | sanitize_guest_lines | while IFS= read -r _n; do if [[ -n "$_n" ]]; then error "  | ${_n}"; fi; done
+    macos_session_env_show_err "$_err"
+    return 1
+}
+
+# Re-check, on base-VM-to-be $1's live sshd configuration, the acceptance
+# install_macos_session_env_acceptance installed, with the same `sshd -T` test (exit 3 when it
+# fails). cmd_build_macos and cmd_update_macos run it as their last guest step before the VM is
+# saved as the base, so nothing that ran after the install (Homebrew, the agent installer, custom
+# provisioning's root hook) can leave a base whose clones refuse every session. Returns non-zero,
+# after an error carrying sshd's own message, when the configuration no longer accepts every name;
+# callers then refuse to save the base VM.
+verify_macos_session_env_acceptance() {
+    local vm="$1" _names _script _err _rc=0
+    _names="$(macos_session_env_names)" || return 1
+    info "Checking that the base VM's sshd still accepts augur's session credentials..."
+    _script="$(macos_session_env_accepts_sh "$_names")"
+    _script+=$'\naccepts || { cat "$err" >&2; rm -f "$err"; exit 3; }\nrm -f "$err"'
+    _err="$(macos_run_root_script "$vm" "$_script" 2>&1 >/dev/null)" || _rc=$?
+    (( _rc == 0 )) && return 0
+    error "The base VM's sshd no longer accepts augur's session credentials ($(macos_session_sshd_dropin)):"
+    macos_session_env_show_err "$_err"
     return 1
 }
 
@@ -4595,8 +4682,9 @@ macos_boot_ssh_failed() {
 
 # Stop VM $1 and the gvproxy and proxy serving it, and remove its record of a passed egress
 # self-test (macos_egress_verified_file), for a VM whose containment is unproven or disproven: a
-# boot that failed before or in its self-test, and a running VM whose self-test failed. A VM left
-# running there would be attached to by the next `claude` / `shell --macos`. Prints nothing; the
+# boot that failed before or in its self-test, a running VM whose self-test failed, and one whose
+# pass cannot be recorded (macos_record_egress_verified). A VM left running there would be attached
+# to by the next `claude` / `shell --macos`, or refused by every one. Prints nothing; the
 # caller has said why. Deliberately keeps the VM itself: removing a project VM's clone is the
 # operator's call (`augur destroy --macos`), and setup-token deletes its throwaway clone itself.
 stop_unverified_macos_vm() {
@@ -4662,7 +4750,8 @@ cmd_up_macos() {
         # runs after the pinned-state warning so that warning is still printed if it ends the run.
         # Skipped with --no-egress, as on the boot path; the mode check above guarantees the VM was
         # booted that way. A pass is recorded as on the boot path (macos_egress_verified_file), so a
-        # running VM whose boot was interrupted before its self-test takes sessions again after it.
+        # running VM whose boot was interrupted before its self-test takes sessions again after it:
+        # the remedy require_macos_egress_verified names.
         if egress_enabled; then
             verify_macos_egress_locked "$project_vm"
             macos_record_egress_verified "$project_vm"
@@ -4834,10 +4923,9 @@ cmd_up_macos() {
     [[ -f "$HOME/.gitconfig" ]] && \
         scp_to_macos "$project_vm" "$HOME/.gitconfig" "/Users/${MACOS_SSH_USER}/.gitconfig"
 
-    # ~/.augur-env and the ~/.zshenv source line. A failed push ends `up` with the VM left running,
-    # booted and self-tested; the next `augur up`, `claude` or `shell --macos` attaches to it and
-    # pushes again, so nothing needs tearing down.
-    push_macos_guest_env "$project_vm" || exit 1
+    # Deliberately no push of ~/.augur-env here: the boot path's one push is
+    # require_macos_session_env_accepted's, right after the SSH wait, and nothing since writes
+    # ~/.augur-env or ~/.zshenv, while its content is built from host-side constants only.
 
     success "VM '${project_vm}' is up."
     echo ""
@@ -4935,7 +5023,7 @@ macos_session_env_refused() {
 # right after the SSH wait, before the boot self-test. The check is the first step of a push of the
 # non-secret ~/.augur-env (push_macos_guest_env --require-session-env), the same code path that
 # refuses a running VM, so a refused guest is scrubbed of credentials an older augur wrote in the
-# same connection.
+# same connection. It is also the boot's only push of ~/.augur-env.
 #
 # Any failure of the push (a transport error, a full disk, a refusal) stops the VM, the clone kept
 # (stop_unverified_macos_vm): the boot cannot go on, and a refused VM is of no use anyway.
@@ -5831,7 +5919,8 @@ cmd_update_macos() {
     # provisioning): it needs none, so a failure here is reported before a long download, and it
     # does not depend on Homebrew or a mirror being healthy. The update still saves the base VM
     # only once every step has passed, so a failing Homebrew upgrade still leaves an old base VM
-    # without it until an update succeeds.
+    # without it until an update succeeds. It is checked again as the update's last guest step
+    # (verify_macos_session_env_acceptance), after everything that could undo it.
     install_macos_session_env_acceptance "$MACOS_UPDATE_VM" || {
         error "The base VM was left as-is."
         exit 1
@@ -5911,6 +6000,13 @@ cmd_update_macos() {
     # Last, on the final guest state, for the reason given in cmd_build_macos.
     agent_verify_integrity_macos "$MACOS_UPDATE_VM" || {
         agent_signature_check_failed updated
+        error "The base VM was left as-is."
+        exit 1
+    }
+
+    # The last guest step, as in cmd_build_macos: the drop-in installed first, before Homebrew,
+    # the agent installer and custom provisioning, must still be live in the guest saved as the base.
+    verify_macos_session_env_acceptance "$MACOS_UPDATE_VM" || {
         error "The base VM was left as-is."
         exit 1
     }

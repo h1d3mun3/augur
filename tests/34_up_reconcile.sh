@@ -138,6 +138,7 @@ ssh_macos()         { echo "ssh_macos" >> "$LOG"; return 0; }
 # VM down mid-reconcile. tests/36_macos_egress_selftest.sh owns its behaviour; here we only assert
 # that this path reaches it, exactly as the container half asserts it reaches finish_up.
 verify_macos_egress_locked() { echo "verify_macos_egress_locked" >> "$LOG"; }
+macos_record_egress_verified() { :; }   # the record of that pass: tests/51 owns it
 scp_to_macos()      { :; }
 # Recorder standing in for the augur-vm CLI. $VM_CLI is invoked as "$VM_CLI" <subcmd>, so a function
 # name works — and unlike a stub that silently succeeds, this makes "run was never invoked" a real
