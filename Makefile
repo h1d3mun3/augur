@@ -18,7 +18,7 @@ SHELL := /usr/bin/env bash
 UNAME := $(shell uname)
 
 .PHONY: help unit swift-build swift-test shellcheck offline-tests version-smoke \
-        augur-vm-version-smoke container-e2e stage image egress e2e
+        augur-vm-version-smoke container-e2e stage image egress e2e e2e-session-creds
 
 help:
 	@echo "augur make targets:"
@@ -26,6 +26,7 @@ help:
 	@echo "  make offline-tests  seam + command-construction shell tiers (CI: ubuntu-latest)"
 	@echo "  make container-e2e  LOCAL egress fail-closed E2E on Apple Container (needs macOS 26+)"
 	@echo "  make e2e            LOCAL macOS VM pre-release gate (boots a VM — never in CI)"
+	@echo "  make e2e-session-creds  LOCAL check of macOS per-session credentials on a running VM (never in CI)"
 	@echo "  components: swift-build  swift-test  shellcheck  offline-tests  version-smoke  augur-vm-version-smoke"
 
 # ── build-unit (macos-26) ─────────────────────────────────────────────────────
@@ -123,3 +124,9 @@ egress: image
 # your project directory before tagging a release. See README "Pre-release gate".
 e2e:
 	AUGUR_TEST_LIVE=1 bash tests/e2e_macos_vm.sh
+
+# LOCAL check, on a Mac, that macOS VM mode delivers credentials only per SSH session (a dummy
+# credential; the project VM must be running or AUGUR_E2E_BOOT=1). AUGUR_E2E_DESTRUCTIVE=1 adds the
+# steps that move the guest's sshd drop-in and stop gvproxy. See tests/README.md.
+e2e-session-creds:
+	AUGUR_TEST_LIVE=1 bash tests/e2e_macos_session_credentials.sh

@@ -32,6 +32,31 @@ same command is safe in CI, the Linux dev container, and on a macOS host.
 the LOCAL pre-release gate behind `make e2e` — it boots a macOS VM and runs `xcodebuild test`
 inside it, which no GitHub-hosted runner can do. See the repo README "Pre-release gate".
 
+`tests/e2e_macos_session_credentials.sh` is not an `NN_*` tier either: it is the LOCAL, on-a-Mac
+check of macOS per-session credentials (`make e2e-session-creds`), and covers what test 56 can only
+stub: the base VM's real sshd drop-in and `sudo sshd -T`, the self-test record against
+`augur-vm`'s real run pid, a session's delivery of a dummy `GH_TOKEN` (and git's helper set) with
+nothing on the guest's disk or the host's argv, a plain ssh that gets none, the push's temp-file
+cleanup, the root-script `sudo -S -k` protocol (a wrong password runs nothing), and the refusal of
+a running VM with no self-test record for its boot. Run it from the augur checkout after
+`bash install --here`, with a base VM built or updated by this augur and the project VM cloned
+from it:
+
+```bash
+AUGUR_TEST_LIVE=1 bash tests/e2e_macos_session_credentials.sh                          # ~3–5 min
+AUGUR_TEST_LIVE=1 AUGUR_E2E_DESTRUCTIVE=1 bash tests/e2e_macos_session_credentials.sh  # +4–6 min
+```
+
+It sends only a random dummy credential and never resolves the operator's own. `AUGUR_E2E_BOOT=1`
+lets it boot a stopped project VM (`AUGUR_E2E_PROJECT=<dir>` picks the project; default this
+checkout). `AUGUR_E2E_DESTRUCTIVE=1` adds the steps that change the VM: the drop-in moved away and
+back (the old-base refusal and the delivery check's exit 197), and gvproxy stopped under the live
+VM (no SSH transport; recovery stops and reboots the VM, ending this project's sessions;
+`AUGUR_E2E_SKIP_GVPROXY=1` leaves it out). An EXIT trap restores what it changed and leaves the VM
+running; if a restore fails, the summary prints the command to finish it
+(`AUGUR_TEST_LIVE=1 AUGUR_E2E_RESTORE=1 bash tests/e2e_macos_session_credentials.sh` puts the
+drop-in back). Like `make e2e`, its `up --macos` runs with `AUGUR_ACCEPT_PROJECT_CONF=1`.
+
 ## How the offline construction test works
 
 `11_construct_container.sh` puts `tests/shims/` first on `PATH`, so augur calls our fake
