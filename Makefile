@@ -63,7 +63,7 @@ shellcheck:
 	@echo "== shellcheck (errors fail, across all shell) =="
 	shellcheck --severity=error augur install agents/*.sh scripts/*.sh tests/*.sh tests/shims/*
 	@echo "== shellcheck (strict on the new test harness) =="
-	SHELLCHECK_OPTS='-e SC1090 -e SC1091' shellcheck --severity=warning tests/22_egress_failclosed.sh tests/e2e_macos_vm.sh
+	SHELLCHECK_OPTS='-e SC1090 -e SC1091' shellcheck --severity=warning tests/22_egress_failclosed.sh tests/e2e_macos_vm.sh tests/e2e_macos_session_credentials.sh
 
 # Offline shell tiers (00/01/11 + macOS source-guard tiers): seam + command-construction contracts
 # via a `container` shim. Live tiers (21/22/30) self-skip without their prereqs, so this is safe
