@@ -75,9 +75,10 @@ has "$managed_fn" 'macos_run_root_script "$vm"' "macOS managed policy is one roo
 hasnt "$managed_fn" 'macos_admin_password_stdin' "macOS managed policy makes no separate privileged call"
 hasnt "$managed_fn" 'cat > ' "macOS managed policy stages no file in the guest before root runs"
 hasnt "$managed_fn" 'MACOS_SSH_USER' "macOS managed policy names no path in the guest user's home"
-has "$managed_fn" "b64='\${b64}'" "macOS managed policy travels as a single-quoted base64 value (the guest shell expands nothing in it)"
+vars_fn="$(awk '/^macos_managed_settings_vars_sh\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
+has "$vars_fn" "b64='%s'" "macOS managed policy travels as a single-quoted base64 value (the guest shell expands nothing in it)"
 has "$managed_fn" 'macos_managed_settings_swap_sh' "macOS managed policy replaces the whole policy directory"
-has "$managed_fn" 'agent_managed_settings_json | base64' "macOS managed policy travels base64-encoded"
+has "$vars_fn" 'agent_managed_settings_json | base64' "macOS managed policy travels base64-encoded"
 swap_sh="$(sed -n '/^macos_managed_settings_swap_sh()/,/^SCRIPT$/p' "$AUGUR")"   # its body is a heredoc with `}` lines
 has "$swap_sh" '/usr/bin/base64 --decode' "macOS managed policy is decoded by the guest's own base64"
 has "$swap_sh" '/usr/sbin/chown root:wheel' "macOS managed policy is root-owned"
@@ -93,6 +94,21 @@ for _b in build update; do
   else fail "macOS $_b installs the managed policy after custom provisioning" "install@$_m provisioning@$_p"; fi
   eq "1" "$(printf '%s\n' "$_body" | grep -c '^    install_macos_managed_settings ')" "macOS $_b installs the managed policy exactly once"
 done
+# Re-checked after everything that could change it, before the sshd drop-in re-check and the save.
+for _b in build update; do
+  _body="$build_macos_body"; [[ "$_b" == update ]] && _body="$update_macos_body"
+  _i="$(printf '%s\n' "$_body" | grep -n 'agent_verify_integrity_macos "' | head -n1 | cut -d: -f1)"
+  _c="$(printf '%s\n' "$_body" | grep -n '^    verify_macos_managed_settings "' | head -n1 | cut -d: -f1)"
+  _s="$(printf '%s\n' "$_body" | grep -n '^    verify_macos_session_env_acceptance "' | head -n1 | cut -d: -f1)"
+  if [[ -n "$_i" && -n "$_c" && -n "$_s" && "$_i" -lt "$_c" && "$_c" -lt "$_s" ]]; then
+    ok "macOS $_b re-checks the managed policy after the signer check, before the drop-in re-check"
+  else fail "macOS $_b: the managed policy re-check is misplaced" "signer@$_i check@$_c dropin@$_s"; fi
+  has "$_body" 'verify_macos_managed_settings "$MACOS_' "macOS $_b runs the managed policy re-check"
+done
+verify_fn="$(awk '/^verify_macos_managed_settings\(\)/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
+has "$managed_fn" 'macos_policy_checks_sh' "the install uses the shared policy checks"
+has "$verify_fn" 'macos_policy_checks_sh' "the re-check uses the same shared policy checks"
+has "$verify_fn" 'macos_managed_settings_vars_sh' "the re-check compares against the same encoded policy"
 # It must land BEFORE cmd_build_macos revokes the build-time sudo grant, or it silently fails.
 m_at="$(printf '%s\n' "$build_macos_body" | grep -n '^    install_macos_managed_settings ' | head -n1 | cut -d: -f1)"
 r_at="$(printf '%s\n' "$build_macos_body" | grep -n 'sudo rm -f /etc/sudoers.d/augur' | head -n1 | cut -d: -f1)"

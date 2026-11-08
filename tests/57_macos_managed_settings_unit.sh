@@ -33,7 +33,13 @@
 #     directory as it was (put back from the quarantine when it was already moved aside, also when
 #     the swapped-in directory fails its check) and no fresh one or empty quarantine behind; when
 #     putting it back fails, the reason names where it is and the quarantine keeps it;
-#   • a quarantine that cannot be removed once the new policy is live is only a warning naming it.
+#   • a quarantine that cannot be removed once the new policy is live is only a warning naming it;
+#   • success needs status 0 AND the script's AUGUR_POLICY_LIVE report; an `ls -le` that fails or
+#     prints nothing is refused (fail closed); entries discarded with an old directory are named;
+#   • verify_macos_managed_settings passes on the policy as installed (other files, a deny-only ACL
+#     on the directory allowed) and names what differs otherwise: the file overwritten, loosened,
+#     removed, hard-linked or given any ACL, the directory loosened, replaced by a symlink or given
+#     an allow ACL entry;
 #
 # How the guest runs: the stub runs the remote command in an unprivileged user + mount namespace
 # (`unshare -rm`, which maps this user to root, so files the test creates are root-owned). In it, a
@@ -146,17 +152,26 @@ fi
 exec '$REAL_RM' "\$@"
 EOF
 chmod +x "$FAKEBIN/sudo" "$FAKESBIN/chown" "$FAKEUSRBIN/chmod"
-# `ls` that plays macOS for a path matching the pattern LS_ACL_PATH: `-ldn` marks its mode with `+`,
-# and `-lden` adds the ACL lines LS_ACL_LINES.
+# `ls` that plays macOS's `-lden` (GNU ls has no -e): the `-ldn` line, and for a path matching the
+# pattern LS_ACL_PATH, `+` on its mode (in `-ldn` too) and the ACL lines LS_ACL_LINES after it. For a
+# path matching LS_LDEN_FAILS, `-lden` fails; for one matching LS_LDEN_EMPTY, it prints nothing.
 cat > "$FAKEUSRBIN/ls" <<EOF
 #!/bin/sh
-if [ -n "\$LS_ACL_PATH" ] && { [ "\$1" = -ldn ] || [ "\$1" = -lden ]; }; then
-    case "\$2" in \$LS_ACL_PATH)
-        out="\$('$REAL_LS' -ldn "\$2")" || exit
-        printf '%s+ %s\\n' "\${out%% *}" "\${out#* }"
-        [ "\$1" = -ldn ] || printf '%s\\n' "\$LS_ACL_LINES"
-        exit 0 ;;
-    esac
+if [ "\$1" = -ldn ] || [ "\$1" = -lden ]; then
+    if [ "\$1" = -lden ]; then
+        if [ -n "\$LS_LDEN_FAILS" ]; then case "\$2" in \$LS_LDEN_FAILS) echo "ls: injected failure" >&2; exit 1 ;; esac; fi
+        if [ -n "\$LS_LDEN_EMPTY" ]; then case "\$2" in \$LS_LDEN_EMPTY) exit 0 ;; esac; fi
+    fi
+    out="\$('$REAL_LS' -ldn "\$2")" || exit
+    if [ -n "\$LS_ACL_PATH" ]; then
+        case "\$2" in \$LS_ACL_PATH)
+            printf '%s+ %s\\n' "\${out%% *}" "\${out#* }"
+            [ "\$1" = -ldn ] || printf '%s\\n' "\$LS_ACL_LINES"
+            exit 0 ;;
+        esac
+    fi
+    printf '%s\\n' "\$out"
+    exit 0
 fi
 exec '$REAL_LS' "\$@"
 EOF
@@ -182,7 +197,7 @@ CAN_RUN=0
 if command -v unshare >/dev/null 2>&1 && [[ -d /usr/sbin && -d /var && -n "$REAL_CHMOD" ]] \
     && in_guest true </dev/null 2>/dev/null; then CAN_RUN=1; fi
 SUDO_NOPASSWD=0; CHOWN_FAILS=0; CHMOD_N_FAILS=0; GUEST_PW="$SECRET"
-MV_FAIL_DEST=""; MV_FAIL_ONCE=""; MV_RACE_DEST=""; RM_QUAR_FAILS=0; CHMOD_N_NOISE=""; LS_ACL_PATH=""; LS_ACL_LINES=""
+MV_FAIL_DEST=""; MV_FAIL_ONCE=""; MV_RACE_DEST=""; RM_QUAR_FAILS=0; CHMOD_N_NOISE=""; LS_ACL_PATH=""; LS_ACL_LINES=""; LS_LDEN_FAILS=""; LS_LDEN_EMPTY=""
 
 # The recording `ssh`: call N leaves its argv in $LOG/N.argv and its stdin in $LOG/N.stdin, then
 # runs the remote command, fed exactly that stdin, as the guest.
@@ -196,7 +211,8 @@ ssh() {
     ( cd "$GUEST_HOME" && HOME="$GUEST_HOME" PATH="$FAKEBIN:$PATH" SUDO_WANT="$GUEST_PW" \
           SUDO_NOPASSWD="$SUDO_NOPASSWD" CHOWNLOG="$CHOWNLOG" CHOWN_FAILS="$CHOWN_FAILS" \
           CHMODLOG="$CHMODLOG" CHMOD_N_FAILS="$CHMOD_N_FAILS" CHMOD_N_NOISE="$CHMOD_N_NOISE" MV_FAIL_DEST="$MV_FAIL_DEST" MV_FAIL_ONCE="$MV_FAIL_ONCE" \
-          MV_RACE_DEST="$MV_RACE_DEST" RM_QUAR_FAILS="$RM_QUAR_FAILS" LS_ACL_PATH="$LS_ACL_PATH" LS_ACL_LINES="$LS_ACL_LINES" in_guest "$cmd" ) < "$LOG/$n.stdin"
+          MV_RACE_DEST="$MV_RACE_DEST" RM_QUAR_FAILS="$RM_QUAR_FAILS" LS_ACL_PATH="$LS_ACL_PATH" LS_ACL_LINES="$LS_ACL_LINES" \
+          LS_LDEN_FAILS="$LS_LDEN_FAILS" LS_LDEN_EMPTY="$LS_LDEN_EMPTY" in_guest "$cmd" ) < "$LOG/$n.stdin"
 }
 reset() {
     rm -rf "$LOG"/* "$CHOWNLOG" "$CHMODLOG" "$TMPD/guest" "$OUTSIDE" "$ROOTHOME" "$TMPD/mv-once"
@@ -282,6 +298,37 @@ eq "1" "$rc" "no SSH transport: returns 1"
 eq "0" "$(n_calls)" "no SSH transport: no ssh connection is made"
 has "$out" "does not resolve" "no SSH transport: augur's error says why"
 hasnt "$out" "| Cannot reach" "no SSH transport: augur's error is not shown as guest text"
+
+section "Tier 1 — success is status 0 AND the script's live report"
+fake_root_script() {   # fake_root_script RC STDOUT — the install against a root script that does only that
+    FAKE_RC="$1"; FAKE_OUT="$2"
+    out="$( macos_run_root_script() { MACOS_ROOT_SCRIPT_ERR="guest said this"; printf '%s' "$FAKE_OUT"; return "$FAKE_RC"; }
+            install_macos_managed_settings testvm 2>&1 )"; rc=$?
+}
+fake_root_script 0 $'AUGUR_POLICY_LIVE\n'
+eq "0" "$rc" "status 0 with AUGUR_POLICY_LIVE: installed"
+hasnt "$out" "guest said this" "status 0 with AUGUR_POLICY_LIVE: the guest's stderr is not shown"
+fake_root_script 0 ''
+eq "1" "$rc" "status 0 without AUGUR_POLICY_LIVE: a failure"
+has "$out" "| guest said this" "status 0 without AUGUR_POLICY_LIVE: the guest's stderr is shown"
+fake_root_script 4 $'AUGUR_POLICY_LIVE\n'
+eq "1" "$rc" "status 4, even with AUGUR_POLICY_LIVE: a failure"
+fake_root_script 4 ''
+eq "1" "$rc" "status 4 alone: a failure"
+fake_root_script 0 $'AUGUR_POLICY_LIVE\nAUGUR_POLICY_LEFTOVER /var/root/.augur-quarantine.X\n'
+eq "0" "$rc" "AUGUR_POLICY_LIVE with a leftover: installed"
+has "$out" "could not be removed: /var/root/.augur-quarantine.X" "AUGUR_POLICY_LIVE with a leftover: warns, naming it"
+fake_verify() {   # fake_verify RC STDOUT — the re-check against a root script that does only that
+    FAKE_RC="$1"; FAKE_OUT="$2"
+    out="$( macos_run_root_script() { MACOS_ROOT_SCRIPT_ERR="guest said this"; printf '%s' "$FAKE_OUT"; return "$FAKE_RC"; }
+            verify_macos_managed_settings testvm 2>&1 )"; rc=$?
+}
+fake_verify 0 $'AUGUR_POLICY_OK\n'
+eq "0" "$rc" "re-check, status 0 with AUGUR_POLICY_OK: passes"
+fake_verify 0 ''
+eq "1" "$rc" "re-check, status 0 without AUGUR_POLICY_OK: refused"
+fake_verify 1 $'AUGUR_POLICY_OK\n'
+eq "1" "$rc" "re-check, non-zero status even with AUGUR_POLICY_OK: refused"
 
 if (( ! CAN_RUN )); then
     skip "the root script, run as the guest" "no unprivileged user+mount namespaces with overlayfs here"
@@ -450,8 +497,66 @@ section "Tier 1 — only the cleanup failing is a warning, not a failure"
 RM_QUAR_FAILS=1; old_tree; install_with "$REAL_PAYLOAD"; RM_QUAR_FAILS=0
 eq "0" "$rc" "the quarantine cannot be removed: returns 0 (the policy is live)"
 has "$out" "the old policy directory could not be removed" "the quarantine cannot be removed: the warning says so"
-has "$out" "| cannot remove the old policy directory, left in /var/root/.augur-quarantine." "the quarantine cannot be removed: the leftover is named"
+has "$out" "could not be removed: /var/root/.augur-quarantine." "the quarantine cannot be removed: the leftover is named"
 if cmp -s "$REAL_PAYLOAD" "$DST"; then ok "the quarantine cannot be removed: the new policy is installed"; else fail "the quarantine cannot be removed: no new policy"; fi
 eq "$(basename "$DST")" "$(ls -A "$DSTDIR")" "the quarantine cannot be removed: the live directory holds only the policy"
+
+section "Tier 1 — an ACL check that cannot be read is refused"
+LS_LDEN_FAILS="$BASE"; old_policy; install_with "$REAL_PAYLOAD"; LS_LDEN_FAILS=""
+base_refused "parent whose ls -le fails"
+LS_LDEN_EMPTY="$BASE"; old_policy; install_with "$REAL_PAYLOAD"; LS_LDEN_EMPTY=""
+base_refused "parent whose ls -le prints nothing"
+LS_LDEN_FAILS="$BASE/.augur-policy.*/managed-settings.json"; old_policy; install_with "$REAL_PAYLOAD"; LS_LDEN_FAILS=""
+check_untouched "new policy file whose ls -le fails"
+has "$out" "| the new policy is not root:wheel without an ACL" "new policy file whose ls -le fails: refused"
+
+section "Tier 1 — what the swap discards is named"
+old_policy; printf 'x\n' > "$DSTDIR/managed-mcp.json"; mkdir "$DSTDIR/sub"
+install_with "$REAL_PAYLOAD"
+eq "0" "$rc" "old directory with other entries: installed"
+has "$out" "Discarded with the old policy directory (custom provisioning must recreate what it owns): managed-mcp.json, sub" \
+    "old directory with other entries: they are named, as an info line"
+_d="$(grep 'Discarded with the old policy directory' <<< "$out")"
+hasnt "$_d" "managed-settings.json" "old directory with other entries: augur's own policy file is not named"
+old_policy; install_with "$REAL_PAYLOAD"
+hasnt "$out" "Discarded" "old directory with only the policy file: nothing is named"
+
+section "Tier 1 — verify_macos_managed_settings: the policy as installed, other files allowed"
+verify_now() { out="$( set -e; verify_macos_managed_settings testvm 2>&1 )"; rc=$?; }
+installed() { reset; install_with "$REAL_PAYLOAD"; [[ "$rc" == 0 ]] || fail "(setup) install failed" "$out"; rm -rf "$LOG"/*; }
+verify_fails() {   # verify_fails NAME REASON
+    eq "1" "$rc" "$1: refused"
+    has "$out" "  | " "$1: the guest's reason is shown as guest text"
+    has "$out" "$2" "$1: says what differs"
+    has "$out" "must not replace or change augur's managed-settings.json" "$1: says provisioning must not replace it"
+}
+installed; verify_now
+eq "0" "$rc" "as installed: passes"
+eq "1" "$(n_calls)" "as installed: one ssh connection"
+if grep -rqF -- "$SECRET" "$LOG"/*.argv; then fail "as installed: the admin password is on an ssh argv"; else ok "as installed: the admin password is on no ssh argv"; fi
+installed; printf '{"mcpServers":{}}\n' > "$DSTDIR/managed-mcp.json"; verify_now
+eq "0" "$rc" "another file added beside it: passes"
+installed; printf '{}' > "$DST"; verify_now
+verify_fails "overwritten" "does not hold augur's policy"
+installed; chmod 666 "$DST"; verify_now
+verify_fails "made 666" "is not a root:wheel 644 regular file without an ACL"
+installed; rm -f "$DST"; verify_now
+verify_fails "removed" "is missing"
+installed; ln "$DST" "$OUTSIDE/hardlink"; verify_now
+verify_fails "a second hard link" "has other hard links or does not hold augur's policy"
+installed; chmod 775 "$DSTDIR"; verify_now
+verify_fails "directory made 775" "is not a root-owned 755 directory without an ACL that allows anything"
+installed; mv "$DSTDIR" "$OUTSIDE/moved"; ln -s "$OUTSIDE/moved" "$DSTDIR"; verify_now
+verify_fails "directory replaced by a symlink" "is not a root-owned 755 directory"
+installed; LS_ACL_PATH="$DSTDIR"; LS_ACL_LINES=' 0: group:staff allow add_file'; verify_now; LS_ACL_PATH=""; LS_ACL_LINES=""
+verify_fails "directory with an allow ACL entry" "without an ACL that allows anything"
+installed; LS_ACL_PATH="$DSTDIR"; LS_ACL_LINES=' 0: group:everyone deny delete'; verify_now; LS_ACL_PATH=""; LS_ACL_LINES=""
+eq "0" "$rc" "directory with a deny-only ACL: passes"
+installed; LS_ACL_PATH="$DST"; LS_ACL_LINES=' 0: group:everyone deny delete'; verify_now; LS_ACL_PATH=""; LS_ACL_LINES=""
+verify_fails "policy file with even a deny-only ACL" "is not a root:wheel 644 regular file without an ACL"
+installed; LS_LDEN_FAILS="$DST"; verify_now; LS_LDEN_FAILS=""
+verify_fails "policy file whose ls -le fails" "is not a root:wheel 644 regular file without an ACL"
+installed; verify_now
+hasnt "$out" "$SECRET" "the check prints no admin password"
 
 finish

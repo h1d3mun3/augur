@@ -126,8 +126,11 @@ has "$out" "Sorry, try again." "timezone, wrong password: sudo's diagnostic is s
 
 section "Tier 1 — install_macos_managed_settings"
 reset_log
+# This sudo stand-in accepts the password but runs nothing, so the root script never reports the
+# policy live: the install must say so (tests/57 runs the script itself).
 out="$( set -e; install_macos_managed_settings testvm 2>&1 )"
-hasnt "$out" "Could not install" "managed policy: the install succeeded against a sudo that reads stdin"
+hasnt "$out" "Sorry, try again." "managed policy: sudo took the password from stdin"
+has "$out" "Could not install" "managed policy: no AUGUR_POLICY_LIVE report, so not taken as installed"
 eq "1" "$(n_calls)" "managed policy: one ssh connection, nothing staged first"
 has "$(cat "$LOG/1.stdin")" "$(agent_managed_settings_json | base64 | tr -d '\n')" "managed policy: the JSON travels base64-encoded inside the root script on ssh's stdin"
 check_site "managed policy"
