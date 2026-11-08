@@ -91,7 +91,14 @@ That kept them off argv, but:
   its own files to the fresh directory, and nothing replaces it again afterwards. Any failure of
   this install is fatal (a failure after the old directory was moved aside first puts it back): the
   build or update stops without saving the base VM, so no clone inherits a missing or old policy.
-  Only a quarantine that cannot be removed once the new policy is live is a warning. Before connecting, `macos_run_root_script` refuses a
+  Only a quarantine that cannot be removed once the new policy is live is a warning; success is
+  the script's own `AUGUR_POLICY_LIVE` report with status 0, never a status alone, and an ACL
+  listing (`ls -le`) that cannot be read is refused. The swap names what it discarded, since the
+  directory is rebuilt on every update from augur's policy plus the operator's provisioning, which
+  must therefore be idempotent. After everything that could change it (provisioning's root hook, a
+  cask's postinstall), `verify_macos_managed_settings` re-checks, with the same checks, that the
+  policy file is still augur's exact bytes, root:wheel 644, one link, no ACL, in a root-owned 755
+  directory with no ACL that allows anything; build and update refuse to save otherwise. Before connecting, `macos_run_root_script` refuses a
   VM with no stored admin password or no SSH transport, and it keeps the guest's stderr apart from
   augur's own messages, so only guest text is shown as such.
 - **The drop-in is checked again last.** Homebrew, the agent installer and custom provisioning
