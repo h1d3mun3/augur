@@ -552,8 +552,12 @@ section "Tier 1 — down / destroy drop the record"
 egress_on
 for c in cmd_down_macos cmd_destroy_macos; do
   record on; verified_now
+  _old="${AUGUR_PROXY_DIR}/$(workspace_slug)-$(workspace_path_hash)"
+  printf 'on\n' > "$_old.egress-mode"; printf 'x\n' > "$_old.egress-verified"
   run_cmd "$c"
   [[ -e "$(macos_boot_record_file)" ]] && fail "$c leaves the record behind" || ok "$c removes the record"
+  [[ -e "$_old.egress-mode" || -e "$_old.egress-verified" ]] && fail "$c leaves an older augur's two record files" \
+    || ok "$c removes an older augur's .egress-mode and .egress-verified too"
 done
 macos_vm_exists() { return 1; }
 record on; verified_now

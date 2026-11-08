@@ -167,7 +167,8 @@ That kept them off argv, but:
   does not parse (one line of `on`/`off`, a space, and a run id or `-`) is no record: the VM is refused as
   one of unknown egress mode, with the "started by an older augur" remedy. An older augur kept the
   mode and the pass in two other files (`.egress-mode`, `.egress-verified`), which this augur does
-  not read, so a VM it started is refused that way once; there is no migration. The pass holds the VM's run id (`macos_vm_run_id`),
+  not read, so a VM it started is refused that way once; `down` / `destroy` remove those two files
+  with the boot record, and there is no other migration. The pass holds the VM's run id (`macos_vm_run_id`),
   `<uuid> <start time>`: the random UUID augur-vm's `run` writes to the VM's `run.id` before it
   writes `run.pid`, and removes with it (as do `stop`'s force-kill and `clone`), and the start
   time `ps -o lstart=` gives for the process in `run.pid`, under `TZ=UTC0 LC_ALL=C` (padding
