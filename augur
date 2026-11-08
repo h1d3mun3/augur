@@ -1110,6 +1110,12 @@ MACOS_SESSION_ENV_MISSING_RC=197
 # the caller's `_creds` names is set and non-empty, for ssh_macos_session to run before its remote
 # command. They name the variables and never print a value. Nothing when `_creds` is empty. Returns
 # 1, after an error, for a name that is not a shell variable name.
+#
+# Accepted trade-off: the guest's sshd runs the remote command through the login shell's `-c`, so
+# zsh has read the guest's startup files (~/.zshenv and what it sources) before the check runs. A
+# startup file that sets one of these names, which augur's own ~/.augur-env never does, hides a
+# credential the sshd dropped, and the session starts with that file's value instead. Those files
+# are the guest's own, writable by the agent, and no earlier point in the session runs a command.
 macos_session_env_delivery_cmd() {
     local _kv _n
     for _kv in ${_creds[@]+"${_creds[@]}"}; do
@@ -1370,6 +1376,9 @@ replace_stale_helper() {
 #     setup-token fall through to `up`, the second call only re-hashes.
 #   • Cheap when fresh: a liveness check and one sha256 per live helper; the guest is queried only
 #     once a helper turns out not fresh.
+#   • A running macOS VM is refused through refuse_running_macos_vm, so its ~/.augur-env is
+#     rewritten before the exit, even through a gvproxy that is not verified (see
+#     refuse_running_macos_vm for why that is acceptable).
 # Deliberately NOT called from down/destroy/status/list: they are the way out of this refusal.
 # Deliberately no override: egress enforcement is augur's core promise, so there is no flag or env
 # var to attach through a helper that cannot be shown to run the installed binary.
@@ -1399,16 +1408,18 @@ require_fresh_egress_helpers() {
         container_running || return 0
         remedy="augur down && augur up"; kept="the container's writable layer"
     fi
-    error "Refusing to attach to the running ${guest}: an egress helper serving it is not verified"
-    error "to run the installed binary."
-    while IFS= read -r l; do [[ -n "$l" ]] && error "  • ${l}"; done <<< "$lines"
+    local _out=("Refusing to attach to the running ${guest}: an egress helper serving it is not verified"
+        "to run the installed binary.")
+    while IFS= read -r l; do [[ -n "$l" ]] && _out+=("  • ${l}"); done <<< "$lines"
     if $cannot_hash; then
-        error "Fix that first: until augur can hash the installed binary it cannot verify any running"
-        error "helper, and this refusal repeats after every restart."
+        _out+=("Fix that first: until augur can hash the installed binary it cannot verify any running"
+            "helper, and this refusal repeats after every restart.")
     fi
-    error "Restart the guest and its egress helpers from the installed binaries: ${BOLD}${remedy}${RESET}"
-    error "  \`down\` ends every running $(agent_cli_name)/shell session of this project; the workspace and"
-    error "  ${kept} are kept."
+    _out+=("Restart the guest and its egress helpers from the installed binaries: ${BOLD}${remedy}${RESET}"
+        "  \`down\` ends every running $(agent_cli_name)/shell session of this project; the workspace and"
+        "  ${kept} are kept.")
+    if $MACOS_MODE; then refuse_running_macos_vm "$(macos_project_vm)" "${_out[@]}"; fi
+    for l in "${_out[@]}"; do error "$l"; done
     exit 1
 }
 
@@ -2272,12 +2283,14 @@ macos_record_egress_verified() {
 # Every refusal of a running VM goes through here, so a refused guest never keeps credentials augur
 # could have removed: a ~/.augur-env an older augur wrote holds them, the VM stays up after the
 # refusal, and the push replaces that file (see push_macos_guest_env). That includes the refusals
-# made before augur's first other connection to the guest (require_macos_egress_mode_current,
-# require_macos_admin_password --running), whose VM is the likeliest to hold such a file: one
-# started by an older augur. Deliberately done on a VM whose containment is unproven or whose
-# egress mode is wrong: the push sends no credential, only the per-VM environment built from
-# host-side constants, and needs only augur's SSH key, never the admin password. The refusals
-# inside a push (the acceptance check) need no call here: that push already rewrote the file.
+# made before augur's first other connection to the guest (require_fresh_egress_helpers,
+# require_macos_egress_mode_current, require_macos_admin_password --running), whose VM is the
+# likeliest to hold such a file: one started by an older augur. cmd_up_macos's already-running
+# branch also pushes on any other exit before its self-test. Deliberately done on a VM whose
+# containment is unproven, whose egress mode is wrong or whose egress helpers are not verified: the
+# push sends no credential, only the per-VM environment built from host-side constants, and needs
+# only augur's SSH key, never the admin password. The refusals inside a push (the acceptance
+# check) need no call here: that push already rewrote the file.
 refuse_running_macos_vm() {
     local vm="$1" _l; shift
     push_macos_guest_env "$vm" --refusing || true
@@ -4817,12 +4830,6 @@ cmd_up_macos() {
     local project_vm
     project_vm="$(macos_project_vm)"
 
-    macos_vm_exists "$MACOS_BASE_VM" || {
-        error "Base VM '${MACOS_BASE_VM}' not found."
-        error "Run: augur build --macos --ipsw <path> --xcode-xip <path>"
-        exit 1
-    }
-
     # Already running: like cmd_up, rebuild what the host owns — rewrite the allowlist (so a
     # revocation takes effect), re-run the boot self-test and push the guest's environment
     # (push_macos_guest_env).
@@ -4839,6 +4846,11 @@ cmd_up_macos() {
         # under the operator.
         require_macos_egress_mode_current "$project_vm"
         warn "VM '${project_vm}' is already running — reconciling host-side state and refreshing the guest's environment."
+        # From here to the self-test, any exit (a declined or unapproved ./.augur/allowlist.conf, a
+        # proxy that cannot start, a failing command, Ctrl-C) rewrites the guest's ~/.augur-env
+        # first, as a refusal of a running VM does (refuse_running_macos_vm). Disarmed before the
+        # self-test, which stops the VM when it fails; every refusal after it pushes itself.
+        trap "push_macos_guest_env $(printf '%q' "$project_vm") --refusing || true" EXIT
         if egress_enabled; then
             check_project_conf_approved      # the gate runs wherever policy is written
             # Rewrites the merged allowlist (augur-proxy hot-reloads it) AND revives a proxy that
@@ -4874,6 +4886,7 @@ cmd_up_macos() {
         # sessions refuse the VM. Deliberately does not stop it, unlike the boot path: the VM has
         # just passed its self-test and may be serving live sessions, and the cause can be as
         # transient as a `ps` that failed once.
+        trap - EXIT
         if egress_enabled; then
             verify_macos_egress_locked "$project_vm"
             macos_record_egress_verified "$project_vm" || refuse_running_macos_vm "$project_vm" \
@@ -4892,6 +4905,14 @@ cmd_up_macos() {
         push_macos_guest_env_retrying "$project_vm" || exit 1
         return 0
     fi
+
+    # Deliberately after the already-running branch: reconciling a running VM does not use the base,
+    # and every way that branch ends rewrites the guest's ~/.augur-env first.
+    macos_vm_exists "$MACOS_BASE_VM" || {
+        error "Base VM '${MACOS_BASE_VM}' not found."
+        error "Run: augur build --macos --ipsw <path> --xcode-xip <path>"
+        exit 1
+    }
 
     # Gate the untrusted project ./.augur/allowlist.conf before cloning or starting the proxy
     # (only relevant when egress filtering is on).

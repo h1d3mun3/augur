@@ -35,6 +35,9 @@
 #     interrupted `up`) is refused with no guest step but the refusal's push of ~/.augur-env, which
 #     removes the credentials an older augur wrote (a push that fails says they may remain), and
 #     `up` on that VM re-runs the self-test and records it;
+#   • every other way a run against a running VM ends before its push (a stale egress helper; on
+#     `up`'s reconcile, an unapproved allowlist, a proxy that cannot start, a failing command)
+#     pushes first, once; a running VM is reconciled without the base VM;
 #   • a push that fails is fatal on every path, after one more try when the connection dropped or the
 #     write failed (a concurrent push took its temp file), and never retried when the guest was
 #     refused or ~/.zshenv could not be updated;
@@ -1236,6 +1239,72 @@ run_cmd claude
 eq "0" "$rc" "…after which claude --macos completes"
 eq "1" "$(launches)" "…and starts its session"
 UNVERIFIED=0
+
+section "Tier 1 — every other exit on a running VM before its session or reconcile pushes first"
+
+# A running VM refused by a check that is not itself a refusal of the VM (a stale egress helper, an
+# unapproved allowlist, a proxy that cannot start) still gets the push that removes the credentials
+# an older augur wrote. Each run pushes exactly once and sends nothing.
+RUNNING=1; GH_HOST_TOKEN="ghp_up5555555"; unset ANTHROPIC_API_KEY
+macos_record_egress_mode
+# The real stale-helper refusal, against a proxy whose binary changed since it was started.
+eval "$(sed -n '/^require_fresh_egress_helpers() {$/,/^}$/p' "$AUGUR")"
+proxy_running()          { return 0; }
+gvproxy_running()        { return 1; }
+egress_helper_staleness() { echo changed; return 1; }
+for _cmd in claude shell up; do
+    old_env; run_cmd "$_cmd"
+    _l="stale egress helper, running VM: $_cmd --macos"
+    nonzero "$_l"
+    has "$out" "an egress helper serving it is not verified" "$_l: says why"
+    no_cred_push "$_l"
+    eq "" "$(cat "$STEPS")" "$_l: runs no other guest step"
+    eq "0" "$(gh_calls)" "$_l: does not resolve the gh token"
+done
+RUNNING=0; old_env; run_cmd up
+eq "0" "$rc" "stale egress helper, VM stopped: up --macos is let through to replace it (control)"
+RUNNING=1
+require_fresh_egress_helpers() { :; }
+unset -f proxy_running gvproxy_running egress_helper_staleness
+eval "$(sed -n '/^proxy_running() {$/,/^}$/p; /^gvproxy_running() {$/,/^}$/p; /^egress_helper_staleness() {$/,/^}$/p' "$AUGUR")"
+# `up` on a running VM: the allowlist gate refuses, or the proxy cannot start.
+for _what in gate proxy; do
+    if [[ "$_what" == gate ]]; then check_project_conf_approved() { echo gate >> "$HOSTLOG"; error "Declined."; exit 1; }
+    else start_proxy() { echo start_proxy >> "$HOSTLOG"; error "Egress proxy failed to start."; exit 1; }; fi
+    old_env; run_cmd up
+    _l="up --macos on a running VM, the $_what exits"
+    nonzero "$_l"
+    no_cred_push "$_l"
+    hasnt "$(cat "$STEPS")" "verify_macos_egress_locked" "$_l: stops before the self-test"
+    hasnt "$out" "may still hold credentials" "$_l: the push succeeded (no warning)"
+    check_project_conf_approved() { echo gate >> "$HOSTLOG"; }
+    start_proxy()                 { echo start_proxy >> "$HOSTLOG"; }
+done
+# A failing command there (set -e) pushes too.
+sync_macos_guest_clock() { false; }
+old_env; out="$( set -e; cmd_up_macos 2>&1 )"; rc=$?
+nonzero "up --macos on a running VM, a command fails under set -e"
+hasnt "$(cat "$ENV_FILE")" "oldbase" "up --macos on a running VM, a command fails under set -e: the old credentials are removed"
+eval "sync_macos_guest_clock() { printf '%s\n' sync_macos_guest_clock >> \"\$STEPS\"; }"
+# A completed `up` leaves no EXIT trap behind, and a failed self-test (which stops the VM) does not
+# push afterwards.
+old_env; out="$( cmd_up_macos >/dev/null 2>&1; trap -p EXIT )"
+eq "" "$out" "up --macos on a running VM: leaves no EXIT trap set"
+verify_macos_egress_locked() { echo "LEAK" >&2; exit 1; }
+run_cmd up
+nonzero "up --macos on a running VM, the self-test fails"
+eq "0" "$(pushes)" "up --macos on a running VM, the self-test fails: no push after it"
+eval "verify_macos_egress_locked() { printf '%s\n' verify_macos_egress_locked >> \"\$STEPS\"; }"
+# The base VM is needed only to clone or boot: a running VM is reconciled without it.
+macos_vm_exists() { [[ "$1" != "$MACOS_BASE_VM" ]]; }
+run_cmd up
+eq "0" "$rc" "no base VM, running VM: up --macos still reconciles"
+RUNNING=0; run_cmd up
+nonzero "no base VM, VM stopped: up --macos"
+has "$out" "Base VM '${MACOS_BASE_VM}' not found." "no base VM, VM stopped: up --macos says so"
+eq "" "$(cat "$VMLOG")" "no base VM, VM stopped: up --macos never calls augur-vm"
+RUNNING=1
+macos_vm_exists() { return 0; }
 
 section "Tier 1 — augur's other ssh calls carry no credentials, and setup-token gets nothing"
 
