@@ -202,12 +202,12 @@ reset_vms; SIG_OK=1
 install_macos_managed_settings() { echo "managed $1" >> "$LOG"; return 1; }
 run_update
 install_macos_managed_settings() { echo "managed $1" >> "$LOG"; }
-[[ "$rc" -ne 0 ]] && ok "tampered managed-policy directory: update exits non-zero" || fail "tampered managed-policy directory: update exited 0"
-has "$out" "The base VM was left as-is." "tampered managed-policy directory: says the base VM was left as-is"
-logged "verify $MACOS_UPDATE_VM" && fail "tampered managed-policy directory: later steps still ran" || ok "tampered managed-policy directory: the update stops there"
-logged "vm delete $MACOS_BASE_VM" && fail "tampered managed-policy directory: the base VM was deleted" || ok "tampered managed-policy directory: the base VM is untouched"
-logged "vm clone $MACOS_UPDATE_VM $MACOS_BASE_VM" && fail "tampered managed-policy directory: the update was saved" || ok "tampered managed-policy directory: nothing is saved as the base VM"
-logged "vm delete $MACOS_UPDATE_VM" && ok "tampered managed-policy directory: the staging copy is discarded" || fail "tampered managed-policy directory: the staging copy is left behind"
+[[ "$rc" -ne 0 ]] && ok "failed managed-policy install: update exits non-zero" || fail "failed managed-policy install: update exited 0"
+has "$out" "The base VM was left as-is; re-run" "failed managed-policy install: says the base VM was left as-is, and the remedy"
+logged "verify $MACOS_UPDATE_VM" && fail "failed managed-policy install: later steps still ran" || ok "failed managed-policy install: the update stops there"
+logged "vm delete $MACOS_BASE_VM" && fail "failed managed-policy install: the base VM was deleted" || ok "failed managed-policy install: the base VM is untouched"
+logged "vm clone $MACOS_UPDATE_VM $MACOS_BASE_VM" && fail "failed managed-policy install: the update was saved" || ok "failed managed-policy install: nothing is saved as the base VM"
+logged "vm delete $MACOS_UPDATE_VM" && ok "failed managed-policy install: the staging copy is discarded" || fail "failed managed-policy install: the staging copy is left behind"
 
 reset_vms; SIG_OK=1
 select_macos_full_xcode() { echo "xcode $1" >> "$LOG"; return 1; }
@@ -821,8 +821,8 @@ SE_OK=1
 install_macos_managed_settings() { guest "$1" managed; return 1; }
 run_build
 install_macos_managed_settings() { guest "$1" managed; }
-[[ "$rc" -ne 0 ]] && ok "build: a tampered managed-policy directory aborts" || fail "build: a tampered managed-policy directory was ignored"
-has "$out" "no base VM was saved" "build: a tampered managed-policy directory says no base VM was saved"
+[[ "$rc" -ne 0 ]] && ok "build: a failed managed-policy install aborts" || fail "build: a failed managed-policy install was ignored"
+has "$out" "no base VM was saved" "build: a failed managed-policy install says no base VM was saved"
 logged "verify $MACOS_BUILD_VM" && fail "…but later steps still ran" || ok "…and the build stops there"
 logged "vm clone $MACOS_BUILD_VM $MACOS_BASE_VM" && fail "…but it was saved as the base VM" || ok "…and nothing is saved as the base VM"
 
