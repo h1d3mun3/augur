@@ -81,7 +81,7 @@ That kept them off argv, but:
   its payload travels base64-encoded inside the root script. The policy directory is wholly
   augur's in the base VM (Claude Code reads other managed files from it), so it is never edited in
   place: after checking that its parent is a real root-owned directory unwritable by group and
-  others, root builds a fresh root:wheel 755 directory next to it, ACL stripped (`chmod -N`),
+  others, with no ACL or one of deny entries only (a deny entry cannot grant write), root builds a fresh root:wheel 755 directory next to it, ACL stripped (`chmod -N`),
   holding only the policy file (root:wheel 644, no ACL), checks both, moves whatever is at the old
   path (a directory, a file, a symlink) into a 700 quarantine under `/var/root` that no other user
   can traverse, renames the fresh directory into place, checks it again and removes the

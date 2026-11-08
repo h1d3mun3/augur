@@ -25,7 +25,9 @@
 #   • the old one is moved into a 700 quarantine under /var/root, which is then removed; nothing
 #     the guest printed is shown on success;
 #   • the parent (/Library/Application Support) must be a real directory owned by root and not
-#     writable by group or others; otherwise nothing is created or moved;
+#     writable by group or others, with no ACL or one of deny entries only (an allow entry or an
+#     unparsable line is refused; the fresh directory gets no ACL at all); otherwise nothing is
+#     created or moved;
 #   • ANY failure (a failing generator, no stored password or SSH transport, a wrong password, a
 #     failed chown, `chmod -N`, quarantine or move) returns 1 with the reason, leaves the old
 #     directory as it was (put back from the quarantine when it was already moved aside, also when
@@ -117,7 +119,7 @@ real_tool() {
     if [[ "$t" == "/usr/bin/$1" ]]; then cp "$t" "$TMPD/real-$1"; t="$TMPD/real-$1"; fi
     printf '%s' "$t"
 }
-REAL_MV="$(real_tool mv)"; REAL_RM="$(real_tool rm)"
+REAL_MV="$(real_tool mv)"; REAL_RM="$(real_tool rm)"; REAL_LS="$(real_tool ls)"
 # `mv` that fails when its destination matches MV_FAIL_DEST (only the first time if MV_FAIL_ONCE
 # names a flag file), and, after moving the fresh directory to exactly MV_RACE_DEST, drops an
 # intruder in it.
@@ -144,7 +146,21 @@ fi
 exec '$REAL_RM' "\$@"
 EOF
 chmod +x "$FAKEBIN/sudo" "$FAKESBIN/chown" "$FAKEUSRBIN/chmod"
-chmod +x "$FAKEUSRBIN/mv" "$FAKEUSRBIN/rm"
+# `ls` that plays macOS for a path matching the pattern LS_ACL_PATH: `-ldn` marks its mode with `+`,
+# and `-lden` adds the ACL lines LS_ACL_LINES.
+cat > "$FAKEUSRBIN/ls" <<EOF
+#!/bin/sh
+if [ -n "\$LS_ACL_PATH" ] && { [ "\$1" = -ldn ] || [ "\$1" = -lden ]; }; then
+    case "\$2" in \$LS_ACL_PATH)
+        out="\$('$REAL_LS' -ldn "\$2")" || exit
+        printf '%s+ %s\\n' "\${out%% *}" "\${out#* }"
+        [ "\$1" = -ldn ] || printf '%s\\n' "\$LS_ACL_LINES"
+        exit 0 ;;
+    esac
+fi
+exec '$REAL_LS' "\$@"
+EOF
+chmod +x "$FAKEUSRBIN/mv" "$FAKEUSRBIN/rm" "$FAKEUSRBIN/ls"
 BASH_BIN="$(readlink -f "$(command -v bash)")"
 SH_TARGET="$(readlink -f /bin/sh)"; SH_WRAP=""
 if [[ "$SH_TARGET" != "$BASH_BIN" ]]; then
@@ -166,7 +182,7 @@ CAN_RUN=0
 if command -v unshare >/dev/null 2>&1 && [[ -d /usr/sbin && -d /var && -n "$REAL_CHMOD" ]] \
     && in_guest true </dev/null 2>/dev/null; then CAN_RUN=1; fi
 SUDO_NOPASSWD=0; CHOWN_FAILS=0; CHMOD_N_FAILS=0; GUEST_PW="$SECRET"
-MV_FAIL_DEST=""; MV_FAIL_ONCE=""; MV_RACE_DEST=""; RM_QUAR_FAILS=0; CHMOD_N_NOISE=""
+MV_FAIL_DEST=""; MV_FAIL_ONCE=""; MV_RACE_DEST=""; RM_QUAR_FAILS=0; CHMOD_N_NOISE=""; LS_ACL_PATH=""; LS_ACL_LINES=""
 
 # The recording `ssh`: call N leaves its argv in $LOG/N.argv and its stdin in $LOG/N.stdin, then
 # runs the remote command, fed exactly that stdin, as the guest.
@@ -180,7 +196,7 @@ ssh() {
     ( cd "$GUEST_HOME" && HOME="$GUEST_HOME" PATH="$FAKEBIN:$PATH" SUDO_WANT="$GUEST_PW" \
           SUDO_NOPASSWD="$SUDO_NOPASSWD" CHOWNLOG="$CHOWNLOG" CHOWN_FAILS="$CHOWN_FAILS" \
           CHMODLOG="$CHMODLOG" CHMOD_N_FAILS="$CHMOD_N_FAILS" CHMOD_N_NOISE="$CHMOD_N_NOISE" MV_FAIL_DEST="$MV_FAIL_DEST" MV_FAIL_ONCE="$MV_FAIL_ONCE" \
-          MV_RACE_DEST="$MV_RACE_DEST" RM_QUAR_FAILS="$RM_QUAR_FAILS" in_guest "$cmd" ) < "$LOG/$n.stdin"
+          MV_RACE_DEST="$MV_RACE_DEST" RM_QUAR_FAILS="$RM_QUAR_FAILS" LS_ACL_PATH="$LS_ACL_PATH" LS_ACL_LINES="$LS_ACL_LINES" in_guest "$cmd" ) < "$LOG/$n.stdin"
 }
 reset() {
     rm -rf "$LOG"/* "$CHOWNLOG" "$CHMODLOG" "$TMPD/guest" "$OUTSIDE" "$ROOTHOME" "$TMPD/mv-once"
@@ -382,6 +398,28 @@ eq "old" "$(cat "$OUTSIDE/realbase/ClaudeCode/managed-settings.json")" "symlinke
 eq "ClaudeCode" "$(ls -A "$OUTSIDE/realbase")" "symlinked parent: nothing is created through it"
 reset; mkdir -p "$BASE"; chmod 755 "$BASE"; install_with "$REAL_PAYLOAD"
 check_install "a stock root-owned 755 parent (control)" "$REAL_PAYLOAD"
+acl_parent() {   # acl_parent LINES — the parent shows an ACL with these lines
+    LS_ACL_PATH="$BASE"; LS_ACL_LINES="$1"; old_policy; install_with "$REAL_PAYLOAD"; LS_ACL_PATH=""; LS_ACL_LINES=""
+}
+acl_parent ' 0: group:everyone deny delete'
+rc_ok=$rc; out_ok="$out"
+eq "0" "$rc_ok" "parent with a deny-only ACL: accepted"
+if cmp -s "$REAL_PAYLOAD" "$DST"; then ok "parent with a deny-only ACL: the policy is installed"; else fail "parent with a deny-only ACL: no policy" "$out_ok"; fi
+acl_parent $' 0: group:everyone deny delete\n 1: user:admin inherited deny add_file,add_subdirectory'
+eq "0" "$rc" "parent with deny-only ACL entries, one inherited: accepted"
+acl_parent ' 0: group:staff allow add_file'
+base_refused "parent with an allow ACL entry"
+acl_parent $' 0: group:everyone deny delete\n 1: group:staff inherited allow add_file'
+base_refused "parent with deny entries and an inherited allow entry"
+acl_parent 'garbage in the ACL listing'
+base_refused "parent with an unparsable ACL line"
+acl_parent ' 0: group:everyone deny'
+base_refused "parent with an ACL line without permissions"
+acl_parent ' x: group:everyone deny delete'
+base_refused "parent with an ACL line without an index"
+LS_ACL_PATH="$BASE/.augur-policy.*"; LS_ACL_LINES=' 0: group:everyone deny delete'; old_policy; install_with "$REAL_PAYLOAD"; LS_ACL_PATH=""; LS_ACL_LINES=""
+check_untouched "fresh directory with even a deny-only ACL"
+has "$out" "| the new policy is not root:wheel without an ACL" "fresh directory with even a deny-only ACL: refused (no ACL allowed there)"
 
 section "Tier 1 — a failure after the old directory is moved aside puts it back"
 old_tree() { old_policy; printf 'x\n' > "$DSTDIR/managed-mcp.json"; }

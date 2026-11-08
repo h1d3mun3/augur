@@ -4361,22 +4361,40 @@ fail() {
     [ -z "$quar" ] || /bin/rm -rf "$quar"
     exit 1
 }
-# ls_ok PATH TYPE OWNER MODE: PATH is not a symlink, is of TYPE (test -d or -f), its numeric
+# deny_only LS-LDEN-OUTPUT: every ACL line after the first (`ls -le` prints them as
+# ` 0: group:everyone deny delete`, with `inherited` before `deny` when inherited) is a deny entry.
+# Anything else, an allow entry or a line of another shape, fails.
+deny_only() {
+    printf '%s\n' "$1" | {
+        IFS= read -r _
+        while IFS= read -r a; do
+            set -- $a
+            case "$1" in [0-9]*:) ;; *) exit 1 ;; esac
+            case "${1%:}" in *[!0-9]*) exit 1 ;; esac
+            case "$2" in ?*:?*) ;; *) exit 1 ;; esac
+            if [ "$3" = inherited ]; then kind="$4"; perms="$5"; else kind="$3"; perms="$4"; fi
+            [ "$kind" = deny ] && [ -n "$perms" ] || exit 1
+        done
+    }
+}
+# ls_ok PATH TYPE OWNER MODE [deny]: PATH is not a symlink, is of TYPE (test -d or -f), its numeric
 # uid:gid matches the pattern OWNER, its `ls` mode string (less a trailing `@` or `.`) matches the
-# pattern MODE, and it has no ACL.
+# pattern MODE, and it has no ACL, or with `deny`, an ACL of deny entries only (deny_only).
 ls_ok() {
     [ ! -L "$1" ] && [ "$2" "$1" ] || return 1
     l="$(/bin/ls -ldn "$1")" || return 1
     acl="$(/bin/ls -lden "$1" 2>/dev/null)" || acl=
-    case "$acl" in *"$nl"*) return 1 ;; esac
-    owner="$3"; mode="$4"
+    owner="$3"; mode="$4"; acl_ok=
+    case "$acl" in *"$nl"*) [ "$5" = deny ] && deny_only "$acl" && acl_ok=1 || return 1 ;; esac
     set -- $l
     case "$3:$4" in $owner) ;; *) return 1 ;; esac
     m="${1%[@.]}"
+    [ -z "$acl_ok" ] || m="${m%+}"
     case "$m" in $mode) return 0 ;; esac
     return 1
 }
-ls_ok "$base" -d '0:*' 'd????[!w]??[!w]?' || fail "$base is not a directory owned by root, unwritable by group and others, without an ACL"
+# Deliberately tolerates a deny-only ACL on $base: a deny entry cannot grant anyone write.
+ls_ok "$base" -d '0:*' 'd????[!w]??[!w]?' deny || fail "$base is not a directory owned by root, unwritable by group and others, without an ACL that allows anything"
 fresh="$(/usr/bin/mktemp -d "$base/.augur-policy.XXXXXX")" || { fresh=; fail "cannot create a directory in $base"; }
 /usr/sbin/chown root:wheel "$fresh" && /bin/chmod 755 "$fresh" && /bin/chmod -N "$fresh" || fail "cannot make $fresh root:wheel 755 without an ACL"
 printf '%s' "$b64" | /usr/bin/base64 --decode > "$fresh/$name" || fail "cannot decode the policy"
