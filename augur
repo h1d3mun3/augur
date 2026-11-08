@@ -2308,7 +2308,10 @@ macos_remove_old_records() {
     rm -f "${p}.egress-mode" "${p}.egress-verified"
 }
 # Drop the record's pass and keep its mode, so every session refuses the VM as one whose current
-# boot passed no self-test. A record with no mode is removed instead.
+# boot passed no self-test. A record with no mode is removed instead, and a missing one stays
+# missing. Accepted trade-off: as in macos_record_egress_verified, the read and the rewrite take no
+# lock, so a `down` / `destroy` between them can see the record written again; augur does not
+# support two commands on the same project at once (see restart_egress_network_helper).
 macos_drop_egress_pass() {
     local _mode _pass
     macos_read_boot_record
@@ -2368,8 +2371,11 @@ macos_vm_run_id() {
 # the VM's run id was $2 (macos_vm_run_id, read before the self-test by macos_selftest_and_record).
 # The id is read again here, and the pass is recorded only when both reads agree: a VM booted again
 # between the probes and now would otherwise get a pass no probe tested. The mode is taken from the
-# existing record, never from this command: a `down` / `destroy` that removed the record while the
-# self-test ran is not undone by writing a new one.
+# existing record, never from this command, and no pass is written when the record is gone at that
+# read: a `down` / `destroy` that removed it while the self-test ran is not undone by a new one.
+# Accepted trade-off: the read and the write take no lock, so a `down` / `destroy` landing between
+# them can still see the record written again; that needs a second augur command on the same
+# project at once, which augur does not support (see restart_egress_network_helper).
 #
 # Returns 1, after an error, when the pass cannot be recorded: no boot record (nothing is written);
 # no run id on either read; two that differ; or a record that cannot be written. This function is

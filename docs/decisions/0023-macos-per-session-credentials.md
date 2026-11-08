@@ -202,9 +202,12 @@ That kept them off argv, but:
   refuses the VM, and `up` fails. One exception, on a running VM: when only the read before the
   self-test failed and the record already holds a pass for the run id read after it, that boot,
   still running, passed an earlier self-test; its pass stands and `up` goes on, with a warning. The
-  pass is written with the mode the record already holds, and not at all when there is no record
-  (a `down` / `destroy` removed it during the self-test), which fails `up` too, so a record is never
-  re-created for a VM being torn down. `macos_selftest_and_record` is the one way `cmd_up_macos`
+  pass is written with the mode the record already holds, and not at all when the record is gone at
+  that read (a `down` / `destroy` removed it during the self-test), which fails `up` too.
+  Accepted trade-off: the read and the write take no lock, so a `down` / `destroy` landing between
+  them can still see the record written again (dropping a pass has the same window); that needs two
+  augur commands on the same project at once, which augur does not support.
+  `macos_selftest_and_record` is the one way `cmd_up_macos`
   runs the self-test: it reads the run id, runs `verify_macos_egress_locked`, and records the pass
   against that id, and on a pass it cannot record it stops a booted VM or refuses a running one
   itself. Its callers run it as a plain statement, never under `||` or `if !`, which would make bash
