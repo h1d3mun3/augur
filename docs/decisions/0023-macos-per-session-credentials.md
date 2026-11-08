@@ -78,11 +78,15 @@ That kept them off argv, but:
   script, where an unknown command would print it. The marker is a shell comment. A wrong password
   fails sudo, and no line of the script runs. The password stays on no argv. The base VM's managed
   agent policy (`install_macos_managed_settings`) is installed the same way, for the same reason:
-  its payload travels base64-encoded in a quoted heredoc inside the root script, and root makes the
-  target directory root:wheel 755 (refusing a symlink) before renaming a root-owned temp file over
-  the target. Before connecting, `macos_run_root_script` refuses a VM with no stored admin password
-  or no SSH transport, and it keeps the guest's stderr apart from augur's own messages, so only
-  guest text is shown as such.
+  its payload travels base64-encoded in a quoted heredoc inside the root script. Root makes the
+  target directory root:wheel 755, removes (and names) every entry in it that is not owned by root,
+  is a symlink, or is writable by group or others, since Claude Code reads other managed files from
+  that directory too, then renames a root-owned temp file over the target. A symlinked directory, or
+  a target that is still not a regular file (a root-owned directory `mv` would put the file inside),
+  is tampering only root could cause: the build or update stops without saving the base VM. Other
+  failures of this install stay best effort. Before connecting, `macos_run_root_script` refuses a
+  VM with no stored admin password or no SSH transport, and it keeps the guest's stderr apart from
+  augur's own messages, so only guest text is shown as such.
 - **The drop-in is checked again last.** Homebrew, the agent installer and custom provisioning
   (which runs a root hook) all run after `update --macos` installs the drop-in, and the build's
   Xcode selection, sudo revoke and signature check run after its install. So both re-run the same
