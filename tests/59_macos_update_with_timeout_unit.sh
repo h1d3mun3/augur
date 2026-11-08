@@ -132,7 +132,8 @@ for sh in "${shells[@]}"; do
   eq "started" "$out" "$sh: a command leaving a child: its output comes through"
   eq 3 "$rc" "$sh: a command leaving a child: its status is kept"
   eq "" "$err" "$sh: a command leaving a child: no job notice on stderr"
-  (( dt < 2000 )) && ok "$sh: a child left running does not hold the reader (${dt} ms)" \
+  # Under 1 s: the end of the group checks it again within moments, not a second later.
+  (( dt < 1000 )) && ok "$sh: a child left running does not hold the reader (${dt} ms)" \
     || fail "$sh: a child left running held the reader for ${dt} ms"
   no_leftover "$sh: the child it left running is ended"
 
@@ -175,5 +176,31 @@ for sig in TERM INT HUP; do
   eq "" "$(cat "$WORK/err")" "$sig: nothing on stderr"
   rm -rf "${WORK:?}/tmp/"*
 done
+
+# (i) A signal that arrives before the pids of the command and the watchdog are known is acted
+# on once they are: both groups end, nothing is left. A stand-in mktemp sends TERM to the helper
+# while it creates its temp dir, which is before either is started. (The window between a fork
+# and its pid assignment cannot be hit on purpose; this checks the same deferral.)
+section "/bin/bash: a signal before the pids are known"
+mkdir -p "$WORK/fakebin"
+printf '#!/bin/sh\nwhile [ ! -s "%s" ]; do sleep 0.05; done\nkill -TERM "$(cat "%s")"\nexec "%s" "$@"\n' \
+  "$WORK/body.pid" "$WORK/body.pid" "$(command -v mktemp)" > "$WORK/fakebin/mktemp"
+chmod +x "$WORK/fakebin/mktemp"
+set -m
+PATH="$WORK/fakebin:$PATH" TMPDIR="$WORK/tmp" /bin/bash -c "$_with_timeout_sh" _with_timeout "$WATCH_SECS" \
+  bash -c "sleep $CHILD_SECS; :" </dev/null >/dev/null 2>"$WORK/err" &
+body=$!; echo "$body" > "$WORK/body.pid"
+set +m
+for i in $(seq 50); do kill -0 "$body" 2>/dev/null || break; sleep 0.2; done
+if kill -0 "$body" 2>/dev/null; then
+  fail "early TERM: the helper was still running 10 s later (the signal was never acted on)"
+  kill -KILL "$body" 2>/dev/null
+else
+  wait "$body"; rc=$?
+  eq 143 "$rc" "early TERM: the helper exits with the TERM status"
+fi
+no_leftover "early TERM: no sleep of the command or the watchdog is left"
+[[ -z "$(ls -A "$WORK/tmp")" ]] && ok "early TERM: its temp dir is removed" || fail "early TERM: temp dir left: $(ls -A "$WORK/tmp")"
+eq "" "$(cat "$WORK/err")" "early TERM: nothing on stderr"
 
 finish

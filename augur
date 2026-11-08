@@ -6146,33 +6146,41 @@ cmd_update_macos() {
         # So nothing CMD or the watchdog started keeps the stdout/stderr of this ssh session,
         # and with it the session and augur, waiting. The group id cannot be taken by anything
         # else while a member is alive.
+        # A signal to this helper is only recorded until both pids are known (armed), and acted
+        # on then: a signal between a fork and its pid assignment still ends that group.
         # Accepted trade-off: a descendant that moves to a group or session of its own (setsid)
         # escapes the group kill.
-        # Accepted trade-off: if CMD exits just as the time runs out, the step is reported as
-        # either finished or timed out, and the watchdog only ever signals the group of CMD.
+        # Accepted trade-off: 124 is also what a step that itself exits 124 returns, and a step
+        # that finishes just as the time runs out may get it; the callers only test for failure.
         # Accepted trade-off: the end of the group after CMD is reaped can name a group that has
         # no member left; reaching an unrelated process needs its id to be reused in that moment.
         _with_timeout_sh=$(cat <<"EOF"
         secs=$1; shift
-        cpid=; wpid=
-        mark=$(mktemp -d 2>/dev/null) || { echo "augur: ERROR could not create a temp dir for the timeout" >&2; exit 1; }
+        cpid=; wpid=; sig=; armed=
+        # end_group PGID GRACE: TERM to the group, then KILL if it is still alive GRACE s later.
         end_group() {
             kill -TERM -- "-$1" || return 0
             n=0
-            while [ "$n" -lt "$2" ] && kill -0 -- "-$1"; do sleep 1; n=$((n + 1)); done
+            while [ "$n" -lt "$(($2 * 10))" ] && kill -0 -- "-$1"; do sleep 0.1; n=$((n + 1)); done
             kill -KILL -- "-$1"
             return 0
         }
-        on_signal() {
+        stop_if_signalled() {
+            [ -n "$sig" ] || return 0
             [ -z "$wpid" ] || kill -KILL -- "-$wpid"
             [ -z "$cpid" ] || end_group "$cpid" 2
-            exit "$1"
+            exit "$sig"
         }
+        on_signal() { sig=$1; [ -z "$armed" ] || stop_if_signalled; }
         on_exit() { rm -rf "$mark"; }
+        mark=
         trap on_exit EXIT
         trap "on_signal 130" INT
         trap "on_signal 143" TERM
         trap "on_signal 129" HUP
+        # Accepted trade-off: the timeout is recorded as a file in a temp dir, so the helper
+        # needs one it can create.
+        mark=$(mktemp -d 2>/dev/null) || { echo "augur: ERROR could not create a temp dir for the timeout" >&2; exit 1; }
         # The shell keeps the caller stderr on fd 3 for CMD alone, so no job notice or kill error of
         # its own reaches the caller.
         exec 3>&2 2>/dev/null
@@ -6180,13 +6188,16 @@ cmd_update_macos() {
         "$@" </dev/null 2>&3 3>&- & cpid=$!
         ( sleep "$secs"; : > "$mark/fired"; end_group "$cpid" 10 ) </dev/null >/dev/null 3>&- & wpid=$!
         set +m
+        armed=1
+        stop_if_signalled
         wait "$cpid"; rc=$?
         if [ -e "$mark/fired" ]; then
             wait "$wpid"; rc=124
         else
             kill -KILL -- "-$wpid"; wait "$wpid"
-            # Deliberately ended, without changing the status: anything CMD left running in its
-            # group (a helper, a daemon) ends with the step.
+            # Accepted trade-off: anything CMD left running in its group (a helper, a daemon) is
+            # ended with the step, without changing its status; no caller starts anything that
+            # has to outlive its step.
             end_group "$cpid" 2
         fi
         exit "$rc"
