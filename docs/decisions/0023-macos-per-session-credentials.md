@@ -32,9 +32,13 @@ That kept them off argv, but:
 - **Host side.** The ssh options are resolved first (so the commands that look up the VM's host
   and port never see a value), then a subshell `export`s each resolved `NAME=value` — `export` is a
   builtin, so no value is on any argv — and execs `ssh` with `-o SendEnv=<NAME>` for exactly the
-  resolved names. For a value read from a host file or from `gh`, augur's own shell and every other
-  child never hold it. A credential the operator exported into augur's environment
-  (`ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` set in their shell) is already held by augur and
+  resolved names. For a value read from a host file or from `gh`, that ssh is the only process
+  whose environment holds it: no other child gets it in its environment, and it is on no argv and
+  in no file. augur's own bash does hold it, as a shell variable (`_creds`) in its memory, and so
+  does every subshell it forks while `_creds` is set (a fork copies the shell's memory); a command
+  those subshells exec gets only their exported environment, which does not hold it. A credential
+  the operator exported into augur's environment (`ANTHROPIC_API_KEY` /
+  `CLAUDE_CODE_OAUTH_TOKEN` set in their shell) is already in augur's environment and
   inherited by every child, like any other variable of that shell; that is an accepted trade-off
   (those processes run as the operator), and none of them forwards it. Not
   `-o SetEnv=NAME=value`: that is argv. `ssh_macos` stays hermetic (`-F /dev/null`, which already
@@ -91,11 +95,27 @@ That kept them off argv, but:
   That push is now **fatal for a session** as well as for `up`: `~/.zshenv` sources the file in
   every session shell *after* sshd has set the session's environment, so a stale
   `export GH_TOKEN=…` would silently replace the fresh value.
+- **A push that must succeed is tried once more, unless it was refused.** The boot's push, `up`'s
+  on a running VM and every session's go through `push_macos_guest_env_retrying`: a push whose
+  ssh connection dropped or failed (outcome unknown), or whose write failed with the old file in
+  place (a full disk, or its temp file removed by a concurrent session's push), is tried a second
+  time, at once; only if that fails too does the boot stop the VM or `up` / the session exit.
+  `push_macos_guest_env` returns a distinct status for that class (3), for a refusal (2) and for
+  a push that cannot work (1). Deliberately never retried: a refusal by the acceptance check,
+  whatever else that push hit (no second attempt makes the guest accept, and the refusal must
+  stop the caller at once); a `~/.zshenv` that could not be updated, which fails the same way every
+  time; and a push that sent nothing (a value or name that cannot be written). The pushes a
+  refusal makes (`--refusing`, below) are not retried either: the refusal stands whatever they
+  return.
 - **Old bases are refused, not migrated.** `up`, `claude` and `shell --macos` check over ssh that
   the drop-in holds exactly the line augur would write (`macos_session_env_check_cmd`), always as
   the first step of every `~/.augur-env` push (`push_macos_guest_env`), so every refusal takes one
   code path and costs no extra connection. The line is built from `macos_session_env_names`, the
-  validated names, the same way the drop-in's is. On a boot that push runs right after
+  validated names, the same way the drop-in's is: `macos_session_env_names` is the one place the
+  names are checked, each caller (the install, the re-check, the push) computes them once, and
+  `macos_session_accept_env_line` and `macos_session_env_check_cmd` take them as an argument. The
+  check is `grep -sqxF`, so an old base with no drop-in is refused without grep's own "No such
+  file" on the operator's terminal. On a boot that push runs right after
   the SSH wait (before the clock, the self-test and the rest of the bring-up) and is the boot's
   only push: its content is built from host-side constants and nothing later in the bring-up
   writes `~/.augur-env` or `~/.zshenv`. On a running VM it is the session's or `up`'s one push. A
@@ -111,9 +131,10 @@ That kept them off argv, but:
   project VMs. Without the check the guest's sshd would silently drop the values and the agent
   would start unauthenticated. A guest that lies to the check gains nothing: its sshd decides what
   it accepts, and a session whose credentials it drops is refused by the delivery check (below).
-- **A VM whose containment is unproven is stopped.** Any failure of the boot's push
-  (a refusal, a transport error, a full disk), the SSH-wait timeout, a failing self-test and a
-  passed one that cannot be recorded (below) all stop the VM, its gvproxy and its proxy through one teardown, `stop_unverified_macos_vm`, which
+- **A VM whose containment is unproven is stopped.** A failure of the boot's push (a refusal at
+  once; a transport error or a failed write after its one retry, above), the SSH-wait timeout, a
+  failing self-test and, on a boot, a passed one that cannot be recorded (below) all stop the VM,
+  its gvproxy and its proxy through one teardown, `stop_unverified_macos_vm`, which
   also drops the record below and keeps the clone (`destroy` stays the operator's call;
   `setup-token --macos` deletes its throwaway clone itself). A VM left running there would be
   attached to by the next `claude` / `shell --macos`. A refused VM is of no use anyway. Under
@@ -141,19 +162,31 @@ That kept them off argv, but:
   the running VM that re-runs the self-test and records it. (On a VM from an old base that `up`
   then refuses with the old-base remedy; the first message promises only the self-test.) When the
   run id cannot be read after a passed self-test (no `run.pid`, no process with that pid, no start
-  time), the pass cannot be recorded and every session would refuse the VM, so `up` fails and stops
-  it through `stop_unverified_macos_vm`, the clone kept. A marker rather than a trap on the interrupted `up`: a trap cannot run on a kill or a
+  time), the pass cannot be recorded: `macos_record_egress_verified` removes any record (one
+  written earlier in the same boot included) and fails, so every session refuses the VM, and `up`
+  fails. On a boot `up` then stops the VM it just booted through `stop_unverified_macos_vm`, the
+  clone kept. On the already-running branch it deliberately leaves the VM running and refuses it
+  as any running VM is refused (the push first), with `augur up --macos` again, then
+  `augur down --macos && augur up --macos`, as the remedy: that VM has just passed its self-test
+  and may be serving live sessions, and the cause can be as transient as a `ps` that failed once.
+  A marker rather than a trap on the interrupted `up`: a trap cannot run on a kill or a
   host crash. Deliberately egress-on only: a `--no-egress` boot has no self-test to record, and a
   `--no-egress` session attaches only to a VM booted that way (`require_macos_egress_mode_current`),
   where there is no containment for the record to vouch for.
 - **Every push removes stale temp files, by age.** A killed push can leave a `~/.augur-env.tmp.*`,
   and one written by an older augur may hold credentials. Every push removes, except its own, each
-  one older than a minute (`find -mmin +1`) or dated ahead of the guest's clock (`-newer` than a
-  reference file it has just created with `mktemp` in `/tmp` and removes again; both are
-  BSD-find primaries): right after a boot the guest clock may lag, so a file written before the
-  reboot looks newer than now rather than old. A concurrent push finishes well within the minute,
-  so it keeps its own file. Accepted trade-off: a concurrent push that creates its temp file in the
-  instant between another push's reference file and its `find` loses it and fails.
+  one older than a minute (`find -mmin +1`) or dated more than a minute ahead of the guest's clock
+  (`-newer` than a reference file it creates with `mktemp` in `/tmp`, touches with `touch -t` to a
+  minute from now, and removes again; both are BSD-find primaries): right after a boot the guest
+  clock may lag, so a file written before the reboot looks newer than now rather than old. The
+  time a minute ahead is formatted with `date -r <seconds>` (macOS's BSD date), or
+  `date -d @<seconds>` (GNU) where that fails; when neither works the reference keeps its mtime of
+  now, the plain "ahead of the clock" test. A concurrent push finishes well within the minute and
+  dates its file by the same clock, so it keeps its own file, even one created after the other
+  push touched its reference. A stale file less than a minute ahead stays until a later push finds
+  it older than a minute. Accepted trade-off: a step of the guest clock between two concurrent
+  pushes (or that fallback) can still make one's file look stale to the other, which then fails
+  with the old file in place and is tried once more (above).
 - **Delivery is checked in the guest, not only the drop-in.** The drop-in check reads a file, so it
   still passes when the guest's `sshd_config` has lost its `Include` (a guest macOS update, a hand
   edit) and sshd silently drops every `SendEnv`. So the session's remote command starts with
@@ -180,12 +213,18 @@ That kept them off argv, but:
   Terminal, a hand-run `ssh`) has none, and git keeps its own helpers there.
 - **Every refusal of a running VM pushes first.** A `~/.augur-env` an older augur wrote holds
   credentials, so a refusal must not leave it behind. The old-base refusal happens inside the push
-  itself; the two refusals made before any push, a credential that cannot be used
-  (`resolve_running_macos_vm_credentials`) and a boot with no passed self-test
-  (`require_macos_egress_verified`), push with `--refusing` before they refuse. With `--refusing`,
-  a push that could not rewrite the file, or whose outcome is unknown, says the file may still hold
-  an older augur's credentials, as the old-base refusal does; the refusal stands either way.
-  `push_macos_guest_env`'s header is the one place the code explains why.
+  itself; the refusals made outside a push, a credential that cannot be used
+  (`resolve_running_macos_vm_credentials`), a boot with no passed self-test
+  (`require_macos_egress_verified`) and, on `up`'s running branch, a passed self-test that cannot
+  be recorded, all go through one helper, `refuse_running_macos_vm`, which pushes with
+  `--refusing`, prints the refusal and exits 1. With `--refusing`, a push that could not rewrite
+  the file, or whose outcome is unknown, says the file may still hold an older augur's
+  credentials, as the old-base refusal does; the refusal stands either way. Deliberately not
+  covered: the egress-mode check (`require_macos_egress_mode_current`) and the stored-admin-password
+  check (`require_macos_admin_password`), which run before augur's first connection to the guest
+  and decide whether it talks to the guest at all; their remedies restart or recreate the VM,
+  whose boot pushes before any session. `refuse_running_macos_vm`'s header is the one place the
+  code explains the rule.
 - **Ordering and validation.** Resolve once and validate; `cmd_up_macos` resolves before the clone
   (and, on its already-running branch, after the self-test). On a running VM a value that fails
   still gets the guest its `~/.augur-env` push (`resolve_running_macos_vm_credentials`) before
@@ -228,8 +267,8 @@ That kept them off argv, but:
   but that user and root (`ps -E` from a second account); that `sshd -T -f <test config>` follows
   the test config's absolute `Include` as described; end-to-end delivery (the session's
   `SendEnv` values and git's `GIT_CONFIG_*` set present in `claude --macos` / `shell --macos`,
-  absent from a plain `ssh`); the temp-file cleanup's `mktemp /tmp/…XXXXXX` and
-  `find … \( -mmin +1 -o -newer … \)` under the guest's zsh and BSD userland; that the VM's
+  absent from a plain `ssh`); the temp-file cleanup's `mktemp /tmp/…XXXXXX`, `date -r <seconds>`,
+  `touch -t` and `find … \( -mmin +1 -o -newer … \)` under the guest's zsh and BSD userland; that the VM's
   `run.pid` keeps one value for the whole boot, and that `ps -o lstart=` under `TZ=UTC0` prints the
   same start time for that process for the whole boot, across host sleep and clock syncs (the
   record of a passed self-test relies on both; a change would refuse sessions until
@@ -306,12 +345,14 @@ point after its startup files at which augur could run a command, short of repla
   refusal is stopped again (clone kept).
 - A guest whose sshd stops delivering the values (a lost `Include`) is refused per session, before
   the agent or shell starts, rather than running unauthenticated.
-- A failed `~/.augur-env` push now stops a session instead of warning.
+- A failed `~/.augur-env` push now stops a session instead of warning, after one more try when the
+  failure may pass (a dropped connection, a failed write); a refusal is not retried.
 - A running VM whose `up --macos` was interrupted before the self-test, or one booted outside
   augur, gets no session until an `augur up --macos`, which re-runs the self-test on the running VM
   and records it (a restart works too). Running VMs booted before this record
   existed are refused once the same way. An `up --macos` that cannot read the VM's run id after a
-  passed self-test fails and stops the VM (clone kept).
+  passed self-test fails and leaves no record; on a boot it also stops the VM (clone kept), on a
+  running VM it leaves the VM running.
 - `build` / `update --macos` fail without saving a base whose sshd no longer accepts the session
   credentials at the end, or whose drop-in no longer holds the line its clones check for, even if
   the drop-in installed earlier in the run.

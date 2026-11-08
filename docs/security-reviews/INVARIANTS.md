@@ -51,7 +51,8 @@ in time," this **prescribes** "what must never break." It changes rarely.
   credential-free push of `~/.augur-env`): it is dropped before every `augur-vm run`, by `down`/`destroy`
   and by the teardown (`stop_unverified_macos_vm`), and written only after the self-test passes,
   so an `up --macos` interrupted before its self-test leaves no VM a session trusts (and an `up`
-  that cannot read the run id to record a pass fails and stops the VM)
+  that cannot read the run id to record a pass fails and leaves no record: it stops a VM it just
+  booted, and leaves a running one running, refused by every session until a pass is recorded)
   (`tests/51_macos_egress_mode_unit.sh`, `tests/56_macos_session_credentials.sh`). `setup-token --macos` boots its throwaway
   VM through the same datapath and self-test (`tests/52_macos_setup_token_unit.sh`). Both self-tests are inherently live (they need a
   booted guest); the *wiring* — invoked on both paths, and a NOT-locked verdict exits non-zero with
@@ -188,15 +189,18 @@ in time," this **prescribes** "what must never break." It changes rarely.
   into the login keychain on disk. A `~/.augur-env` an older augur wrote with credentials in it
   loses them at the first push, including the push that refuses a guest without the drop-in (the
   check is that push's first step, and the refusal follows the rewrite) and the push a running VM
-  still gets when its credentials fail to resolve (`resolve_running_macos_vm_credentials`) or its
-  current boot has no passed self-test (`require_macos_egress_verified`). In
+  still gets when its credentials fail to resolve (`resolve_running_macos_vm_credentials`), its
+  current boot has no passed self-test (`require_macos_egress_verified`) or `up` cannot record its
+  passed self-test, every such refusal going through `refuse_running_macos_vm`. In
   Container mode credentials are never passed to `container run` at all; they reach only the `container exec`
   that starts `augur claude` / `augur shell`, through `--env-file <(…)` written by the bash builtin `printf`
   (`session_credential_env`). `augur setup-token` and augur's own execs get none. In macOS VM mode
   `augur setup-token --macos` never uses the project VM: it runs in a throwaway clone of the base VM
   that receives no `~/.augur-env`, no `GH_TOKEN`, no git config and no share, and is deleted on every
   exit path. On the macOS host the values sit in that one `ssh` process's environment for the life
-  of the session. macOS is expected to serve a process's environment only to its own user and root,
+  of the session, and (for file- and `gh`-sourced values) in no other child's environment; augur's
+  own bash and the subshells it forks hold them as shell variables in their memory. macOS is
+  expected to serve a process's environment only to its own user and root,
   who can already read the host files and `gh` token the values come from; that is not yet observed
   on a Mac (ADR-0023), so it is a residual risk, not something augur enforces.
 - **Why:** Prevent a co-resident process from reading credentials via `ps` / `/proc`. In Container
