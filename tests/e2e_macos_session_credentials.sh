@@ -250,7 +250,7 @@ fi
 
 # ── 3. A session gets the credential; the disk does not ────────────────────────────────────────
 section "Credential delivery in a session"
-SESSION_PROBE='printf "tok=%s\n" "$(printf %s "${GH_TOKEN:-}" | shasum -a 256 | cut -c1-64)"; printf "gcc=%s\n" "${GIT_CONFIG_COUNT:-}"; printf "fill=%s\n" "$(printf "protocol=https\nhost=github.com\n\n" | GIT_TERMINAL_PROMPT=0 git credential fill 2>/dev/null | sed -n "s/^password=//p" | shasum -a 256 | cut -c1-64)"'
+SESSION_PROBE='printf "tok=%s\n" "$(printf %s "${GH_TOKEN:-}" | shasum -a 256 | cut -c1-64)"; printf "gcc=%s\n" "${GIT_CONFIG_COUNT:-}"; printf "fill=%s\n" "$(printf %s "$(printf "protocol=https\nhost=github.com\n\n" | GIT_TERMINAL_PROMPT=0 git credential fill 2>/dev/null | sed -n "s/^password=//p")" | shasum -a 256 | cut -c1-64)"'
 session_probe() { ( ssh_macos_session "$vm" "$SESSION_PROBE" </dev/null ) 2>&1; }
 pout="$(session_probe)"; prc=$?
 eq "0" "$prc" "a session with a dummy GH_TOKEN runs"
