@@ -4262,27 +4262,42 @@ warn_if_macos_egress_pinned() {
 # settings from re-enabling the auto-updater and swapping out the binary the integrity gate
 # verifies. In Container mode the same file IS root-owned against an unprivileged agent.
 install_macos_managed_settings() {
-    local vm="$1" dst parent staged
+    local vm="$1" dst parent payload body size delim script err
     dst="$(agent_macos_managed_settings_path)"; parent="$(dirname "$dst")"
-    staged="/Users/${MACOS_SSH_USER}/.augur-managed-settings.json"
     info "Installing augur's managed $(agent_display_name) policy into the base VM..."
-    # Two calls on purpose. The payload travels over STDIN because it contains double quotes that
-    # would terminate the host-side quoted string if interpolated — and `sudo -S` reads the PASSWORD
-    # from stdin, so the transfer and the privileged move cannot share one invocation.
-    agent_managed_settings_json | ssh_macos "$vm" "cat > '${staged}'" || {
-        warn "Could not stage the managed $(agent_display_name) policy in the VM; skipping."
+    # The payload, byte for byte: the trailing `x` keeps `$( )` from dropping its final newlines.
+    payload="$(agent_managed_settings_json; printf x)"; payload="${payload%x}"
+    size="$(printf '%s' "$payload" | wc -c | tr -d ' ')"
+    if (( size == 0 )); then
+        warn "The managed $(agent_display_name) policy is empty; not installing it."
         return 0
+    fi
+    # The payload travels inside the root script, as a quoted heredoc: the guest shell expands
+    # nothing in it, so its quotes, `$` and backslashes arrive as written. Its delimiter is
+    # lengthened until no payload line equals it, so no payload can end the heredoc early. The
+    # heredoc always ends in a newline the payload may not have; `head -c` keeps exactly the
+    # payload's bytes.
+    delim="AUGUR_MANAGED_SETTINGS_EOF"
+    while grep -qxF -- "$delim" <<< "$payload"; do delim+="_"; done
+    body="$payload"; [[ "$body" == *$'\n' ]] || body+=$'\n'
+    # Root writes a root-owned temp file in the target directory (mktemp creates it 0600), sets its
+    # owner and mode, then renames it over the target, so the live file is never partial or
+    # writable by anyone else. Absolute tool paths, because the guest's PATH starts at ~/.local/bin.
+    # dst is a plain constant (agent_macos_managed_settings_path), safe inside single quotes.
+    script="dst='${dst}'; parent='${parent}'
+/bin/mkdir -p \"\$parent\" || exit 1
+tmp=\"\$(/usr/bin/mktemp \"\$parent/.managed-settings.XXXXXX\")\" || exit 1
+/usr/bin/head -c ${size} > \"\$tmp\" <<'${delim}' || { /bin/rm -f \"\$tmp\"; exit 1; }
+${body}${delim}
+/usr/sbin/chown root:wheel \"\$tmp\" && /bin/chmod 644 \"\$tmp\" && /bin/mv -f \"\$tmp\" \"\$dst\" || { /bin/rm -f \"\$tmp\"; exit 1; }"
+    # `sudo -S` (inside macos_run_root_script) works whether or not the build-time NOPASSWD grant
+    # is still present, which is what lets `update --macos` reach a base VM that no longer has it.
+    # The password is this base VM's own admin password (see macos_admin_password()), so this takes
+    # no privilege augur's build doesn't already take.
+    err="$(macos_run_root_script "$vm" "$script" 2>&1 >/dev/null)" || {
+        warn "Could not install the managed $(agent_display_name) policy in the VM; continuing without it."
+        printf '%s\n' "$err" | show_guest_lines
     }
-    # `sudo -S` works whether or not the build-time NOPASSWD grant is still present, which is what
-    # lets `update --macos` reach a base VM that no longer has it. The password is this base VM's
-    # own admin password (see macos_admin_password()) — no privilege here augur's build doesn't
-    # already take.
-    macos_admin_password_stdin "$vm" | ssh_macos "$vm" "sudo -S -p '' sh -c '
-        mkdir -p \"${parent}\" &&
-        mv \"${staged}\" \"${dst}\" &&
-        chown root:wheel \"${dst}\" &&
-        chmod 644 \"${dst}\"'" \
-        || warn "Could not install the managed $(agent_display_name) policy in the VM; continuing without it."
     return 0
 }
 

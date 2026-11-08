@@ -128,11 +128,11 @@ section "Tier 1 — install_macos_managed_settings"
 reset_log
 out="$( set -e; install_macos_managed_settings testvm 2>&1 )"
 hasnt "$out" "Could not install" "managed policy: the install succeeded against a sudo that reads stdin"
-eq "2" "$(n_calls)" "managed policy: stage + privileged move (two calls)"
-has "$(cat "$LOG/1.stdin")" "DISABLE_AUTOUPDATER" "managed policy: the JSON still travels on the staging call's stdin"
+eq "1" "$(n_calls)" "managed policy: one ssh connection, nothing staged first"
+has "$(cat "$LOG/1.stdin")" "DISABLE_AUTOUPDATER" "managed policy: the JSON travels inside the root script on ssh's stdin"
 check_site "managed policy"
 
-section "Tier 1 — macos_run_root_script (the session-env sshd drop-in's install and re-check)"
+section "Tier 1 — macos_run_root_script (the managed policy, the session-env sshd drop-in's install and re-check)"
 reset_log
 macos_run_root_script testvm 'echo root-script-ran' >/dev/null 2>&1; rc=$?
 eq "0" "$rc" "root script: succeeded against a sudo that reads stdin"
@@ -206,6 +206,6 @@ done <<< "$code"
 eq "" "$_bad" "every \`sudo -S\` is fed by macos_admin_password_stdin for the same VM, piped into an ssh_macos* wrapper"
 eq "0" "$(printf '%s\n' "$code" | grep -cE 'macos_admin_password_stdin "[^"]*" \| ssh_macos_provision "')" \
     "the password is never piped into ssh_macos_provision (its -n would drop it; use ssh_macos_provision_stdin)"
-eq "10" "$_sites" "ten sudo -S call sites use the helper (build sudoers, manual-flow auto-login, provisioning, managed policy, session-env sshd drop-in, xcode-select, clock, timezone, guest session, guest poweroff)"
+eq "9" "$_sites" "nine sudo -S call sites use the helper (build sudoers, manual-flow auto-login, provisioning, root script (managed policy, session-env sshd drop-in), xcode-select, clock, timezone, guest session, guest poweroff)"
 
 finish
