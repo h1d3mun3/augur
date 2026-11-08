@@ -242,18 +242,23 @@ That kept them off argv, but:
   the old-base refusal does; the refusal stands either way. A stopped VM with no stored admin
   password is refused before anything touches it. `refuse_running_macos_vm`'s header is the one
   place the code explains the rule.
-  The exits that are not refusals of the VM itself push too. The stale-egress-helper refusal
-  (`require_fresh_egress_helpers`), which `up`, `claude` and `shell --macos` run first, goes
-  through `refuse_running_macos_vm` when the VM is running (through the gvproxy it does not
-  trust: the push sends no credential). On `up`'s running branch, everything between the
-  egress-mode check and the self-test (the allowlist approval gate, the proxy start, the clock and
-  timezone fixes) runs under an EXIT trap that pushes with `--refusing`, so a declined or
-  unapproved `./.augur/allowlist.conf`, a proxy that cannot start, a command that fails under
-  `set -e` or a Ctrl-C there still removes the old file; the trap is disarmed before the self-test,
-  which stops the VM when it fails, and the refusals after it push themselves. The base-VM check
-  moved below the running branch, which does not use the base. Each such run still pushes once.
-  Not covered: `require_vz` (no VM backend to ask whether the VM runs) and a session's best-effort
-  clock and timezone fixes, which come after its refusals and before its push and do not exit.
+  Every other exit pushes too, through one mechanism (`arm_macos_push_on_exit`). As soon as
+  `cmd_up_macos`'s already-running branch or `prepare_macos_session` finds the VM running, it arms
+  an EXIT trap (INT, TERM and HUP become exits with the usual 128+N status) that pushes with
+  `--refusing`. So a declined or unapproved `./.augur/allowlist.conf`, a proxy that cannot start, a
+  command failing under `set -e`, an exit or Ctrl-C during the clock and timezone fixes or the
+  self-test, or one between the self-test and the push, all leave the guest with the new file.
+  Every push of an armed run disarms the trap once it has returned, whatever its status:
+  `refuse_running_macos_vm` after its push, and the caller's own final push, which then exits on
+  failure. So each run pushes once, and a push cut short (Ctrl-C mid-ssh) is followed by the
+  trap's. A VM that is no longer running at exit (a failed self-test stops it) is skipped; its next
+  boot's push rewrites the file. The boot path never arms the trap: the VM it booted was pushed
+  right after its SSH wait. The stale-egress-helper refusal (`require_fresh_egress_helpers`), which
+  runs before either of them, goes through `refuse_running_macos_vm` when the VM is running
+  (through the gvproxy it does not trust: the push sends no credential). The base-VM check moved
+  below the running branch, which does not use the base. Accepted trade-offs: a `kill -9` or a
+  host crash runs no trap, and `require_vz` (no VM backend to ask) comes before any of it; in each
+  case the next `up` or session against the VM pushes before anything else.
 - **Ordering and validation.** Resolve once and validate; `cmd_up_macos` resolves before the clone
   (and, on its already-running branch, after the self-test). On a running VM a value that fails
   still gets the guest its `~/.augur-env` push (`resolve_running_macos_vm_credentials`) before

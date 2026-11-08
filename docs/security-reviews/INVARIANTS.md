@@ -197,8 +197,9 @@ in time," this **prescribes** "what must never break." It changes rarely.
   passed self-test, its egress mode is wrong or unknown (`require_macos_egress_mode_current`) or,
   on `up`, it has no stored admin password, every such refusal going through
   `refuse_running_macos_vm`, as does the refusal of a running VM whose egress helper is not verified
-  (`require_fresh_egress_helpers`); `up`'s reconcile of a running VM pushes on any other exit before
-  its self-test (an EXIT trap). In
+  (`require_fresh_egress_helpers`); any other exit (or INT/TERM/HUP) of `up`'s reconcile of a
+  running VM or of a session's preparation before its own push pushes first (one EXIT trap,
+  `arm_macos_push_on_exit`; a `kill -9` or host crash is left to the next run's push). In
   Container mode credentials are never passed to `container run` at all; they reach only the `container exec`
   that starts `augur claude` / `augur shell`, through `--env-file <(…)` written by the bash builtin `printf`
   (`session_credential_env`). `augur setup-token` and augur's own execs get none. In macOS VM mode
@@ -233,7 +234,7 @@ in time," this **prescribes** "what must never break." It changes rarely.
   guest without the drop-in gets no session and has an older augur's credential lines removed from
   `~/.augur-env` (also when a later step of that push fails, when a running VM's credentials
   fail to resolve, when its current boot has no passed self-test, when an egress helper serving it is
-  not verified, and when `up`'s reconcile exits before its self-test), and
+  not verified, and when a run against a running VM exits or is interrupted before its push), and
   `tests/51_macos_egress_mode_unit.sh` that a running VM refused for its egress mode or a missing
   admin password gets that push too. With the `ssh` shim playing a
   guest sshd that drops a sent variable, it also
