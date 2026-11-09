@@ -62,6 +62,30 @@ non-zero. If a restore fails, the summary prints the command to finish it
 (`AUGUR_TEST_LIVE=1 AUGUR_E2E_RESTORE=1 bash tests/e2e_macos_session_credentials.sh` puts the
 drop-in back).
 
+`tests/e2e_macos_managed_settings.sh` is not an `NN_*` tier either: it is the LOCAL, on-a-Mac check
+of the managed Claude Code policy in the macOS base VM (`make e2e-managed-settings`), and covers
+what test 57 can only emulate: macOS's own `/bin/sh`, `ls -le` ACL lines, `chmod -N`, `mv` of a
+symlink, `cmp -s -`, `base64 --decode` and `mktemp -d` as root through the real
+`macos_run_root_script`; the stock `/Library/Application Support` against the install script's own
+parent check; the real install script swapping a sandbox directory under `/var/root`; and the
+policy the base VM holds (root:wheel 755 / 644, no ACL, one link, the bytes the host renders, no
+staging or quarantine file left, the real `verify_macos_managed_settings`). It works on a throwaway
+clone of the base VM (`augur-e2e-policy`, booted on NAT and deleted at the end); the base VM must be
+stopped, and no project VM is touched.
+
+```bash
+AUGUR_TEST_LIVE=1 bash tests/e2e_macos_managed_settings.sh            # ~3–6 min
+AUGUR_TEST_LIVE=1 bash tests/e2e_macos_managed_settings.sh --update   # +10–30 min
+AUGUR_TEST_LIVE=1 bash tests/e2e_macos_managed_settings.sh --hook     # +35–90 min
+```
+
+`--update` runs `augur update --macos` first. `--hook` moves `~/.augur/provision/` and its approval
+record aside, runs an update whose hook adds a file beside the policy (it must succeed and keep the
+file) and one whose hook overwrites the policy (it must fail and save nothing), puts your own
+provisioning back, and ends with a clean update that discards the test file; your own provisioning
+must already be approved. An EXIT trap deletes the clone and puts `~/.augur/provision/` back; after
+an interrupted run, `--restore` does that.
+
 ## How the offline construction test works
 
 `11_construct_container.sh` puts `tests/shims/` first on `PATH`, so augur calls our fake
