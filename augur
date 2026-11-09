@@ -6133,18 +6133,89 @@ cmd_update_macos() {
         # The agent via its official installer (see cmd_build_macos for why npm is avoided).
         # The VM has no virtiofs mounts here, so ~/.claude is local and writable.
         # Download to a temp file before executing — avoids piping untrusted content to a shell.
-        # No "timeout" binary on stock macOS: background the command, race it against a
-        # backgrounded sleep+kill, and wait on the real PID for its actual exit status — a
-        # stalled network call (curl gives no output at all while blocked) cannot hang this
-        # step forever.
-        _with_timeout() {
-            local _secs="$1"; shift
-            "$@" & local _cpid=$!
-            ( sleep "$_secs"; pkill -TERM -P "$_cpid" 2>/dev/null; kill -TERM "$_cpid" 2>/dev/null ) & local _wpid=$!
-            wait "$_cpid" 2>/dev/null; local _rc=$?
-            kill "$_wpid" 2>/dev/null; wait "$_wpid" 2>/dev/null
-            return $_rc
+        # _with_timeout SECS CMD...: no "timeout" binary on stock macOS, so a stalled network call
+        # (curl gives no output at all while blocked) cannot hang a step forever. It returns the
+        # status of CMD, or 124 if the time ran out.
+        # It runs in /bin/bash, not in this zsh: job control (set -m) is what puts CMD and the
+        # watchdog each in a process group of their own, and bash allows it without a terminal
+        # (this ssh session has none).
+        # Each group is ended once its part is over: the group of CMD at the timeout, when CMD is
+        # done, and when this helper is stopped by a signal (end_group: TERM, then KILL once still
+        # alive after the grace); the group of the watchdog with KILL straight away, as it has
+        # nothing to clean up and a TERM can arrive before its subshell is ready to die of it.
+        # That KILL is sent again while the group still has a member (kill_watchdog): on macOS a
+        # group kill that lands while the subshell forks its sleep can miss the new sleep.
+        # So nothing CMD or the watchdog started keeps the stdout/stderr of this ssh session,
+        # and with it the session and augur, waiting. The group id cannot be taken by anything
+        # else while a member is alive.
+        # A signal to this helper is only recorded until both pids are known (armed), and acted
+        # on then: a signal between a fork and its pid assignment still ends that group.
+        # Accepted trade-off: a descendant that moves to a group or session of its own (setsid)
+        # escapes the group kill.
+        # Accepted trade-off: 124 is also what a step that itself exits 124 returns, and a step
+        # that finishes just as the time runs out may get it; the callers only test for failure.
+        # Accepted trade-off: ending a group after its leader (CMD, or the watchdog subshell) is
+        # reaped can name a group that has no member left; reaching an unrelated process needs its
+        # id to be reused in that moment.
+        _with_timeout_sh=$(cat <<"EOF"
+        secs=$1; shift
+        cpid=; wpid=; sig=; armed=
+        # end_group PGID GRACE: TERM to the group, then KILL if it is still alive GRACE s later.
+        end_group() {
+            kill -TERM -- "-$1" || return 0
+            n=0
+            while [ "$n" -lt "$(($2 * 10))" ] && kill -0 -- "-$1"; do sleep 0.1; n=$((n + 1)); done
+            kill -KILL -- "-$1"
+            return 0
         }
+        # kill_watchdog: KILL the group of the watchdog, reap its subshell, then KILL the group
+        # again until no member is left (for at most 2 s).
+        kill_watchdog() {
+            kill -KILL -- "-$wpid"; wait "$wpid"
+            n=0
+            while [ "$n" -lt 40 ] && kill -KILL -- "-$wpid"; do sleep 0.05; n=$((n + 1)); done
+            return 0
+        }
+        stop_if_signalled() {
+            [ -n "$sig" ] || return 0
+            [ -z "$wpid" ] || kill_watchdog
+            [ -z "$cpid" ] || end_group "$cpid" 2
+            exit "$sig"
+        }
+        on_signal() { sig=$1; [ -z "$armed" ] || stop_if_signalled; }
+        on_exit() { rm -rf "$mark"; }
+        mark=
+        trap on_exit EXIT
+        trap "on_signal 130" INT
+        trap "on_signal 143" TERM
+        trap "on_signal 129" HUP
+        # Accepted trade-off: the timeout is recorded as a file in a temp dir, so the helper
+        # needs one it can create. Where is up to mktemp: on macOS, the per-user temp dir whatever
+        # TMPDIR says.
+        mark=$(mktemp -d 2>/dev/null) || { echo "augur: ERROR could not create a temp dir for the timeout" >&2; exit 1; }
+        # The shell keeps the caller stderr on fd 3 for CMD alone, so no job notice or kill error of
+        # its own reaches the caller.
+        exec 3>&2 2>/dev/null
+        set -m
+        "$@" </dev/null 2>&3 3>&- & cpid=$!
+        ( sleep "$secs"; : > "$mark/fired"; end_group "$cpid" 10 ) </dev/null >/dev/null 3>&- & wpid=$!
+        set +m
+        armed=1
+        stop_if_signalled
+        wait "$cpid"; rc=$?
+        if [ -e "$mark/fired" ]; then
+            wait "$wpid"; rc=124
+        else
+            kill_watchdog
+            # Accepted trade-off: anything CMD left running in its group (a helper, a daemon) is
+            # ended with the step, without changing its status; no caller starts anything that
+            # has to outlive its step.
+            end_group "$cpid" 2
+        fi
+        exit "$rc"
+EOF
+)
+        _with_timeout() { /bin/bash -c "$_with_timeout_sh" _with_timeout "$@"; }
         _installer=$(mktemp)
         curl -fsSL --connect-timeout 10 --max-time 120 "$_agent_url" -o "$_installer" \
             || { echo "augur: ERROR failed to download the $_agent_name installer (timed out or unreachable)" >&2; rm -f "$_installer"; exit 1; }
