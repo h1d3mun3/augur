@@ -31,11 +31,29 @@ if ! grep -q '^EOF$' "$snippet" || ! tail -n1 "$snippet" | grep -q '_with_timeou
 fi
 [[ -x /bin/bash ]] || { skip "_with_timeout" "no /bin/bash on this host"; finish; exit; }
 
-# Milliseconds since some fixed point; whole seconds where bash has no EPOCHREALTIME (bash 3.2).
-now_ms() {
-  if [[ -n "${EPOCHREALTIME:-}" ]]; then local t="${EPOCHREALTIME/[.,]/}"; echo "${t:0:${#t}-3}"
-  else echo $(( SECONDS * 1000 )); fi
-}
+# Stand-in mktemp commands, put first on PATH to steer where the helper's temp dir goes.
+# TMPDIR cannot do it: macOS's mktemp puts `mktemp -d` in the per-user temp dir whatever TMPDIR
+# says. failbin/mktemp cannot create anything; tmpbin/mktemp creates the dir in $WORK/tmp.
+real_mktemp="$(command -v mktemp)"
+mkdir -p "$WORK/failbin" "$WORK/tmpbin" "$WORK/tmp"
+printf '#!/bin/sh\nexit 1\n' > "$WORK/failbin/mktemp"
+printf '#!/bin/sh\nexec "%s" -d "%s/tmp/wt.XXXXXX"\n' "$real_mktemp" "$WORK" > "$WORK/tmpbin/mktemp"
+chmod +x "$WORK/failbin/mktemp" "$WORK/tmpbin/mktemp"
+
+# Milliseconds since some fixed point. bash 3.2 has no EPOCHREALTIME, and its SECONDS only
+# counts whole seconds, too coarse for the sub-second checks below, so it borrows a clock from
+# perl or zsh (zsh is always there on macOS). SECONDS is the last resort, with one tick of slack.
+tick_ms=0
+if [[ -n "${EPOCHREALTIME:-}" ]]; then
+  now_ms() { local t="${EPOCHREALTIME/[.,]/}"; echo "${t:0:${#t}-3}"; }
+elif perl -MTime::HiRes -e 1 2>/dev/null; then
+  now_ms() { perl -MTime::HiRes=time -e 'printf "%d\n", time() * 1000'; }
+elif zsh -fc 'zmodload zsh/datetime' 2>/dev/null; then
+  now_ms() { zsh -fc 'zmodload zsh/datetime; printf "%.0f\n" $(( EPOCHREALTIME * 1000 ))'; }
+else
+  now_ms() { echo $(( SECONDS * 1000 )); }; tick_ms=1000
+  echo "  NOTE: no sub-second clock here; timings are in whole seconds, with one second of slack."
+fi
 leftover() { pgrep -f "$LEFT" >/dev/null; }
 
 # timed CAP ARGS... — run `_with_timeout ARGS...` with its stdout piped to a reader. Sets
@@ -133,12 +151,12 @@ for sh in "${shells[@]}"; do
   eq 3 "$rc" "$sh: a command leaving a child: its status is kept"
   eq "" "$err" "$sh: a command leaving a child: no job notice on stderr"
   # Under 1 s: the end of the group checks it again within moments, not a second later.
-  (( dt < 1000 )) && ok "$sh: a child left running does not hold the reader (${dt} ms)" \
+  (( dt < 1000 + tick_ms )) && ok "$sh: a child left running does not hold the reader (${dt} ms)" \
     || fail "$sh: a child left running held the reader for ${dt} ms"
   no_leftover "$sh: the child it left running is ended"
 
   # (g) The temp dir for the timeout cannot be created: a message of its own, and status 1.
-  TMPDIR="$WORK/no-such-dir" timed 10 "$WATCH_SECS" echo never
+  PATH="$WORK/failbin:$PATH" timed 10 "$WATCH_SECS" echo never
   eq 1 "$rc" "$sh: no temp dir: the helper returns 1"
   eq "" "$out" "$sh: no temp dir: the command never runs"
   eq "augur: ERROR could not create a temp dir for the timeout" "$err" "$sh: no temp dir: says so on stderr"
@@ -150,12 +168,11 @@ done
 # is known (the wrapper only passes its arguments to /bin/bash).
 section "/bin/bash: the helper stopped by a signal"
 source "$snippet"
-mkdir -p "$WORK/tmp"
 for sig in TERM INT HUP; do
   # Started as a job of its own (set -m): a plain background job would have INT ignored, as
   # this script has no job control, and the guest runs the body in the foreground.
   set -m
-  TMPDIR="$WORK/tmp" /bin/bash -c "$_with_timeout_sh" _with_timeout "$WATCH_SECS" bash -c "sleep $CHILD_SECS; :" \
+  PATH="$WORK/tmpbin:$PATH" /bin/bash -c "$_with_timeout_sh" _with_timeout "$WATCH_SECS" bash -c "sleep $CHILD_SECS; :" \
     </dev/null >/dev/null 2>"$WORK/err" &
   body=$!
   set +m
@@ -183,11 +200,11 @@ done
 # and its pid assignment cannot be hit on purpose; this checks the same deferral.)
 section "/bin/bash: a signal before the pids are known"
 mkdir -p "$WORK/fakebin"
-printf '#!/bin/sh\nwhile [ ! -s "%s" ]; do sleep 0.05; done\nkill -TERM "$(cat "%s")"\nexec "%s" "$@"\n' \
-  "$WORK/body.pid" "$WORK/body.pid" "$(command -v mktemp)" > "$WORK/fakebin/mktemp"
+printf '#!/bin/sh\nwhile [ ! -s "%s" ]; do sleep 0.05; done\nkill -TERM "$(cat "%s")"\nexec "%s"\n' \
+  "$WORK/body.pid" "$WORK/body.pid" "$WORK/tmpbin/mktemp" > "$WORK/fakebin/mktemp"
 chmod +x "$WORK/fakebin/mktemp"
 set -m
-PATH="$WORK/fakebin:$PATH" TMPDIR="$WORK/tmp" /bin/bash -c "$_with_timeout_sh" _with_timeout "$WATCH_SECS" \
+PATH="$WORK/fakebin:$PATH" /bin/bash -c "$_with_timeout_sh" _with_timeout "$WATCH_SECS" \
   bash -c "sleep $CHILD_SECS; :" </dev/null >/dev/null 2>"$WORK/err" &
 body=$!; echo "$body" > "$WORK/body.pid"
 set +m
