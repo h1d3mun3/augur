@@ -324,6 +324,10 @@ run_cmd() {   # run_cmd claude|shell|up — sets $out / $rc; truncates the per-r
     # The session ssh's argv joins the whole-file argv log, for the no-value-on-argv check.
     awk '/^ARGV$/{a=1; next} /^ENV$/{a=0} a' "$SESSLOG" >> "$ALL_SSH"
 }
+# kill_self <signal>: send <signal> to the shell running the code under test (run_cmd's subshell).
+# Not $BASHPID: bash 3.2, macOS's /bin/bash, has none, so that kill would signal nothing. The
+# exec'd sh's parent is the calling shell itself, since a function call does not fork.
+kill_self() { kill -"$1" "$(exec sh -c 'echo "$PPID"')"; }
 pushes()     { grep -c 'cat > .*\.augur-env' "$SSHLOG"; }
 ssh_calls()  { grep -vc '^scp ' "$SSHLOG"; }            # guest connections other than the session
 gh_calls()   { wc -l < "$GHCALLS" | tr -d ' '; }
@@ -1434,7 +1438,7 @@ eq "0" "$(pushes)" "up --macos on a running VM, the self-test fails and stops th
 # An exit or a Ctrl-C (INT, TERM) during the self-test, on a VM still running, pushes once.
 for _how in exit INT TERM; do
     if [[ "$_how" == exit ]]; then verify_macos_egress_locked() { exit 1; }
-    else eval "verify_macos_egress_locked() { kill -$_how \$BASHPID; sleep 1; }"; fi
+    else eval "verify_macos_egress_locked() { kill_self $_how; sleep 1; }"; fi
     old_env; run_cmd up
     _l="up --macos on a running VM, $_how during the self-test"
     nonzero "$_l"
@@ -1444,19 +1448,21 @@ for _how in exit INT TERM; do
 done
 # …and between the self-test and the push (the credential resolution).
 eval "verify_macos_egress_locked() { printf '%s\n' verify_macos_egress_locked >> \"\$STEPS\"; }"
-macos_record_egress_verified() { kill -INT "$BASHPID"; sleep 1; }
+macos_record_egress_verified() { kill_self INT; sleep 1; }
 old_env; run_cmd up
 no_cred_push "up --macos on a running VM, Ctrl-C after the self-test"
+eq "130" "$rc" "up --macos on a running VM, Ctrl-C after the self-test: exits 130"
 unset -f macos_record_egress_verified; eval "$(sed -n '/^macos_record_egress_verified() {$/,/^}$/p' "$AUGUR")"
 # A session's clock and timezone fixes run before its push: an exit or a Ctrl-C there pushes once.
 for _step in sync_macos_guest_clock sync_macos_guest_timezone; do
     for _how in exit INT; do
-        if [[ "$_how" == exit ]]; then eval "${_step}() { exit 1; }"; else eval "${_step}() { kill -INT \$BASHPID; sleep 1; }"; fi
+        if [[ "$_how" == exit ]]; then eval "${_step}() { exit 1; }"; else eval "${_step}() { kill_self INT; sleep 1; }"; fi
         for _cmd in claude shell; do
             old_env; run_cmd "$_cmd"
             _l="$_cmd --macos on a running VM, $_how during $_step"
             nonzero "$_l"
             no_cred_push "$_l"
+            [[ "$_how" == INT ]] && eq "130" "$rc" "$_l: exits 130"
         done
     done
     eval "${_step}() { printf '%s\n' ${_step} >> \"\$STEPS\"; }"
