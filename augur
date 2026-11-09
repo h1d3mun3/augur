@@ -4394,11 +4394,12 @@ macos_managed_settings_vars_sh() {
 #     entries on the lines after the entry's own (`ls -l` alone shows `@` instead of `+` when there
 #     are also extended attributes). An `ls -le` that fails or prints nothing is refused, never
 #     guessed around.
-#   deny_only LS-LDEN-OUTPUT: every ACL line after the first (` 0: group:everyone deny delete`,
-#     with `inherited` before `deny` when inherited) is a deny entry that does not deny reading
+#   deny_only LS-LDEN-OUTPUT: every ACL line after the first (` 0: <who> deny delete`, with
+#     `inherited` before `deny` when inherited) is a deny entry that does not deny reading
 #     (read, search, list, readattr, readextattr or readsecurity), which would keep the non-root
-#     agent from reading the policy. An allow entry, such a deny entry, or a line of any other
-#     shape, fails.
+#     agent from reading the policy. <who> is a UUID, as `-n` makes macOS print every principal
+#     (group:everyone shows as ABCDEFAB-CDEF-ABCD-EFAB-CDEF0000000C), or a `type:name` such as
+#     group:everyone. An allow entry, such a deny entry, or a line of any other shape, fails.
 #   policy_file_ok PATH: ls_ok as a root:wheel 644 regular file with no ACL, one hard link (no other
 #     name can change it), and holding exactly the bytes in $b64.
 # Absolute tool paths, because the guest's PATH starts at ~/.local/bin. Deliberately
@@ -4416,7 +4417,11 @@ deny_only() {
             set -- $a
             case "$1" in [0-9]*:) ;; *) exit 1 ;; esac
             case "${1%:}" in *[!0-9]*) exit 1 ;; esac
-            case "$2" in ?*:?*) ;; *) exit 1 ;; esac
+            case "$2" in
+                ?*:?*) ;;
+                ????????-????-????-????-????????????) case "$2" in *[!0-9A-Fa-f-]*) exit 1 ;; esac ;;
+                *) exit 1 ;;
+            esac
             if [ "$3" = inherited ]; then kind="$4"; perms="$5"; else kind="$3"; perms="$4"; fi
             [ "$kind" = deny ] && [ -n "$perms" ] || exit 1
             case ",$perms," in

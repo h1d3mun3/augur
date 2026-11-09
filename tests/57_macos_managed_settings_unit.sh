@@ -25,7 +25,8 @@
 #   • the old one is moved into a 700 quarantine under /var/root, which is then removed; nothing
 #     the guest printed is shown on success;
 #   • the parent (/Library/Application Support) must be a real directory owned by root and not
-#     writable by group or others, with no ACL or one of deny entries only (an allow entry or an
+#     writable by group or others, with no ACL or one of deny entries only, whether `ls -lden`
+#     names the principal by UUID (as macOS does) or type:name (an allow entry or an
 #     unparsable line is refused; the fresh directory gets no ACL at all); otherwise nothing is
 #     created or moved;
 #   • ANY failure (a failing generator, no stored password or SSH transport, a wrong password, a
@@ -363,6 +364,29 @@ out="$( set -e; macos_ssh_host() { :; }; verify_macos_managed_settings testvm 2>
 has "$out" "Could not check the base VM's managed" "re-check with no SSH transport: says the check could not run"
 hasnt "$out" "no longer holds" "re-check with no SSH transport: does not claim the policy differs"
 
+section "Tier 1 — deny_only on real macOS 27 ls -lden output"
+# Recorded verbatim on a macOS 27 guest: with -n, every ACL principal prints as a UUID
+# (group:everyone is ABCDEFAB-CDEF-ABCD-EFAB-CDEF0000000C). Run through POSIX sh, as the guest does
+# (on a Mac, /bin/sh is the bash 3.2 the guest has).
+REAL_DENY='-rw-r--r--+ 1 0  0  0 Nov  9 06:44 /var/root/augur-e2e-swap/acl-deny
+ 0: ABCDEFAB-CDEF-ABCD-EFAB-CDEF0000000C deny delete'
+REAL_INHERITED='drwx------+ 2 0  0  64 Nov  9 06:44 /var/root/augur-e2e-swap/inherit/.augur-policy.1xjdm8
+ 0: ABCDEFAB-CDEF-ABCD-EFAB-CDEF0000000C inherited deny delete,file_inherit,directory_inherit'
+deny_only_rc() {   # deny_only_rc LS-LDEN-OUTPUT — deny_only's status under /bin/sh
+    /bin/sh -c "$(macos_policy_checks_sh)"'
+deny_only "$1"' sh "$1" >/dev/null 2>&1; echo $?
+}
+eq "0" "$(deny_only_rc "$REAL_DENY")" "real deny entry with a UUID principal: accepted"
+eq "0" "$(deny_only_rc "$REAL_INHERITED")" "real inherited deny entry with file_inherit,directory_inherit: accepted"
+eq "0" "$(deny_only_rc "${REAL_DENY/ABCDEFAB-CDEF-ABCD-EFAB-CDEF0000000C/group:everyone}")" "the same entry with a type:name principal: accepted"
+eq "1" "$(deny_only_rc "${REAL_DENY/deny delete/allow delete}")" "real line made an allow entry: refused"
+eq "1" "$(deny_only_rc "${REAL_INHERITED/inherited deny/inherited allow}")" "real inherited line made an allow entry: refused"
+eq "1" "$(deny_only_rc "${REAL_DENY/deny delete/deny delete,readsecurity}")" "real line that also denies readsecurity: refused"
+eq "1" "$(deny_only_rc "${REAL_INHERITED/delete,file_inherit/delete,list,file_inherit}")" "real inherited line that also denies list: refused"
+eq "1" "$(deny_only_rc "${REAL_DENY/CDEF0000000C/CDEF0000000Z}")" "a principal that is UUID-shaped but not hex: refused"
+eq "1" "$(deny_only_rc "${REAL_DENY/ABCDEFAB-CDEF-ABCD-EFAB-CDEF0000000C/everyone}")" "a principal that is neither a UUID nor type:name: refused"
+eq "1" "$(deny_only_rc "${REAL_DENY/ 0: / 0:}")" "a real line with its fields run together: refused"
+
 if (( ! CAN_RUN )); then
     skip "the root script, run as the guest" "no unprivileged user+mount namespaces with overlayfs here"
     finish; exit $?
@@ -503,6 +527,14 @@ acl_parent ' 0: group:everyone inherited deny delete,readattr'
 base_refused "parent with an inherited deny entry that includes readattr"
 acl_parent ' x: group:everyone deny delete'
 base_refused "parent with an ACL line without an index"
+acl_parent "$(sed -n 2p <<< "$REAL_DENY")"
+eq "0" "$rc" "parent with macOS 27's real deny entry (UUID principal): accepted"
+acl_parent "$(sed -n 2p <<< "$REAL_INHERITED")"
+eq "0" "$rc" "parent with macOS 27's real inherited deny entry: accepted"
+acl_parent ' 0: ABCDEFAB-CDEF-ABCD-EFAB-CDEF0000000C allow add_file'
+base_refused "parent with an allow entry for a UUID principal"
+acl_parent ' 0: ABCDEFAB-CDEF-ABCD-EFAB-CDEF0000000C inherited deny delete,readextattr,file_inherit,directory_inherit'
+base_refused "parent with an inherited deny entry for a UUID principal that includes readextattr"
 LS_ACL_PATH="$BASE/.augur-policy.*"; LS_ACL_LINES=' 0: group:everyone deny delete'; old_policy; install_with "$REAL_PAYLOAD"; LS_ACL_PATH=""; LS_ACL_LINES=""
 check_untouched "fresh directory with even a deny-only ACL"
 has "$out" "| the new policy is not root:wheel without an ACL" "fresh directory with even a deny-only ACL: refused (no ACL allowed there)"
@@ -598,6 +630,10 @@ installed; LS_ACL_PATH="$DSTDIR"; LS_ACL_LINES=' 0: group:staff allow add_file';
 verify_fails "directory with an allow ACL entry" "without an ACL that allows anything"
 installed; LS_ACL_PATH="$DSTDIR"; LS_ACL_LINES=' 0: group:everyone deny delete'; verify_now; LS_ACL_PATH=""; LS_ACL_LINES=""
 eq "0" "$rc" "directory with a deny-only ACL: passes"
+installed; LS_ACL_PATH="$DSTDIR"; LS_ACL_LINES="$(sed -n 2p <<< "$REAL_INHERITED")"; verify_now; LS_ACL_PATH=""; LS_ACL_LINES=""
+eq "0" "$rc" "directory with macOS 27's real inherited deny entry (UUID principal): passes"
+installed; LS_ACL_PATH="$DSTDIR"; LS_ACL_LINES=' 0: ABCDEFAB-CDEF-ABCD-EFAB-CDEF0000000C allow add_file'; verify_now; LS_ACL_PATH=""; LS_ACL_LINES=""
+verify_fails "directory with an allow entry for a UUID principal" "without an ACL that allows anything"
 installed; LS_ACL_PATH="$DSTDIR"; LS_ACL_LINES=' 0: group:everyone deny list,search'; verify_now; LS_ACL_PATH=""; LS_ACL_LINES=""
 verify_fails "directory with a deny entry for list,search" "or denies reading"
 installed; LS_ACL_PATH="$DST"; LS_ACL_LINES=' 0: group:everyone deny delete'; verify_now; LS_ACL_PATH=""; LS_ACL_LINES=""

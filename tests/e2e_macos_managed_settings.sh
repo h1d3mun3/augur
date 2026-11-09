@@ -384,7 +384,7 @@ f="$S/acl-deny"; : > "$f"
 /bin/chmod +a "group:everyone deny delete" "$f"; r "chmod +a adds a deny entry" $?
 out="$(/bin/ls -lden "$f")"; echo "R ls -lden, deny entry: $(printf '%s' "$out" | /usr/bin/tr '\n' '|')"
 [ "$(nlines "$out")" = 2 ]; r "ls -lden prints the entry on a line of its own" $?
-line2 "$out" | /usr/bin/grep -Eq '^ 0: [^ ]+:[^ ]+ deny delete$'; r "the ACL line reads ' 0: <who> deny delete'" $?
+line2 "$out" | /usr/bin/grep -Eq '^ 0: [^ ]+ deny delete$'; r "the ACL line reads ' 0: <who> deny delete'" $?
 m="$(/bin/ls -ldn "$f")"; m="${m%% *}"; [ "${m%+}" != "$m" ]; r "the mode string ends in + with an ACL" $?
 deny_only "$out"; r "deny_only accepts a deny-delete ACL" $?
 no "ls_ok refuses a file with an ACL when deny entries are not allowed" "$(ls_ok "$f" -f '0:*' '-rw-r--r--' >/dev/null 2>&1; echo $?)"
@@ -396,7 +396,7 @@ d="$S/inherit"; /bin/mkdir -m 755 "$d"
 /bin/chmod +a "group:everyone deny delete,file_inherit,directory_inherit" "$d"; r "chmod +a adds an inheritable deny entry" $?
 c="$(/usr/bin/mktemp -d "$d/.augur-policy.XXXXXX")"
 out="$(/bin/ls -lden "$c")"; echo "R ls -lden, inherited entry: $(printf '%s' "$out" | /usr/bin/tr '\n' '|')"
-line2 "$out" | /usr/bin/grep -Eq '^ 0: [^ ]+:[^ ]+ inherited deny '; r "mktemp -d inherits it, shown as ' 0: <who> inherited deny …'" $?
+line2 "$out" | /usr/bin/grep -Eq '^ 0: [^ ]+ inherited deny '; r "mktemp -d inherits it, shown as ' 0: <who> inherited deny …'" $?
 deny_only "$out"; r "deny_only accepts the inherited deny entry" $?
 /bin/chmod -N "$c"; r "chmod -N runs" $?
 [ "$(nlines "$(/bin/ls -lden "$c")")" = 1 ]; r "chmod -N strips the inherited ACL (ls -lden prints one line)" $?
