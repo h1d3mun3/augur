@@ -229,8 +229,9 @@ else
     success "Added PATH entry to $SHELL_CONFIG"
 fi
 
-# Tab completion (subcommands, options, and the container/VM names `augur destroy` takes). The
-# script matches the login shell; the hook is skipped if it is already there, so re-running
+# Tab completion for augur and augur-vm (subcommands, options, the container/VM names
+# `augur destroy` takes, and the VM names augur-vm's per-VM commands take). One script per shell
+# covers both commands and matches the login shell; the hook is skipped if it is already there, so re-running
 # install never duplicates it.
 if [[ -n "$SHELL_CONFIG" && -d "$INSTALL_DIR/completions" ]]; then
     comp_ext="$login_shell"
