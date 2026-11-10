@@ -35,22 +35,6 @@ fi
 # No `set -e`: a failed assertion records and continues so one script reports every check.
 set -uo pipefail
 
-# git_exec_path_without_keychain DIR — make DIR a git exec path (for GIT_EXEC_PATH) that holds only
-# a stand-in for git-credential-osxkeychain, and print DIR. macOS's Apple git names that helper in a
-# gitconfig of its own (in the Command Line Tools) that pointing GIT_CONFIG_SYSTEM elsewhere does
-# not replace, so a test that runs `git credential approve` under a sandboxed $HOME otherwise
-# reaches the real helper: it asks the login keychain to store the credential, finds no keychain
-# under that $HOME, and macOS shows a "Keychain Not Found" dialog whose "Reset To Defaults" resets
-# the operator's real login keychain. git looks a helper up in its exec path before PATH, so a PATH
-# shim cannot stand in for it. The stand-in reads the request, appends its action to DIR/calls, and
-# succeeds. Only for tests that run git builtins: other git-* programs are not in DIR.
-git_exec_path_without_keychain() {
-  mkdir -p "$1"
-  printf '#!/bin/sh\necho "$1" >> "%s/calls"\ncat > /dev/null\n' "$1" > "$1/git-credential-osxkeychain"
-  chmod +x "$1/git-credential-osxkeychain"
-  printf '%s\n' "$1"
-}
-
 _T_PASS=0; _T_FAIL=0; _T_SKIP=0
 if [[ -t 1 ]]; then _G=$'\e[32m'; _R=$'\e[31m'; _Y=$'\e[33m'; _B=$'\e[1m'; _0=$'\e[0m'
 else _G=''; _R=''; _Y=''; _B=''; _0=''; fi

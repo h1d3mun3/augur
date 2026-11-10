@@ -30,6 +30,10 @@ AUGUR="$REPO/augur"
 
 TMPD="$(mktemp -d)"
 trap 'rm -rf "$TMPD"' EXIT
+# Every git call runs from a directory of this test's own, never from the caller's checkout: a
+# worktree whose .git file points at a path missing on this machine (a synced copy) makes git die
+# with "not a git repository" before it does anything.
+cd "$TMPD"
 
 # BOOT-PROOFING (the technique tests/30_macos_vm.sh and tests/34_up_reconcile.sh use): point
 # AUGUR_VM_BIN at a path that cannot exist BEFORE sourcing, so the resolved $VM_CLI can never be a
@@ -49,9 +53,6 @@ AUGUR_DIR="$TMPD/augur"
 export GIT_CONFIG_NOSYSTEM=1
 unset GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GH_TOKEN
 unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN
-# Apple git's own osxkeychain helper is never run (see git_exec_path_without_keychain); every
-# `env -i` below passes GIT_EXEC_PATH on.
-export GIT_EXEC_PATH="$(git_exec_path_without_keychain "$TMPD/git-exec")"
 
 # The exact helper augur means to install. Pinned as a literal on purpose: it is the contract with
 # the guest (`$GH_TOKEN` stays a REFERENCE), and a silent edit to the helper body should have to be
@@ -96,8 +97,16 @@ wire() {   # wire <host gh token> — sets $out / $rc / SESSION_ENV / SESSION_PR
 FAKE="$TMPD/fake-helper"; FAKELOG="$TMPD/fake-helper.log"
 printf '#!/bin/sh\necho "$1" >> "%s"\ncat > /dev/null\n' "$FAKELOG" > "$FAKE"
 chmod +x "$FAKE"
-SYSCONF="$TMPD/system-gitconfig"       # the role Apple git's system gitconfig plays on macOS
-printf '[credential]\n\thelper = %s\n' "$FAKE" > "$SYSCONF"
+# The role Apple git's system gitconfig plays on macOS. It opens with an empty helper value, which
+# resets git's helper list: Apple git also reads a gitconfig of its own (Xcode's or the Command Line
+# Tools' usr/share/git-core/gitconfig; `git config --show-scope` calls it "unknown") that names
+# osxkeychain. git reads it before this file, and GIT_CONFIG_SYSTEM does not replace it. Without the
+# reset every `git credential approve` here would ask the operator's real login keychain to store a
+# credential, and under the sandboxed $HOME macOS shows a "Keychain Not Found" dialog whose "Reset
+# To Defaults" resets that keychain. The guard after mk_guest control checks the reset holds before
+# any credential call.
+SYSCONF="$TMPD/system-gitconfig"
+printf '[credential]\n\thelper =\n\thelper = %s\n' "$FAKE" > "$SYSCONF"
 fake_calls() { tr '\n' ' ' < "$FAKELOG" 2>/dev/null; }
 
 # mk_guest <name> — a fresh guest home whose every config layer names the fake helper, and a
@@ -134,10 +143,10 @@ EOF
 # starts (SESSION_ENV). sshd's shell sources ~/.zshenv (and through it augur's ~/.augur-env), runs
 # the session's remote command, whose exports (SESSION_PREFIX) come first, and the login zsh that
 # command starts sources ~/.zshenv again. (bash stands in for zsh: these are plain `export
-# NAME='value'` lines.) The system config is the fake-helper file; GIT_TERMINAL_PROMPT=0 turns a
+# NAME='value'` lines.) The system config is SYSCONF; GIT_TERMINAL_PROMPT=0 turns a
 # would-be prompt into a failure.
 guest_sh() {
-    env -i PATH="$PATH" GIT_EXEC_PATH="$GIT_EXEC_PATH" HOME="$GUEST_HOME" GIT_CONFIG_SYSTEM="$SYSCONF" GIT_TERMINAL_PROMPT=0 \
+    env -i PATH="$PATH" HOME="$GUEST_HOME" GIT_CONFIG_SYSTEM="$SYSCONF" GIT_TERMINAL_PROMPT=0 \
         ${SESSION_ENV[@]+"${SESSION_ENV[@]}"} bash -c 'source "$HOME/.zshenv" 2>/dev/null; eval "$3"; source "$HOME/.zshenv" 2>/dev/null; cd "$1" && eval "$2"' _ "$REPO_DIR" "$1" "$SESSION_PREFIX"
 }
 cred_fill()    { guest_sh "printf 'protocol=https\nhost=github.com\n\n' | git credential fill" 2>&1; }
@@ -174,9 +183,34 @@ section "Tier 1 — controls: the fixture really reaches the fake helper at ever
 
 mk_guest control
 : > "$GUEST_HOME/.zshenv"; : > "$GUEST_HOME/.augur-env"     # no augur env at all
+
+# effective_helpers [system file] — the plain credential.helper list git would run in the control
+# repository: every value after the last empty one (the reset). Reads config only; runs no helper.
+effective_helpers() {
+    env -i PATH="$PATH" HOME="$GUEST_HOME" GIT_CONFIG_SYSTEM="${1:-$SYSCONF}" bash -c \
+        'cd "$1" && git config --get-all credential.helper' _ "$REPO_DIR" 2>/dev/null \
+        | awk '$0 == "" { n = 0; next } { h[n++] = $0 } END { for (i = 0; i < n; i++) print h[i] }'
+}
+# The reader on real git: an osxkeychain named ahead of the fake helper stays in the list, and a
+# reset between them drops it.
+printf '[credential]\n\thelper = osxkeychain\n\thelper = %s\n' "$FAKE" > "$TMPD/sys-keychain"
+printf '[credential]\n\thelper = osxkeychain\n\thelper =\n\thelper = %s\n' "$FAKE" > "$TMPD/sys-keychain-reset"
+has   "$(effective_helpers "$TMPD/sys-keychain")"       "osxkeychain" "control: effective_helpers sees an osxkeychain git would run"
+hasnt "$(effective_helpers "$TMPD/sys-keychain-reset")" "osxkeychain" "control: effective_helpers drops one a later reset clears"
+# The guard every credential call below relies on: if git would still run osxkeychain (on a Mac,
+# Apple git's own gitconfig), stop before any call can reach the real keychain.
+_eff="$(effective_helpers)"
+if [[ "$_eff" == *osxkeychain* ]]; then
+    fail "git runs no osxkeychain helper under SYSCONF" "effective helpers: $(tr '\n' ' ' <<<"$_eff")"
+    echo "  stopping before any git credential call can reach the real keychain" >&2
+    finish; exit 1
+fi
+ok "git runs no osxkeychain helper under SYSCONF"
+eq "$FAKE" "$(head -n 1 <<<"$_eff")" "control: the first helper git runs is SYSCONF's own, after its reset"
+
 store_calls() {   # store_calls [dir] — how many times one approve reaches the fake helper
     : > "$FAKELOG"
-    env -i PATH="$PATH" GIT_EXEC_PATH="$GIT_EXEC_PATH" HOME="$GUEST_HOME" GIT_CONFIG_SYSTEM="$SYSCONF" bash -c \
+    env -i PATH="$PATH" HOME="$GUEST_HOME" GIT_CONFIG_SYSTEM="$SYSCONF" bash -c \
         "cd \"\$1\" && printf 'protocol=https\nhost=github.com\nusername=u\npassword=p\n\n' | git credential approve" _ "${1:-$REPO_DIR}" >/dev/null 2>&1
     wc -l < "$FAKELOG" | tr -d ' '
 }
@@ -186,17 +220,11 @@ eq "8" "$(store_calls)" "control: without augur, one store reaches the fake help
 for _f in "$SYSCONF" "$GUEST_HOME/.config/git/config" "$GUEST_HOME/.gitconfig-inc" \
           "$GUEST_HOME/.gitconfig-work" "$REPO_DIR/.git/config"; do
     cp "$_f" "$TMPD/layer.orig"
-    git config --file "$_f" --unset-all credential.helper
+    git config --file "$_f" --unset-all credential.helper .   # non-empty values: SYSCONF keeps its reset
     eq "7" "$(store_calls)" "control: ${_f#"$TMPD"/} contributes exactly one of them"
     cp "$TMPD/layer.orig" "$_f"
 done
 eq "6" "$(store_calls "$GUEST_HOME")" "control: outside the repository the includeIf and repo helpers drop out (the gitdir: match is real)"
-# The stand-in really takes osxkeychain's place: a store through that helper reaches it, here as on
-# a Mac whose git config names it.
-: > "$GIT_EXEC_PATH/calls"
-printf 'protocol=https\nhost=github.com\nusername=u\npassword=p\n\n' | env -i PATH="$PATH" GIT_EXEC_PATH="$GIT_EXEC_PATH" \
-    HOME="$TMPD/host-home" GIT_CONFIG_NOSYSTEM=1 git -c credential.helper=osxkeychain credential approve >/dev/null 2>&1
-has "$(cat "$GIT_EXEC_PATH/calls")" "store" "control: git runs the osxkeychain stand-in, never the real keychain helper"
 
 section "Tier 1 — macOS: the session exports the reset and the helper, and git obeys it"
 
@@ -303,10 +331,10 @@ hasnt "${_env[*]}" "$TOKEN" "container: the token is in no -e argument"
 _creds=()
 mk_guest container
 : > "$FAKELOG"
-cfill="$(cd "$REPO_DIR" && printf 'protocol=https\nhost=github.com\n\n' | env -i PATH="$PATH" GIT_EXEC_PATH="$GIT_EXEC_PATH" HOME="$GUEST_HOME" \
+cfill="$(cd "$REPO_DIR" && printf 'protocol=https\nhost=github.com\n\n' | env -i PATH="$PATH" HOME="$GUEST_HOME" \
     GIT_CONFIG_SYSTEM="$SYSCONF" GIT_TERMINAL_PROMPT=0 GH_TOKEN="$TOKEN" "${cenv[@]}" git credential fill 2>&1)"
 ( cd "$REPO_DIR" && printf 'protocol=https\nhost=github.com\nusername=x-access-token\npassword=%s\n\n' "$TOKEN" \
-    | env -i PATH="$PATH" GIT_EXEC_PATH="$GIT_EXEC_PATH" HOME="$GUEST_HOME" GIT_CONFIG_SYSTEM="$SYSCONF" "${cenv[@]}" git credential approve >/dev/null 2>&1 )
+    | env -i PATH="$PATH" HOME="$GUEST_HOME" GIT_CONFIG_SYSTEM="$SYSCONF" "${cenv[@]}" git credential approve >/dev/null 2>&1 )
 has "$cfill" "password=$TOKEN" "container: augur's helper answers get (password from \$GH_TOKEN)"
 eq "" "$(fake_calls)"          "container: the fake helper is called on neither get nor store, at any layer"
 
