@@ -27,7 +27,8 @@ AUGUR="$REPO/augur"
 
 TMPD="$(mktemp -d)"
 cleanup_pids=()
-trap 'for p in "${cleanup_pids[@]}"; do kill "$p" 2>/dev/null; done; rm -rf "$TMPD"' EXIT
+# The wait reaps each killed sleep, so bash 3.2 does not report it as "Terminated" on exit.
+trap 'for p in ${cleanup_pids[@]+"${cleanup_pids[@]}"}; do kill "$p" 2>/dev/null; wait "$p" 2>/dev/null; done; rm -rf "$TMPD"' EXIT
 # Boot-proofing (see tests/36): $VM_CLI can never resolve to a real augur-vm.
 export AUGUR_VM_BIN="$TMPD/no-such-augur-vm"
 
@@ -52,6 +53,9 @@ BIN="/Users/${MACOS_SSH_USER}/.local/bin/claude"
 LOG="$TMPD/calls"; : > "$LOG"
 logged() { grep -qx "$1" "$LOG" 2>/dev/null; }
 line_of() { grep -nx "$1" "$LOG" | head -n1 | cut -d: -f1; }
+# kill_self <signal>: send <signal> to the shell running the code under test (see kill_self in
+# tests/56_macos_session_credentials.sh for why not $BASHPID or a plain $(sh -c ...)).
+kill_self() { kill -"$1" "$(exec sh -c 'echo "$PPID"')"; }
 
 section "Tier 0 — the seam declares the signer and the install path"
 if [[ "$TEAM" =~ ^[A-Z0-9]{10}$ ]]; then ok "agent_macos_signing_team is a 10-character Apple Team ID ($TEAM)"
@@ -164,7 +168,11 @@ vm_cli_rec() {
     return 0
 }
 VM_CLI=vm_cli_rec
-reset_vms() { printf '%s\n' "$MACOS_BASE_VM" > "$VMS"; : > "$LOG"; RUNNING_VMS=""; CLONE_FAIL_TO=""; CLONE_PARTIAL=""; ON_DELETE_BASE=""; }
+# Every case starts with no host lock, so a lock one case leaks fails only that case's own check.
+reset_vms() {
+    printf '%s\n' "$MACOS_BASE_VM" > "$VMS"; : > "$LOG"; RUNNING_VMS=""; CLONE_FAIL_TO=""; CLONE_PARTIAL=""; ON_DELETE_BASE=""
+    rm -f "$(host_lock_path "$MACOS_BASE_WRITER_LOCK")" "$(host_lock_path "$MACOS_SETUP_TOKEN_LOCK")"
+}
 macos_vm_exists()  { grep -qx "$1" "$VMS" 2>/dev/null; }
 macos_vm_running() { [[ " $RUNNING_VMS " == *" $1 "* ]]; }
 require_vz() { :; }
@@ -358,7 +366,7 @@ macos_vm_exists "$MACOS_BASE_VM" && ok "failed staging clone: the base VM is unt
 [[ -L "$WLOCK" ]] && fail "failed staging clone: the lock is left behind" || ok "failed staging clone: the lock is released"
 
 section "Tier 1 — update --macos: the swap always leaves one copy"
-reset_vms; ON_DELETE_BASE='kill -INT "$(sh -c "echo \$PPID")"'
+reset_vms; ON_DELETE_BASE='kill_self INT'
 run_update
 eq 0 "$rc" "Ctrl-C between deleting the old base and saving the new one is ignored: the swap completes"
 macos_vm_exists "$MACOS_BASE_VM" && ok "…and the base VM exists" || fail "…and the base VM is gone" "$(cat "$LOG")"
@@ -505,7 +513,7 @@ torn_down "credential scrub failure"
 SCRUB_OK=1
 
 reset_vms
-sync_macos_guest_clock() { echo "clock $1" >> "$LOG"; kill -INT "$(sh -c 'echo $PPID')"; }
+sync_macos_guest_clock() { echo "clock $1" >> "$LOG"; kill_self INT; }
 run_st
 sync_macos_guest_clock() { echo "clock $1" >> "$LOG"; }
 eq 130 "$rc" "Ctrl-C: exits 130"

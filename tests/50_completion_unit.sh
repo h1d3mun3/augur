@@ -68,10 +68,12 @@ export PATH="$work/bin:$PATH"
 source "$REPO/completions/augur.bash"
 
 # complete WORD...  — the last word is the one under the cursor (pass '' for an empty word).
+# The reply is expanded as ${COMPREPLY[@]+...}: under set -u, bash 3.2 (macOS's /bin/bash) treats an
+# empty array as unbound, and expanding it would exit the shell.
 complete_words() {
   COMP_WORDS=("$@"); COMP_CWORD=$(( $# - 1 )); COMPREPLY=()
   _augur
-  printf '%s\n' "${COMPREPLY[@]}"
+  printf '%s\n' ${COMPREPLY[@]+"${COMPREPLY[@]}"}
 }
 
 eq $'down\ndestroy' "$(complete_words augur d)" "subcommand: 'd' completes down/destroy"
@@ -98,7 +100,7 @@ chmod +x "$work/bin/augur-vm"
 complete_vm() {
   COMP_WORDS=("$@"); COMP_CWORD=$(( $# - 1 )); COMPREPLY=()
   _augur_vm
-  printf '%s\n' "${COMPREPLY[@]}"
+  printf '%s\n' ${COMPREPLY[@]+"${COMPREPLY[@]}"}
 }
 vm_names=$'augur-macos-base\naugur-macos-app-0123456789ab'
 
@@ -137,7 +139,7 @@ has "$reg" "-F _augur_vm" "augur-vm registration: uses _augur_vm"
 hasnt "$reg" "-o default" "augur-vm registration: no filename fallback (-o default)"
 
 # No augur-vm on PATH: no names, no noise, no failure.
-out="$( COMP_WORDS=(/no/such/augur-vm delete ''); COMP_CWORD=2; COMPREPLY=(); _augur_vm 2>&1; rc=$?; printf '%s' "${COMPREPLY[*]}"; exit $rc )"; rc=$?
+out="$( COMP_WORDS=(/no/such/augur-vm delete ''); COMP_CWORD=2; COMPREPLY=(); _augur_vm 2>&1; rc=$?; printf '%s' ${COMPREPLY[*]+"${COMPREPLY[*]}"}; exit $rc )"; rc=$?
 eq "0" "$rc" "augur-vm missing: completion still succeeds"
 eq ""  "$out" "augur-vm missing: no names and no error output"
 

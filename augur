@@ -894,10 +894,12 @@ macos_wait_for_ssh() {
 # can block forever. Route through the bounded `augur-vm stop` (SIGTERM, then SIGKILL after 30s)
 # first, so the process is dead and the following `wait` returns promptly instead of hanging.
 # The optional pid is a `run` we backgrounded and must reap (avoids a zombie / stray job message).
+# Always returns 0, also with no pid (a stop by name only), so an EXIT trap or failure path that
+# calls it under set -e goes on to its next cleanup step.
 stop_and_reap_macos_vm() {
     local vm="$1" pid="${2:-}"
     "$VM_CLI" stop "$vm" 2>/dev/null || true
-    [[ -n "$pid" ]] && { wait "$pid" 2>/dev/null || true; }
+    if [[ -n "$pid" ]]; then wait "$pid" 2>/dev/null || true; fi
 }
 
 # SSH target for a VM. The project VM in egress mode lives behind gvproxy's
@@ -6238,7 +6240,9 @@ cmd_install_cert_macos() {
     # ${vm_pid:-} (not $vm_pid): the EXIT trap fires while the function frame is live on every
     # abort path here, so the local is normally visible — but tolerate an unbound value so the
     # teardown degrades to a stop-by-name (stop_and_reap needs only the VM name) instead of a
-    # set -u crash, per this codebase's "traps referencing locals are fragile" rule.
+    # set -u crash, per this codebase's "traps referencing locals are fragile" rule. bash 3.2
+    # (macOS's /bin/bash) does drop the local when this runs inside a command substitution, as
+    # the tests run it; the lock is still released then (see stop_and_reap_macos_vm()).
     trap 'stop_and_reap_macos_vm "$MACOS_BASE_VM" "${vm_pid:-}"; host_lock_release "$MACOS_BASE_WRITER_LOCK" install-cert' EXIT
     trap 'exit 130' INT TERM
     if ! wait_for_macos_ssh "$MACOS_BASE_VM" 300 &>/dev/null; then
