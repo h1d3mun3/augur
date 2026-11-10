@@ -52,6 +52,9 @@ export AUGUR_VM_BIN="$TMPD/no-such-augur-vm"
 # resolves function names at CALL time, so a later definition wins.
 AUGUR_SOURCE_ONLY=1 source "$AUGUR"
 set +e                                    # augur enables `set -e`; restore lib.sh assert-and-continue
+# No host gh login: the real gh would hand over the operator's own token, read from the macOS
+# keychain. A case that needs a token defines its own gh.
+gh() { return 1; }
 AUGUR_PROXY_DIR="$TMPD/proxy"; mkdir -p "$AUGUR_PROXY_DIR"   # keep the test off the real ~/.augur
 # These five are assigned in the dispatch tail the AUGUR_SOURCE_ONLY seam returns before, so mint
 # them here exactly as that tail does — cmd_up's messages interpolate CONTAINER_NAME, cmd_up_macos's

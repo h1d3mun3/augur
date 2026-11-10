@@ -449,7 +449,9 @@ has   "$(cat "$envf" 2>/dev/null)" "ANTHROPIC_API_KEY=sk-ant-test123" "shell (no
 
 # ── setup-token: no credentials at all ────────────────────────────────────────
 # It exists to mint a token; the current one is not handed to a guest binary for that. The shim
-# makes the integrity gate's two sha256 probes agree so the flow reaches its interactive exec.
+# makes the integrity gate's two sha256 probes agree so the flow reaches its interactive exec. Its
+# paste prompt then reads /dev/tty, which fails at once: tests/lib.sh runs every test without a
+# controlling terminal.
 section "Tier 1 — setup-token and augur's own execs get no credentials"
 rm -f "$AUGUR_TEST_SHIMLOG.trace" "$envf"
 claude_sha="$(printf 'a%.0s' {1..64})"

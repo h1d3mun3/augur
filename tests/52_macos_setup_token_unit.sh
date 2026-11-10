@@ -34,6 +34,9 @@ export AUGUR_VM_BIN="$TMPD/no-such-augur-vm"
 
 AUGUR_SOURCE_ONLY=1 source "$AUGUR"
 set +e
+# No host gh login: the real gh would hand over the operator's own token, read from the macOS
+# keychain. A case that needs a token defines its own gh.
+gh() { return 1; }
 
 HOME="$TMPD/home"; mkdir -p "$HOME"
 AUGUR_DIR="$TMPD/augur"; mkdir -p "$AUGUR_DIR"
@@ -428,8 +431,9 @@ SELFTEST_OK=1; SCRUB_OK=1
 verify_macos_egress_locked() { echo "selftest $1" >> "$LOG"; [[ "$SELFTEST_OK" == 1 ]] || exit 1; }
 macos_poweroff_before_teardown() { echo "poweroff $1" >> "$LOG"; }
 macos_guest_poweroff()           { echo "poweroff $1" >> "$LOG"; }
-# `read … < /dev/tty`: with a terminal this stub supplies the paste; without one (CI) the redirect
-# fails first and no token is saved. Both are fine here: every assertion below holds either way.
+# `read … < /dev/tty`: the suite runs with no controlling terminal (see tests/lib.sh), so the
+# redirect fails before this stub runs and no token is saved. Every assertion below would also hold
+# with the paste this stub supplies, should the redirect ever succeed.
 read() {
     [[ "$1" == "-rp" ]] || { builtin read "$@"; return; }
     printf -v "${*: -1}" '%s' "sk-ant-oat01-pasted_token-0123456789"
