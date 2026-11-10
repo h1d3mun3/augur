@@ -94,10 +94,10 @@ eq 1 "$(grep -cF "host is '\${host_tz}'): \$(sanitize_guest_text \"\${setout%%\$
   "sync_macos_guest_timezone sanitises the failed sudo's first line"
 eq 2 "$(grep -c 'true 2>&1 | head -n 6 | show_guest_lines' "$AUGUR")" \
   "both ssh-probe diagnostics (up --macos, update --macos) go through show_guest_lines"
-eq 0 "$(grep -E 'do error "  \| ' "$AUGUR" | grep -vFc 'do error "  | $(sanitize_guest_text "${_lines[_i]}")"')" \
-  "every log tail / probe echoed through error() goes through show_guest_lines"
-eq 1 "$(grep -cE 'do error "  \| ' "$AUGUR")" \
-  "one loop echoes guest lines through error() (show_guest_lines; every site uses it)"
+eq 0 "$(grep -E 'do (error|"\$_say") "  \| ' "$AUGUR" | grep -vFc 'do "$_say" "  | $(sanitize_guest_text "${_lines[_i]}")"')" \
+  "every log tail / probe echoed through error() or warn() goes through show_guest_lines"
+eq 1 "$(grep -cE 'do (error|"\$_say") "  \| ' "$AUGUR")" \
+  "one loop echoes guest lines through error() or warn() (show_guest_lines; every site uses it)"
 has "$(declare -f show_guest_lines)" 'sanitize_guest_text "${_lines[_i]}"' "show_guest_lines prints each line through the sanitiser"
 # show_guest_lines itself: sanitised, one `  | ` line per input line, blank lines between others
 # kept, blank lines before the first and after the last dropped, and nothing at all for input that
@@ -123,6 +123,12 @@ has "$(tail -n 1 <<<"$crlf")" '  | last\x0d' "…and the last is 'last'"
 has "$(sed -n 2p <<<"$crlf")" '  | \x0d' "…keeping the CR-only line between them, made visible"
 eq "" "$(printf '\r\n\t\n \t\r\n' | show_guest_lines 2>&1)" "only CR, tab and space lines: nothing is printed"
 eq 1 "$(printf 'no newline at the end' | show_guest_lines 2>&1 | grep -c 'no newline at the end')" "a last line without a newline is still shown"
+# `show_guest_lines warn`: the same lines, through warn() (stdout) instead of error() (stderr).
+warned="$(printf '\nx\033[1m\n\ny\n\n' | show_guest_lines warn 2>/dev/null)"
+eq 3 "$(grep -c '  | ' <<<"$warned")" "show_guest_lines warn prints the same lines (blank one between kept, ends trimmed)"
+has "$warned" '  | x\x1b[1m' "…sanitised"
+eq "" "$(printf 'x\n' | show_guest_lines warn 2>&1 >/dev/null)" "…as warnings, not errors (nothing on stderr)"
+eq "" "$(printf 'x\n' | show_guest_lines 2>/dev/null)" "without warn they are errors (nothing on stdout)"
 eq 0 "$(grep -E '^(info|success|warn|error)\(\) ' "$AUGUR" | grep -c 'echo -e')" \
   "no log helper interprets escapes (echo -e)"
 

@@ -132,13 +132,16 @@ plant_old_env() { printf "export GH_TOKEN='%s'\n" "$DUMMY_OLD" | ssh_macos "$vm"
 # Pass/fail on whether $1 holds either dummy value, without showing $1.
 lacks_dummy() { if [[ "$1" == *"$DUMMY"* || "$1" == *"$DUMMY_OLD"* ]]; then fail "$2" "a dummy value is in it"; else ok "$2"; fi; }
 record_ok() { local _mode _pass; macos_read_boot_record; [[ -n "$(macos_vm_run_id "$vm")" && "$_mode" == on && "$_pass" == "$(macos_vm_run_id "$vm")" ]]; }
+# macos_run_root_script, with the guest stderr it keeps in MACOS_ROOT_SCRIPT_ERR written back to
+# stderr, so a `$( … 2>&1)` capture below sees all of its output.
+root_script() { local _rc=0; macos_run_root_script "$@" || _rc=$?; [[ -z "$MACOS_ROOT_SCRIPT_ERR" ]] || printf '%s\n' "$MACOS_ROOT_SCRIPT_ERR" >&2; return "$_rc"; }
 
 # ── Restores (also on Ctrl-C) ──────────────────────────────────────────────────────────────────
 DROPIN_MOVED=0; RECORD_REMOVED=0; GVPROXY_STOPPED=0; RESTORE_FAILED=(); E2E_SIGNAL=0
 RESTORE_DROPIN_HOW="AUGUR_TEST_LIVE=1 AUGUR_E2E_RESTORE=1 bash tests/e2e_macos_session_credentials.sh  (or, in the VM's own Terminal: sudo mv ${SAVED} ${DROPIN})"
 RESTORE_VM_HOW="cd '${PROJECT}' && augur up --macos  (run it twice if the first one stops the VM)"
 restore_dropin() {
-    macos_run_root_script "$vm" "if [ -e '${SAVED}' ]; then mv -f '${SAVED}' '${DROPIN}'; fi; grep -qxF '${LINE}' '${DROPIN}'" >/dev/null 2>&1
+    root_script "$vm" "if [ -e '${SAVED}' ]; then mv -f '${SAVED}' '${DROPIN}'; fi; grep -qxF '${LINE}' '${DROPIN}'" >/dev/null 2>&1
 }
 # The EXIT trap. INT/TERM/HUP are ignored while it runs (augur_up inherits that, so a second Ctrl-C
 # cannot cut a restore short), the drop-in goes back first, and each slow step prints its by-hand
@@ -227,7 +230,7 @@ has "$dout" "owner=root:wheel mode=644" "the drop-in is root:wheel, mode 644"
 pwfile="$(macos_admin_password_file "$vm")"
 if [[ -f "$pwfile" ]]; then
     PW="$(cat "$pwfile")"
-    sout="$(macos_run_root_script "$vm" '/usr/sbin/sshd -T </dev/null 2>/dev/null | awk '"'"'tolower($1) == "acceptenv" { for (i = 2; i <= NF; i++) print $i }'"'"'' 2>&1)"; src=$?
+    sout="$(root_script "$vm" '/usr/sbin/sshd -T </dev/null 2>/dev/null | awk '"'"'tolower($1) == "acceptenv" { for (i = 2; i <= NF; i++) print $i }'"'"'' 2>&1)"; src=$?
     eq "0" "$src" "sudo sshd -T runs (password on stdin)"
     for _n in $NAMES; do
         if grep -qxF -- "$_n" <<<"$sout"; then ok "sshd -T accepts ${_n}"; else fail "sshd -T accepts ${_n}" "not in its AcceptEnv list (output not shown: it comes from a sudo session)"; fi
@@ -236,7 +239,7 @@ if [[ -f "$pwfile" ]]; then
     else ok "the sshd -T output holds no admin password"; fi
 
     section "Root scripts over one ssh stdin (sudo -S -k)"
-    rout="$(macos_run_root_script "$vm" 'id -u' 2>&1)"; rrc=$?
+    rout="$(root_script "$vm" 'id -u' 2>&1)"; rrc=$?
     eq "0" "$rrc" "macos_run_root_script runs a script"
     if [[ "$(printf '%s' "$rout" | tr -d '[:space:]')" == 0 ]]; then ok "…as root (id -u prints 0, and nothing else)"
     else fail "…as root (id -u prints 0, and nothing else)" "it printed something else (not shown: it comes from a sudo session)"; fi
@@ -246,7 +249,7 @@ if [[ -f "$pwfile" ]]; then
     else
         marker="/tmp/augur-e2e-ran-${DUMMY##*-}"
         wout="$( macos_admin_password_stdin() { printf '%s\n' "augur-e2e-wrong-password"; }
-                 macos_run_root_script "$vm" "touch '${marker}'; id -u" 2>&1 )"; wrc=$?
+                 root_script "$vm" "touch '${marker}'; id -u" 2>&1 )"; wrc=$?
         if (( wrc != 0 )); then ok "a wrong password fails"; else fail "a wrong password fails" "exit 0"; fi
         if grep -qx 0 <<<"$wout"; then fail "…without running the script's id -u" "it printed 0"; else ok "…without running the script's id -u"; fi
         if gssh "test ! -e '${marker}'" 2>/dev/null; then ok "…and the script never ran (no marker file)"
@@ -355,7 +358,7 @@ if ! on "$DESTRUCTIVE"; then
     skip "old-base refusal and the delivery check" "set AUGUR_E2E_DESTRUCTIVE=1 (moves the sshd drop-in away and back)"
 else
     DROPIN_MOVED=1
-    if macos_run_root_script "$vm" "mv -f '${DROPIN}' '${SAVED}'" >/dev/null 2>&1; then
+    if root_script "$vm" "mv -f '${DROPIN}' '${SAVED}'" >/dev/null 2>&1; then
         ok "moved the drop-in to ${SAVED}"
         plant_old_env
         bout="$(push_macos_guest_env "$vm" 2>&1)"; brc=$?

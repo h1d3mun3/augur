@@ -204,8 +204,8 @@ else
 fi
 eq "3" "$(n_calls)" "skewed guest: exactly three round-trips (nothing extra, nothing missing)"
 
-# The command SHAPE, pinned as a literal contract with the guest: the `sudo -S` mechanism
-# install_macos_managed_settings established (a project clone has NO passwordless sudo), an absolute
+# The command SHAPE, pinned as a literal contract with the guest: the `sudo -S` mechanism every
+# privileged guest command uses (a project clone has NO passwordless sudo), an absolute
 # /bin/date so ~/.local/bin cannot shadow it, and -u so the stamp is read as UTC.
 if did_set; then ok "skewed guest: the set is 'sudo -S -p '' /bin/date -u <stamp>'"
 else fail "skewed guest: the privileged set does not have the intended shape" "log: [$(tr '\n' ' ' < "$SSHLOG")]"; fi

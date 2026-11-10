@@ -279,14 +279,14 @@ build_ssh() {   # an ssh_macos for the build path
     local c="$*" s
     printf '%s\n' "$c" >> "$BUILDLOG"
     case "$c" in
-        "sudo "*)
+        "/usr/bin/sudo "*)
             s="$(cat; echo x)"; s="${s%x}"; s="$(guest_map "$s")"
             s="${s//\/usr\/sbin\/sshd/$SHIMDIR/sshd}"; s="${s//chown root:wheel/true}"
             printf '%s' "$s" > "$TMPD/build-stdin"
             printf '%s' "$s" | PATH="$ROOTBIN:$PATH" SUDO_FLAGLOG="$TMPD/sudo-flags" SUDO_PWLOG="$TMPD/sudo-pw" \
                 SUDO_WANT="$TEST_PW" SUDO_NOPASSWD="$SUDO_NOPASSWD" \
                 GUEST_ETC="$GUEST_ETC" DROPIN="$DROPIN" SSHDLOG="$SSHDLOG" SSHD_T_FAILS="$SSHD_T_FAILS" SSHD_LOWER="${SSHD_LOWER:-0}" \
-                bash -c "$c" ;;
+                bash -c "sudo ${c#/usr/bin/sudo }" ;;   # the stand-in on ROOTBIN plays /usr/bin/sudo
         true) return "$FRESH_RC" ;;
         *) echo "UNEXPECTED BUILD COMMAND: $c" >&2; return 1 ;;
     esac
@@ -404,7 +404,7 @@ eq "0" "$rc" "reinstall (control)"
 rm -f "$DROPIN"; install_dropin
 eq "0" "$rc" "the install runs over the stdin protocol"
 eq "2" "$(wc -l < "$BUILDLOG" | tr -d ' ')" "the install opens two connections: the root script's and the fresh one"
-eq "1" "$(grep -c '^sudo -S -k -p '"''"' /bin/sh -c ' "$BUILDLOG")" "the root script runs under one sudo -S -k, from stdin"
+eq "1" "$(grep -c '^/usr/bin/sudo -S -k -p '"''"' /bin/sh -c ' "$BUILDLOG")" "the root script runs under one sudo -S -k, from stdin"
 hasnt "$(cat "$BUILDLOG")" "cat > " "nothing is written to a file in the guest before sudo runs"
 eq "" "$(find "$GUEST_HOME" -name '*.sh' 2>/dev/null)" "no script is left in (or staged into) the guest user's home"
 eq "$MACOS_ROOT_SCRIPT_BEGIN" "$(sed -n 2p "$TMPD/build-stdin")" "the marker follows the password line on stdin"

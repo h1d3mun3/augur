@@ -18,7 +18,8 @@ SHELL := /usr/bin/env bash
 UNAME := $(shell uname)
 
 .PHONY: help unit swift-build swift-test shellcheck offline-tests version-smoke \
-        augur-vm-version-smoke container-e2e stage image egress e2e e2e-session-creds
+        augur-vm-version-smoke container-e2e stage image egress e2e e2e-session-creds \
+        e2e-managed-settings
 
 help:
 	@echo "augur make targets:"
@@ -27,6 +28,7 @@ help:
 	@echo "  make container-e2e  LOCAL egress fail-closed E2E on Apple Container (needs macOS 26+)"
 	@echo "  make e2e            LOCAL macOS VM pre-release gate (boots a VM — never in CI)"
 	@echo "  make e2e-session-creds  LOCAL check of macOS per-session credentials on a running VM (never in CI)"
+	@echo "  make e2e-managed-settings  LOCAL check of the macOS base VM's managed policy (throwaway clone; ARGS=--update/--hook; never in CI)"
 	@echo "  components: swift-build  swift-test  shellcheck  offline-tests  version-smoke  augur-vm-version-smoke"
 
 # ── build-unit (macos-26) ─────────────────────────────────────────────────────
@@ -130,3 +132,9 @@ e2e:
 # steps that move the guest's sshd drop-in and stop gvproxy. See tests/README.md.
 e2e-session-creds:
 	AUGUR_TEST_LIVE=1 bash tests/e2e_macos_session_credentials.sh
+
+# LOCAL check, on a Mac, of the managed Claude Code policy a macOS base VM holds, on a throwaway clone
+# of it (the base VM must be stopped). ARGS="--update" runs `augur update --macos` first;
+# ARGS="--hook" adds the slow provisioning-hook stage (three updates). See tests/README.md.
+e2e-managed-settings:
+	AUGUR_TEST_LIVE=1 bash tests/e2e_macos_managed_settings.sh $(ARGS)
