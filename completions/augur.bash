@@ -61,7 +61,10 @@ _augur_vm() {
     fi
 
     case "$prev" in
-        --from-ipsw|--net-vfkit) COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
+        --from-ipsw|--net-vfkit)
+            # Paths: have readline add a trailing slash to directories and quote special characters.
+            compopt -o filenames 2>/dev/null
+            COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
         --disk-size|--cpu|--memory|--dir|--provision-username|--provision-full-name) return 0 ;;  # free-form values
     esac
 
@@ -100,4 +103,6 @@ _augur_vm() {
     return 0
 }
 
-complete -o default -F _augur_vm augur-vm
+# Deliberately no `-o default`: an empty reply (a new VM name, a free-form option value) must offer
+# nothing rather than fall back to the files in the current directory.
+complete -F _augur_vm augur-vm

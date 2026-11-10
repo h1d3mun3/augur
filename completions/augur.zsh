@@ -92,6 +92,11 @@ _augur_vm() {
         --from-ipsw|--net-vfkit) _files; return ;;
         --disk-size|--cpu|--memory|--dir|--provision-username|--provision-full-name) return ;;  # free-form values
     esac
+    # zsh keeps `--opt=value` as one word: complete only the part after the `=`.
+    case $words[CURRENT] in
+        --from-ipsw=*|--net-vfkit=*) compset -P '*='; _files; return ;;
+        --disk-size=*|--cpu=*|--memory=*|--dir=*|--provision-username=*|--provision-full-name=*) return ;;  # free-form values
+    esac
 
     case $words[2] in
         create) opts=(--from-ipsw --disk-size) ;;

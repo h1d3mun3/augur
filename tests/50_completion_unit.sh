@@ -128,6 +128,13 @@ eq "$work/macOS.ipsw" "$(complete_vm augur-vm create --from-ipsw "$work/mac")" "
 hasnt "$(complete_vm augur-vm create --from-ipsw '')" "--disk-size" "augur-vm create --from-ipsw: offers no option words"
 eq "$work/macOS.ipsw" "$(complete_vm augur-vm run vm1 --net-vfkit "$work/mac")" "augur-vm run --net-vfkit: completes file paths"
 eq "delete" "$(complete_vm augur-vm help del)" "augur-vm help: offers the subcommands"
+out="$( COMP_WORDS=(augur-vm create --from-ipsw "$work/mac"); COMP_CWORD=3; COMPREPLY=(); _augur_vm 2>&1 >/dev/null )"
+eq "" "$out" "augur-vm --from-ipsw: no error output when run outside readline"
+
+# The registration itself: without `-o default`, an empty reply offers nothing instead of the cwd's files.
+reg="$(complete -p augur-vm 2>&1)"
+has "$reg" "-F _augur_vm" "augur-vm registration: uses _augur_vm"
+hasnt "$reg" "-o default" "augur-vm registration: no filename fallback (-o default)"
 
 # No augur-vm on PATH: no names, no noise, no failure.
 out="$( COMP_WORDS=(/no/such/augur-vm delete ''); COMP_CWORD=2; COMPREPLY=(); _augur_vm 2>&1; rc=$?; printf '%s' "${COMPREPLY[*]}"; exit $rc )"; rc=$?
