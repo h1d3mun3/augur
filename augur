@@ -269,11 +269,13 @@ sanitize_guest_lines() {
     done
 }
 # Show guest text or a log excerpt from stdin as error lines, each `  | <line>`, sanitised
-# (sanitize_guest_lines). Blank lines are skipped: a bare `  |` tells the operator nothing, and
-# empty captured output then prints no line at all.
+# (sanitize_guest_lines). Blank lines (empty, or spaces only) are skipped: a bare `  |` tells the
+# operator nothing, and empty captured output then prints no line at all. `show_guest_lines warn`
+# prints them as warnings, for guest text that does not mean a failure.
 show_guest_lines() {
-    local _l
-    sanitize_guest_lines | while IFS= read -r _l; do if [[ -n "$_l" ]]; then error "  | ${_l}"; fi; done
+    local _l _say=error
+    [[ "${1:-}" != warn ]] || _say=warn
+    sanitize_guest_lines | while IFS= read -r _l; do if [[ "$_l" == *[!\ ]* ]]; then "$_say" "  | ${_l}"; fi; done
 }
 
 # ══ Apple Container ══════════════════════════════════════════════════════════════
@@ -4576,17 +4578,28 @@ MACOS_ROOT_SCRIPT_BEGIN='#augur-root-script'
 # show_guest_lines. augur's own messages go to stderr as usual: before connecting, a VM with no
 # stored admin password or no SSH transport is refused (return 1, after augur's error), so nothing
 # connects without a password to send.
+# $3 is the ssh wrapper: ssh_macos (the default), or ssh_macos_provision_stdin for a VM on the
+# provisioning network. Only these two: a wrapper that drops stdin (ssh_macos_provision's -n) would
+# lose the password and the script.
 MACOS_ROOT_SCRIPT_ERR=""
 macos_run_root_script() {
-    local vm="$1" script="$2" _rc=0
+    local vm="$1" script="$2" ssh_fn="${3:-ssh_macos}" _rc=0
     MACOS_ROOT_SCRIPT_ERR=""
-    # Accepted trade-off: the transport can stop resolving between the checks below and the connection;
-    # ssh_macos then reports it, and that error lands in MACOS_ROOT_SCRIPT_ERR as if from the guest.
+    case "$ssh_fn" in
+        ssh_macos | ssh_macos_provision_stdin) ;;
+        *) error "macos_run_root_script: unsupported ssh wrapper '${ssh_fn}'."; return 1 ;;
+    esac
     ( require_macos_admin_password "$vm" ) || return 1
-    macos_ssh_transport_ok "$vm" || { error "Cannot reach VM '${vm}' over SSH: its SSH host or port does not resolve."; return 1; }
+    # Accepted trade-off: the transport can stop resolving between this check and the connection;
+    # ssh_macos then reports it, and that error lands in MACOS_ROOT_SCRIPT_ERR as if from the guest.
+    # No check for ssh_macos_provision_stdin: its fixed forward 127.0.0.1:AUGUR_SSH_FWD_PORT_PROVISION
+    # has nothing to resolve.
+    if [[ "$ssh_fn" == ssh_macos ]] && ! macos_ssh_transport_ok "$vm"; then
+        error "Cannot reach VM '${vm}' over SSH: its SSH host or port does not resolve."; return 1
+    fi
     { MACOS_ROOT_SCRIPT_ERR="$(
     { macos_admin_password_stdin "$vm" && printf '%s\n' "$MACOS_ROOT_SCRIPT_BEGIN" "$script"; } \
-        | ssh_macos "$vm" "sudo -S -k -p '' /bin/sh -c 'm=; while IFS= read -r l; do if [ \"\$l\" = \"${MACOS_ROOT_SCRIPT_BEGIN}\" ]; then m=1; break; fi; done; [ -n \"\$m\" ] && exec /bin/sh -s; exit 1'" 2>&1 >&3 3>&-
+        | "$ssh_fn" "$vm" "/usr/bin/sudo -S -k -p '' /bin/sh -c 'm=; while IFS= read -r l; do if [ \"\$l\" = \"${MACOS_ROOT_SCRIPT_BEGIN}\" ]; then m=1; break; fi; done; [ -n \"\$m\" ] && exec /bin/sh -s; exit 1'" 2>&1 >&3 3>&-
     )"; } 3>&1 || _rc=$?
     return "$_rc"
 }
@@ -6969,13 +6982,18 @@ stop_provision_gvproxy() {
 # build already guarantees brew exists at this path by the time provisioning ever runs; if
 # that assumption were ever wrong, the actual command right after would fail anyway with the
 # same diagnostic.
-ssh_macos_provision() { _ssh_macos_provision -n "$@"; }
-# The same, minus `-n`: forwards stdin to the remote command. Only for a caller that pipes
-# something in on purpose (macos_admin_password_stdin), never from inside the manifest loop.
-ssh_macos_provision_stdin() { _ssh_macos_provision "" "$@"; }
+ssh_macos_provision() { _ssh_macos_provision -n brew "$@"; }
+# The same, minus `-n` and minus the Homebrew prefix: forwards stdin to a remote command that starts
+# with `/usr/bin/sudo -S` (macos_admin_password_stdin, macos_run_root_script), never from inside the
+# manifest loop. The guest user's Homebrew is writable by that user, so nothing of it runs while
+# the password and a root script wait on stdin.
+# Accepted trade-off: the guest user's login shell still reads ~/.zshenv before the remote command,
+# as for every ssh_macos sudo call; that file is the guest user's, like Homebrew.
+ssh_macos_provision_stdin() { _ssh_macos_provision "" "" "$@"; }
 _ssh_macos_provision() {
-    local stdin_opt="$1" vm="$2"; shift 2
-    local key_opts=()
+    local stdin_opt="$1" brew_env="$2" vm="$3"; shift 3
+    local key_opts=() prefix=""
+    [[ -n "$brew_env" ]] && prefix="eval \"\$(/opt/homebrew/bin/brew shellenv)\" 2>/dev/null; "
     if [[ -f "$MACOS_SSH_KEY" ]]; then
         key_opts=(-i "$MACOS_SSH_KEY" -o PasswordAuthentication=no -o BatchMode=yes)
     fi
@@ -6989,22 +7007,7 @@ _ssh_macos_provision() {
         -o ServerAliveCountMax=4 \
         ${key_opts[@]+"${key_opts[@]}"} \
         "${MACOS_SSH_USER}@127.0.0.1" \
-        "eval \"\$(/opt/homebrew/bin/brew shellenv)\" 2>/dev/null; $*"
-}
-
-scp_to_macos_provision() {
-    local vm="$1" src="$2" dst="$3"
-    local key_opts=()
-    if [[ -f "$MACOS_SSH_KEY" ]]; then
-        key_opts=(-i "$MACOS_SSH_KEY" -o PasswordAuthentication=no -o BatchMode=yes)
-    fi
-    scp -F /dev/null \
-        -P "$AUGUR_SSH_FWD_PORT_PROVISION" \
-        -o StrictHostKeyChecking=accept-new \
-        -o UserKnownHostsFile="$(vm_known_hosts_file "$vm")" \
-        -o LogLevel=ERROR \
-        ${key_opts[@]+"${key_opts[@]}"} \
-        "$src" "${MACOS_SSH_USER}@127.0.0.1:${dst}"
+        "${prefix}$*"
 }
 
 # Mirrors wait_for_macos_ssh, hardcoded to the fixed provisioning host/port (macos_ssh_host/
@@ -7059,16 +7062,84 @@ run_provision_manifest() {
     done < <(provision_manifest_entries)
 }
 
-# Copy hook.sh into the VM (never piped/eval'd from a string) and run it as root — mirrors
-# the existing "download-to-file-then-execute" rule cmd_build_macos uses for the Homebrew/
-# Claude installers. Its allowlist domains were already merged into the filtered session by
-# write_provision_allowlist. Explicit `|| return 1` — see run_provision_manifest's note.
+# Root shell code (for macos_run_root_script) that runs the hook whose base64 encoding is $1: see
+# run_provision_hook. Deliberately a function that prints a heredoc, not a heredoc inside "$(...)":
+# macOS's /bin/bash 3.2 ends a command substitution at the first unmatched `)`, even one closing a
+# case pattern inside a heredoc, and then the whole augur script fails to parse.
+macos_provision_hook_root_sh() {
+    cat <<SCRIPT
+d=
+trap '[ -z "\$d" ] || /bin/rm -rf "\$d"' EXIT
+trap 'exit 129' HUP
+trap 'exit 143' TERM
+hook_path=/opt/homebrew/bin:/opt/homebrew/sbin
+set -f; IFS=:
+for p in \$PATH; do case "\$p" in /*) hook_path="\$hook_path:\$p" ;; esac; done
+set +f; unset IFS
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+d="\$(/usr/bin/mktemp -d /var/root/augur-provision-hook.XXXXXX)" || exit 1
+printf '%s\n' '${1}' | /usr/bin/base64 --decode > "\$d/hook.sh" || exit 1
+/usr/bin/env PATH="\$hook_path" HOMEBREW_PREFIX=/opt/homebrew HOMEBREW_CELLAR=/opt/homebrew/Cellar \\
+    HOMEBREW_REPOSITORY=/opt/homebrew INFOPATH="/opt/homebrew/share/info:\${INFOPATH:-}" \\
+    bash "\$d/hook.sh" </dev/null 2>&1
+SCRIPT
+}
+
+# Run ~/.augur/provision/hook.sh as root in VM $1, which is on the provisioning network, without
+# writing it anywhere the guest user can: a copy in a user-writable file could be swapped by any
+# process of that user before root runs it. The hook travels base64-encoded inside a root script,
+# over one ssh connection (macos_run_root_script over ssh_macos_provision_stdin, so no Homebrew
+# code runs before sudo). The base64 alphabet has no quote, `$`, backslash or newline, so every
+# hook body arrives byte-exact. Root decodes it into a new directory that `mktemp -d` creates mode
+# 0700 under /var/root (root's home, writable only by root), runs it from there (interpreter: see
+# below), and removes the directory when the root shell exits, whether the hook succeeded or not.
+# The root script's own tools are absolute paths under a system-only PATH, so none of them is
+# looked up in the guest user's Homebrew.
+#
+# The hook runs with stdin from /dev/null (which also keeps it from reading the rest of the root
+# script, its shell's stdin), no TTY, the cwd sudo leaves (the guest user's home) and the
+# environment sudo leaves plus Homebrew's: a PATH of /opt/homebrew/bin, /opt/homebrew/sbin and then
+# the absolute entries of the PATH sudo left (empty, `.` and other relative entries dropped), and
+# HOMEBREW_PREFIX, HOMEBREW_CELLAR, HOMEBREW_REPOSITORY and INFOPATH as `brew shellenv` sets them,
+# set by root without running brew. Its interpreter is the first `bash` on that PATH, so a
+# Homebrew bash runs it when one is installed. Its exit status is the root script's, so a failing
+# hook fails the build or update. Its $0 is the file in that directory. Its allowlist domains were
+# already merged into the filtered session by write_provision_allowlist. Explicit `|| return 1`:
+# see run_provision_manifest's note.
+#
+# Its stderr joins its stdout in the guest, so all of its output streams to the operator as it
+# runs, in order, unsanitised like the manifest's brew output. Deliberately not left in
+# MACOS_ROOT_SCRIPT_ERR: that would hold back a long hook's errors until it ends and separate them
+# from the output around them. What is left there (sudo's, the root shell's and ssh's own stderr)
+# is shown afterwards through show_guest_lines: as errors when the hook failed, as warnings when it
+# succeeded.
+#
+# Accepted trade-off: the hook's commands, its interpreter included, resolve through Homebrew
+# first, a directory the guest user owns, because hooks rely on Homebrew's tools. A process of that
+# user can already run anything as root through provisioning's NOPASSWD grant, which is live while
+# the hook runs.
+# Accepted trade-off: HOME and TMPDIR are what sudo keeps, the guest user's home and temp
+# directory, so a guest-user process can redirect what a root hook writes there.
+# Accepted trade-off: a HUP or TERM that reaches the root shell while the hook runs is acted on
+# (exit and cleanup) only once the hook exits.
 run_provision_hook() {
-    local vm="$1"
+    local vm="$1" b64 _rc=0
     [[ -f "$AUGUR_PROVISION_HOOK" ]] || return 0
     info "Provisioning: running ~/.augur/provision/hook.sh"
-    scp_to_macos_provision "$vm" "$AUGUR_PROVISION_HOOK" "/tmp/augur-provision-hook.sh" || return 1
-    ssh_macos_provision "$vm" "sudo bash /tmp/augur-provision-hook.sh; rc=\$?; rm -f /tmp/augur-provision-hook.sh; exit \$rc" || return 1
+    b64="$(base64 < "$AUGUR_PROVISION_HOOK" | tr -d '\n')" || return 1
+    macos_run_root_script "$vm" "$(macos_provision_hook_root_sh "$b64")" ssh_macos_provision_stdin \
+        || _rc=$?
+    # A header only over a line show_guest_lines shows: one with a character other than a space.
+    if [[ "$MACOS_ROOT_SCRIPT_ERR" == *[!$' \n']* ]]; then
+        if (( _rc == 0 )); then
+            warn "The provisioning hook's root shell reported:"
+            printf '%s\n' "$MACOS_ROOT_SCRIPT_ERR" | show_guest_lines warn
+        else
+            error "The provisioning hook did not complete (exit ${_rc}):"
+            printf '%s\n' "$MACOS_ROOT_SCRIPT_ERR" | show_guest_lines
+        fi
+    fi
+    (( _rc == 0 )) || return 1
 }
 
 # Shared failure path for run_base_provisioning: revoke any sudo grant this session may
@@ -7135,9 +7206,9 @@ run_base_provisioning() {
     # establishes it fresh in that case). Same admin credential the rest of the build already
     # depends on — see macos_admin_password().
     macos_admin_password_stdin "$vm" | ssh_macos_provision_stdin "$vm" \
-        "sudo -S -p '' bash -c \
+        "/usr/bin/sudo -S -p '' /bin/bash -c \
             'echo \"${MACOS_SSH_USER} ALL=(ALL) NOPASSWD:ALL\" > /etc/sudoers.d/augur \
-             && chmod 440 /etc/sudoers.d/augur'" \
+             && /bin/chmod 440 /etc/sudoers.d/augur'" \
         || provision_fail "Failed to grant temporary sudo for provisioning."
 
     run_provision_manifest "$vm" || provision_fail "Base-VM manifest provisioning failed."
