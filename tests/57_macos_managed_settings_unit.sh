@@ -388,6 +388,35 @@ eq "1" "$(deny_only_rc "${REAL_DENY/CDEF0000000C/CDEF0000000Z}")" "a principal t
 eq "1" "$(deny_only_rc "${REAL_DENY/ABCDEFAB-CDEF-ABCD-EFAB-CDEF0000000C/everyone}")" "a principal that is neither a UUID nor type:name: refused"
 eq "1" "$(deny_only_rc "${REAL_DENY/ 0: / 0:}")" "a real line with its fields run together: refused"
 
+section "Tier 1 — macos_run_root_script connects over a pinned SSH transport"
+# A stand-in transport: macos_ssh_build counts its resolves and names fake_ssh as the ssh command,
+# which records the destination it was given and drains its stdin (the password and the script).
+pin_run() {   # pin_run — macos_run_root_script testvm in a subshell, then what is pinned afterwards
+    ( macos_ssh_build() { echo "$1" >> "$TMPD/pin-builds"; _ssh=(fake_ssh); _ssh_dest="dest-$1"; return "${PIN_BUILD_RC:-0}"; }
+      fake_ssh() { printf '%s\n' "$1" >> "$TMPD/pin-ssh"; cat >/dev/null; }
+      if [[ -n "${PIN_FIRST:-}" ]]; then macos_ssh_pin "$PIN_FIRST"; fi
+      macos_run_root_script testvm 'true' >/dev/null 2>"$TMPD/pin-err"; echo "rc=$?"
+      echo "pinned=${_MACOS_SSH_PIN_VM}:${_MACOS_SSH_PIN_DEST}" )
+}
+pin_count() { if [[ -f "$1" ]]; then grep -c . "$1"; else echo 0; fi; }
+rm -f "$TMPD"/pin-*; out="$(pin_run)"
+has "$out" "rc=0" "not pinned by the caller: the script runs"
+eq "1" "$(pin_count "$TMPD/pin-builds")" "…resolving the transport once"
+eq "dest-testvm" "$(cat "$TMPD/pin-ssh" 2>/dev/null)" "…and connecting over it"
+has "$out" "pinned=:" "…and leaves nothing pinned afterwards"
+rm -f "$TMPD"/pin-*; out="$(PIN_FIRST=testvm pin_run)"
+has "$out" "rc=0" "the caller pinned this VM: the script runs"
+eq "1" "$(pin_count "$TMPD/pin-builds")" "…over the caller's pin, resolving nothing again"
+has "$out" "pinned=testvm:dest-testvm" "…and the caller's pin is still there afterwards"
+rm -f "$TMPD"/pin-*; out="$(PIN_FIRST=othervm pin_run)"
+has "$out" "rc=0" "the caller pinned another VM: the script runs"
+eq "dest-testvm" "$(cat "$TMPD/pin-ssh" 2>/dev/null)" "…connecting to this VM, not the pinned one"
+has "$out" "pinned=othervm:dest-othervm" "…and the caller's pin of the other VM is back afterwards"
+rm -f "$TMPD"/pin-*; out="$(PIN_BUILD_RC=2 pin_run)"
+has "$out" "rc=1" "a transport that does not resolve: returns 1"
+eq "0" "$(pin_count "$TMPD/pin-ssh")" "…connecting nothing"
+has "$(cat "$TMPD/pin-err")" "does not resolve" "…with augur's own error"
+
 if (( ! CAN_RUN )); then
     skip "the root script, run as the guest" "no unprivileged user+mount namespaces with overlayfs here"
     finish; exit $?
