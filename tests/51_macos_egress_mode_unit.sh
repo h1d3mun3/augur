@@ -99,7 +99,9 @@ exec "$REAL_PS" "\$@"
 EOS
 chmod +x "$SHIMDIR/ps"; PATH="$SHIMDIR:$PATH"
 sleep 600 & BOOT2_PID=$!
-trap 'kill "$BOOT2_PID" 2>/dev/null; rm -rf "$TMPD"' EXIT
+# The wait reaps the killed sleep with its stderr discarded; without it, bash 3.2 reports the kill on
+# stderr ("line N: PID Terminated: 15  sleep 600") once the trap's next command returns.
+trap 'kill "$BOOT2_PID" 2>/dev/null; wait "$BOOT2_PID" 2>/dev/null; rm -rf "$TMPD"' EXIT
 RUN_ID_FILE="$AUGUR_DIR/vms/$PV/run.id"; RUN_PID_FILE="$AUGUR_DIR/vms/$PV/run.pid"
 boot_id()  { printf '%s' "$1" > "$RUN_ID_FILE"; printf '%s' "${2:-$$}" > "$RUN_PID_FILE"; }
 # The run id boot_id "$@" would give, leaving the current boot as it is.
