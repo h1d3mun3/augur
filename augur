@@ -2274,13 +2274,15 @@ requested_egress_mode()  { if egress_enabled; then echo on; else echo off; fi; }
 # empty when it is missing or is not one line of a mode, a space and a pass: `-`, or a run id
 # (macos_vm_run_id: a UUID, a space and a start time).
 macos_read_boot_record() {
-    local _line _m _p
+    # The pattern sits in a variable, expanded unquoted: bash then reads every character of it as
+    # regex syntax, the same in bash 3.2 as later, with no backslash or quote handling to differ.
+    local _line _m _p _run_id_re="^${MACOS_UUID_RE} [^ ]"
     _mode=""; _pass=""
     _line="$(cat "$(macos_boot_record_file)" 2>/dev/null)" || return 0
     [[ "$_line" != *$'\n'* && "$_line" == *" "* ]] || return 0
     _m="${_line%% *}"; _p="${_line#* }"
     [[ "$_m" == on || "$_m" == off ]] || return 0
-    [[ "$_p" == - || "$_p" =~ ^${MACOS_UUID_RE}\ [^\ ] ]] || return 0
+    [[ "$_p" == - || "$_p" =~ $_run_id_re ]] || return 0
     _mode="$_m"
     if [[ "$_p" != - ]]; then _pass="$_p"; fi
 }
@@ -2704,8 +2706,8 @@ verify_macos_egress_locked() {
     # `eng exec` stops working, because its proxy probe then returns no status either.
     #
     # The transport is resolved and pinned once, before the first probe (macos_ssh_pin), and every
-    # probe below uses it until the unpin after the last. Left to ssh_macos, an unresolvable host or port would not return: the
-    # _macos_ssh_cmd it calls `exit 1`s the whole script (see _macos_ssh_cmd). Every probe below
+    # probe below uses it until the unpin after the last. Left to ssh_macos, an unresolvable host or
+    # port would not return: the _macos_ssh_cmd it calls `exit 1`s the whole script. Every probe below
     # runs under `&>/dev/null` or inside `$( … )`, so that exit would be UNOBSERVABLE and, being an
     # exit rather than a non-zero return, it would jump clean over the fail-closed teardown at the
     # bottom of this function — leaving precisely the live VM with a live NIC that the teardown

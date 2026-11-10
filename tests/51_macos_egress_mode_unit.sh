@@ -169,6 +169,15 @@ for _bad in "on" "maybe -" "on - extra" $'on -\non -' "" "-"; do
   run_cmd require_macos_egress_mode_current "$PV"
   refused "a boot record that does not parse ($(printf '%q' "$_bad"))" "augur down --macos && augur up --macos" "unknown egress mode"
 done
+# The pass field: `-`, or a run id (a UUID, a space, then a start time); anything else is no record.
+_uuid="0A1B2C3D-4E5F-6789-ABCD-EF0123456789"
+read_rec() { local _mode _pass; printf '%s\n' "$1" > "$(macos_boot_record_file)"; macos_read_boot_record; printf '%s|%s' "$_mode" "$_pass"; }
+eq "on|" "$(read_rec "on -")" "boot record 'on -': mode on, no pass"
+eq "on|${_uuid} Mon Nov 10 09:00:00 2026" "$(read_rec "on ${_uuid} Mon Nov 10 09:00:00 2026")" "boot record with a run id: mode and pass"
+eq "off|${_uuid} x" "$(read_rec "off ${_uuid} x")" "boot record 'off' with a run id: both read"
+for _bad in "on ${_uuid}" "on ${_uuid} " "on ${_uuid}  x" "on not-a-uuid Mon" "on ${_uuid/0A/0G} Mon" "on x${_uuid} Mon"; do
+  eq "|" "$(read_rec "$_bad")" "a pass that is not a run id is no record ($(printf '%q' "$_bad"))"
+done
 rm -f "$(macos_boot_record_file)"
 printf 'on\n' > "$_rec_dir/$_rec_stem.egress-mode"; printf '%s\n' "$BOOT1" > "$_rec_dir/$_rec_stem.egress-verified"
 for c in cmd_up_macos cmd_claude_macos cmd_shell_macos; do
