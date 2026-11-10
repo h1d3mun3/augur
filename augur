@@ -3992,6 +3992,12 @@ cmd_build_macos() {
         echo '\''export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer'\'' >> ~/.zshenv
     '
 
+    # augur's managed Claude Code policy — the one settings layer a repo cannot override. Must land
+    # before the sudo revoke below, and before the base VM is frozen, since /Library is root-owned.
+    # Before custom provisioning: the install replaces the whole policy directory, and the
+    # operator's provisioning may then add its own files to it (see install_macos_managed_settings).
+    install_macos_managed_settings "$MACOS_BUILD_VM" || { error "Aborting the build; no base VM was saved."; exit 1; }
+
     # Step 6.5: optional custom provisioning (~/.augur/provision/manifest.conf and/or
     # hook.sh) — no-op unless the operator created those files. See run_base_provisioning.
     run_base_provisioning "$MACOS_BUILD_VM"
@@ -4005,9 +4011,6 @@ cmd_build_macos() {
     info "Scrubbing any accumulated $(agent_display_name) account state from the base VM..."
     macos_scrub_agent_config "$MACOS_BUILD_VM"
 
-    # augur's managed Claude Code policy — the one settings layer a repo cannot override. Must land
-    # before the sudo revoke below, and before the base VM is frozen, since /Library is root-owned.
-    install_macos_managed_settings "$MACOS_BUILD_VM"
     # Root-owned too. Fatal: every claude/shell session in a clone of a base without it is refused.
     install_macos_session_env_acceptance "$MACOS_BUILD_VM" || exit 1
 
@@ -4031,6 +4034,13 @@ cmd_build_macos() {
     # vendor's: the EXIT trap above discards the build VM.
     agent_verify_integrity_macos "$MACOS_BUILD_VM" || {
         agent_signature_check_failed installed
+        error "Aborting the build; no base VM was saved."
+        exit 1
+    }
+
+    # The managed policy installed before custom provisioning must still be augur's, as installed:
+    # provisioning's root hook or a cask's postinstall could have replaced or loosened it.
+    verify_macos_managed_settings "$MACOS_BUILD_VM" || {
         error "Aborting the build; no base VM was saved."
         exit 1
     }
@@ -4261,29 +4271,275 @@ warn_if_macos_egress_pinned() {
 # that password can rewrite it. It still does the job it is here for: stopping a repository's own
 # settings from re-enabling the auto-updater and swapping out the binary the integrity gate
 # verifies. In Container mode the same file IS root-owned against an unprivileged agent.
+#
+# Deliberately, the policy directory (the target's parent) is wholly augur's in the base VM when
+# augur installs its policy: Claude Code reads other managed files from it too, so each install
+# replaces the whole directory (macos_managed_settings_swap_sh), and whatever was in it, root's
+# included, is discarded with the old one; the names of what was discarded are shown. build and
+# update run the operator's custom provisioning (trusted root content) right after it, and that may
+# add its own files to the fresh directory; nothing after provisioning replaces it again, and
+# verify_macos_managed_settings checks the policy file is still augur's before the base is saved.
+# Deliberately, then, the directory is rebuilt on every update from augur's policy plus the
+# operator's provisioning: provisioning must be idempotent and recreate what it owns there.
+#
+# Returns 1, after an error carrying the guest's output, on ANY failure (the policy cannot be
+# produced, the VM cannot be reached, or the root script fails or does not report the policy
+# live), and build/update then stop without saving the base VM: a base saved with no policy, an
+# old one, or a directory someone else can write would hand that state to every clone. One
+# exception is only a warning: the policy is live and checked, and only the removal of the old
+# directory failed.
 install_macos_managed_settings() {
-    local vm="$1" dst parent staged
-    dst="$(agent_macos_managed_settings_path)"; parent="$(dirname "$dst")"
-    staged="/Users/${MACOS_SSH_USER}/.augur-managed-settings.json"
+    local vm="$1" script outf out rc=0 _l _n discarded="" leftover=""
     info "Installing augur's managed $(agent_display_name) policy into the base VM..."
-    # Two calls on purpose. The payload travels over STDIN because it contains double quotes that
-    # would terminate the host-side quoted string if interpolated — and `sudo -S` reads the PASSWORD
-    # from stdin, so the transfer and the privileged move cannot share one invocation.
-    agent_managed_settings_json | ssh_macos "$vm" "cat > '${staged}'" || {
-        warn "Could not stage the managed $(agent_display_name) policy in the VM; skipping."
-        return 0
-    }
-    # `sudo -S` works whether or not the build-time NOPASSWD grant is still present, which is what
-    # lets `update --macos` reach a base VM that no longer has it. The password is this base VM's
-    # own admin password (see macos_admin_password()) — no privilege here augur's build doesn't
-    # already take.
-    macos_admin_password_stdin "$vm" | ssh_macos "$vm" "sudo -S -p '' sh -c '
-        mkdir -p \"${parent}\" &&
-        mv \"${staged}\" \"${dst}\" &&
-        chown root:wheel \"${dst}\" &&
-        chmod 644 \"${dst}\"'" \
-        || warn "Could not install the managed $(agent_display_name) policy in the VM; continuing without it."
+    script="$(macos_managed_settings_vars_sh)" || return 1
+    script+=$'\n'"$(macos_policy_checks_sh)"$'\n'"$(macos_managed_settings_swap_sh)"
+    outf="$(mktemp)" || { error "Could not create a temporary file."; return 1; }
+    # `sudo -S` (inside macos_run_root_script) works whether or not the build-time NOPASSWD grant
+    # is still present, which is what lets `update --macos` reach a base VM that no longer has it.
+    # The password is this base VM's own admin password (see macos_admin_password()), so this takes
+    # no privilege augur's build doesn't already take.
+    macos_run_root_script "$vm" "$script" > "$outf" || rc=$?
+    out="$(cat "$outf")"; rm -f "$outf"
+    # Success is status 0 AND the script's own report that the policy is live as the LAST line of its
+    # output, never a status alone. Each discarded name arrives base64-encoded on its own line, so no
+    # name can forge a report line.
+    if (( rc != 0 )) || [[ "${out##*$'\n'}" != AUGUR_POLICY_LIVE ]]; then
+        error "Could not install the managed $(agent_display_name) policy in the VM:"
+        printf '%s\n' "$MACOS_ROOT_SCRIPT_ERR" | show_guest_lines
+        return 1
+    fi
+    while IFS= read -r _l; do
+        case "$_l" in
+            "AUGUR_POLICY_DISCARDED "*)
+                _l="${_l#AUGUR_POLICY_DISCARDED }"
+                if [[ "$_l" =~ ^[A-Za-z0-9+/]+=*$ ]] && _n="$(printf '%s' "$_l" | base64 --decode 2>/dev/null && printf x)" \
+                        && [[ "$_n" == *x ]]; then
+                    _n="$(sanitize_guest_text "${_n%x}")"
+                else
+                    _n="(a name that cannot be decoded)"
+                fi
+                discarded+="${discarded:+, }${_n}" ;;
+            "AUGUR_POLICY_LEFTOVER "*)  leftover="${_l#AUGUR_POLICY_LEFTOVER }" ;;
+        esac
+    done <<< "$out"
+    if [[ -n "$discarded" ]]; then
+        info "Discarded with the old policy directory (custom provisioning must recreate what it owns): ${discarded}"
+    fi
+    if [[ -n "$leftover" ]]; then
+        warn "The managed $(agent_display_name) policy is installed, but the old policy directory could not be removed: $(sanitize_guest_text "$leftover")"
+    fi
     return 0
+}
+
+# Fail (return 1, after an error saying what differs) unless base-VM-to-be $1 still holds augur's
+# managed policy exactly as install_macos_managed_settings left it: the policy directory a
+# root-owned 755 directory, not a symlink, with no ACL entry that allows anything, and in it
+# managed-settings.json a root:wheel 644 regular file with no ACL and no other hard link, holding
+# agent_managed_settings_json's bytes. Other files in the directory are fine (custom provisioning
+# may add them). Read-only. cmd_build_macos and cmd_update_macos run it after everything that
+# could change the policy (custom provisioning's root hook, a cask's postinstall), right before
+# the sshd drop-in re-check, and refuse to save the base VM when it fails.
+# A mismatch the check found (its own AUGUR_POLICY_MISMATCH report) and a check that could not run
+# (no stored admin password or SSH transport, a failed ssh or sudo) are reported apart; both fail.
+# Accepted trade-off: this guards against custom provisioning (TOFU-gated, trusted root content)
+# replacing or breaking augur's policy file by accident. It does not try to contain a malicious
+# provisioning step, which runs as root and can do anything, a LaunchDaemon that rewrites the policy
+# at every clone's boot included; so the parent directory and the other files in the policy
+# directory are not re-checked either.
+verify_macos_managed_settings() {
+    local vm="$1" script outf out rc=0
+    info "Checking that the base VM still holds augur's managed $(agent_display_name) policy..."
+    script="$(macos_managed_settings_vars_sh)" || return 1
+    script+=$'\n'"$(macos_policy_checks_sh)"$'\n'"$(macos_managed_settings_check_sh)"
+    outf="$(mktemp)" || { error "Could not create a temporary file."; return 1; }
+    macos_run_root_script "$vm" "$script" > "$outf" || rc=$?
+    out="$(cat "$outf")"; rm -f "$outf"
+    # As for the install: the report must be the last line of the output, with a matching status.
+    local last="${out##*$'\n'}"
+    (( rc == 0 )) && [[ "$last" == AUGUR_POLICY_OK ]] && return 0
+    if (( rc != 0 )) && [[ "$last" == AUGUR_POLICY_MISMATCH ]]; then
+        error "The base VM no longer holds augur's managed $(agent_display_name) policy as installed:"
+        printf '%s\n' "$MACOS_ROOT_SCRIPT_ERR" | show_guest_lines
+        error "Custom provisioning must not replace or change augur's $(basename "$(agent_macos_managed_settings_path)"); it may add its own files beside it."
+        return 1
+    fi
+    error "Could not check the base VM's managed $(agent_display_name) policy: the check did not run to the end."
+    printf '%s\n' "$MACOS_ROOT_SCRIPT_ERR" | show_guest_lines
+    return 1
+}
+
+# The shell assignments both root scripts above start with: base, dir and name (the policy path
+# split up; plain constants from agent_macos_managed_settings_path, safe in single quotes) and b64,
+# the policy base64-encoded. base64 characters are safe inside single quotes, so the script carries
+# the payload as a plain shell value, and the decode restores its exact bytes, quotes, `$`,
+# backslashes and trailing newlines included. GNU base64 wraps its output and macOS's does not;
+# the newlines are dropped so both give one line. Fails, after an error, when the policy cannot be
+# produced.
+macos_managed_settings_vars_sh() {
+    local dst dir b64
+    dst="$(agent_macos_managed_settings_path)"; dir="$(dirname "$dst")"
+    if ! b64="$(agent_managed_settings_json | base64 | tr -d '\n')" \
+            || [[ ! "$b64" =~ ^[A-Za-z0-9+/]+=*$ ]]; then
+        error "Could not produce the managed $(agent_display_name) policy."
+        return 1
+    fi
+    printf "base='%s'; dir='%s'; name='%s'; b64='%s'" "$(dirname "$dir")" "$dir" "$(basename "$dst")" "$b64"
+}
+
+# Root shell code both policy scripts share (after macos_managed_settings_vars_sh): the checks.
+#   ls_ok PATH TYPE OWNER MODE [deny]: PATH is not a symlink, is of TYPE (test -d or -f), its
+#     numeric uid:gid matches the pattern OWNER, its `ls` mode string (less a trailing `@`, `.` or,
+#     for an accepted ACL, `+`) matches the pattern MODE, and it has no ACL, or with `deny`, an ACL
+#     of deny entries only (deny_only). The ACL comes from macOS's `ls -le`, which lists ACL
+#     entries on the lines after the entry's own (`ls -l` alone shows `@` instead of `+` when there
+#     are also extended attributes). An `ls -le` that fails or prints nothing is refused, never
+#     guessed around.
+#   deny_only LS-LDEN-OUTPUT: every ACL line after the first (` 0: <who> deny delete`, with
+#     `inherited` before `deny` when inherited) is a deny entry that does not deny reading
+#     (read, search, list, readattr, readextattr or readsecurity), which would keep the non-root
+#     agent from reading the policy. <who> is a UUID, as `-n` makes macOS print every principal
+#     (group:everyone shows as ABCDEFAB-CDEF-ABCD-EFAB-CDEF0000000C), or a `type:name` such as
+#     group:everyone. An allow entry, such a deny entry, or a line of any other shape, fails.
+#   policy_file_ok PATH: ls_ok as a root:wheel 644 regular file with no ACL, one hard link (no other
+#     name can change it), and holding exactly the bytes in $b64.
+# Absolute tool paths, because the guest's PATH starts at ~/.local/bin. Deliberately
+# `base64 --decode`: the spelling both macOS's base64 and GNU's accept. `printf` is a shell
+# builtin, so the payload is on no argv (it is not secret either way).
+macos_policy_checks_sh() {
+    cat <<'SCRIPT'
+set -f
+nl='
+'
+deny_only() {
+    printf '%s\n' "$1" | {
+        IFS= read -r _
+        while IFS= read -r a; do
+            set -- $a
+            case "$1" in [0-9]*:) ;; *) exit 1 ;; esac
+            case "${1%:}" in *[!0-9]*) exit 1 ;; esac
+            case "$2" in
+                ?*:?*) ;;
+                ????????-????-????-????-????????????) case "$2" in *[!0-9A-Fa-f-]*) exit 1 ;; esac ;;
+                *) exit 1 ;;
+            esac
+            if [ "$3" = inherited ]; then kind="$4"; perms="$5"; else kind="$3"; perms="$4"; fi
+            [ "$kind" = deny ] && [ -n "$perms" ] || exit 1
+            case ",$perms," in
+                *,read,*|*,search,*|*,list,*|*,readattr,*|*,readextattr,*|*,readsecurity,*) exit 1 ;;
+            esac
+        done
+    }
+}
+ls_ok() {
+    [ ! -L "$1" ] && [ "$2" "$1" ] || return 1
+    l="$(/bin/ls -ldn "$1")" || return 1
+    acl="$(/bin/ls -lden "$1" 2>/dev/null)" && [ -n "$acl" ] || return 1
+    owner="$3"; mode="$4"; acl_ok=
+    case "$acl" in *"$nl"*) [ "$5" = deny ] && deny_only "$acl" && acl_ok=1 || return 1 ;; esac
+    set -- $l
+    case "$3:$4" in $owner) ;; *) return 1 ;; esac
+    m="${1%[@.]}"
+    [ -z "$acl_ok" ] || m="${m%+}"
+    case "$m" in $mode) return 0 ;; esac
+    return 1
+}
+policy_file_ok() {
+    ls_ok "$1" -f 0:0 -rw-r--r-- || return 1
+    set -- "$1" $(/bin/ls -ldn "$1")
+    [ "$3" = 1 ] || return 1
+    printf '%s' "$b64" | /usr/bin/base64 --decode | /usr/bin/cmp -s - "$1"
+}
+SCRIPT
+}
+
+# Root shell code for verify_macos_managed_settings (after macos_managed_settings_vars_sh and
+# macos_policy_checks_sh): read-only, it names the first thing that differs on stderr and prints
+# AUGUR_POLICY_MISMATCH, then exits 1, or prints AUGUR_POLICY_OK. Either report is the last line.
+macos_managed_settings_check_sh() {
+    cat <<'SCRIPT'
+f="$dir/$name"
+mismatch() { echo "$1" >&2; echo AUGUR_POLICY_MISMATCH; exit 1; }
+{ [ -e "$dir" ] || [ -L "$dir" ]; } || mismatch "$dir is missing"
+ls_ok "$dir" -d '0:*' drwxr-xr-x deny || mismatch "$dir is not a root-owned 755 directory without an ACL that allows anything or denies reading"
+{ [ -e "$f" ] || [ -L "$f" ]; } || mismatch "$f is missing"
+ls_ok "$f" -f 0:0 -rw-r--r-- || mismatch "$f is not a root:wheel 644 regular file without an ACL"
+policy_file_ok "$f" || mismatch "$f has other hard links or does not hold augur's policy"
+echo AUGUR_POLICY_OK
+SCRIPT
+}
+
+# Root shell code for install_macos_managed_settings (after macos_managed_settings_vars_sh and
+# macos_policy_checks_sh) that replaces the policy directory $dir as a whole, never editing it in
+# place, so nothing a non-root user put in or on the old one (entries, hard links, ACLs, a symlink,
+# a file or directory where the policy belongs) can survive:
+#   0. $base itself must be a real directory owned by root, not writable by group or others, with
+#      no ACL that allows anything (any group: stock macOS has root:admin 755), or no other user
+#      could be kept from renaming things in it. Refused otherwise.
+#   1. A fresh directory is made next to $dir in $base: root:wheel, 755, its ACL stripped
+#      (`chmod -N`; mktemp may inherit one from $base). The payload is decoded straight into
+#      $name in it, which then gets root:wheel, 644, no ACL. Both are checked before anything
+#      goes live; nobody else can write the fresh directory meanwhile.
+#   2. The old $dir, whatever it is (a directory, a file, a symlink, which `mv` moves as a link),
+#      is moved into a fresh 700 quarantine directory under /var/root, which only root can
+#      traverse, so its removal at the end cannot be raced through its path. The names in an old
+#      directory, other than $name, are reported, each base64-encoded on its own line
+#      (AUGUR_POLICY_DISCARDED <base64>), so no name can forge a report line. The fresh directory is then renamed to $dir, a free name by then, so `mv` cannot put it inside
+#      anything.
+#      Accepted trade-off: a process already holding a directory of the old tree open (its cwd)
+#      can still change that directory during the removal; `rm -rf` does not follow symlinks, so
+#      at worst it removes less.
+#   3. The live $dir and its file are checked again, then the quarantine is removed; when that
+#      fails, the script reports it (AUGUR_POLICY_LEFTOVER <path>) and goes on. Deliberately not a
+#      failure: the policy is in place, and the leftover sits under /var/root, which only root can
+#      reach. Last of all, it prints AUGUR_POLICY_LIVE on stdout and exits 0: the host takes
+#      nothing else as success.
+# Any other failure exits 1 with the reason on stderr (fail): the fresh directory is removed (after
+# step 2's rename, by moving the new $dir into the quarantine), an old $dir already moved aside is
+# put back, and the quarantine is removed once nothing of the old one is left in it. When either
+# move fails, it says so, says where the old one is, and keeps the quarantine.
+macos_managed_settings_swap_sh() {
+    cat <<'SCRIPT'
+fresh=; quar=; moved=; live=
+fail() {
+    echo "$1" >&2
+    [ -z "$fresh" ] || /bin/rm -rf "$fresh"
+    if [ -n "$live" ] && ! /bin/mv "$dir" "$quar/new"; then
+        echo "cannot move the new $dir aside${moved:+, so the old one was not put back; it is at $quar/old}" >&2; exit 1
+    fi
+    if [ -n "$moved" ]; then
+        /bin/mv "$quar/old" "$dir" || { echo "cannot put the old $dir back; it is at $quar/old" >&2; exit 1; }
+    fi
+    [ -z "$quar" ] || /bin/rm -rf "$quar"
+    exit 1
+}
+# Deliberately tolerates a deny-only ACL on $base: a deny entry cannot grant anyone write.
+ls_ok "$base" -d '0:*' 'd????[!w]??[!w]?' deny || fail "$base is not a directory owned by root, unwritable by group and others, without an ACL that allows anything"
+fresh="$(/usr/bin/mktemp -d "$base/.augur-policy.XXXXXX")" || { fresh=; fail "cannot create a directory in $base"; }
+/usr/sbin/chown root:wheel "$fresh" && /bin/chmod 755 "$fresh" && /bin/chmod -N "$fresh" || fail "cannot make $fresh root:wheel 755 without an ACL"
+printf '%s' "$b64" | /usr/bin/base64 --decode > "$fresh/$name" || fail "cannot decode the policy"
+/usr/sbin/chown root:wheel "$fresh/$name" && /bin/chmod 644 "$fresh/$name" && /bin/chmod -N "$fresh/$name" \
+    || fail "cannot make the policy file root:wheel 644 without an ACL"
+ls_ok "$fresh" -d 0:0 drwxr-xr-x && policy_file_ok "$fresh/$name" || fail "the new policy is not root:wheel without an ACL"
+quar="$(/usr/bin/mktemp -d /var/root/.augur-quarantine.XXXXXX)" || { quar=; fail "cannot create a quarantine directory in /var/root"; }
+/bin/chmod 700 "$quar" && /bin/chmod -N "$quar" || fail "cannot make $quar 700 without an ACL"
+if [ -e "$dir" ] || [ -L "$dir" ]; then /bin/mv "$dir" "$quar/old" && moved=1 || fail "cannot move the old $dir aside"; fi
+if [ -n "$moved" ] && [ -d "$quar/old" ] && [ ! -L "$quar/old" ]; then
+    set +f
+    for p in "$quar/old"/* "$quar/old"/.[!.]* "$quar/old"/..?*; do
+        { [ -e "$p" ] || [ -L "$p" ]; } || continue
+        e="${p##*/}"
+        [ "$e" = "$name" ] || echo "AUGUR_POLICY_DISCARDED $(printf '%s' "$e" | /usr/bin/base64 | /usr/bin/tr -d '\n')"
+    done
+    set -f
+fi
+/bin/mv "$fresh" "$dir" || fail "cannot move the new policy directory to $dir"
+fresh=; live=1
+ls_ok "$dir" -d 0:0 drwxr-xr-x && policy_file_ok "$dir/$name" && [ "$(/bin/ls -A "$dir")" = "$name" ] \
+    || fail "$dir is not exactly the new policy after the swap"
+/bin/rm -rf "$quar" || { echo "cannot remove the old policy directory, left in $quar" >&2; echo "AUGUR_POLICY_LEFTOVER $quar"; }
+echo AUGUR_POLICY_LIVE
+exit 0
+SCRIPT
 }
 
 # The sshd drop-in that lets a macOS guest receive a session's credentials, and the one line in it.
@@ -4311,12 +4567,26 @@ MACOS_ROOT_SCRIPT_BEGIN='#augur-root-script'
 #     marker, so the password never reaches the shell that runs the script, where an unknown
 #     command would print it into the output.
 # A wrong password makes sudo fail after taking further lines as retries, so the script never runs.
-# The script must not read stdin itself (it is that stdin). Its output and exit status are the
-# caller's. The password is on no argv (see macos_admin_password_stdin).
+# The script must not read stdin itself (it is that stdin). The password is on no argv (see
+# macos_admin_password_stdin).
+# Its stdout and exit status are the caller's. Its stderr (sudo's, the script's, ssh's) is guest
+# text and is NOT passed on: it is left in MACOS_ROOT_SCRIPT_ERR, for the caller to show through
+# show_guest_lines. augur's own messages go to stderr as usual: before connecting, a VM with no
+# stored admin password or no SSH transport is refused (return 1, after augur's error), so nothing
+# connects without a password to send.
+MACOS_ROOT_SCRIPT_ERR=""
 macos_run_root_script() {
-    local vm="$1" script="$2"
+    local vm="$1" script="$2" _rc=0
+    MACOS_ROOT_SCRIPT_ERR=""
+    # Accepted trade-off: the transport can stop resolving between the checks below and the connection;
+    # ssh_macos then reports it, and that error lands in MACOS_ROOT_SCRIPT_ERR as if from the guest.
+    ( require_macos_admin_password "$vm" ) || return 1
+    macos_ssh_transport_ok "$vm" || { error "Cannot reach VM '${vm}' over SSH: its SSH host or port does not resolve."; return 1; }
+    { MACOS_ROOT_SCRIPT_ERR="$(
     { macos_admin_password_stdin "$vm" && printf '%s\n' "$MACOS_ROOT_SCRIPT_BEGIN" "$script"; } \
-        | ssh_macos "$vm" "sudo -S -k -p '' /bin/sh -c 'm=; while IFS= read -r l; do if [ \"\$l\" = \"${MACOS_ROOT_SCRIPT_BEGIN}\" ]; then m=1; break; fi; done; [ -n \"\$m\" ] && exec /bin/sh -s; exit 1'"
+        | ssh_macos "$vm" "sudo -S -k -p '' /bin/sh -c 'm=; while IFS= read -r l; do if [ \"\$l\" = \"${MACOS_ROOT_SCRIPT_BEGIN}\" ]; then m=1; break; fi; done; [ -n \"\$m\" ] && exec /bin/sh -s; exit 1'" 2>&1 >&3 3>&-
+    )"; } 3>&1 || _rc=$?
+    return "$_rc"
 }
 
 # The credential names of an augur session (session_credential_names) on one line, space-separated,
@@ -4389,7 +4659,8 @@ accepts || { cat "\$err" >&2; rm -f "\$dst"; cleanup; exit 3; }
 cleanup
 SCRIPT
 )"
-    _err="$(macos_run_root_script "$vm" "$_script" 2>&1 >/dev/null)" || _rc=$?
+    macos_run_root_script "$vm" "$_script" >/dev/null || _rc=$?
+    _err="$MACOS_ROOT_SCRIPT_ERR"
     if (( _rc == 0 )) && ! ssh_macos "$vm" true </dev/null; then
         _rc=4; _err="no new SSH connection is accepted after installing ${dst}"
     fi
@@ -4417,7 +4688,8 @@ verify_macos_session_env_acceptance() {
     _script="$(macos_session_env_accepts_sh "$_names")"
     _script+=$'\naccepts || { cat "$err" >&2; rm -f "$err"; exit 3; }\nrm -f "$err"'
     _script+=$'\n'"${_check} || { echo \"$(macos_session_sshd_dropin) does not hold the line every clone checks for: $(macos_session_accept_env_line "$_names")\" >&2; exit 5; }"
-    _err="$(macos_run_root_script "$vm" "$_script" 2>&1 >/dev/null)" || _rc=$?
+    macos_run_root_script "$vm" "$_script" >/dev/null || _rc=$?
+    _err="$MACOS_ROOT_SCRIPT_ERR"
     (( _rc == 0 )) && return 0
     error "The base VM's sshd no longer accepts augur's session credentials ($(macos_session_sshd_dropin)):"
     printf '%s\n' "$_err" | show_guest_lines
@@ -6237,6 +6509,16 @@ EOF
         exit 1
     fi
 
+    # Re-assert augur's managed policy on every update, so a base VM built before this existed
+    # self-heals on routine maintenance instead of needing a full rebuild. Each install replaces the
+    # whole policy directory with a fresh one holding the same policy. Before custom provisioning,
+    # as in cmd_build_macos: provisioning, re-run below on every update, then adds its own files to
+    # the directory again.
+    install_macos_managed_settings "$MACOS_UPDATE_VM" || {
+        error "The base VM was left as-is; re-run ${BOLD}augur update --macos${RESET}, or rebuild with ${BOLD}augur build --macos${RESET}."
+        exit 1
+    }
+
     # Optional custom provisioning (~/.augur/provision/manifest.conf and/or hook.sh) — kept
     # in sync with the base VM on every update too, not just at first build. No-op unless
     # the operator created those files. See run_base_provisioning.
@@ -6248,11 +6530,6 @@ EOF
     # nor this update step ever runs `claude` interactively); running this on every update makes
     # that self-healing instead of requiring a full rebuild to notice and fix.
     macos_scrub_agent_config "$MACOS_UPDATE_VM"
-
-    # Same reasoning as the scrub above: re-assert augur's managed policy on every update, so a base
-    # VM built before this existed self-heals on routine maintenance instead of needing a full
-    # rebuild. Idempotent (it overwrites the same file with the same bytes).
-    install_macos_managed_settings "$MACOS_UPDATE_VM"
 
     # Same as the end of cmd_build_macos, re-run here so a base VM built with the Command Line
     # Tools left selected self-heals without a rebuild, and provisioning above cannot undo it.
@@ -6266,6 +6543,12 @@ EOF
     agent_verify_integrity_macos "$MACOS_UPDATE_VM" || {
         agent_signature_check_failed updated
         error "The base VM was left as-is."
+        exit 1
+    }
+
+    # As in cmd_build_macos: the managed policy must still be augur's after custom provisioning.
+    verify_macos_managed_settings "$MACOS_UPDATE_VM" || {
+        error "The base VM was left as-is; re-run ${BOLD}augur update --macos${RESET}, or rebuild with ${BOLD}augur build --macos${RESET}."
         exit 1
     }
 

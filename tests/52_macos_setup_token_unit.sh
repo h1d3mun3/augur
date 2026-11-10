@@ -178,6 +178,8 @@ install_macos_session_env_acceptance() { echo "sessionenv $1" >> "$LOG"; }
 SE_OK=1
 verify_macos_session_env_acceptance() { echo "sessionenv-check $1" >> "$LOG"; [[ "$SE_OK" == 1 ]]; }
 select_macos_full_xcode()        { echo "xcode $1" >> "$LOG"; }
+MC_OK=1
+verify_macos_managed_settings() { echo "managed-check $1" >> "$LOG"; [[ "$MC_OK" == 1 ]]; }
 SIG_OK=1
 verify_real="$(declare -f agent_verify_integrity_macos)"
 agent_verify_integrity_macos() { echo "verify $1" >> "$LOG"; [[ "$SIG_OK" == 1 ]]; }
@@ -197,6 +199,17 @@ for s in provision managed sessionenv xcode; do
   v_at="$(line_of "verify $MACOS_UPDATE_VM")"; s_at="$(line_of "$s $MACOS_UPDATE_VM")"
   [[ -n "$s_at" && -n "$v_at" && "$s_at" -lt "$v_at" ]] && ok "the check runs on the final guest state, after $s" || fail "the check ran before $s" "$(cat "$LOG")"
 done
+
+reset_vms; SIG_OK=1
+install_macos_managed_settings() { echo "managed $1" >> "$LOG"; return 1; }
+run_update
+install_macos_managed_settings() { echo "managed $1" >> "$LOG"; }
+[[ "$rc" -ne 0 ]] && ok "failed managed-policy install: update exits non-zero" || fail "failed managed-policy install: update exited 0"
+has "$out" "The base VM was left as-is; re-run" "failed managed-policy install: says the base VM was left as-is, and the remedy"
+logged "verify $MACOS_UPDATE_VM" && fail "failed managed-policy install: later steps still ran" || ok "failed managed-policy install: the update stops there"
+logged "vm delete $MACOS_BASE_VM" && fail "failed managed-policy install: the base VM was deleted" || ok "failed managed-policy install: the base VM is untouched"
+logged "vm clone $MACOS_UPDATE_VM $MACOS_BASE_VM" && fail "failed managed-policy install: the update was saved" || ok "failed managed-policy install: nothing is saved as the base VM"
+logged "vm delete $MACOS_UPDATE_VM" && ok "failed managed-policy install: the staging copy is discarded" || fail "failed managed-policy install: the staging copy is left behind"
 
 reset_vms; SIG_OK=1
 select_macos_full_xcode() { echo "xcode $1" >> "$LOG"; return 1; }
@@ -269,7 +282,7 @@ reset_vms; SIG_OK=1; SE_OK=1
 run_update
 k_at="$(line_of "sessionenv-check $MACOS_UPDATE_VM")"; v_at="$(line_of "verify $MACOS_UPDATE_VM")"
 c_at="$(line_of "vm clone $MACOS_UPDATE_VM $MACOS_BASE_VM")"
-last_guest="$(grep -nE "^(ssh|provision|managed|sessionenv|sessionenv-check|xcode|verify) $MACOS_UPDATE_VM$" "$LOG" | tail -n1 | cut -d: -f1)"
+last_guest="$(grep -nE "^(ssh|provision|managed|managed-check|sessionenv|sessionenv-check|xcode|verify) $MACOS_UPDATE_VM$" "$LOG" | tail -n1 | cut -d: -f1)"
 if [[ -n "$k_at" && -n "$v_at" && -n "$c_at" && "$v_at" -lt "$k_at" && "$k_at" -lt "$c_at" && "$k_at" == "$last_guest" ]]; then
   ok "update: the drop-in is re-checked as the last guest step, before the save (verify@$v_at check@$k_at save@$c_at)"
 else fail "update: the drop-in re-check is misplaced" "$(cat "$LOG")"; fi
@@ -283,6 +296,13 @@ logged "vm delete $MACOS_BASE_VM" && fail "drop-in re-check fails: the base VM w
 logged "vm clone $MACOS_UPDATE_VM $MACOS_BASE_VM" && fail "drop-in re-check fails: the update was saved as the base VM" || ok "drop-in re-check fails: nothing is saved as the base VM"
 logged "vm delete $MACOS_UPDATE_VM" && ok "drop-in re-check fails: the staging copy is discarded" || fail "drop-in re-check fails: the staging copy is left behind"
 SE_OK=1
+reset_vms; SIG_OK=1; SE_OK=1; MC_OK=0
+run_update
+MC_OK=1
+[[ "$rc" -ne 0 ]] && ok "managed policy re-check fails: update exits non-zero" || fail "managed policy re-check fails: update exited 0"
+logged "vm clone $MACOS_UPDATE_VM $MACOS_BASE_VM" && fail "managed policy re-check fails: the update was saved" || ok "managed policy re-check fails: nothing is saved as the base VM"
+logged "sessionenv-check $MACOS_UPDATE_VM" && fail "managed policy re-check fails: later steps still ran" || ok "managed policy re-check fails: the update stops there"
+reset_vms; SE_OK=1
 
 section "Tier 1 — update --macos: never touches the build VM; serialized with build by the base-writer lock"
 WLOCK="$(host_lock_path "$MACOS_BASE_WRITER_LOCK")"
@@ -716,7 +736,15 @@ run_update() { out="$( exec 2>&1 </dev/null; set -e; cmd_update_macos )"; rc=$?;
 ssh_macos_provision()            { local vm="$1"; shift; guest "$vm" "pssh"; }
 ssh_macos_provision_stdin()      { cat >/dev/null; local vm="$1"; shift; guest "$vm" "pssh"; }
 macos_admin_password_stdin()     { echo pw; }
-install_macos_managed_settings() { guest "$1" managed; }
+# A stand-in for the guest's policy directory: the managed install replaces it whole (as the real
+# one does), and the hook adds the operator's file to it. The file must still be there at the end.
+POLICY_DIR="$TMPD/policy-dir"
+install_macos_managed_settings() { guest "$1" managed && rm -rf "$POLICY_DIR" && mkdir -p "$POLICY_DIR" && printf augur-policy > "$POLICY_DIR/managed-settings.json" && chmod 644 "$POLICY_DIR/managed-settings.json"; }
+# The re-check, against the stand-in: the policy file still holds what the install wrote, mode 644.
+verify_macos_managed_settings() {
+    guest "$1" managed-check && [[ "$(cat "$POLICY_DIR/managed-settings.json" 2>/dev/null)" == augur-policy ]] \
+        && [[ "$(stat -c %a "$POLICY_DIR/managed-settings.json" 2>/dev/null || stat -f %Lp "$POLICY_DIR/managed-settings.json")" == 644 ]]
+}
 select_macos_full_xcode()        { guest "$1" xcode; }
 agent_verify_integrity_macos()   { guest "$1" verify && [[ "$SIG_OK" == 1 ]]; }
 SE_OK=1
@@ -730,18 +758,34 @@ stop_provision_proxy()           { echo "stop_provision_proxy" >> "$LOG"; }
 stop_provision_gvproxy()         { echo "stop_provision_gvproxy" >> "$LOG"; }
 run_provision_manifest()         { guest "$1" manifest; }
 HOOK_OK=1
-run_provision_hook()             { guest "$1" hook && [[ "$HOOK_OK" == 1 ]]; }
+# HOOK_DOES: add (another file beside the policy), overwrite or chmod (augur's policy file).
+HOOK_DOES=add
+run_provision_hook() {
+    guest "$1" hook && : > "$POLICY_DIR/managed-mcp.json" || return 1
+    case "$HOOK_DOES" in
+        overwrite) printf '{}' > "$POLICY_DIR/managed-settings.json" ;;
+        chmod)     chmod 666 "$POLICY_DIR/managed-settings.json" ;;
+    esac
+    [[ "$HOOK_OK" == 1 ]]
+}
 no_stopped_steps() {   # no_stopped_steps <label>
   grep -q '^STOPPED ' "$LOG" && fail "$1: a step ran against a stopped VM" "$(grep '^STOPPED ' "$LOG")" || ok "$1: no step ran against a stopped VM"
 }
-after_hook() {   # after_hook <label> <vm>: managed, xcode, verify all after the hook, verify last
-  local h m x v
+after_hook() {   # after_hook <label> <vm>: managed before the hook; xcode, verify after it, verify last
+  local h m x v p
   h="$(line_of "hook $2")"; m="$(line_of "managed $2")"; x="$(grep -nx "xcode $2" "$LOG" | tail -n1 | cut -d: -f1)"; v="$(line_of "verify $2")"
-  if [[ -n "$h" && -n "$m" && -n "$x" && -n "$v" && "$h" -lt "$m" && "$m" -lt "$v" && "$x" -lt "$v" ]]; then
-    ok "$1: managed policy, Xcode selection and then the signer check run after the hook (hook@$h verify@$v)"
-  else fail "$1: post-provisioning steps out of order" "hook@$h managed@$m xcode@$x verify@$v"; fi
+  p="$(line_of "boot-filtered $2")"
+  if [[ -n "$h" && -n "$m" && -n "$p" && -n "$x" && -n "$v" && "$m" -lt "$p" && "$p" -lt "$h" && "$h" -lt "$x" && "$x" -lt "$v" ]]; then
+    ok "$1: managed policy before provisioning, then the hook, Xcode selection and the signer check (managed@$m provision@$p hook@$h verify@$v)"
+  else fail "$1: steps around provisioning out of order" "managed@$m provision@$p hook@$h xcode@$x verify@$v"; fi
+  eq "1" "$(grep -cx "managed $2" "$LOG")" "$1: the managed policy is installed once (nothing after provisioning replaces its directory)"
+  local mc k2; mc="$(line_of "managed-check $2")"; k2="$(line_of "sessionenv-check $2")"
+  [[ -n "$mc" && "$v" -lt "$mc" && "$mc" -lt "$k2" ]] && ok "$1: the managed policy is re-checked after the signer check, before the drop-in re-check (check@$mc)" \
+    || fail "$1: the managed policy re-check is misplaced" "verify@$v managed-check@$mc sessionenv-check@$k2"
+  [[ -e "$POLICY_DIR/managed-mcp.json" && -e "$POLICY_DIR/managed-settings.json" ]] && ok "$1: a file the provisioning hook adds to the policy directory survives" \
+    || fail "$1: the provisioning hook's file in the policy directory is gone" "$(ls -A "$POLICY_DIR" 2>&1)"
   local b; b="$(grep -n "^boot-nat $2$" "$LOG" | tail -n1 | cut -d: -f1)"
-  [[ -n "$b" && "$h" -lt "$b" && "$b" -lt "$m" ]] && ok "$1: the VM is restarted on NAT after provisioning" || fail "$1: no NAT restart after provisioning" "hook@$h nat@$b managed@$m"
+  [[ -n "$b" && "$h" -lt "$b" && "$b" -lt "$x" ]] && ok "$1: the VM is restarted on NAT after provisioning" || fail "$1: no NAT restart after provisioning" "hook@$h nat@$b xcode@$x"
   local k last; k="$(line_of "sessionenv-check $2")"
   last="$(grep -nE "^[a-z-]+ $2$" "$LOG" | grep -vE ':(boot-nat|boot-filtered) ' | tail -n1 | cut -d: -f1)"
   [[ -n "$k" && "$v" -lt "$k" && "$k" == "$last" ]] && ok "$1: the sshd drop-in is re-checked last, after the signer check (check@$k)" \
@@ -793,6 +837,22 @@ v_at="$(line_of "verify $MACOS_BUILD_VM")"; c_at="$(line_of "vm clone $MACOS_BUI
 macos_vm_exists "$MACOS_BASE_VM" && ok "build with provisioning: the base VM is saved" || fail "build with provisioning: no base VM"
 [[ -L "$WLOCK" ]] && fail "build: the base-writer lock is left behind" || ok "build: the base-writer lock is released"
 
+# Provisioning that replaces or loosens augur's policy file: the re-check stops both, nothing saved.
+for how in overwrite chmod; do
+  reset_vms; : > "$RUNF"; SIG_OK=1; HOOK_DOES=$how
+  run_update
+  HOOK_DOES=add
+  [[ "$rc" -ne 0 ]] && ok "update, provisioning that does $how to the policy file: exits non-zero" || fail "update, provisioning that does $how to the policy file: exited 0"
+  has "$out" "The base VM was left as-is; re-run" "update, provisioning that does $how to the policy file: says the base VM was left as-is"
+  logged "vm clone $MACOS_UPDATE_VM $MACOS_BASE_VM" && fail "update, $how: saved as the base VM" || ok "update, provisioning that does $how to the policy file: nothing is saved"
+  : > "$VMS"; : > "$LOG"; : > "$RUNF"; HOOK_DOES=$how
+  run_build
+  HOOK_DOES=add
+  [[ "$rc" -ne 0 ]] && ok "build, provisioning that does $how to the policy file: exits non-zero" || fail "build, provisioning that does $how to the policy file: exited 0"
+  has "$out" "no base VM was saved" "build, provisioning that does $how to the policy file: says no base VM was saved"
+  logged "vm clone $MACOS_BUILD_VM $MACOS_BASE_VM" && fail "build, $how: saved as the base VM" || ok "build, provisioning that does $how to the policy file: nothing is saved"
+done
+
 : > "$VMS"; : > "$LOG"; : > "$RUNF"; SIG_OK=0
 run_build
 [[ "$rc" -ne 0 ]] && ok "build: a binary failing the final check aborts" || fail "build: the final check passed a bad binary"
@@ -805,6 +865,15 @@ run_build
 has "$out" "no base VM was saved" "build: a failing re-check says no base VM was saved"
 logged "vm clone $MACOS_BUILD_VM $MACOS_BASE_VM" && fail "…but it was saved as the base VM" || ok "…and nothing is saved as the base VM"
 SE_OK=1
+
+: > "$VMS"; : > "$LOG"; : > "$RUNF"
+install_macos_managed_settings() { guest "$1" managed; return 1; }
+run_build
+install_macos_managed_settings() { guest "$1" managed; }
+[[ "$rc" -ne 0 ]] && ok "build: a failed managed-policy install aborts" || fail "build: a failed managed-policy install was ignored"
+has "$out" "no base VM was saved" "build: a failed managed-policy install says no base VM was saved"
+logged "verify $MACOS_BUILD_VM" && fail "…but later steps still ran" || ok "…and the build stops there"
+logged "vm clone $MACOS_BUILD_VM $MACOS_BASE_VM" && fail "…but it was saved as the base VM" || ok "…and nothing is saved as the base VM"
 
 : > "$VMS"; : > "$LOG"; : > "$RUNF"; CLONE_FAIL_TO="$MACOS_BASE_VM"
 run_build
