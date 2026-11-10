@@ -71,4 +71,11 @@ else
   fail "helper hung (~${elapsed}s)" "teardown not bounded — only the 5s safety net freed it"
 fi
 
+# With no pid (a stop by name only) it still succeeds, so a set -e EXIT trap that calls it goes on
+# to its next step: install-cert --macos releases the base-writer lock right after it.
+: > "$calls"
+out="$( set -e; trap 'stop_and_reap_macos_vm testvm ""; echo next' EXIT; exit 1 )"
+eq "next" "$out" "helper with no pid succeeds, so a set -e EXIT trap goes on to its next step"
+has "$(cat "$calls")" 'stop testvm' "…and still stops the VM by name"
+
 finish
