@@ -368,7 +368,7 @@ if (( CAN_RUN )); then guest_tiers
 else skip "the tiers that run the root script" "needs unprivileged user+mount namespaces, overlayfs and /bin linked to /usr/bin"; fi
 
 section "Tier 0 — source guard"
-code="$(declare -f run_provision_hook)"
+code="$(declare -f run_provision_hook; declare -f macos_provision_hook_root_sh)"
 hasnt "$code" "scp" "run_provision_hook copies nothing with scp"
 hasnt "$code" "/tmp" "run_provision_hook names no /tmp path"
 has "$code" "ssh_macos_provision_stdin" "run_provision_hook runs over the provisioning network's stdin wrapper"

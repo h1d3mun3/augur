@@ -7058,6 +7058,29 @@ run_provision_manifest() {
     done < <(provision_manifest_entries)
 }
 
+# Root shell code (for macos_run_root_script) that runs the hook whose base64 encoding is $1: see
+# run_provision_hook. Deliberately a function that prints a heredoc, not a heredoc inside "$(...)":
+# macOS's /bin/bash 3.2 ends a command substitution at the first unmatched `)`, even one closing a
+# case pattern inside a heredoc, and then the whole augur script fails to parse.
+macos_provision_hook_root_sh() {
+    cat <<SCRIPT
+d=
+trap '[ -z "\$d" ] || /bin/rm -rf "\$d"' EXIT
+trap 'exit 129' HUP
+trap 'exit 143' TERM
+hook_path=/opt/homebrew/bin:/opt/homebrew/sbin
+set -f; IFS=:
+for p in \$PATH; do case "\$p" in /*) hook_path="\$hook_path:\$p" ;; esac; done
+set +f; unset IFS
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+d="\$(/usr/bin/mktemp -d /var/root/augur-provision-hook.XXXXXX)" || exit 1
+printf '%s\n' '${1}' | /usr/bin/base64 --decode > "\$d/hook.sh" || exit 1
+/usr/bin/env PATH="\$hook_path" HOMEBREW_PREFIX=/opt/homebrew HOMEBREW_CELLAR=/opt/homebrew/Cellar \\
+    HOMEBREW_REPOSITORY=/opt/homebrew INFOPATH="/opt/homebrew/share/info:\${INFOPATH:-}" \\
+    bash "\$d/hook.sh" </dev/null 2>&1
+SCRIPT
+}
+
 # Run ~/.augur/provision/hook.sh as root in VM $1, which is on the provisioning network, without
 # writing it anywhere the guest user can: a copy in a user-writable file could be swapped by any
 # process of that user before root runs it. The hook travels base64-encoded inside a root script,
@@ -7100,23 +7123,8 @@ run_provision_hook() {
     [[ -f "$AUGUR_PROVISION_HOOK" ]] || return 0
     info "Provisioning: running ~/.augur/provision/hook.sh"
     b64="$(base64 < "$AUGUR_PROVISION_HOOK" | tr -d '\n')" || return 1
-    macos_run_root_script "$vm" "$(cat <<SCRIPT
-d=
-trap '[ -z "\$d" ] || /bin/rm -rf "\$d"' EXIT
-trap 'exit 129' HUP
-trap 'exit 143' TERM
-hook_path=/opt/homebrew/bin:/opt/homebrew/sbin
-set -f; IFS=:
-for p in \$PATH; do case "\$p" in /*) hook_path="\$hook_path:\$p" ;; esac; done
-set +f; unset IFS
-PATH=/usr/bin:/bin:/usr/sbin:/sbin
-d="\$(/usr/bin/mktemp -d /var/root/augur-provision-hook.XXXXXX)" || exit 1
-printf '%s\n' '${b64}' | /usr/bin/base64 --decode > "\$d/hook.sh" || exit 1
-/usr/bin/env PATH="\$hook_path" HOMEBREW_PREFIX=/opt/homebrew HOMEBREW_CELLAR=/opt/homebrew/Cellar \\
-    HOMEBREW_REPOSITORY=/opt/homebrew INFOPATH="/opt/homebrew/share/info:\${INFOPATH:-}" \\
-    bash "\$d/hook.sh" </dev/null 2>&1
-SCRIPT
-)" ssh_macos_provision_stdin || _rc=$?
+    macos_run_root_script "$vm" "$(macos_provision_hook_root_sh "$b64")" ssh_macos_provision_stdin \
+        || _rc=$?
     # A header only over a line show_guest_lines shows: one with a character other than a space.
     if [[ "$MACOS_ROOT_SCRIPT_ERR" == *[!$' \n']* ]]; then
         if (( _rc == 0 )); then
