@@ -7064,10 +7064,10 @@ run_provision_manifest() {
 # over one ssh connection (macos_run_root_script over ssh_macos_provision_stdin, so no Homebrew
 # code runs before sudo). The base64 alphabet has no quote, `$`, backslash or newline, so every
 # hook body arrives byte-exact. Root decodes it into a new directory that `mktemp -d` creates mode
-# 0700 under /var/root (root's home, writable only by root), runs it with /bin/bash from there, and
-# removes the directory when the root shell exits, whether the hook succeeded or not. The root
-# script's own tools are absolute paths under a system-only PATH, so none of them is looked up in
-# the guest user's Homebrew.
+# 0700 under /var/root (root's home, writable only by root), runs it from there (interpreter: see
+# below), and removes the directory when the root shell exits, whether the hook succeeded or not.
+# The root script's own tools are absolute paths under a system-only PATH, so none of them is
+# looked up in the guest user's Homebrew.
 #
 # The hook runs with stdin from /dev/null (which also keeps it from reading the rest of the root
 # script, its shell's stdin), no TTY, the cwd sudo leaves (the guest user's home) and the
