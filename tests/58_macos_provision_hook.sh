@@ -317,8 +317,8 @@ hasnt "$out" "did not complete" "a clean run prints no failure"
 
 section "Tier 1 — no SSH transport precheck for the provisioning network"
 # The VM's own host/port (ssh_macos's transport) does not resolve on the provisioning network.
-_real_transport="$(declare -f macos_ssh_transport_ok)"
-macos_ssh_transport_ok() { echo called >> "$TMPD/transport-calls"; return 1; }
+_real_transport="$(declare -f macos_ssh_build)"
+macos_ssh_build() { echo called >> "$TMPD/transport-calls"; return 1; }
 rm -f "$TMPD/transport-calls"; run_hook
 eq "0" "$rc" "the hook runs although the VM's own SSH host/port does not resolve"
 [[ -f "$EVID/hook-ran" ]] && ok "…it ran" || fail "…it did not run"
@@ -353,7 +353,7 @@ eq "0" "$rc" "the hook succeeds"
 hasnt "$out" "reported:" "no header is printed over nothing"
 
 section "Tier 1 — the password is checked before the SSH transport"
-macos_ssh_transport_ok() { echo called >> "$TMPD/transport-calls"; return 0; }
+macos_ssh_build() { echo called >> "$TMPD/transport-calls"; return 0; }
 rm -f "$TMPD/transport-calls"
 mv "$(macos_admin_password_file testvm)" "$TMPD/pw.saved"; reset
 out="$(macos_run_root_script testvm 'true' 2>&1)"; rc=$?

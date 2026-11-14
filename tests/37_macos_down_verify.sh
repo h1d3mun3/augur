@@ -339,7 +339,7 @@ else fail "down --macos does not re-check after the stop" "stop@${s_at:-none} re
 hasnt "$down_body" 'run.pid" ]]' "the re-check does not read the VM pidfile itself"
 # The delete's bare exit status IS destroy's re-check. Guard it explicitly: `|| true` here would put
 # the false success straight back, in the one function where it also loses the backend's own message.
-if printf '%s\n' "$destroy_body" | grep -q '"\$VM_CLI" delete "\$project_vm"$'
+if grep -q '"\$VM_CLI" delete "\$project_vm"$' <<<"$destroy_body"
 then ok "destroy --macos leaves its delete unguarded (a refusal aborts before the success line)"
 else fail "destroy --macos guarded or reshaped its delete" "$(printf '%s\n' "$destroy_body" | grep 'delete')"; fi
 

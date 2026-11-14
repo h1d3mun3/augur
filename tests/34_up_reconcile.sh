@@ -52,6 +52,9 @@ export AUGUR_VM_BIN="$TMPD/no-such-augur-vm"
 # resolves function names at CALL time, so a later definition wins.
 AUGUR_SOURCE_ONLY=1 source "$AUGUR"
 set +e                                    # augur enables `set -e`; restore lib.sh assert-and-continue
+# No host gh login: the real gh would hand over the operator's own token, read from the macOS
+# keychain. A case that needs a token defines its own gh.
+gh() { return 1; }
 AUGUR_PROXY_DIR="$TMPD/proxy"; mkdir -p "$AUGUR_PROXY_DIR"   # keep the test off the real ~/.augur
 # These five are assigned in the dispatch tail the AUGUR_SOURCE_ONLY seam returns before, so mint
 # them here exactly as that tail does — cmd_up's messages interpolate CONTAINER_NAME, cmd_up_macos's
@@ -133,7 +136,7 @@ stop_gvproxy()      { :; }
 stop_proxy()        { :; }
 wait_for_macos_ssh() { return 1; }   # would fail loudly if the branch ever fell through
 ssh_macos()         { echo "ssh_macos" >> "$LOG"; return 0; }
-macos_ssh_transport_ok() { return 0; }   # the stub ssh_macos above needs no host or port
+macos_ssh_pin() { :; }   # the stub ssh_macos above needs no host or port
 # The macOS boot self-test, recorded rather than run: it probes the guest over ssh_macos, and the
 # blanket stub above answers every probe with success — i.e. a screaming leak — which would tear the
 # VM down mid-reconcile. tests/36_macos_egress_selftest.sh owns its behaviour; here we only assert
@@ -310,10 +313,10 @@ pinned_fn="$(awk '/^warn_if_macos_egress_pinned\(\)/{f=1} f{print} f&&/^}/{exit}
 
 # `claude`/`shell` attach to a running VM WITHOUT going through cmd_up_macos, so they must warn
 # themselves — exactly why warn_if_macos_profile_stale is called from those same two sites.
-if printf '%s\n' "$claude_macos_body" | grep -q '^ *warn_if_macos_egress_pinned '
+if grep -q '^ *warn_if_macos_egress_pinned ' <<<"$claude_macos_body"
 then ok "macOS claude warns about pinned egress state (it attaches without going through up)"
 else fail "macOS claude does not call warn_if_macos_egress_pinned"; fi
-if printf '%s\n' "$shell_macos_body" | grep -q '^ *warn_if_macos_egress_pinned '
+if grep -q '^ *warn_if_macos_egress_pinned ' <<<"$shell_macos_body"
 then ok "macOS shell warns about pinned egress state"
 else fail "macOS shell does not call warn_if_macos_egress_pinned"; fi
 # Host-side only, like its peer: the thing being reported must not be asked to judge itself.
@@ -334,8 +337,9 @@ has "$running_branch" 'require_macos_egress_mode_current' "cmd_up_macos's alread
 # be a drift refusal.
 has "$running_branch" 'resolve_running_macos_vm_credentials "$project_vm"' "cmd_up_macos's already-running path resolves through resolve_running_macos_vm_credentials"
 has "$(fn_body resolve_running_macos_vm_credentials)" 'refuse_running_macos_vm "$1"' "…which is where a credential that cannot be used stops it (refuse_running_macos_vm)"
-has "$(fn_body refuse_running_macos_vm)" 'exit 1' "…which exits"
-if printf '%s\n' "$running_branch" | grep -v 'disarm_macos_push_on_exit; (( _prc == 0 )) || exit 1' | grep -q 'exit 1'
+has "$(fn_body refuse_running_macos_vm)" 'exit_with_errors "$@"' "…which exits (exit_with_errors)"
+has "$(fn_body exit_with_errors)" 'exit 1' "…with status 1"
+if grep -q 'exit 1' <<<"$(grep -v 'disarm_macos_push_on_exit; (( _prc == 0 )) || exit 1' <<<"$running_branch")"
 then fail "cmd_up_macos refuses on some other drift on the already-running path" "only the egress mode is a refusal"
 else ok "cmd_up_macos refuses on no other drift on the already-running path"; fi
 

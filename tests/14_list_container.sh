@@ -45,13 +45,13 @@ has "$out" "${yellow}stopped"                        "list: stopped state painte
 # A stopped container has a BLANK IP in real Apple output, and the trailing CPUS/MEMORY columns
 # shift left into the IP slot. cmd_list must NOT print that shifted CPU count — a stopped row's IP
 # degrades to "-". This is the exact field-shift bug the running-guard defends against.
-if grep 'augur-beta-eeff22334455-swift-6-0' <<<"$out" | grep -Eq -- '-[[:space:]]*$'; then
+if grep -Eq -- '-[[:space:]]*$' <<<"$(grep 'augur-beta-eeff22334455-swift-6-0' <<<"$out")"; then
   ok "list: stopped container's blank IP degrades to '-' (no CPU-count leak)"
 else
   fail "list: stopped IP not degraded to '-'" "$(grep beta <<<"$out")"
 fi
 # Belt-and-braces: the shifted CPU/MEMORY values must never surface as an IP on the beta line.
-grep 'augur-beta-eeff22334455-swift-6-0' <<<"$out" | grep -Eq '4096|MB' \
+grep -Eq '4096|MB' <<<"$(grep 'augur-beta-eeff22334455-swift-6-0' <<<"$out")" \
   && fail "list: stopped row leaked CPUS/MEMORY into the IP column" "$(grep beta <<<"$out")" \
   || ok "list: stopped row does not leak CPUS/MEMORY into the IP column"
 

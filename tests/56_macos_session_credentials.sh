@@ -153,10 +153,19 @@ gh() {
 # rest of the push (the acceptance check included) run for real. FAIL_STEP=vanish removes, in the
 # run's first push only, its temp file between the write and the rename, as a concurrent push's
 # cleanup would. FAIL_STEP=mktemp makes the guest's mktemp of the cleanup's reference file fail.
+# FAIL_STEP=drop runs the whole push, then drops the connection (255) as it closes. FAIL_STEP=noise
+# has the guest print a line with no newline before the push's own output.
 GUEST_HOME="$TMPD/guest"; mkdir -p "$GUEST_HOME"
 GUEST_ETC="$TMPD/guest-etc"; mkdir -p "$GUEST_ETC/ssh/sshd_config.d"
 FAIL_PUSH=0; FAIL_CHECK=0; FAIL_STEP=""
-guest_map() { local c="${1//\/Users\/${MACOS_SSH_USER}/$GUEST_HOME}"; printf '%s' "${c//\/etc\/ssh/$GUEST_ETC/ssh}"; }
+# The guest's /tmp reference file for the push's cleanup lands in GUEST_TMP, this run's own, so a
+# concurrent run of this file (or anything else using the host's /tmp) cannot change its count.
+GUEST_TMP="$TMPD/guest-tmp"; mkdir -p "$GUEST_TMP"
+guest_map() {
+    local c="${1//\/Users\/${MACOS_SSH_USER}/$GUEST_HOME}"
+    c="${c//\/tmp\/augur-env-ref/$GUEST_TMP/augur-env-ref}"
+    printf '%s' "${c//\/etc\/ssh/$GUEST_ETC/ssh}"
+}
 guest_run() { HOME="$GUEST_HOME" bash -c "$(guest_map "$1")"; }
 ssh_macos() {
     local vm="$1"; shift
@@ -176,8 +185,10 @@ ssh_macos() {
                 vanish) $first && c="${c//&& mv -f /&& find ~ -maxdepth 1 -name '.augur-env.tmp.*' -exec rm -f {} + && mv -f }" ;;
                 zshenv) c="${c//"~/.zshenv"/"/nonexistent-augur-test/zshenv"}" ;;
                 mktemp) c="${c//mktemp \/tmp\/augur-env-ref/false \/tmp\/augur-env-ref}" ;;
+                noise)  c="printf 'guest startup noise'; $c" ;;
             esac
-            printf '%s' "$in" | guest_run "$c" ;;
+            printf '%s' "$in" | guest_run "$c" || return
+            [[ "$FAIL_STEP" != drop ]] || return 255 ;;
         *) echo "UNEXPECTED GUEST COMMAND: $*" >&2; return 1 ;;
     esac
 }
@@ -293,16 +304,19 @@ verify_dropin() {   # sets $out / $rc
 ENV_FILE="$GUEST_HOME/.augur-env"
 # The value git_credential_env gives augur's helper (entry 1), as the session must export it.
 git_credential_env_value_1() { local _creds=(GH_TOKEN=x); git_credential_env | sed -n 's/^GIT_CONFIG_VALUE_1=//p'; }
-# The VM's current boot (augur-vm's run.pid), and the record that its self-test passed during it
-# (macos_egress_verified_file). The boot's pid is this test shell's, so the process is alive and
-# its start time readable, as augur-vm's would be. A running VM has that record before each run
-# unless UNVERIFIED=1; tests/51 covers the record itself.
+# The VM's current boot (the UUID augur-vm writes to run.id and its run.pid, this test shell's pid,
+# so the process is alive and its start time readable), and its boot record
+# (macos_boot_record_file) with the pass of a self-test during it. A running VM has that pass before
+# each run unless UNVERIFIED=1; tests/51 covers the record itself. no_pass: the record of a boot
+# whose self-test has not passed.
+printf '%s' 0C1D2E3F-4A5B-4C6D-8E7F-901A2B3C4D5E > "$AUGUR_DIR/vms/$(macos_project_vm)/run.id"
 printf '%s' "$$" > "$AUGUR_DIR/vms/$(macos_project_vm)/run.pid"
 BOOT_ID="$(macos_vm_run_id "$(macos_project_vm)")"
-[[ "$BOOT_ID" == "$$ "?* ]] || { echo "cannot read this shell's start time for the boot id: '$BOOT_ID'" >&2; exit 1; }
+[[ -n "$BOOT_ID" ]] || { echo "cannot read the VM's run id" >&2; exit 1; }
 UNVERIFIED=0
+no_pass() { printf 'on -\n' > "$(macos_boot_record_file)"; }
 run_cmd() {   # run_cmd claude|shell|up — sets $out / $rc; truncates the per-run logs first
-    if [[ "$RUNNING" != 0 && "$UNVERIFIED" == 0 ]]; then printf '%s\n' "$BOOT_ID" > "$(macos_egress_verified_file)"; fi
+    if [[ "$RUNNING" != 0 && "$UNVERIFIED" == 0 ]]; then printf 'on %s\n' "$BOOT_ID" > "$(macos_boot_record_file)"; fi
     : > "$SSHLOG"; : > "$PUSHLOG"; : > "$STEPS"; : > "$VMCHECKS"; : > "$VMLOG"; : > "$HOSTLOG"; : > "$GHCALLS"; : > "$SESSLOG"
     # The INT trap keeps a SIGINT the case sends itself from also ending this script (bash exits
     # when a child it waits for dies of SIGINT); the code under test sets its own over it.
@@ -338,7 +352,8 @@ section "Tier 1 — the base VM build writes the sshd drop-in that accepts the s
 
 install_dropin
 eq "0" "$rc" "the drop-in install succeeds when sshd confirms it"
-eq "$(macos_session_accept_env_line "$(macos_session_env_names)")" "$(grep -v '^#' "$DROPIN")" "the drop-in holds exactly one AcceptEnv line"
+eq "$(macos_session_accept_env_line "$(macos_session_env_names)")" "$(cat "$DROPIN")" "the drop-in holds exactly one AcceptEnv line and nothing else"
+[[ "$(tail -c 1 "$DROPIN" | od -An -c | tr -d ' ')" == '\n' ]] && ok "…which ends in a newline" || fail "the drop-in does not end in a newline"
 eq "AcceptEnv ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN GH_TOKEN" "$(macos_session_accept_env_line "$(macos_session_env_names)")" \
    "it names exactly the agent's credentials and GH_TOKEN, no patterns"
 eq "644" "$(mode_of "$DROPIN")" "the drop-in is mode 644"
@@ -374,8 +389,8 @@ nonzero "no fresh connection after the install: the install"
 has "$out" "no new SSH connection is accepted" "no fresh connection after the install: says so"
 FRESH_RC=0
 SSHD_T_FAILS=0
-real_names="$(declare -f session_credential_names)"
-session_credential_names() { echo 'BAD*NAME'; }
+real_names="$(declare -f agent_auth_specs)"
+agent_auth_specs() { echo 'BAD*NAME|BAD_HOST_VAR|/nonexistent|'; }
 install_dropin
 nonzero "a credential name that is a pattern: the install"
 eq "" "$(cat "$BUILDLOG")" "a credential name that is a pattern: nothing reaches the guest"
@@ -462,17 +477,73 @@ guest_run "$(macos_session_env_check_cmd "$(macos_session_env_names)")" && fail 
 cp "$TMPD/dropin.saved" "$DROPIN"
 verify_dropin
 eq "0" "$rc" "the re-check passes again with augur's own drop-in (control)"
-session_credential_names() { echo 'BAD*NAME'; }
+# Comment and blank lines in the drop-in are ignored, and what remains must be exactly augur's line:
+# a drop-in an earlier install wrote (a comment line above the line) passes, and one with any other
+# directive, or no line at all, is refused by the clones' check and so by the re-check before the
+# save.
+_al="$(macos_session_accept_env_line "$(macos_session_env_names)")"
+dropin_variants() {   # dropin_variants <name>: writes that variant of the drop-in
+  case "$1" in
+    earlier-install) printf '%s\n%s\n' '# augur: the credential names an augur claude/shell session sends.' "$_al" > "$DROPIN" ;;
+    comments-blanks) printf '\n  # one\n\n%s\n# two\n   \n' "$_al" > "$DROPIN" ;;
+    extra-acceptenv) printf '%s\nAcceptEnv FOO\n' "$_al" > "$DROPIN" ;;
+    extra-before)    printf '# augur\nAcceptEnv FOO\n%s\n' "$_al" > "$DROPIN" ;;
+    other-directive) printf '%s\nPermitUserEnvironment yes\n' "$_al" > "$DROPIN" ;;
+    commented-line)  printf '# %s\n' "$_al" > "$DROPIN" ;;
+    comments-only)   printf '# augur\n# nothing else\n' > "$DROPIN" ;;
+    empty)           : > "$DROPIN" ;;
+  esac
+}
+for _v in earlier-install comments-blanks; do
+  dropin_variants "$_v"
+  guest_run "$(macos_session_env_check_cmd "$(macos_session_env_names)")" && ok "the clones' check accepts a drop-in with $_v" \
+    || fail "the clones' check refuses a drop-in with $_v"
+  verify_dropin
+  eq "0" "$rc" "the re-check before the save passes a drop-in with $_v"
+done
+for _v in extra-acceptenv extra-before other-directive commented-line comments-only empty; do
+  dropin_variants "$_v"
+  guest_run "$(macos_session_env_check_cmd "$(macos_session_env_names)")" && fail "the clones' check accepts a drop-in with $_v" \
+    || ok "the clones' check refuses a drop-in with $_v"
+  verify_dropin
+  nonzero "the re-check before the save on a drop-in with $_v"
+  hasnt "$out" "No such file" "…with no raw error ($_v)"
+done
+rm -f "$DROPIN"
+guest_run "$(macos_session_env_check_cmd "$(macos_session_env_names)")" 2>"$TMPD/chk.err" && fail "the clones' check accepts a missing drop-in" \
+  || ok "the clones' check refuses a missing drop-in"
+eq "" "$(cat "$TMPD/chk.err")" "…without printing an error"
+printf '%s' "$_al" > "$DROPIN"
+guest_run "$(macos_session_env_check_cmd "$(macos_session_env_names)")" && ok "the clones' check accepts the exact line without its trailing newline" \
+  || fail "the clones' check refuses the exact line without a trailing newline"
+cp "$TMPD/dropin.saved" "$DROPIN"
+guest_run "$(macos_session_env_check_cmd "$(macos_session_env_names)")" && ok "the clones' check accepts augur's own drop-in (control)" \
+  || fail "the clones' check refuses augur's own drop-in"
+agent_auth_specs() { echo 'BAD*NAME|BAD_HOST_VAR|/nonexistent|'; }
 verify_dropin
 nonzero "the re-check with a credential name that is a pattern"
 eq "" "$(cat "$BUILDLOG")" "the re-check with a pattern name: nothing reaches the guest"
 # The AcceptEnv line, and so the drop-in and the clones' check, is built from the validated names:
-# macos_session_env_names is the one place they are checked, and every caller of the line and the
-# check computes them once, there.
-session_credential_names() { echo 'BAD*NAME'; }
+# session_credential_names is the one place they are checked, and every caller of the line and the
+# check computes them once, through macos_session_env_names.
+agent_auth_specs() { echo 'BAD*NAME|BAD_HOST_VAR|/nonexistent|'; }
 _al="$(macos_session_env_names 2>/dev/null)" && fail "the session's names take a pattern credential name" "[$_al]" \
     || ok "the session's names refuse a credential name that is a pattern"
 eq "" "$_al" "…and give no names for it"
+has "$(macos_session_env_names 2>&1)" "Refusing to use the credential name 'BAD*NAME': not a shell variable name." \
+    "…naming it"
+# The same check covers the names a session sends: resolve_session_credentials, the only producer of
+# `_creds`, runs it first, so a bad name fails resolution, before any value is read.
+out="$( BAD_HOST_VAR=value; _creds=(); resolve_session_credentials 2>&1; echo "rc=$? n=${#_creds[@]}" )"
+has "$out" "rc=1 n=0" "resolution refuses a credential name that is a pattern, with no credential resolved"
+has "$out" "Refusing to use the credential name 'BAD*NAME'" "…with the one name check's error"
+# Resolution checks each name in the loop that builds `_creds`, reading agent_auth_specs once.
+eq "1" "$(declare -f resolve_session_credentials | grep -c 'agent_auth_specs')" "resolution reads agent_auth_specs once"
+has "$(declare -f resolve_session_credentials)" 'credential_name_ok "$_genv" || return 1' "…and checks each name in that loop"
+# The writers check again, whatever they were handed (see the hostile `_creds` cases below).
+for _w in macos_session_env_names macos_session_env_delivery_cmd; do
+  has "$(declare -f "$_w")" 'credential_name_ok' "$_w checks each name it writes into guest shell code"
+done
 : > "$SSHLOG"; out="$( push_macos_guest_env "$(macos_project_vm)" 2>&1 )"; rc=$?
 eq "1" "$rc" "a push with a pattern credential name fails as one that cannot work (no retry)"
 eq "" "$(cat "$SSHLOG")" "a push with a pattern credential name: nothing reaches the guest"
@@ -480,6 +551,18 @@ eq "" "$(cat "$SSHLOG")" "a push with a pattern credential name: nothing reaches
 nonzero "a retried push with a pattern credential name"
 eq "" "$(cat "$SSHLOG")" "a retried push with a pattern credential name: nothing reaches the guest, twice or once"
 eval "$real_names"
+# A hostile name put straight into `_creds` (as no resolution produces it): the session's own check
+# refuses it, and nothing reaches the guest.
+for _bad in 'X;touch /tmp/augur-pwn' 'A B' '$(id)' '1BAD' "NL"$'\n'"X"; do
+  : > "$SESSLOG"
+  out="$( _creds=("${_bad}=value" "GH_TOKEN=ghp_x"); ssh_macos_session "$(macos_project_vm)" -t "true" 2>&1 )"; rc=$?
+  _l="a hostile credential name in _creds ($(printf '%q' "$_bad"))"
+  nonzero "$_l"
+  has "$out" "Refusing to use the credential name" "$_l: says so"
+  eq "0" "$(launches)" "$_l: no ssh is started (nothing reaches the guest)"
+  _dc="$( _creds=("${_bad}=value"); macos_session_env_delivery_cmd 2>/dev/null )"; _drc=$?
+  [[ "$_drc" -ne 0 ]] && ok "$_l: the delivery check refuses to build" || fail "$_l: the delivery check built guest code" "$_dc"
+done
 # The names come from the canonical list, not from the display line.
 _line_real="$(declare -f macos_session_accept_env_line)"
 macos_session_accept_env_line() { printf 'AcceptEnv X_DISPLAY_ONLY'; }
@@ -568,7 +651,7 @@ eq "" "$(src_git_env GH_TOKEN=ghp_session)" "…not even with a GH_TOKEN of its 
 grep -q sync_macos_guest_clock "$STEPS" && ok "shell --macos: the clock is synced on this path (control)" \
     || fail "shell --macos: the clock sync did not run" "steps: $(tr '\n' ' ' < "$STEPS")"
 pc="$(pushcmd)"
-if [[ "$pc" == "_acc=0; grep -sqxF '$(macos_session_accept_env_line "$(macos_session_env_names)")' "* ]]; then ok "shell --macos: the acceptance check is the push's first step"
+if [[ "$pc" == "$(macos_session_env_check_cmd "$(macos_session_env_names)") || echo $MACOS_PUSH_REFUSED_MARKER; "* ]]; then ok "shell --macos: the acceptance check is the push's first step, its failure printing the refusal marker"
 else fail "shell --macos: the acceptance check is not the push's first step" "$pc"; fi
 
 # The shape that makes the write atomic and private.
@@ -671,7 +754,7 @@ stale_cleaned() {
 }
 # Every push (every session, `up` on a running VM, the boot's only push) carries the acceptance
 # check and the cleanup.
-stale_fixture; ref_files() { find /tmp -maxdepth 1 -name 'augur-env-ref.*' 2>/dev/null | wc -l | tr -d ' '; }; refs_before="$(ref_files)"
+stale_fixture; ref_files() { find "$GUEST_TMP" -maxdepth 1 -name 'augur-env-ref.*' 2>/dev/null | wc -l | tr -d ' '; }; refs_before="$(ref_files)"
 run_cmd shell
 eq "0" "$rc" "stale temp files: shell --macos completes"
 stale_cleaned "checked push"
@@ -679,6 +762,7 @@ has "$(pushcmd)" "! -name .augur-env.tmp.\$\$" "checked push: the push's own tem
 has "$(pushcmd)" '\( -mmin +1 -o -newer "$_ref" \)' "checked push: the age test is the BSD-find-safe -mmin / -newer pair"
 has "$(pushcmd)" 'date -r "$_t" +%Y%m%d%H%M.%S' "checked push: the reference time is formatted the macOS (BSD date) way first"
 eq "$refs_before" "$(ref_files)" "checked push: its reference file in /tmp is removed again"
+has "$(pushcmd)" "mktemp /tmp/augur-env-ref." "checked push: the reference file is made in the guest's /tmp (mapped to this run's own directory here)"
 # On a refused guest too.
 mv "$DROPIN" "$TMPD/dropin.saved"
 stale_fixture
@@ -751,6 +835,18 @@ RUNNING=1
 printf '# augur\nAcceptEnv ANTHROPIC_API_KEY GH_TOKEN\n' > "$DROPIN"
 old_env; run_cmd shell
 refused "a drop-in for other names: shell --macos"
+# The push's check, on the same variants: a drop-in an earlier install wrote takes a session; one
+# with another directive, comments only or no line is refused.
+_al="$(macos_session_accept_env_line "$(macos_session_env_names)")"
+for _v in extra-acceptenv other-directive comments-only empty; do
+  dropin_variants "$_v"
+  old_env; run_cmd shell
+  refused "a drop-in with $_v: shell --macos"
+done
+dropin_variants earlier-install
+run_cmd shell
+eq "0" "$rc" "a drop-in an earlier install wrote (comment line, then the line): shell --macos completes"
+eq "1" "$(launches)" "…and starts its session"
 mv "$TMPD/dropin.saved" "$DROPIN"
 # With the drop-in, a boot checks once, in its only push, which writes no GIT_CONFIG_* helper lines:
 # the session that follows exports them itself. No guest command checks on its own.
@@ -806,6 +902,31 @@ FAIL_STEP=env; run_cmd shell; FAIL_STEP=""
 nonzero "the ~/.augur-env write fails on a current guest: shell --macos"
 hasnt "$out" "does not accept augur's session credentials" "the ~/.augur-env write fails on a current guest: no refusal is claimed"
 hasnt "$out" "may still hold credentials" "the ~/.augur-env write fails on a current guest: no old-credential warning"
+# The refusal is a marker on the guest's stdout, apart from the exit status: a connection that drops
+# once the guest has refused still refuses (no retry), and the same drop on a guest that accepts is
+# an unknown outcome, tried once more.
+mv "$DROPIN" "$TMPD/dropin.saved"
+old_env; : > "$SSHLOG"; FAIL_STEP=drop
+out="$( push_macos_guest_env_retrying "$(macos_project_vm)" 2>&1 )"; rc=$?; FAIL_STEP=""
+_l="no drop-in, the connection drops after the push"
+eq "$MACOS_PUSH_REFUSED_RC" "$rc" "$_l: refused"
+has "$out" "unknown outcome (ssh exit 255)" "$_l: says the outcome of the write is unknown"
+has "$out" "does not accept augur's session credentials" "$_l: reports the refusal"
+eq "1" "$(pushes)" "$_l: not retried"
+old_env; : > "$SSHLOG"; FAIL_STEP=noise
+out="$( push_macos_guest_env "$(macos_project_vm)" 2>&1 )"; rc=$?; FAIL_STEP=""
+eq "$MACOS_PUSH_REFUSED_RC" "$rc" "no drop-in, a guest startup file prints an open line first: still refused"
+mv "$TMPD/dropin.saved" "$DROPIN"
+: > "$SSHLOG"; FAIL_STEP=drop
+out="$( push_macos_guest_env_retrying "$(macos_project_vm)" 2>&1 )"; rc=$?; FAIL_STEP=""
+_l="drop-in present, the connection drops after the push"
+eq "$MACOS_PUSH_RETRYABLE_RC" "$rc" "$_l: an unknown outcome, twice"
+hasnt "$out" "does not accept augur's session credentials" "$_l: no refusal is claimed"
+eq "2" "$(pushes)" "$_l: tried once more"
+: > "$SSHLOG"; FAIL_STEP=noise
+out="$( push_macos_guest_env "$(macos_project_vm)" 2>&1 )"; rc=$?; FAIL_STEP=""
+eq "0" "$rc" "drop-in present, a guest startup file prints first: the push succeeds"
+hasnt "$(pushcmd)" "_acc" "the push's exit status carries no refusal offset"
 
 section "Tier 1 — a credential that cannot be injected aborts, after only the push of ~/.augur-env"
 
@@ -1043,7 +1164,7 @@ for _run in "1 shell" "1 up"; do
     no_transport "no SSH transport (running=$RUNNING): $_cmd --macos"
 done
 # As a refusal's push too: it adds that the old file may still hold credentials.
-UNVERIFIED=1; rm -f "$(macos_egress_verified_file)"
+UNVERIFIED=1; no_pass
 out="$( macos_ssh_host() { :; }; run_cmd shell; printf '%s' "$out"; exit "$rc" )"; rc=$?
 UNVERIFIED=0
 no_transport "no SSH transport, unverified VM: shell --macos"
@@ -1060,6 +1181,15 @@ has "$out" "No SSH transport to VM" "$_l: says there is no SSH transport"
 hasnt "$out" "Could not write ~/.augur-env" "$_l: does not call it a failed write"
 hasnt "$out" "once more" "$_l: does not retry"
 eq "0" "$(launches)" "$_l: no ssh process is started"
+# With a transport, the push resolves it once and its ssh reuses it.
+: > "$SESSLOG"; : > "$TMPD/resolves"
+out="$( unset -f ssh_macos; eval "$(sed -n '/^ssh_macos() {$/,/^}$/p' "$AUGUR")"
+        macos_ssh_port() { echo resolve >> "$TMPD/resolves"; echo 2222; }
+        push_macos_guest_env "$(macos_project_vm)" 2>&1 )"; rc=$?
+eq "0" "$rc" "the real ssh_macos with a transport: the push succeeds"
+eq "1" "$(wc -l < "$TMPD/resolves" | tr -d ' ')" "…resolving the VM's SSH transport once"
+eq "1" "$(launches)" "…for its one ssh"
+has "$(sed -n '/^ARGV$/,/^ENV$/p' "$SESSLOG")" "2222" "…which uses the resolved port"
 
 section "Tier 1 — a session checks in the guest that every credential it sent arrived"
 
@@ -1199,13 +1329,13 @@ else fail "up --macos on a running VM: the push is not after the self-test" "sel
 section "Tier 1 — a running VM whose boot never passed its self-test gets no credential"
 
 # An `up --macos` interrupted between `augur-vm run` and the self-test leaves the VM running with no
-# record of a passed self-test (macos_egress_verified_file). A session refuses it with no guest step
+# pass in its boot record (macos_boot_record_file). A session refuses it with no guest step
 # but the refusal's push of ~/.augur-env, which sends no credential and removes those an older augur
 # wrote: no session, nothing sent.
 RUNNING=1; UNVERIFIED=1
 eval "verify_macos_egress_locked() { printf '%s\\n' verify_macos_egress_locked >> \"\$STEPS\"; }"
 for _cmd in claude shell; do
-    old_env; rm -f "$(macos_egress_verified_file)"; run_cmd "$_cmd"
+    old_env; no_pass; run_cmd "$_cmd"
     _l="no passed self-test since the boot: $_cmd --macos"
     nonzero "$_l"
     has "$out" "no egress self-test has passed since it booted" "$_l: says why"
@@ -1218,7 +1348,7 @@ for _cmd in claude shell; do
 done
 # A refusal whose push fails still refuses, and says the old file may still hold credentials.
 for FAIL_PUSH in 1 2; do
-    old_env; rm -f "$(macos_egress_verified_file)"; run_cmd shell
+    old_env; no_pass; run_cmd shell
     _l="no passed self-test, the push fails ($FAIL_PUSH): shell --macos"
     nonzero "$_l"
     has "$out" "no egress self-test has passed since it booted" "$_l: still refuses, saying why"
@@ -1228,23 +1358,22 @@ done
 FAIL_PUSH=0
 # On an old base too: both refusals are reported, after the one push.
 mv "$DROPIN" "$TMPD/dropin.saved"
-old_env; rm -f "$(macos_egress_verified_file)"; run_cmd claude
+old_env; no_pass; run_cmd claude
 _l="no passed self-test and no drop-in: claude --macos"
 has "$out" "no egress self-test has passed since it booted" "$_l: reports the missing self-test"
 has "$out" "does not accept augur's session credentials" "$_l: reports the old base"
 no_cred_push "$_l"
 mv "$TMPD/dropin.saved" "$DROPIN"
-# A record from an earlier boot of the VM is no better, even one whose pid was handed to this boot's
-# process (a recycled pid): the start time differs.
-printf '%s Thu Jan 1 00:00:00 1970\n' "$$" > "$(macos_egress_verified_file)"; run_cmd claude
+# A record from an earlier boot of the VM is no better: its run id differs.
+printf 'on %s Sun Nov 8 10:00:00 2026\n' 0C1D2E3F-4A5B-4C6D-8E7F-901A2B3C4D00 > "$(macos_boot_record_file)"; run_cmd claude
 nonzero "a record from an earlier boot: claude --macos"
 eq "0" "$(launches)" "a record from an earlier boot: claude --macos starts no session"
 # `up --macos` on that VM re-runs the self-test, records its pass for this boot, and the next
 # session goes ahead.
-rm -f "$(macos_egress_verified_file)"; run_cmd up
+no_pass; run_cmd up
 eq "0" "$rc" "up --macos on the unverified running VM: completes"
 has "$(cat "$STEPS")" "verify_macos_egress_locked" "up --macos on the unverified running VM: runs the self-test"
-eq "$BOOT_ID" "$(cat "$(macos_egress_verified_file)" 2>/dev/null)" "up --macos on the unverified running VM: records the pass for this boot"
+eq "on $BOOT_ID" "$(cat "$(macos_boot_record_file)" 2>/dev/null)" "up --macos on the unverified running VM: records the pass for this boot"
 run_cmd claude
 eq "0" "$rc" "…after which claude --macos completes"
 eq "1" "$(launches)" "…and starts its session"
@@ -1339,7 +1468,7 @@ for _step in sync_macos_guest_clock sync_macos_guest_timezone; do
     eval "${_step}() { printf '%s\n' ${_step} >> \"\$STEPS\"; }"
 done
 # A refusal under the armed trap is still the run's only push (the trap does not repeat it).
-old_env; rm -f "$(macos_egress_verified_file)"; UNVERIFIED=1; run_cmd shell; UNVERIFIED=0
+old_env; no_pass; UNVERIFIED=1; run_cmd shell; UNVERIFIED=0
 no_cred_push "a refusal while the push-on-exit trap is armed"
 # The base VM is needed only to clone or boot: a running VM is reconciled without it.
 macos_vm_exists() { [[ "$1" != "$MACOS_BASE_VM" ]]; }

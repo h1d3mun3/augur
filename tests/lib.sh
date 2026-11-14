@@ -1,5 +1,37 @@
 # shellcheck shell=bash
 # tests/lib.sh — minimal assert library. `source` me from a test script.
+
+# Every test runs without a controlling terminal, as it does under CI. augur's setup-token reads the
+# pasted token from /dev/tty, not stdin, so on a developer's terminal a test that reaches that
+# prompt would wait, invisibly, for a paste; in a session with no terminal the open fails at once.
+# So a test script that sources this file and still has a controlling terminal runs itself again in
+# a new session (macOS has no setsid command; perl ships with it), with stdin, stdout and stderr
+# unchanged. Only for a script sourcing this file directly (BASH_SOURCE[1] is $0), never for an
+# interactive shell that sources it.
+if [[ "${BASH_SOURCE[1]:-}" == "$0" ]]; then
+  if [[ "${AUGUR_TEST_NO_CTTY:-}" != 1 ]] && { : </dev/tty; } 2>/dev/null; then
+    export AUGUR_TEST_NO_CTTY=1
+    if command -v perl >/dev/null 2>&1; then
+      # The parent stays in the terminal's process group, passes Ctrl-C (and TERM/HUP) on to the
+      # new session, which the terminal no longer signals, and exits with the test's status.
+      exec perl -MPOSIX -e '
+        my $pid = fork() // die "fork: $!\n";
+        if ($pid == 0) { defined(POSIX::setsid()) or die "setsid: $!\n"; exec { $ARGV[0] } @ARGV; die "exec $ARGV[0]: $!\n"; }
+        for my $sig (qw(INT TERM HUP)) { $SIG{$sig} = sub { kill($sig, -$pid) or kill($sig, $pid) } }
+        my $r; do { $r = waitpid($pid, 0) } while ($r == -1 && $!{EINTR});
+        exit(($? & 127) ? 128 + ($? & 127) : $? >> 8);
+      ' "$BASH" "$0" ${1+"$@"}
+    elif command -v setsid >/dev/null 2>&1; then
+      exec setsid -w "$BASH" "$0" ${1+"$@"}
+    fi
+  fi
+  # The guard behind it: a test that can still open /dev/tty does not run at all.
+  if { : </dev/tty; } 2>/dev/null; then
+    echo "tests/lib.sh: ${0##*/} still has a controlling terminal and cannot leave it (no perl or setsid); not running it." >&2
+    exit 1
+  fi
+fi
+
 # No `set -e`: a failed assertion records and continues so one script reports every check.
 set -uo pipefail
 

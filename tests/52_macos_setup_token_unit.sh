@@ -34,6 +34,9 @@ export AUGUR_VM_BIN="$TMPD/no-such-augur-vm"
 
 AUGUR_SOURCE_ONLY=1 source "$AUGUR"
 set +e
+# No host gh login: the real gh would hand over the operator's own token, read from the macOS
+# keychain. A case that needs a token defines its own gh.
+gh() { return 1; }
 
 HOME="$TMPD/home"; mkdir -p "$HOME"
 AUGUR_DIR="$TMPD/augur"; mkdir -p "$AUGUR_DIR"
@@ -137,7 +140,7 @@ hasnt "$bin_fn" "codesign"   "no signature check at plain claude launch (a proje
   ensure_macos_agent_profile() { :; }; warn_if_macos_egress_pinned() { :; }
   # The ~/.augur-env push (its guest command holds a `touch -t`) succeeds; the binary probe says missing.
   ssh_macos() { [[ "$*" == *".augur-env"* ]] && { cat >/dev/null; return 0; }; [[ "$*" == *" -t "* ]] && { echo AGENT_LAUNCHED; return 0; }; echo missing; }
-  macos_ssh_transport_ok() { return 0; }   # the stub ssh_macos above needs no host or port
+  macos_ssh_pin() { :; }   # the stub ssh_macos above needs no host or port
   out="$( set -e; cmd_claude_macos 2>&1 )"; rc=$?
   [[ "$rc" -ne 0 ]] && ok "claude --macos with no binary: exits non-zero" || fail "claude --macos with no binary: exit 0"
   hasnt "$out" "AGENT_LAUNCHED" "claude --macos with no binary: nothing is launched"
@@ -428,8 +431,9 @@ SELFTEST_OK=1; SCRUB_OK=1
 verify_macos_egress_locked() { echo "selftest $1" >> "$LOG"; [[ "$SELFTEST_OK" == 1 ]] || exit 1; }
 macos_poweroff_before_teardown() { echo "poweroff $1" >> "$LOG"; }
 macos_guest_poweroff()           { echo "poweroff $1" >> "$LOG"; }
-# `read … < /dev/tty`: with a terminal this stub supplies the paste; without one (CI) the redirect
-# fails first and no token is saved. Both are fine here: every assertion below holds either way.
+# `read … < /dev/tty`: the suite runs with no controlling terminal (see tests/lib.sh), so the
+# redirect fails before this stub runs and no token is saved. Every assertion below would also hold
+# with the paste this stub supplies, should the redirect ever succeed.
 read() {
     [[ "$1" == "-rp" ]] || { builtin read "$@"; return; }
     printf -v "${*: -1}" '%s' "sk-ant-oat01-pasted_token-0123456789"
@@ -448,7 +452,7 @@ torn_down() {   # torn_down <label>
   logged stop_gvproxy && logged stop_proxy && ok "$1: its gvproxy and proxy are stopped" || fail "$1: its egress helpers are left running"
   [[ -L "$(host_lock_path "$MACOS_SETUP_TOKEN_LOCK")" ]] && fail "$1: the lock is left behind" || ok "$1: the lock is released"
   [[ -L "$(host_lock_path "$MACOS_BASE_WRITER_LOCK")" ]] && fail "$1: the base-writer lock is left behind" || ok "$1: the base-writer lock is released"
-  ( adopt_setup_token_identity; [[ -e "$(macos_egress_mode_file)" ]] ) && fail "$1: an egress-mode record was written (nothing reads it)" || ok "$1: no egress-mode record"
+  ( adopt_setup_token_identity; [[ -e "$(macos_boot_record_file)" ]] ) && fail "$1: a boot record was written (nothing reads it)" || ok "$1: no boot record"
   grep -q "^poweroff " "$LOG" && fail "$1: the guest was asked to shut down before its disk is deleted" || ok "$1: stopped directly, no in-guest poweroff"
 }
 

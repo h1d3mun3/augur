@@ -141,7 +141,8 @@ its `Identifier` says.
 
 Recorded with this change because it closes the same "attach to a guest whose state augur did not
 verify" class. `cmd_up_macos` writes the egress mode (`on`/`off`) to a host-side record
-(`macos_egress_mode_file`) just before `augur-vm run`; `down`/`destroy` remove it. On a running VM,
+(`macos_boot_record_file`, whose mode field it is; ADR-0023 adds the pass field) just before
+`augur-vm run`; `down`/`destroy` remove it. On a running VM,
 `up`, `claude` and `shell --macos` compare it with the requested mode and, on a mismatch or a missing
 record, refuse with `augur down --macos && augur up --macos [--no-egress]` and exit non-zero
 without stopping the VM — the macOS peer of `require_running_container_current`. A missing record

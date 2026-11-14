@@ -96,7 +96,8 @@ fi
 create_trace="$(cat "$AUGUR_TEST_SHIMLOG.trace" 2>/dev/null)"
 hasnt "$create_trace" "hasTrustDialogAccepted"                "up: does NOT seed folder-trust in the guest on create"
 hasnt "$create_trace" ".claude.json"                          "up: create path never writes the guest ~/.claude.json (ADR-0012)"
-hasnt "$create_trace" "jq"                                    "up: no jq config merge left on the create path"
+# With the random temp-dir name taken out first: `mktemp -d` can hand back a name holding "jq".
+hasnt "${create_trace//"$work"/<work>}" "jq"                  "up: no jq config merge left on the create path"
 # The execs it DOES issue must be exactly the profile wiring (history restore no-ops with no
 # snapshot). A new exec appearing here should force whoever added it to justify it in this test.
 has   "$create_trace" "AUGUR_PROFILE_SRC=/home/dev/.augur-profile" "up: create path wires the operator profile"
@@ -210,7 +211,7 @@ if [[ -f "$ex" && -n "$launch_line" ]]; then
   has   "$body" "GIT_CONFIG_KEY_1=credential.https://github.com.helper -e GIT_CONFIG_VALUE_1=!f() " "claude: augur's helper is the last entry, after the reset"
   has   "$body" 'password=$GH_TOKEN'                   "claude: the helper carries only the \$GH_TOKEN reference"
   # augur's own non-interactive execs (profile wiring, history snapshot) get no credentials.
-  if printf '%s\n' "$full_trace" | grep '^container exec ' | grep -v '^container exec -it ' | grep -q -- '--env-file'
+  if grep -q -- '--env-file' <<<"$(grep '^container exec ' <<<"$full_trace" | grep -v '^container exec -it ')"
   then fail "claude: a non-interactive exec carries --env-file" "only the session launch may"
   else ok "claude: profile-wiring / history execs carry no --env-file"; fi
 else
@@ -448,7 +449,9 @@ has   "$(cat "$envf" 2>/dev/null)" "ANTHROPIC_API_KEY=sk-ant-test123" "shell (no
 
 # ── setup-token: no credentials at all ────────────────────────────────────────
 # It exists to mint a token; the current one is not handed to a guest binary for that. The shim
-# makes the integrity gate's two sha256 probes agree so the flow reaches its interactive exec.
+# makes the integrity gate's two sha256 probes agree so the flow reaches its interactive exec. Its
+# paste prompt then reads /dev/tty, which fails at once: tests/lib.sh runs every test without a
+# controlling terminal.
 section "Tier 1 — setup-token and augur's own execs get no credentials"
 rm -f "$AUGUR_TEST_SHIMLOG.trace" "$envf"
 claude_sha="$(printf 'a%.0s' {1..64})"
