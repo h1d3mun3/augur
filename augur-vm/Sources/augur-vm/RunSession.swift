@@ -330,9 +330,11 @@ final class RunSession: NSObject, VZVirtualMachineDelegate {
         try "\(getpid())".write(to: Paths.pid(name), atomically: true, encoding: .utf8)
     }
 
+    /// Removes the run id, then the pidfile. run.pid naming a live pid is the lock that keeps a new
+    /// `run` from starting, so removing it last means a new boot's run.id is never deleted here.
     func cleanup() {
-        try? FileManager.default.removeItem(at: Paths.pid(name))
         try? FileManager.default.removeItem(at: Paths.runID(name))
+        try? FileManager.default.removeItem(at: Paths.pid(name))
     }
 
     private func installSignalHandlers() {
