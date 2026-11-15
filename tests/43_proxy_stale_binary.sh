@@ -18,6 +18,9 @@ AUGUR="$REPO/augur"
 
 AUGUR_SOURCE_ONLY=1 source "$AUGUR"
 set +e                                    # augur enables `set -e`; restore lib.sh assert-and-continue
+# No host gh login: the real gh would hand over the operator's own token, read from the macOS
+# keychain. A case that needs a token defines its own gh.
+gh() { return 1; }
 # Short on purpose: start_gvproxy binds a unix socket in here (104-byte sun_path limit).
 TMPD="$(mktemp -d /tmp/augur43.XXXXXX)"
 cleanup() {

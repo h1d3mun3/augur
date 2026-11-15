@@ -322,11 +322,18 @@ final class RunSession: NSObject, VZVirtualMachineDelegate {
 
     // MARK: - Lifecycle
 
+    /// Writes a fresh random run id (Paths.runID), then the pidfile. The id comes first, so a VM that
+    /// reads as running (a live pid in run.pid) always has this boot's id beside it, never an earlier
+    /// boot's: a stale run.id left by a crash is replaced before the new pid appears.
     private func writePidfile() throws {
+        try UUID().uuidString.write(to: Paths.runID(name), atomically: true, encoding: .utf8)
         try "\(getpid())".write(to: Paths.pid(name), atomically: true, encoding: .utf8)
     }
 
+    /// Removes the run id, then the pidfile. run.pid naming a live pid is the lock that keeps a new
+    /// `run` from starting, so removing it last means a new boot's run.id is never deleted here.
     func cleanup() {
+        try? FileManager.default.removeItem(at: Paths.runID(name))
         try? FileManager.default.removeItem(at: Paths.pid(name))
     }
 

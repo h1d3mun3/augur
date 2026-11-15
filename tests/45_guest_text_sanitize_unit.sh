@@ -94,15 +94,41 @@ eq 1 "$(grep -cF "host is '\${host_tz}'): \$(sanitize_guest_text \"\${setout%%\$
   "sync_macos_guest_timezone sanitises the failed sudo's first line"
 eq 2 "$(grep -c 'true 2>&1 | head -n 6 | show_guest_lines' "$AUGUR")" \
   "both ssh-probe diagnostics (up --macos, update --macos) go through show_guest_lines"
-eq 0 "$(grep -E 'while IFS= read -r _l; do .*(error|"\$_say") ' "$AUGUR" | grep -vc 'sanitize_guest_lines |')" \
-  "every log tail / probe echoed through error() or warn() is sanitised"
-eq 1 "$(grep -cE 'while IFS= read -r _l; do .*(error|"\$_say") ' "$AUGUR")" \
+eq 0 "$(grep -E 'do (error|"\$_say") "  \| ' "$AUGUR" | grep -vFc 'do "$_say" "  | $(sanitize_guest_text "${_lines[_i]}")"')" \
+  "every log tail / probe echoed through error() or warn() goes through show_guest_lines"
+eq 1 "$(grep -cE 'do (error|"\$_say") "  \| ' "$AUGUR")" \
   "one loop echoes guest lines through error() or warn() (show_guest_lines; every site uses it)"
-# show_guest_lines itself: sanitised, one `  | ` line per non-empty line.
+has "$(declare -f show_guest_lines)" 'sanitize_guest_text "${_lines[_i]}"' "show_guest_lines prints each line through the sanitiser"
+# show_guest_lines itself: sanitised, one `  | ` line per input line, blank lines between others
+# kept, blank lines before the first and after the last dropped, and nothing at all for input that
+# is only blank lines.
 shown="$(printf 'a\033[31m\n\nb\n' | show_guest_lines 2>&1)"
 has "$shown" '  | a\x1b[31m' "show_guest_lines sanitises each line"
-eq 2 "$(grep -c '  | ' <<<"$shown")" "show_guest_lines prints one line per non-empty input line"
-eq 0 "$(printf '  \n \n' | show_guest_lines 2>&1 | grep -c '  | ')" "show_guest_lines skips lines of spaces only"
+eq 3 "$(grep -c '  | ' <<<"$shown")" "show_guest_lines prints one line per input line, a blank one included"
+eq 1 "$(grep -cx '.*  | ' <<<"$shown")" "…the blank line as a bare '  | '"
+eq "" "$(printf '\n' | show_guest_lines 2>&1)" "show_guest_lines prints nothing for an empty captured error"
+eq "" "$(printf '\n \n   \n' | show_guest_lines 2>&1)" "show_guest_lines prints nothing for blank or space-only lines only"
+eq "" "$(show_guest_lines </dev/null 2>&1)" "show_guest_lines prints nothing for no input"
+trimmed="$(printf '\n\n  \na\n\n\nb\n\n\n' | show_guest_lines 2>&1)"
+eq 4 "$(grep -c '  | ' <<<"$trimmed")" "show_guest_lines drops blank lines before the first and after the last non-blank line"
+has "$(head -n 1 <<<"$trimmed")" '  | a' "…starts at the first non-blank line (a line of spaces counts as blank)"
+has "$(tail -n 1 <<<"$trimmed")" '  | b' "…ends at the last non-blank line"
+eq 2 "$(grep -cx '.*  | ' <<<"$trimmed")" "…and keeps the two blank lines between a and b"
+# Blankness is judged on the raw line: CRLF input and a trailing tab-only line are blank there,
+# though sanitising would show their CR and tab as \x0d / \x09.
+crlf="$(printf '\r\nfirst\r\n\r\nlast\r\n\t\n\r\n' | show_guest_lines 2>&1)"
+eq 3 "$(grep -c '  | ' <<<"$crlf")" "CRLF input: the CR-only lines around it and a trailing tab line are dropped"
+has "$(head -n 1 <<<"$crlf")" '  | first\x0d' "…the first line shown is 'first', its CR made visible"
+has "$(tail -n 1 <<<"$crlf")" '  | last\x0d' "…and the last is 'last'"
+has "$(sed -n 2p <<<"$crlf")" '  | \x0d' "…keeping the CR-only line between them, made visible"
+eq "" "$(printf '\r\n\t\n \t\r\n' | show_guest_lines 2>&1)" "only CR, tab and space lines: nothing is printed"
+eq 1 "$(printf 'no newline at the end' | show_guest_lines 2>&1 | grep -c 'no newline at the end')" "a last line without a newline is still shown"
+# `show_guest_lines warn`: the same lines, through warn() (stdout) instead of error() (stderr).
+warned="$(printf '\nx\033[1m\n\ny\n\n' | show_guest_lines warn 2>/dev/null)"
+eq 3 "$(grep -c '  | ' <<<"$warned")" "show_guest_lines warn prints the same lines (blank one between kept, ends trimmed)"
+has "$warned" '  | x\x1b[1m' "…sanitised"
+eq "" "$(printf 'x\n' | show_guest_lines warn 2>&1 >/dev/null)" "…as warnings, not errors (nothing on stderr)"
+eq "" "$(printf 'x\n' | show_guest_lines 2>/dev/null)" "without warn they are errors (nothing on stdout)"
 eq 0 "$(grep -E '^(info|success|warn|error)\(\) ' "$AUGUR" | grep -c 'echo -e')" \
   "no log helper interprets escapes (echo -e)"
 

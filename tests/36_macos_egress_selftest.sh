@@ -369,7 +369,7 @@ selftest_fn="$(awk '/^verify_macos_egress_locked\(\)/{f=1} f{print} f&&/^}/{exit
 
 # Position in the source, not just its effect: an edit that moves the call below the guest wiring
 # or the banner must fail here too. (grep -n indexes within the extracted function body.)
-v_at="$(printf  '%s\n' "$up_macos_body" | grep -n 'verify_macos_egress_locked "\$project_vm"' | tail -n1 | cut -d: -f1)"
+v_at="$(printf  '%s\n' "$up_macos_body" | grep -n 'macos_selftest_and_record "\$project_vm"' | tail -n1 | cut -d: -f1)"
 env_at="$(printf '%s\n' "$up_macos_body" | grep -n '^    ensure_macos_workspace "\$project_vm"' | head -n1 | cut -d: -f1)"
 ban_at="$(printf '%s\n' "$up_macos_body" | grep -n "success \"VM '"           | head -n1 | cut -d: -f1)"
 ssh_at="$(printf '%s\n' "$up_macos_body" | grep -n '^ *wait_for_macos_ssh '   | head -n1 | cut -d: -f1)"
@@ -380,7 +380,11 @@ else
   fail "macOS up does not self-test between the SSH wait and the guest wiring" \
        "ssh@${ssh_at:-none} test@${v_at:-none} wiring@${env_at:-none} banner@${ban_at:-none}"
 fi
-if printf '%s\n' "$up_macos_body" | sed -n '/already running/,/^    fi$/p' | grep -q 'verify_macos_egress_locked'; then
+# Here-strings, not pipes, into `grep -q`: under pipefail a grep that exits at its first match
+# makes the writer upstream die of SIGPIPE when it writes after that, and the pipeline then fails
+# on a match, more often the more loaded the host is.
+running_branch="$(sed -n '/already running/,/^    fi$/p' <<<"$up_macos_body")"
+if grep -q 'macos_selftest_and_record' <<<"$running_branch"; then
   ok "the already-running branch calls the self-test (I1 says every \`up\`, and container mode does)"
 else
   fail "the already-running branch skips the self-test" "I1's tripwire would not fire on that path"
@@ -388,16 +392,20 @@ fi
 # The teardown goes through stop_unverified_macos_vm, the one teardown for a VM whose containment
 # is unproven, and that must name all three.
 stop_fn="$(awk '/^stop_unverified_macos_vm\(\) \{/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")"
-printf '%s\n' "$selftest_fn" | grep -q '^ *stop_unverified_macos_vm "\$vm"$' \
+grep -q '^ *stop_unverified_macos_vm "\$vm"$' <<<"$selftest_fn" \
   && ok "the self-test's teardown is stop_unverified_macos_vm" || fail "the self-test's teardown does not call stop_unverified_macos_vm"
-printf '%s\n' "$stop_fn" | grep -q '"\$VM_CLI" stop "\$1"' \
+has "$(declare -f macos_selftest_and_record)" 'verify_macos_egress_locked "$vm"' "macos_selftest_and_record runs the self-test"
+grep -q '^ *stop_macos_vm_and_egress "\$1"$' <<<"$stop_fn" \
+  && ok "the teardown stops the VM and its egress helpers (stop_macos_vm_and_egress)" || fail "the teardown does not call stop_macos_vm_and_egress"
+stop_fn="$(awk '/^stop_macos_vm_and_egress\(\) \{/{f=1} f{print} f&&/^}/{exit}' "$AUGUR")$'\n'$stop_fn"
+grep -q '"\$VM_CLI" stop "\$1"' <<<"$stop_fn" \
   && ok "the teardown stops the VM"    || fail "the teardown does not stop the VM"
-printf '%s\n' "$stop_fn" | grep -q '^ *stop_gvproxy$' \
+grep -q '^ *stop_gvproxy$' <<<"$stop_fn" \
   && ok "the teardown stops gvproxy"   || fail "the teardown does not stop gvproxy"
-printf '%s\n' "$stop_fn" | grep -q '^ *stop_proxy$' \
+grep -q '^ *stop_proxy$' <<<"$stop_fn" \
   && ok "the teardown stops the proxy" || fail "the teardown does not stop the proxy"
-printf '%s\n' "$stop_fn" | grep -qF 'rm -f "$(macos_egress_verified_file)"' \
-  && ok "the teardown drops the record of a passed self-test" || fail "the teardown keeps the record of a passed self-test"
+grep -q '^ *macos_drop_egress_pass$' <<<"$stop_fn" \
+  && ok "the teardown drops the passed self-test from the boot record" || fail "the teardown keeps the passed self-test in the boot record"
 # The positive half must target a MANAGED-BASELINE domain: the already-running path warns that
 # gvproxy snapshots its DNS allowlist at boot, so a project-conf domain could be allowlisted
 # host-side and still unresolvable in a live guest — a false leak that tears down a working VM.

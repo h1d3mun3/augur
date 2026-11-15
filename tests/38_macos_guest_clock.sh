@@ -104,7 +104,7 @@ g_offset()     { printf '%s' "$1" > "$OFFSET_FILE"; }
 reset_guest()  { G_READ=1; G_NOISE=0; G_SET_RC=0; G_SET_TO=0; G_SET_BADREASON=0; g_offset 0; }
 reset_guest
 
-macos_ssh_transport_ok() { return 0; }   # the stub ssh_macos below needs no host or port
+macos_ssh_pin() { :; }   # the stub ssh_macos below needs no host or port
 ssh_macos() {
     local vm="$1"; shift
     local cmd="$*"
@@ -418,7 +418,7 @@ section "Tier 1 — call sites: \`claude --macos\` and \`shell --macos\` attach 
 # sites: on a running VM they skip cmd_up_macos entirely. `claude` is the highest-impact case — the
 # launch below hands a JWT to the agent.
 macos_vm_running() { return 0; }
-# Its boot passed a self-test (macos_egress_verified_file; tests/51 covers the refusal without one).
+# Its boot passed a self-test (the boot record's pass, macos_boot_record_file; tests/51 covers the refusal without one).
 require_macos_egress_verified() { :; }
 
 reset_guest; g_offset -5733
@@ -462,7 +462,7 @@ prep_body="$(awk    '/^prepare_macos_session\(\)/{f=1} f{print} f&&/^}/{exit}' "
 # — either way the comparison below fails.
 c_at="$(printf   '%s\n' "$up_macos_body" | grep -n '^    sync_macos_guest_clock '          | head -n1 | cut -d: -f1)"
 ssh_at="$(printf '%s\n' "$up_macos_body" | grep -n '^ *wait_for_macos_ssh '                | head -n1 | cut -d: -f1)"
-v_at="$(printf   '%s\n' "$up_macos_body" | grep -n 'verify_macos_egress_locked "\$project_vm"' | tail -n1 | cut -d: -f1)"
+v_at="$(printf   '%s\n' "$up_macos_body" | grep -n 'macos_selftest_and_record "\$project_vm"' | tail -n1 | cut -d: -f1)"
 env_at="$(printf '%s\n' "$up_macos_body" | grep -n '^    ensure_macos_workspace "\$project_vm"'  | head -n1 | cut -d: -f1)"
 ban_at="$(printf '%s\n' "$up_macos_body" | grep -n "success \"VM '"                        | head -n1 | cut -d: -f1)"
 if [[ -n "$c_at" && -n "$ssh_at" && -n "$v_at" && -n "$env_at" && -n "$ban_at" \
@@ -472,10 +472,12 @@ else
   fail "macOS up does not sync the clock between the SSH wait and the self-test" \
        "ssh@${ssh_at:-none} clock@${c_at:-none} test@${v_at:-none} wiring@${env_at:-none} banner@${ban_at:-none}"
 fi
-if printf '%s\n' "$up_macos_body" | sed -n '/already running/,/^    fi$/p' | grep -q '^ *sync_macos_guest_clock '
+# A here-string, not a pipe, into `grep -q` (see tests/36: a writer that outlives the early exit
+# dies of SIGPIPE, and under pipefail the pipeline then fails on a match).
+if grep -q '^ *sync_macos_guest_clock ' <<<"$(sed -n '/already running/,/^    fi$/p' <<<"$up_macos_body")"
 then ok "the already-running branch syncs the clock (the only place a long-lived guest is re-corrected)"
 else fail "the already-running branch skips the clock sync" "a VM kept across \`down --macos\` would drift forever"; fi
-printf '%s\n' "$prep_body" | grep -q '^ *sync_macos_guest_clock ' \
+grep -q '^ *sync_macos_guest_clock ' <<<"$prep_body" \
   && ok "prepare_macos_session syncs the clock (claude/shell attach without going through up)" \
   || fail "prepare_macos_session does not sync the clock"
 has "$claude_body" 'prepare_macos_session "$project_vm"' "cmd_claude_macos goes through prepare_macos_session"

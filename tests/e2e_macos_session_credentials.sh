@@ -131,7 +131,7 @@ disk_scan() { printf '%s\n' "$DUMMY" "$DUMMY_OLD" | ssh_macos "$vm" "$GUEST_DISK
 plant_old_env() { printf "export GH_TOKEN='%s'\n" "$DUMMY_OLD" | ssh_macos "$vm" 'umask 077; cat > ~/.augur-env' 2>/dev/null; }
 # Pass/fail on whether $1 holds either dummy value, without showing $1.
 lacks_dummy() { if [[ "$1" == *"$DUMMY"* || "$1" == *"$DUMMY_OLD"* ]]; then fail "$2" "a dummy value is in it"; else ok "$2"; fi; }
-record_ok() { [[ -n "$(macos_vm_run_id "$vm")" && "$(cat "$(macos_egress_verified_file)" 2>/dev/null)" == "$(macos_vm_run_id "$vm")" ]]; }
+record_ok() { local _mode _pass; macos_read_boot_record; [[ -n "$(macos_vm_run_id "$vm")" && "$_mode" == on && "$_pass" == "$(macos_vm_run_id "$vm")" ]]; }
 # macos_run_root_script, with the guest stderr it keeps in MACOS_ROOT_SCRIPT_ERR written back to
 # stderr, so a `$( … 2>&1)` capture below sees all of its output.
 root_script() { local _rc=0; macos_run_root_script "$@" || _rc=$?; [[ -z "$MACOS_ROOT_SCRIPT_ERR" ]] || printf '%s\n' "$MACOS_ROOT_SCRIPT_ERR" >&2; return "$_rc"; }
@@ -192,14 +192,19 @@ if (( uprc == 0 )); then ok "augur up --macos completes on '${vm}'"
 else fail "augur up --macos completes on '${vm}'" "exit ${uprc}: $(redact "$(printf '%s\n' "$upout" | tail -n 8)")"; exit; fi
 has "$upout" "Egress self-test passed" "the egress self-test passed"
 if record_ok; then ok "the self-test record matches macos_vm_run_id ($(macos_vm_run_id "$vm"))"
-else fail "the self-test record matches macos_vm_run_id" "record [$(cat "$(macos_egress_verified_file)" 2>/dev/null)] id [$(macos_vm_run_id "$vm")]"; fi
+else fail "the self-test record matches macos_vm_run_id" "record [$(cat "$(macos_boot_record_file)" 2>/dev/null)] id [$(macos_vm_run_id "$vm")]"; fi
 
-section "The run id is stable for one boot"
+section "The run id is augur-vm's run.id plus its process's start time, stable for one boot"
+id1="$(macos_vm_run_id "$vm")"
+uuid="$(tr -d '[:space:]' < "$AUGUR_DIR/vms/$vm/run.id" 2>/dev/null)"
 pid="$(tr -d '[:space:]' < "$AUGUR_DIR/vms/$vm/run.pid" 2>/dev/null)"
-if [[ "$pid" =~ ^[0-9]+$ ]]; then
+if [[ -n "$id1" && -n "$uuid" && "$pid" =~ ^[0-9]+$ ]]; then
+    ok "augur-vm wrote a run.id ($uuid) and a run.pid for this boot"
+    [[ "$id1" == "$uuid "?* ]] && ok "the run id starts with that UUID" || fail "the run id starts with run.id's UUID" "[$id1]"
     l1="$(LC_ALL=C TZ=UTC0 ps -o lstart= -p "$pid")"; sleep 3; l2="$(LC_ALL=C TZ=UTC0 ps -o lstart= -p "$pid")"
     [[ -n "$l1" ]] && eq "$l1" "$l2" "ps -o lstart= of augur-vm's run pid is the same 3 s apart" \
         || fail "ps -o lstart= of augur-vm's run pid answers" "pid ${pid}"
+    eq "$id1" "$(macos_vm_run_id "$vm")" "the run id is the same 3 s apart"
     id_jst="$(TZ=JST-9 macos_vm_run_id "$vm")"; id_utc="$(TZ=UTC macos_vm_run_id "$vm")"
     id_unset="$(unset TZ; macos_vm_run_id "$vm")"
     eq "$id_utc" "$id_jst" "macos_vm_run_id is the same under TZ=JST-9 and TZ=UTC"
@@ -208,14 +213,19 @@ if [[ "$pid" =~ ^[0-9]+$ ]]; then
     if [[ "$raw_jst" != "$raw_utc" ]]; then ok "control: ps's own lstart differs between TZ=JST-9 and TZ=UTC"
     else skip "control: ps's own lstart differs by TZ" "it does not on this host, so the TZ checks above prove less"; fi
 else
-    fail "read augur-vm's run pid" "$AUGUR_DIR/vms/$vm/run.pid holds no pid"
+    fail "augur-vm wrote a run.id and a run.pid for this boot" "run id [$id1], run.id [$uuid], run.pid [$pid] (an augur-vm older than this augur writes no run.id)"
 fi
 
 # ── 2. The base's sshd drop-in, and root over stdin ────────────────────────────────────────────
 section "The sshd drop-in"
 dout="$(gssh "cat '${DROPIN}'; stat -f 'owner=%Su:%Sg mode=%Lp' '${DROPIN}'" 2>&1)"
-if grep -qxF -- "$LINE" <<<"$dout"; then ok "${DROPIN} holds the exact line: ${LINE}"
-else fail "${DROPIN} holds the exact line: ${LINE}" "$(redact "$dout")"; fi
+dcontent="$(gssh "cat '${DROPIN}'" 2>&1)"
+# Comment and blank lines aside (a base an earlier install built has a comment line above it).
+dlines="$(grep -v -e '^[[:space:]]*#' -e '^[[:space:]]*$' <<<"$dcontent" || true)"
+if [[ "$dlines" == "$LINE" ]]; then ok "${DROPIN} holds exactly the one line, and no other directive: ${LINE}"
+else fail "${DROPIN} holds exactly the one line, and no other directive: ${LINE}" "$(redact "$dcontent")"; fi
+if gssh "$(macos_session_env_check_cmd "$NAMES")"; then ok "the clones' check (macos_session_env_check_cmd) passes on this guest"
+else fail "the clones' check (macos_session_env_check_cmd) passes on this guest"; fi
 has "$dout" "owner=root:wheel mode=644" "the drop-in is root:wheel, mode 644"
 pwfile="$(macos_admin_password_file "$vm")"
 if [[ -f "$pwfile" ]]; then
@@ -330,7 +340,7 @@ hasnt "$cout" "grep:" "the push printed no raw grep error"
 # ── 5. A running VM with no self-test record for its boot ──────────────────────────────────────
 section "Interrupted boot: no self-test record for the running VM"
 plant_old_env
-RECORD_REMOVED=1; rm -f "$(macos_egress_verified_file)"
+RECORD_REMOVED=1; macos_drop_egress_pass
 rout="$(prepare_with_dummy)"; rrc=$?
 if (( rrc != 0 )); then ok "a session (prepare_macos_session) refuses the VM"; else fail "a session refuses the VM" "exit 0"; fi
 has "$rout" "$MSG_UNVERIFIED" "…saying no self-test has passed since the boot"
@@ -387,7 +397,7 @@ else
     GVPROXY_STOPPED=1
     stop_gvproxy >/dev/null 2>&1
     if gvproxy_running; then fail "stop gvproxy" "it is still running"
-    elif macos_ssh_transport_ok "$vm"; then
+    elif ( macos_ssh_pin "$vm" ); then
         skip "no-transport checks" "the VM still resolves an SSH host and port without gvproxy ('augur-vm ip' answered)"
     else
         ok "gvproxy stopped; the VM has no SSH transport"

@@ -38,6 +38,8 @@ struct StopCommand: ParsableCommand {
 
         if Registry.isRunning(name) {
             if let pid = readPid() { kill(pid, SIGKILL) }
+            // run.id before run.pid, for the reason in RunSession.cleanup().
+            try? FileManager.default.removeItem(at: Paths.runID(name))
             try? FileManager.default.removeItem(at: Paths.pid(name))
             FileHandle.standardError.write(Data(
                 "[augur-vm] '\(name)' did not stop in time; force-killed.\n".utf8))
