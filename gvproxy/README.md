@@ -127,8 +127,16 @@ on every package the patch touches (the directories of the `.go` files it names)
 failed step is re-run on unpatched `main`: if that passes, the failure is the patch's and
 the run is `ACTION`; if it fails too (a new vet check in a newer Go, a flaky upstream
 test), the issue notes it without grading it. Either way the issue quotes the first lines
-of the output. The tests are upstream's unreviewed code, so they run without the
-workflow's GitHub token in their environment, and the workflow's checkout keeps none.
+of the output.
+
+The tests are upstream's unreviewed code, so the workflow runs them in a separate job
+(`patched-tests`, via `check-freshness.sh --run-patched-tests`) that has no token, no
+permissions and no persisted credentials. It reports back only data: a state, the
+upstream commit it tested, and the go output as an artifact. The job holding
+`issues: write` (`check`, via `--use-patched-tests-result`) never runs upstream code (its
+`go list` runs none). It accepts only a known state for the same upstream `main` it
+resolved itself, treating anything else as "could not run", and it sanitizes and bounds
+the quoted output itself.
 
 Without a working `go` the build graph is skipped and the check falls back to paths:
 any change under `cmd/gvproxy/`/`pkg/` or to `go.mod`/`vendor` counts as `REVIEW`.
@@ -141,7 +149,8 @@ churn; the signals that matter are "does the patch still apply" and "did anythin
 reaches the binary move".
 
 Run it locally any time: `bash gvproxy/check-freshness.sh` (needs an authenticated
-`gh` and Go).
+`gh` and Go). With no option it does both halves in one process, so `go test` runs
+upstream's tests on your machine with your privileges.
 
 **Manual (backup).** Watch <https://github.com/containers/gvisor-tap-vsock> →
 **Custom → Releases + Security advisories** so an advisory reaches you even if the

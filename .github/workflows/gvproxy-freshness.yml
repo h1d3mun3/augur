@@ -5,45 +5,101 @@ name: gvproxy-freshness
 # upstream base moved in a way that matters, and does our patch still apply, type-check
 # and pass the patched packages' tests?", and opens/refreshes a single tracking issue
 # when it has. See gvproxy/check-freshness.sh.
+#
+# Two jobs, split at the trust boundary:
+#   patched-tests  runs upstream's unreviewed test code (go test on the patched tree), so
+#                  it holds no token, no permissions and no persisted credentials, and
+#                  hands back only data: a state and the upstream commit it tested (job
+#                  outputs) and the go output (an artifact).
+#   check          the drift check and the issue steps, with issues: write. It never runs
+#                  upstream code; it validates patched-tests' result and sanitizes the log
+#                  excerpt itself (check-freshness.sh --use-patched-tests-result).
 
 on:
   schedule:
     - cron: '0 0 * * *'   # daily, 00:00 UTC (09:00 JST)
   workflow_dispatch: {}    # allow a manual run from the Actions tab
 
-permissions:
-  contents: read
-  issues: write
+permissions: {}
 
 concurrency:
   group: gvproxy-freshness
   cancel-in-progress: false
 
 jobs:
-  check:
+  patched-tests:
     runs-on: ubuntu-latest
+    # Deliberately no permissions: this job executes upstream code. Checking out augur
+    # needs none while the repository is public.
+    permissions: {}
+    outputs:
+      state: ${{ steps.tests.outputs.state }}
+      sha: ${{ steps.tests.outputs.sha }}
     steps:
-      # The check runs upstream gvisor-tap-vsock's tests (unreviewed code) on this runner,
-      # so the checkout leaves no token in .git/config for them to read.
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
 
-      # The check lists gvproxy's build graph with `go list` and runs `go vet`/`go test`
-      # on the patched packages; GOTOOLCHAIN=auto in the script fetches a newer Go if
-      # upstream's go.mod asks for one.
+      # GOTOOLCHAIN=auto in the script fetches a newer Go if upstream's go.mod asks for one.
       - uses: actions/setup-go@v5
         with:
           go-version: stable
           cache: false
 
+      - name: Run go vet / go test on the patched tree
+        id: tests
+        env:
+          TESTS_LOG_FILE: ${{ runner.temp }}/patched-tests.log
+        run: bash gvproxy/check-freshness.sh --run-patched-tests
+
+      - name: Upload the go output
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: patched-tests-log
+          path: ${{ runner.temp }}/patched-tests.log
+          if-no-files-found: ignore
+          retention-days: 1
+
+  check:
+    needs: patched-tests
+    # Runs whatever patched-tests did: a failed or missing result reads as "unavailable".
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # The check lists gvproxy's build graph with `go list` (which runs no upstream code);
+      # GOTOOLCHAIN=auto in the script fetches a newer Go if upstream's go.mod asks for one.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+
+      - name: Fetch patched-tests' go output
+        continue-on-error: true          # missing log: the excerpt is just empty
+        uses: actions/download-artifact@v4
+        with:
+          name: patched-tests-log
+          path: ${{ runner.temp }}/patched-tests
+
+      # patched-tests' outputs reach the script only through env, never through ${{ }} in
+      # the script text, and the script checks them before use.
       - name: Run freshness check
         id: check
         continue-on-error: true          # non-zero just means "action warranted"
         env:
           GH_TOKEN: ${{ github.token }}
           BODY_FILE: ${{ github.workspace }}/gvproxy-freshness-body.md
-        run: bash gvproxy/check-freshness.sh
+          TESTS_STATE: ${{ needs.patched-tests.outputs.state }}
+          TESTS_SHA: ${{ needs.patched-tests.outputs.sha }}
+          TESTS_LOG_FILE: ${{ runner.temp }}/patched-tests/patched-tests.log
+        run: bash gvproxy/check-freshness.sh --use-patched-tests-result
 
       - name: Ensure tracking label exists
         if: steps.check.outputs.severity == 'REVIEW' || steps.check.outputs.severity == 'ACTION'

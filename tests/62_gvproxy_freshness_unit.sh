@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Tier 0 — gvproxy/check-freshness.sh grades a patch that applies cleanly but leaves the patched
 # tree failing `go vet` or `go test` as ACTION, with its own title, an issue-body line saying so and
-# a bounded excerpt of the failure. No network, no real Go: the script runs from a scratch copy
+# a bounded excerpt of the failure. Covers the one-process local run and the split CI run: the
+# tokenless --run-patched-tests half (no gh needed, reports state= / sha= and the go output) and
+# the trusted --use-patched-tests-result half (runs no go vet/test, accepts only a known state for
+# the upstream main it resolved). No network, no real Go: the script runs from a scratch copy
 # whose build.sh points REPO at a local fixture repository (fetched over file://), with `gh` and
 # `go` stubs on PATH. The go stub records each call's environment and arguments.
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/.." && pwd)"
@@ -86,15 +89,16 @@ EOF
 cp "$NOGO/gh" "$BIN/gh"
 chmod +x "$BIN/go" "$BIN/gh" "$NOGO/gh"
 
-# run_check MAIN_SHA PATHDIR — run the script; sets rc, out, body, ghout, golog.
+# run_check MAIN_SHA PATHDIR [OPTION] — run the script in a fresh directory ($rundir); sets rc,
+# out, body, ghout, golog. TESTS_STATE / TESTS_SHA / TESTS_LOG_FILE pass through when exported.
 run_check() {
-  local n="$T/run.$RANDOM"; mkdir -p "$n"; : > "$n/go.log"; : > "$n/ghout"
-  out="$(cd "$n" && env -u GOOS -u GOARCH -u CGO_ENABLED -u GOFLAGS -u GOTOOLCHAIN \
-           PATH="$2:/usr/bin:/bin" FAKE_MAIN="$1" GO_LOG="$n/go.log" \
-           BODY_FILE="$n/body.md" GITHUB_OUTPUT="$n/ghout" GH_TOKEN=tok GITHUB_TOKEN=tok \
-           bash "$GV/check-freshness.sh" 2>&1)"
+  rundir="$T/run.$RANDOM"; mkdir -p "$rundir"; : > "$rundir/go.log"; : > "$rundir/ghout"
+  out="$(cd "$rundir" && env -u GOOS -u GOARCH -u CGO_ENABLED -u GOFLAGS -u GOTOOLCHAIN \
+           PATH="$2:/usr/bin:/bin" FAKE_MAIN="$1" GO_LOG="$rundir/go.log" \
+           BODY_FILE="$rundir/body.md" GITHUB_OUTPUT="$rundir/ghout" GH_TOKEN=tok GITHUB_TOKEN=tok \
+           bash "$GV/check-freshness.sh" ${3+"$3"} 2>&1)"
   rc=$?
-  body="$(cat "$n/body.md" 2>/dev/null)"; ghout="$(cat "$n/ghout")"; golog="$(cat "$n/go.log")"
+  body="$(cat "$rundir/body.md" 2>/dev/null)"; ghout="$(cat "$rundir/ghout")"; golog="$(cat "$rundir/go.log")"
 }
 
 # --- patched tree passes --------------------------------------------------------------------------
@@ -193,6 +197,112 @@ has "$ghout" "title=gvproxy: patch no longer applies to upstream main (action re
 has "$out" "tests  : skipped" "summary reports tests: skipped"
 hasnt "$golog" ":: vet" "vet is not run on an unpatched tree"
 hasnt "$body" "Patched-tree failure" "no failure excerpt"
+
+# --- split mode, tokenless half: --run-patched-tests ------------------------------------------------
+# Resolves upstream main itself (git ls-remote of the fixture's refs/heads/main), with no gh on
+# PATH at all, and reports state= / sha= plus the go output in TESTS_LOG_FILE.
+GOONLY="$T/goonly"; mkdir -p "$GOONLY"; cp "$BIN/go" "$GOONLY/go"
+unset TESTS_STATE TESTS_SHA TESTS_LOG_FILE FAKE_GO_FAIL FAKE_GO_OUT
+
+section "--run-patched-tests: patched tree passes"
+g -C "$UP" update-ref refs/heads/main "$MAIN_OK"
+run_check "" "$GOONLY" --run-patched-tests
+eq 0 "$rc" "exit 0"
+has "$ghout" "state=pass" "emits state=pass"
+has "$ghout" "sha=$MAIN_OK" "emits the upstream main commit it tested"
+has "$golog" "[patched] darwin arm64 0 -mod=vendor auto :: vet ./pkg/a" "runs go vet on the patched tree"
+has "$golog" ":: test -count=1 -timeout 10m ./pkg/a" "runs go test"
+hasnt "$golog" ":: list" "runs no go list (no drift check in this mode)"
+[[ -e "$rundir/body.md" ]] && fail "writes no issue body" || ok "writes no issue body"
+hasnt "$ghout" "severity=" "emits no severity"
+
+section "--run-patched-tests: patched tree fails go vet"
+export FAKE_GO_FAIL=vet FAKE_GO_OUT="$T/vet.out" TESTS_LOG_FILE="$T/split-vet.log"
+run_check "" "$GOONLY" --run-patched-tests
+unset TESTS_LOG_FILE
+eq 0 "$rc" "exit 0 (the state is the result)"
+has "$ghout" "state=fail-vet" "emits state=fail-vet"
+has "$(cat "$T/split-vet.log")" "not enough arguments in call to F" "go output lands in TESTS_LOG_FILE"
+
+section "--run-patched-tests: patch conflicts"
+unset FAKE_GO_FAIL FAKE_GO_OUT
+g -C "$UP" update-ref refs/heads/main "$MAIN_CONFLICT"
+run_check "" "$GOONLY" --run-patched-tests
+has "$ghout" "state=skipped" "emits state=skipped"
+has "$ghout" "sha=$MAIN_CONFLICT" "still names the commit"
+hasnt "$golog" ":: vet" "runs no vet on a tree the patch does not apply to"
+
+# --- split mode, trusted half: --use-patched-tests-result -------------------------------------------
+# The go stub stays on PATH for the drift check's go list; vet, test and the version probe must
+# never run, whatever the result says.
+no_tests_run() {
+  eq "" "$(printf '%s\n' "$golog" | grep -E ':: (vet|test|version)')" "runs no go vet, go test or go version"
+}
+
+section "--use-patched-tests-result: a valid failing result is honored"
+printf '# example.invalid/gtv/pkg/a\nvet: from the test job: bad `call`\n' > "$T/job.log"
+export TESTS_STATE=fail-vet TESTS_SHA="$MAIN_OK" TESTS_LOG_FILE="$T/job.log"
+run_check "$MAIN_OK" "$BIN" --use-patched-tests-result
+eq 1 "$rc" "exit 1"
+has "$ghout" "severity=ACTION" "severity ACTION"
+has "$ghout" "title=gvproxy: patch applies but the patched tree fails go vet/test (action required)" "distinct title"
+has "$body" "from the test job: bad 'call'" "excerpt comes from TESTS_LOG_FILE, backticks defused here"
+no_tests_run
+
+section "--use-patched-tests-result: a valid passing result is honored"
+export TESTS_STATE=pass
+run_check "$MAIN_OK" "$BIN" --use-patched-tests-result
+eq 0 "$rc" "exit 0"
+has "$out" "tests  : pass" "summary reports tests: pass"
+no_tests_run
+
+for bad in "" bogus skipped "pass
+severity=ACTION" "fail-vet "; do
+  section "--use-patched-tests-result: state [$bad] is not a known state"
+  export TESTS_STATE="$bad"
+  run_check "$MAIN_OK" "$BIN" --use-patched-tests-result
+  has "$out" "tests  : unavailable" "becomes unavailable"
+  hasnt "$ghout" "severity=ACTION" "is not ACTION"
+  has "$body" "the test job's result is missing or not a known state" "body says why"
+  no_tests_run
+done
+
+section "--use-patched-tests-result: result for another upstream commit"
+export TESTS_STATE=fail-vet TESTS_SHA="$MAIN_CONFLICT"
+run_check "$MAIN_OK" "$BIN" --use-patched-tests-result
+has "$out" "tests  : unavailable" "becomes unavailable"
+hasnt "$ghout" "severity=ACTION" "is not ACTION"
+has "$body" "the test job tested upstream \`${MAIN_CONFLICT:0:8}\`, not \`${MAIN_OK:0:8}\`" "body names both commits"
+no_tests_run
+
+section "--use-patched-tests-result: no or malformed commit"
+for badsha in "" "not-a-sha \`x\`"; do
+  export TESTS_SHA="$badsha"
+  run_check "$MAIN_OK" "$BIN" --use-patched-tests-result
+  has "$out" "tests  : unavailable" "[$badsha] becomes unavailable"
+  has "$body" "the test job did not report a valid upstream commit" "[$badsha] body says why"
+  hasnt "$body" "not-a-sha" "[$badsha] the bad value is not echoed"
+done
+
+section "--use-patched-tests-result: a symlinked log is not read"
+printf 'SECRET-FILE-CONTENT\n' > "$T/secret"; ln -s "$T/secret" "$T/link.log"
+export TESTS_STATE=fail-vet TESTS_SHA="$MAIN_OK" TESTS_LOG_FILE="$T/link.log"
+run_check "$MAIN_OK" "$BIN" --use-patched-tests-result
+has "$ghout" "severity=ACTION" "still ACTION"
+hasnt "$body" "SECRET-FILE-CONTENT" "the symlink's target is not quoted"
+
+section "--use-patched-tests-result: a conflicting patch ignores the result"
+export TESTS_STATE=pass TESTS_SHA="$MAIN_CONFLICT"
+run_check "$MAIN_CONFLICT" "$BIN" --use-patched-tests-result
+has "$ghout" "title=gvproxy: patch no longer applies to upstream main (action required)" "conflict title"
+has "$out" "tests  : skipped" "tests: skipped"
+no_tests_run
+unset TESTS_STATE TESTS_SHA TESTS_LOG_FILE
+
+section "an unknown option is refused"
+run_check "$MAIN_OK" "$BIN" --bogus
+eq 2 "$rc" "exit 2"
+eq "" "$golog" "runs nothing"
 
 # --- package list derived from the real patch ------------------------------------------------------
 section "patched packages come from the real augur-egress.patch"

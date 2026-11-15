@@ -33,8 +33,26 @@
 #   NOISE    behind, but nothing that reaches the shipped binary (exit 0)
 #   CURRENT  pin is at upstream main                             (exit 0)
 #
-# Usage:   bash gvproxy/check-freshness.sh
-# Requires: gh (authenticated: GH_TOKEN or `gh auth login`), git, go.
+# Usage:   bash gvproxy/check-freshness.sh [--run-patched-tests | --use-patched-tests-result]
+#
+#   (no option)                 Everything in one process: the drift check AND the
+#                               patched-tree go vet/go test. For a local run. go test
+#                               executes upstream's unreviewed test code with your
+#                               privileges.
+#   --run-patched-tests         Only the patched-tree go vet/go test, for a job that holds
+#                               no token: resolves upstream main with `git ls-remote` (no
+#                               gh), writes the go output to $TESTS_LOG_FILE (default
+#                               ./gvproxy-patched-tests.log), prints and, with
+#                               GITHUB_OUTPUT, emits `state=` and `sha=` (the upstream
+#                               commit tested). Always exits 0: the state is the result.
+#   --use-patched-tests-result  The drift check without running go vet/go test: takes the
+#                               result of a --run-patched-tests run as plain data from
+#                               TESTS_STATE, TESTS_SHA and TESTS_LOG_FILE. A state that is
+#                               not one patched_tests() prints, or a commit other than the
+#                               upstream main this run resolved, counts as `unavailable`.
+#
+# Requires: gh (authenticated: GH_TOKEN or `gh auth login`), git, go; --run-patched-tests
+#           needs only git and go.
 #           Without a working go the build graph is skipped: any change under
 #           cmd/gvproxy/ or pkg/, and any go.mod/go.sum/vendor change, counts as
 #           shipped (fails toward REVIEW). The patched-tree vet/test is skipped
@@ -43,12 +61,22 @@
 #           GITHUB_OUTPUT (if set, writes severity=/title= for the workflow)
 set -euo pipefail
 
+MODE=all
+case "${1:-}" in
+  "")                         ;;
+  --run-patched-tests)        MODE=run-tests ;;
+  --use-patched-tests-result) MODE=use-result ;;
+  *) echo "usage: check-freshness.sh [--run-patched-tests | --use-patched-tests-result]" >&2; exit 2 ;;
+esac
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_SH="$SCRIPT_DIR/build.sh"
 PATCH="$SCRIPT_DIR/augur-egress.patch"
 BODY_FILE="${BODY_FILE:-$PWD/gvproxy-freshness-body.md}"
 
-command -v gh  >/dev/null || { echo "check-freshness: gh not found" >&2;  exit 2; }
+if [ "$MODE" != run-tests ]; then
+  command -v gh >/dev/null || { echo "check-freshness: gh not found" >&2; exit 2; }
+fi
 command -v git >/dev/null || { echo "check-freshness: git not found" >&2; exit 2; }
 
 PIN="$(grep -E '^PIN=' "$BUILD_SH" | head -1 | cut -d'"' -f2)"
@@ -61,47 +89,6 @@ emit() {  # severity  title
     { echo "severity=$1"; echo "title=$2"; } >> "$GITHUB_OUTPUT"
   fi
 }
-
-read -r MAIN_SHA MAIN_DATE < <(gh api "repos/$SLUG/commits/main" --jq '"\(.sha) \(.commit.committer.date[0:10])"')
-PIN_DATE="$(gh api "repos/$SLUG/commits/$PIN" --jq '.commit.committer.date[0:10]')"
-SHORT_PIN="${PIN:0:8}"; SHORT_MAIN="${MAIN_SHA:0:8}"
-
-# Already current — nothing moved.
-if [ "$PIN" = "$MAIN_SHA" ]; then
-  echo "SEVERITY: CURRENT — gvproxy pin $SHORT_PIN is at upstream main ($MAIN_DATE)."
-  emit CURRENT ""
-  exit 0
-fi
-
-CMP="repos/$SLUG/compare/$PIN...$MAIN_SHA"
-AHEAD="$(gh api "$CMP" --jq '.ahead_by')"
-# while-read rather than mapfile so this also runs on macOS's stock bash 3.2.
-FILES=();   while IFS= read -r l; do FILES+=("$l");   done < <(gh api "$CMP" --jq '.files[].filename' 2>/dev/null || true)
-COMMITS=(); while IFS= read -r l; do COMMITS+=("$l"); done < <(gh api "$CMP" --jq '.commits[] | "\(.sha[0:8])\t\(.commit.committer.date[0:10])\t\(.commit.message | split("\n")[0])"')
-
-# Classify changed files: shipped code / shipped deps vs. dev-only noise. This is the
-# path-based fallback; once the build graph is available, code vs. noise is
-# re-decided from it below.
-# ${a[@]+"${a[@]}"} expands an empty array without tripping bash 3.2's `set -u`.
-code=(); dep=(); noise=()
-for f in ${FILES[@]+"${FILES[@]}"}; do
-  case "$f" in
-    tools/*)                 noise+=("$f") ;;   # dev tooling (linters) — never shipped
-    *_test.go)               noise+=("$f") ;;   # tests are never compiled into the binary
-    cmd/gvproxy/*|pkg/*)     code+=("$f")  ;;
-    go.mod|go.sum|vendor/*)  dep+=("$f")   ;;
-    *)                       noise+=("$f") ;;
-  esac
-done
-
-# Flag security-flavoured commit subjects (enriches the report; does not gate).
-sec=()
-for c in ${COMMITS[@]+"${COMMITS[@]}"}; do
-  msg="${c#*$'\t'}"; msg="${msg#*$'\t'}"
-  if printf '%s' "$msg" | grep -qiE 'secur|cve|vuln|overflow|panic|leak|bypass|out.of.bounds|(^| )oob( |$)|denial|dos'; then
-    sec+=("$c")
-  fi
-done
 
 fetch_tree() {  # dir sha — shallow checkout of one upstream commit
   git init --quiet "$1" &&
@@ -128,7 +115,8 @@ shipped_code() {  # dir
 }
 
 # `go list -deps ./cmd/gvproxy` with a template, for the darwin/arm64 build (what augur
-# ships, matching build.sh) whatever the host OS.
+# ships, matching build.sh) whatever the host OS. go list only reads upstream's sources and
+# module files and runs none of its code, so the drift check runs it where the token is.
 list_deps() {  # dir template
   ( cd "$1" &&
       GOTOOLCHAIN=auto GOFLAGS=-mod=vendor GOOS=darwin GOARCH=arm64 CGO_ENABLED=1 \
@@ -178,9 +166,11 @@ existing_pkgs() {  # dir
 # One step of the patched-tree check in tree $1: `vet` type-checks, test files included,
 # for the darwin/arm64 build augur ships; `test` runs the tests natively. Same vendored
 # build and toolchain selection as list_deps().
-# Accepted trade-off: `go test` runs upstream main's test code, unreviewed, on this host.
-# It gets no GitHub token and cannot write the workflow's outputs (the workflow's checkout
-# also keeps no credentials), but it does have the network.
+# `go test` executes upstream main's unreviewed test code with this process's privileges,
+# network and filesystem, and it can read its parent processes' environment. So in CI it
+# runs only under --run-patched-tests, in a job with no token, no permissions and no
+# persisted credentials, whose result the job that files the issue reads as data. Unsetting
+# the token variables below is defense in depth only, not a boundary.
 # Accepted trade-off: vet runs with CGO_ENABLED=0. Cross-type-checking with cgo on a Linux
 # runner would need a darwin C toolchain; the packages the patch touches are pure Go, and
 # the shipped binary is still built and tested on a Mac before a re-pin.
@@ -234,14 +224,111 @@ patched_tests() {  # dir log
 }
 
 # The failing part of a patched_tests() log for the issue body: no "ok"/"no test files"
-# lines, at most 40 lines of at most 200 characters, every backtick turned into a quote
-# so the excerpt cannot close its code block. awk reads the whole log, so a long one
-# cannot end the pipeline early under pipefail.
+# lines, at most 40 lines of at most 200 characters, control characters blanked and every
+# backtick turned into a quote so the excerpt cannot close its code block. Reads at most
+# 1 MiB of the log. awk reads all of what head passes it, so a long log cannot end the
+# pipeline early under pipefail. The log may come from the tokenless test job, so this is
+# the trusted side's own sanitizing; it does not rely on that job's.
 failure_excerpt() {  # log
-  awk '/^(ok |\?   )/ { next } n < 40 { gsub(/`/, "\047"); print substr($0, 1, 200); n++ }' "$1"
+  head -c 1048576 "$1" |
+    awk '/^(ok |\?   )/ { next } n < 40 { gsub(/[[:cntrl:]]/, " "); gsub(/`/, "\047"); print substr($0, 1, 200); n++ }'
+}
+
+# --use-patched-tests-result: take the tokenless job's result (IN_TESTS_*) as data. Sets
+# TESTS_STATE to one of the values patched_tests() prints, or to unavailable (with
+# TESTS_NOTE saying why) when the state is not one of them or the commit tested is not
+# the upstream main this run resolved (main moved between the jobs, or the job failed).
+# Uses the log only when it is a regular file, never a symlink.
+check_tests_result() {
+  case "$IN_TESTS_STATE" in
+    pass|fail-vet|fail-test|upstream-vet|upstream-test|none|unavailable) ;;
+    *) TESTS_STATE=unavailable; TESTS_NOTE="the test job's result is missing or not a known state"; return 0 ;;
+  esac
+  if [ "$IN_TESTS_SHA" != "$MAIN_SHA" ]; then
+    TESTS_STATE=unavailable
+    if printf '%s' "$IN_TESTS_SHA" | grep -qE '^[0-9a-f]{40}$'; then
+      TESTS_NOTE="the test job tested upstream \`${IN_TESTS_SHA:0:8}\`, not \`$SHORT_MAIN\`"
+    else
+      TESTS_NOTE="the test job did not report a valid upstream commit"
+    fi
+    return 0
+  fi
+  TESTS_STATE="$IN_TESTS_STATE"
+  if [ "$TESTS_STATE" = unavailable ]; then TESTS_NOTE="no working go in the test job"; fi
+  if [ -n "$IN_TESTS_LOG" ] && [ -f "$IN_TESTS_LOG" ] && [ ! -L "$IN_TESTS_LOG" ]; then
+    TESTS_LOG="$IN_TESTS_LOG"
+  fi
 }
 
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
+
+# --run-patched-tests: patch upstream main and run patched_tests() on it, nothing else.
+# This is the only part of the check that executes upstream code, so the workflow runs
+# it in a job with no token and no permissions; it reports back only data.
+if [ "$MODE" = run-tests ]; then
+  log="${TESTS_LOG_FILE:-$PWD/gvproxy-patched-tests.log}"
+  : > "$log"
+  state=unavailable
+  sha="$(git ls-remote "$REPO_URL" refs/heads/main 2>/dev/null | awk 'NR == 1 { print $1 }')"
+  if printf '%s' "$sha" | grep -qE '^[0-9a-f]{40}$' && fetch_tree "$WORK/main" "$sha" 2>/dev/null; then
+    if ! git -C "$WORK/main" apply "$PATCH" 2>/dev/null; then
+      state=skipped
+    elif command -v go >/dev/null; then
+      state="$(patched_tests "$WORK/main" "$log")"
+    fi
+  else
+    sha=""
+  fi
+  echo "patched tests: $state   upstream main: ${sha:-unresolved}   log: $log"
+  if [ -n "${GITHUB_OUTPUT:-}" ]; then
+    { echo "state=$state"; echo "sha=$sha"; } >> "$GITHUB_OUTPUT"
+  fi
+  exit 0
+fi
+
+# Inputs for --use-patched-tests-result (data from the tokenless job; see check_tests_result()).
+IN_TESTS_STATE="${TESTS_STATE:-}"; IN_TESTS_SHA="${TESTS_SHA:-}"; IN_TESTS_LOG="${TESTS_LOG_FILE:-}"
+
+read -r MAIN_SHA MAIN_DATE < <(gh api "repos/$SLUG/commits/main" --jq '"\(.sha) \(.commit.committer.date[0:10])"')
+PIN_DATE="$(gh api "repos/$SLUG/commits/$PIN" --jq '.commit.committer.date[0:10]')"
+SHORT_PIN="${PIN:0:8}"; SHORT_MAIN="${MAIN_SHA:0:8}"
+
+# Already current — nothing moved.
+if [ "$PIN" = "$MAIN_SHA" ]; then
+  echo "SEVERITY: CURRENT — gvproxy pin $SHORT_PIN is at upstream main ($MAIN_DATE)."
+  emit CURRENT ""
+  exit 0
+fi
+
+CMP="repos/$SLUG/compare/$PIN...$MAIN_SHA"
+AHEAD="$(gh api "$CMP" --jq '.ahead_by')"
+# while-read rather than mapfile so this also runs on macOS's stock bash 3.2.
+FILES=();   while IFS= read -r l; do FILES+=("$l");   done < <(gh api "$CMP" --jq '.files[].filename' 2>/dev/null || true)
+COMMITS=(); while IFS= read -r l; do COMMITS+=("$l"); done < <(gh api "$CMP" --jq '.commits[] | "\(.sha[0:8])\t\(.commit.committer.date[0:10])\t\(.commit.message | split("\n")[0])"')
+
+# Classify changed files: shipped code / shipped deps vs. dev-only noise. This is the
+# path-based fallback; once the build graph is available, code vs. noise is
+# re-decided from it below.
+# ${a[@]+"${a[@]}"} expands an empty array without tripping bash 3.2's `set -u`.
+code=(); dep=(); noise=()
+for f in ${FILES[@]+"${FILES[@]}"}; do
+  case "$f" in
+    tools/*)                 noise+=("$f") ;;   # dev tooling (linters) — never shipped
+    *_test.go)               noise+=("$f") ;;   # tests are never compiled into the binary
+    cmd/gvproxy/*|pkg/*)     code+=("$f")  ;;
+    go.mod|go.sum|vendor/*)  dep+=("$f")   ;;
+    *)                       noise+=("$f") ;;
+  esac
+done
+
+# Flag security-flavoured commit subjects (enriches the report; does not gate).
+sec=()
+for c in ${COMMITS[@]+"${COMMITS[@]}"}; do
+  msg="${c#*$'\t'}"; msg="${msg#*$'\t'}"
+  if printf '%s' "$msg" | grep -qiE 'secur|cve|vuln|overflow|panic|leak|bypass|out.of.bounds|(^| )oob( |$)|denial|dos'; then
+    sec+=("$c")
+  fi
+done
 
 # Does the augur patch still apply to current main? (highest-priority signal)
 # git apply is all-or-nothing: on a conflict it leaves the tree untouched.
@@ -251,11 +338,15 @@ if fetch_tree "$WORK/main" "$MAIN_SHA" 2>/dev/null; then
 fi
 
 # Does the patched main still type-check and pass its tests? Only meaningful once the
-# patch applied; see patched_tests().
-TESTS_STATE="skipped"
+# patch applied; see patched_tests(). TESTS_LOG is the go output the excerpt is cut from,
+# TESTS_NOTE says why the result is unavailable.
+TESTS_STATE="skipped"; TESTS_LOG="$WORK/tests.log"; TESTS_NOTE="no working go"
+: > "$TESTS_LOG"
 if [ "$PATCH_STATE" = "clean" ]; then
-  if command -v go >/dev/null; then
-    TESTS_STATE="$(patched_tests "$WORK/main" "$WORK/tests.log")"
+  if [ "$MODE" = use-result ]; then
+    check_tests_result
+  elif command -v go >/dev/null; then
+    TESTS_STATE="$(patched_tests "$WORK/main" "$TESTS_LOG")"
   else
     TESTS_STATE="unavailable"
   fi
@@ -353,7 +444,7 @@ PKG_LIST="$(patched_pkgs | tr '\n' ' ')"; PKG_LIST="${PKG_LIST% }"
     pass)        echo "- the patched tree passes \`go vet\` (darwin/arm64) and \`go test\`" ;;
     fail-vet)    echo "- it applies, but the **patched tree FAILS \`go vet\`** (darwin/arm64, test files included) — re-pin needs a manual rebase" ;;
     fail-test)   echo "- it applies, but the **patched tree FAILS \`go test\`** — re-pin needs a manual rebase" ;;
-    unavailable) echo "- patched-tree \`go vet\`/\`go test\` could not run (no working go)" ;;
+    unavailable) echo "- patched-tree \`go vet\`/\`go test\` could not run ($TESTS_NOTE)" ;;
     none)        echo "- no package the patch touches has Go files on main; patched-tree \`go vet\`/\`go test\` did not run" ;;
     upstream-*)  echo "- the patched tree fails \`go ${TESTS_STATE#upstream-}\`, but so does unpatched main — not attributed to the patch, not graded" ;;
   esac
@@ -362,7 +453,7 @@ PKG_LIST="$(patched_pkgs | tr '\n' ' ')"; PKG_LIST="${PKG_LIST% }"
     fail-*|upstream-*)
       echo "**Patched-tree failure (excerpt):**"
       echo '```'
-      failure_excerpt "$WORK/tests.log"
+      failure_excerpt "$TESTS_LOG"
       echo '```'
       echo ;;
   esac
