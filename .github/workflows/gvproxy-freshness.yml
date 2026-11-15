@@ -2,8 +2,9 @@ name: gvproxy-freshness
 
 # Daily drift check for augur's pinned gvproxy fork. It does NOT build the binary
 # (that needs an Apple Silicon macOS host for the real E2E) — it only asks "has the
-# upstream base moved in a way that matters, and does our patch still apply?", and
-# opens/refreshes a single tracking issue when it has. See gvproxy/check-freshness.sh.
+# upstream base moved in a way that matters, and does our patch still apply, type-check
+# and pass the patched packages' tests?", and opens/refreshes a single tracking issue
+# when it has. See gvproxy/check-freshness.sh.
 
 on:
   schedule:
@@ -24,8 +25,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The check lists gvproxy's build graph with `go list`; GOTOOLCHAIN=auto in the
-      # script fetches a newer Go if upstream's go.mod asks for one.
+      # The check lists gvproxy's build graph with `go list` and runs `go vet`/`go test`
+      # on the patched packages; GOTOOLCHAIN=auto in the script fetches a newer Go if
+      # upstream's go.mod asks for one.
       - uses: actions/setup-go@v5
         with:
           go-version: stable

@@ -97,13 +97,13 @@ behind — and because gvproxy parses attacker-influenced guest frames on the ho
 an upstream hardening fix can be security-relevant to us. Two layers watch for that:
 
 **Automated (primary).** `check-freshness.sh` runs daily via
-`.github/workflows/gvproxy-freshness.yml`. It does NOT build (the real E2E needs an
-Apple Silicon host) — it compares `PIN` against upstream `main`, ignores tooling/docs/test
-noise, and grades what remains:
+`.github/workflows/gvproxy-freshness.yml`. It does NOT build the binary (the real E2E
+needs an Apple Silicon host) — it compares `PIN` against upstream `main`, ignores
+tooling/docs/test noise, and grades what remains:
 
 | severity | meaning | issue? |
 |---|---|---|
-| `ACTION`  | `augur-egress.patch` no longer applies to `main` | yes |
+| `ACTION`  | `augur-egress.patch` no longer applies to `main`, or applies but the patched tree fails `go vet`/`go test` | yes |
 | `REVIEW`  | upstream code compiled into the binary, a module linked into it, or a `go.mod` build setting moved | yes |
 | `NOISE`   | behind, but nothing that reaches the binary (`tools/`/docs/CI/tests, test-only deps) | closes the issue |
 | `CURRENT` | pin is at `main` | closes the issue |
@@ -120,8 +120,15 @@ the augur patch applied, at both the pin and `main`:
 - **Build settings**: changes to `go.mod`'s `go`/`toolchain`/`godebug`/`replace` lines
   are always `REVIEW`.
 
+A patch that applies cleanly can still break: upstream may add a test or call site
+that uses a signature the patch changes. So once it applies, the check runs `go vet`
+for darwin/arm64 (which type-checks `_test.go` files too) and then a native `go test`
+on every package the patch touches (the directories of the `.go` files it names). A
+failure is `ACTION`, and the issue quotes the first lines of the output.
+
 Without a working `go` the build graph is skipped and the check falls back to paths:
 any change under `cmd/gvproxy/`/`pkg/` or to `go.mod`/`vendor` counts as `REVIEW`.
+The patched-tree `go vet`/`go test` is skipped as well, and the issue says it did not run.
 
 On `REVIEW`/`ACTION` it opens or refreshes a **single** issue labelled
 `gvproxy-freshness` (idempotent — no notification spam); on `NOISE`/`CURRENT` it
@@ -138,5 +145,6 @@ keyword heuristic misses it. Note that release tags lag `main`: a security fix c
 on `main` for weeks before it is tagged, so we pin to a `main` commit, not a release.
 
 **Responding.** Bump `PIN` in `build.sh` to the chosen commit, re-run `build.sh`
-(re-applies the patch), then run the macOS egress E2E on Apple Silicon. If the patch
-conflicted (`ACTION`), rebase it against `main` first.
+(re-applies the patch), run `go vet` and `go test` on the patched packages in a clone
+of upstream at the new pin with the patch applied (`build.sh` removes its own), then run the macOS egress E2E on Apple Silicon. If the patch conflicted, or applies but
+the patched tree fails `go vet`/`go test` (`ACTION`), rebase it against `main` first.

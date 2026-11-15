@@ -4,6 +4,9 @@
 # Detect whether augur's pinned gvproxy fork base has fallen behind upstream in a
 # way that MATTERS — not raw commit count (that is mostly tools/vendor churn), but:
 #   - the augur patch no longer applies cleanly to upstream main, or
+#   - it applies, but the patched tree no longer type-checks or passes its tests
+#     (`go vet` for darwin/arm64 and native `go test` on every package the patch
+#     touches — see patched_tests()), or
 #   - upstream's own code that is compiled into the shipped binary changed, or
 #   - a dependency that is linked into the shipped binary moved, or
 #   - a go.mod setting that changes how the binary is built moved.
@@ -23,7 +26,8 @@
 # non-zero when action is warranted so a daily GitHub Actions cron can open/refresh
 # a tracking issue. Severities are TEXT (no emoji — some renderers drop glyphs):
 #
-#   ACTION   patch no longer applies cleanly to main            (exit 1)
+#   ACTION   patch no longer applies cleanly to main, or applies
+#            but the patched tree fails go vet / go test         (exit 1)
 #   REVIEW   security/code/dependency change in the shipped tree (exit 1)
 #   NOISE    behind, but nothing that reaches the shipped binary (exit 0)
 #   CURRENT  pin is at upstream main                             (exit 0)
@@ -32,7 +36,8 @@
 # Requires: gh (authenticated: GH_TOKEN or `gh auth login`), git, go.
 #           Without a working go the build graph is skipped: any change under
 #           cmd/gvproxy/ or pkg/, and any go.mod/go.sum/vendor change, counts as
-#           shipped (fails toward REVIEW).
+#           shipped (fails toward REVIEW). The patched-tree vet/test is skipped
+#           too, and the issue body says it did not run.
 # Honors:   BODY_FILE  (where to write the Markdown issue body; default ./gvproxy-freshness-body.md)
 #           GITHUB_OUTPUT (if set, writes severity=/title= for the workflow)
 set -euo pipefail
@@ -148,12 +153,75 @@ vendored_modules() {  # dir
   awk '/^# / { print $2, $3 }' "$1/vendor/modules.txt" | LC_ALL=C sort -u
 }
 
+# Package directories the augur patch touches, as "./dir" (or "."), one per line: the
+# directory of every .go file named by a `diff --git` header (new, changed and
+# deleted files alike, so a package whose test file the patch edits is included).
+patched_pkgs() {
+  sed -n 's|^diff --git a/.* b/\(.*\.go\)$|\1|p' "$PATCH" |
+    awk '{ d = $0; if (!sub(/\/[^\/]*$/, "", d)) d = "."; print (d == "." ? "." : "./" d) }' |
+    sort -u
+}
+
+# Type-check the patched tree, test files included, for the darwin/arm64 build augur
+# ships (`go vet`), then run its tests natively (`go test`), on every package the patch
+# touches that still exists. The patch can apply cleanly yet break a call site or a
+# test upstream added since the pin, which `go list` alone never compiles.
+# Writes the go output to $2 and prints the result: pass, fail-vet, fail-test, or
+# unavailable when go cannot run in the tree at all (e.g. GOTOOLCHAIN=auto could not
+# fetch the Go that go.mod asks for), so a broken toolchain never reads as a broken patch.
+# Accepted trade-off: vet runs with CGO_ENABLED=0. Cross-type-checking with cgo on a
+# Linux runner would need a darwin C toolchain; the patched packages are pure Go.
+patched_tests() {  # dir log
+  local pkgs=() p
+  while IFS= read -r p; do
+    if [ -d "$1/$p" ]; then pkgs+=("$p"); fi
+  done < <(patched_pkgs)
+  : > "$2"
+  if [ "${#pkgs[@]}" -eq 0 ] ||
+     ! ( cd "$1" && GOTOOLCHAIN=auto GOFLAGS=-mod=vendor go version ) >> "$2" 2>&1; then
+    echo unavailable; return 0
+  fi
+  if ! ( cd "$1" && GOTOOLCHAIN=auto GOFLAGS=-mod=vendor GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 \
+         go vet "${pkgs[@]}" ) >> "$2" 2>&1; then
+    echo fail-vet; return 0
+  fi
+  # -timeout bounds each test binary, so a hung test fails the run instead of stalling it.
+  if ! ( cd "$1" && GOTOOLCHAIN=auto GOFLAGS=-mod=vendor \
+         go test -count=1 -timeout 10m "${pkgs[@]}" ) >> "$2" 2>&1; then
+    echo fail-test; return 0
+  fi
+  echo pass
+}
+
+# The failing part of a patched_tests() log for the issue body: no "ok"/"no test files"
+# lines, at most 40 lines of 200 characters, triple backticks defused so the excerpt
+# cannot close its code block.
+failure_excerpt() {  # log
+  { grep -vE '^(ok |\?   )' "$1" || true; } | cut -c1-200 | head -n 40 | sed 's/```/` ` `/g'
+}
+
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 
 # Does the augur patch still apply to current main? (highest-priority signal)
 PATCH_STATE="unknown"
 if fetch_tree "$WORK/main" "$MAIN_SHA" 2>/dev/null; then
-  if git -C "$WORK/main" apply --check "$PATCH" 2>/dev/null; then PATCH_STATE="clean"; else PATCH_STATE="conflict"; fi
+  if git -C "$WORK/main" apply --check "$PATCH" 2>/dev/null &&
+     git -C "$WORK/main" apply "$PATCH" 2>/dev/null; then
+    PATCH_STATE="clean"
+  else
+    PATCH_STATE="conflict"
+  fi
+fi
+
+# Does the patched main still type-check and pass its tests? Only meaningful once the
+# patch applied; see patched_tests().
+TESTS_STATE="skipped"
+if [ "$PATCH_STATE" = "clean" ]; then
+  if command -v go >/dev/null; then
+    TESTS_STATE="$(patched_tests "$WORK/main" "$WORK/tests.log")"
+  else
+    TESTS_STATE="unavailable"
+  fi
 fi
 
 # Compare what actually goes into the binary at the pin vs. main, both with the augur
@@ -164,7 +232,6 @@ graph_diff=""; settings_diff=""; other_bumps=""
 if [ "$PATCH_STATE" != "unknown" ] && command -v go >/dev/null &&
    fetch_tree "$WORK/pin" "$PIN" 2>/dev/null &&
    git -C "$WORK/pin" apply "$PATCH" 2>/dev/null; then
-  [ "$PATCH_STATE" = "clean" ] && git -C "$WORK/main" apply "$PATCH"
   if build_graph  "$WORK/pin"  > "$WORK/graph.pin"  &&
      build_graph  "$WORK/main" > "$WORK/graph.main" &&
      shipped_code "$WORK/pin"  > "$WORK/code.pin"   &&
@@ -220,11 +287,15 @@ fi
 relevant=$(( ${#code[@]} + dep_relevant ))
 if [ "$PATCH_STATE" = "conflict" ]; then
   SEV="ACTION"; TITLE="gvproxy: patch no longer applies to upstream main (action required)"
+elif [ "$TESTS_STATE" = "fail-vet" ] || [ "$TESTS_STATE" = "fail-test" ]; then
+  SEV="ACTION"; TITLE="gvproxy: patch applies but the patched tree fails go vet/test (action required)"
 elif [ "$relevant" -gt 0 ]; then
   SEV="REVIEW"; TITLE="gvproxy: upstream security/code update available (review)"
 else
   SEV="NOISE";  TITLE=""
 fi
+
+PKG_LIST="$(patched_pkgs | tr '\n' ' ')"; PKG_LIST="${PKG_LIST% }"
 
 # --- Markdown issue body ---------------------------------------------------
 {
@@ -241,7 +312,20 @@ fi
     conflict) echo "- \`augur-egress.patch\` **NO LONGER APPLIES** to main — re-pin needs a manual rebase" ;;
     *)        echo "- patch apply-check could not run (clone failed)" ;;
   esac
+  case "$TESTS_STATE" in
+    pass)        echo "- the patched tree passes \`go vet\` (darwin/arm64) and \`go test\`" ;;
+    fail-vet)    echo "- it applies, but the **patched tree FAILS \`go vet\`** (darwin/arm64, test files included) — re-pin needs a manual rebase" ;;
+    fail-test)   echo "- it applies, but the **patched tree FAILS \`go test\`** — re-pin needs a manual rebase" ;;
+    unavailable) echo "- patched-tree \`go vet\`/\`go test\` could not run (no working go)" ;;
+  esac
   echo
+  if [ "$TESTS_STATE" = "fail-vet" ] || [ "$TESTS_STATE" = "fail-test" ]; then
+    echo "**Patched-tree failure (excerpt):**"
+    echo '```'
+    failure_excerpt "$WORK/tests.log"
+    echo '```'
+    echo
+  fi
 
   if [ "${#code[@]}" -gt 0 ]; then
     if [ "$GRAPH_STATE" = "ok" ]; then
@@ -286,8 +370,9 @@ fi
   echo "**Runbook**"
   echo "1. Bump \`PIN\` in \`gvproxy/build.sh\` to \`$MAIN_SHA\` (or a chosen newer commit)."
   echo "2. Re-apply \`augur-egress.patch\` and rebuild (\`bash gvproxy/build.sh\`)."
-  echo "3. Run the macOS egress E2E on Apple Silicon (allowlisted host reachable, blocked host denied, SSH via gvproxy)."
-  echo "4. If the patch conflicted, rebase it against main first, then re-run this check."
+  echo "3. In a clone of upstream at the new pin with \`augur-egress.patch\` applied, run \`GOFLAGS=-mod=vendor GOOS=darwin GOARCH=arm64 go vet $PKG_LIST\` and \`GOFLAGS=-mod=vendor go test $PKG_LIST\`."
+  echo "4. Run the macOS egress E2E on Apple Silicon (allowlisted host reachable, blocked host denied, SSH via gvproxy)."
+  echo "5. If the patch conflicted, or applies but the patched tree fails \`go vet\`/\`go test\`, rebase it against main first (fix the call sites and tests it breaks), then re-run this check."
   echo
   echo "_Filed automatically by \`gvproxy/check-freshness.sh\` (daily). Body refreshes in place; closes once nothing pending reaches the shipped binary._"
 } > "$BODY_FILE"
@@ -297,6 +382,7 @@ echo "SEVERITY: $SEV"
 echo "  pinned : $SHORT_PIN ($PIN_DATE)"
 echo "  main   : $SHORT_MAIN ($MAIN_DATE)   [$AHEAD ahead]"
 echo "  patch  : $PATCH_STATE"
+echo "  tests  : $TESTS_STATE"
 echo "  graph  : $GRAPH_STATE"
 if [ "$GRAPH_STATE" = "ok" ]; then
   echo "  shipped modules changed : $(printf '%s' "$graph_diff" | grep -c . || true)   build settings changed : $(printf '%s' "$settings_diff" | grep -c . || true)   other bumps : $(printf '%s' "$other_bumps" | grep -c . || true)"
