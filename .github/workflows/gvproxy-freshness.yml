@@ -23,7 +23,11 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
+      # The check runs upstream gvisor-tap-vsock's tests (unreviewed code) on this runner,
+      # so the checkout leaves no token in .git/config for them to read.
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       # The check lists gvproxy's build graph with `go list` and runs `go vet`/`go test`
       # on the patched packages; GOTOOLCHAIN=auto in the script fetches a newer Go if

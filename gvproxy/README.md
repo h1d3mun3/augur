@@ -124,7 +124,11 @@ A patch that applies cleanly can still break: upstream may add a test or call si
 that uses a signature the patch changes. So once it applies, the check runs `go vet`
 for darwin/arm64 (which type-checks `_test.go` files too) and then a native `go test`
 on every package the patch touches (the directories of the `.go` files it names). A
-failure is `ACTION`, and the issue quotes the first lines of the output.
+failed step is re-run on unpatched `main`: if that passes, the failure is the patch's and
+the run is `ACTION`; if it fails too (a new vet check in a newer Go, a flaky upstream
+test), the issue notes it without grading it. Either way the issue quotes the first lines
+of the output. The tests are upstream's unreviewed code, so they run without the
+workflow's GitHub token in their environment, and the workflow's checkout keeps none.
 
 Without a working `go` the build graph is skipped and the check falls back to paths:
 any change under `cmd/gvproxy/`/`pkg/` or to `go.mod`/`vendor` counts as `REVIEW`.

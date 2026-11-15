@@ -64,10 +64,16 @@ esac
 EOF
 cat > "$BIN/go" <<'EOF'
 #!/usr/bin/env bash
-# Records "GOOS GOARCH CGO_ENABLED GOFLAGS GOTOOLCHAIN :: args" per call; FAKE_GO_FAIL names the
-# subcommand (version, vet, test) that fails, printing FAKE_GO_OUT first.
-echo "${GOOS:--} ${GOARCH:--} ${CGO_ENABLED:--} ${GOFLAGS:--} ${GOTOOLCHAIN:--} :: $*" >> "$GO_LOG"
-if [ "${FAKE_GO_FAIL:-}" = "$1" ]; then
+# Records "[patched|unpatched] GOOS GOARCH CGO_ENABLED GOFLAGS GOTOOLCHAIN :: args" per call, and
+# "secret" lines naming any token or workflow-output variable it can see. FAKE_GO_FAIL names the
+# subcommand (version, vet, test) that fails, printing FAKE_GO_OUT first: on the patched tree
+# only, or on both trees when FAKE_GO_FAIL_UNPATCHED is set.
+tree=unpatched; grep -q 'return 2' pkg/a/a.go 2>/dev/null && tree=patched
+echo "[$tree] ${GOOS:--} ${GOARCH:--} ${CGO_ENABLED:--} ${GOFLAGS:--} ${GOTOOLCHAIN:--} :: $*" >> "$GO_LOG"
+for v in GH_TOKEN GITHUB_TOKEN GITHUB_OUTPUT; do
+  if [ -n "${!v:-}" ]; then echo "secret $v visible to go $1" >> "$GO_LOG"; fi
+done
+if [ "${FAKE_GO_FAIL:-}" = "$1" ] && { [ "$tree" = patched ] || [ -n "${FAKE_GO_FAIL_UNPATCHED:-}" ]; }; then
   [ -n "${FAKE_GO_OUT:-}" ] && cat "$FAKE_GO_OUT"
   exit 1
 fi
@@ -85,7 +91,7 @@ run_check() {
   local n="$T/run.$RANDOM"; mkdir -p "$n"; : > "$n/go.log"; : > "$n/ghout"
   out="$(cd "$n" && env -u GOOS -u GOARCH -u CGO_ENABLED -u GOFLAGS -u GOTOOLCHAIN \
            PATH="$2:/usr/bin:/bin" FAKE_MAIN="$1" GO_LOG="$n/go.log" \
-           BODY_FILE="$n/body.md" GITHUB_OUTPUT="$n/ghout" \
+           BODY_FILE="$n/body.md" GITHUB_OUTPUT="$n/ghout" GH_TOKEN=tok GITHUB_TOKEN=tok \
            bash "$GV/check-freshness.sh" 2>&1)"
   rc=$?
   body="$(cat "$n/body.md" 2>/dev/null)"; ghout="$(cat "$n/ghout")"; golog="$(cat "$n/go.log")"
@@ -101,7 +107,9 @@ has "$ghout" "severity=NOISE" "workflow severity NOISE"
 has "$body" 'the patched tree passes `go vet` (darwin/arm64) and `go test`' "body says the patched tree passes"
 has "$golog" "darwin arm64 0 -mod=vendor auto :: vet ./pkg/a" "vet: darwin/arm64, cgo off, vendored, GOTOOLCHAIN=auto, on the patched package"
 has "$golog" "- - - -mod=vendor auto :: test -count=1 -timeout 10m ./pkg/a" "test: native, vendored, GOTOOLCHAIN=auto, with a timeout"
-has "$body" "go test ./pkg/a" "runbook names go test on the patched packages"
+has "$body" "go test -count=1 ./pkg/a" "runbook names go test on the patched packages"
+eq "" "$(printf "%s\n" "$golog" | grep -E "visible to go (vet|test)")" "go vet/test see no GH_TOKEN, GITHUB_TOKEN or GITHUB_OUTPUT"
+hasnt "$golog" "[unpatched]" "no baseline run when the patched tree passes"
 has "$body" "or applies but the patched tree fails" "runbook's rebase step covers a failing patched tree"
 
 # --- vet fails --------------------------------------------------------------------------------------
@@ -129,10 +137,24 @@ has "$out" "tests  : fail-test" "summary reports tests: fail-test"
 has "$ghout" "severity=ACTION" "workflow severity ACTION"
 has "$body" 'patched tree FAILS `go test`' "body says the patched tree fails test"
 has "$body" "--- FAIL: TestF" "body carries the test failure"
+has "$golog" "[unpatched] - - - -mod=vendor auto :: test -count=1 -timeout 10m ./pkg/a" "the failing step re-runs on unpatched main"
+eq "" "$(printf "%s\n" "$golog" | grep -E "visible to go (vet|test)")" "go vet/test see no GH_TOKEN, GITHUB_TOKEN or GITHUB_OUTPUT (baseline included)"
+
+# --- unpatched main fails the same way: not the patch's failure ------------------------------------
+section "patched tree fails go vet, unpatched main fails it too"
+export FAKE_GO_FAIL=vet FAKE_GO_OUT="$T/vet.out" FAKE_GO_FAIL_UNPATCHED=1
+run_check "$MAIN_OK" "$BIN"
+unset FAKE_GO_FAIL_UNPATCHED
+eq 0 "$rc" "exit 0 (not ACTION)"
+has "$out" "tests  : upstream-vet" "summary reports tests: upstream-vet"
+hasnt "$ghout" "severity=ACTION" "workflow severity is not ACTION"
+has "$body" 'but so does unpatched main' "body says unpatched main fails too"
+has "$body" "not enough arguments in call to F" "body still carries the excerpt"
 
 # --- excerpt is bounded and cannot break its code block ---------------------------------------------
 section "failure excerpt is bounded"
-{ for i in $(seq 1 100); do printf 'line%03d %s ```\n' "$i" "$(printf 'x%.0s' $(seq 1 300))"; done; } > "$T/long.out"
+xs="$(printf 'x%.0s' $(seq 1 300))"
+{ for i in $(seq 1 2000); do printf 'line%03d ````` %s\n' "$i" "$xs"; done; } > "$T/long.out"   # ~600 KB: past any pipe buffer
 export FAKE_GO_FAIL=vet FAKE_GO_OUT="$T/long.out"
 run_check "$MAIN_OK" "$BIN"
 excerpt="$(printf '%s\n' "$body" | awk '/^\*\*Patched-tree failure/ { f = 1; next } f && /^```$/ { if (++n == 2) exit; next } f && n == 1')"
@@ -140,6 +162,8 @@ eq 40 "$(printf '%s\n' "$excerpt" | grep -c .)" "at most 40 lines"
 eq 0 "$(printf '%s\n' "$excerpt" | awk 'length > 200' | grep -c .)" "no line longer than 200 characters"
 eq 2 "$(printf '%s\n' "$body" | grep -c '```')" "only the two fences carry triple backticks"
 hasnt "$body" "line041" "lines past the bound are dropped"
+has "$ghout" "severity=ACTION" "a log far past the pipe buffer still reaches the workflow as ACTION"
+has "$out" "SEVERITY: ACTION" "and the summary is printed"
 
 # --- go cannot run: never ACTION on its own ------------------------------------------------------
 section "go present but the toolchain cannot run in the tree"

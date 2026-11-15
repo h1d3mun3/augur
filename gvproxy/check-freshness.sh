@@ -27,7 +27,8 @@
 # a tracking issue. Severities are TEXT (no emoji — some renderers drop glyphs):
 #
 #   ACTION   patch no longer applies cleanly to main, or applies
-#            but the patched tree fails go vet / go test         (exit 1)
+#            but the patched tree fails go vet / go test where
+#            unpatched main passes                               (exit 1)
 #   REVIEW   security/code/dependency change in the shipped tree (exit 1)
 #   NOISE    behind, but nothing that reaches the shipped binary (exit 0)
 #   CURRENT  pin is at upstream main                             (exit 0)
@@ -162,55 +163,91 @@ patched_pkgs() {
     sort -u
 }
 
-# Type-check the patched tree, test files included, for the darwin/arm64 build augur
-# ships (`go vet`), then run its tests natively (`go test`), on every package the patch
-# touches that still exists. The patch can apply cleanly yet break a call site or a
-# test upstream added since the pin, which `go list` alone never compiles.
-# Writes the go output to $2 and prints the result: pass, fail-vet, fail-test, or
-# unavailable when go cannot run in the tree at all (e.g. GOTOOLCHAIN=auto could not
-# fetch the Go that go.mod asks for), so a broken toolchain never reads as a broken patch.
-# Accepted trade-off: vet runs with CGO_ENABLED=0. Cross-type-checking with cgo on a
-# Linux runner would need a darwin C toolchain; the patched packages are pure Go.
-patched_tests() {  # dir log
-  local pkgs=() p
+# Patched package directories that hold Go files in tree $1 (a directory the patch
+# names but upstream has emptied or removed is left out).
+existing_pkgs() {  # dir
+  local p f
   while IFS= read -r p; do
-    if [ -d "$1/$p" ]; then pkgs+=("$p"); fi
+    for f in "$1/$p"/*.go; do
+      if [ -e "$f" ]; then echo "$p"; fi
+      break
+    done
   done < <(patched_pkgs)
+}
+
+# One step of the patched-tree check in tree $1: `vet` type-checks, test files included,
+# for the darwin/arm64 build augur ships; `test` runs the tests natively. Same vendored
+# build and toolchain selection as list_deps().
+# Accepted trade-off: `go test` runs upstream main's test code, unreviewed, on this host.
+# It gets no GitHub token and cannot write the workflow's outputs (the workflow's checkout
+# also keeps no credentials), but it does have the network.
+# Accepted trade-off: vet runs with CGO_ENABLED=0. Cross-type-checking with cgo on a Linux
+# runner would need a darwin C toolchain; the packages the patch touches are pure Go, and
+# the shipped binary is still built and tested on a Mac before a re-pin.
+go_step() {  # dir vet|test pkg...
+  local dir="$1" step="$2"; shift 2
+  ( cd "$dir" || exit 1
+    unset GH_TOKEN GITHUB_TOKEN GITHUB_OUTPUT
+    export GOTOOLCHAIN=auto GOFLAGS=-mod=vendor
+    case "$step" in
+      vet)  GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go vet "$@" ;;
+      # -timeout bounds each test binary, so a hung test fails the run instead of stalling it.
+      test) go test -count=1 -timeout 10m "$@" ;;
+    esac )
+}
+
+# Does patched tree $1 still type-check and pass its tests? The patch can apply cleanly
+# yet break a call site or a test upstream added since the pin, which `go list` alone
+# never compiles. Runs `vet`, then `test`, on every package the patch touches; writes the
+# go output to $2 and prints one of:
+#   pass                       both steps passed
+#   fail-vet | fail-test       that step fails on the patched tree only
+#   upstream-vet|upstream-test that step fails on unpatched main too, so the failure is
+#                              not the patch's (a new vet check in a newer Go, a flaky or
+#                              runner-dependent upstream test)
+#   none                       no package the patch touches has Go files any more
+#   unavailable                go cannot run in the tree (e.g. GOTOOLCHAIN=auto could not
+#                              fetch the Go that go.mod asks for)
+# Accepted trade-off: a failure the patch causes in a step that unpatched main already
+# fails is reported as upstream-*, not graded; it shows once upstream is fixed.
+patched_tests() {  # dir log
+  local pkgs=() base=() p step
+  while IFS= read -r p; do pkgs+=("$p"); done < <(existing_pkgs "$1")
   : > "$2"
-  if [ "${#pkgs[@]}" -eq 0 ] ||
-     ! ( cd "$1" && GOTOOLCHAIN=auto GOFLAGS=-mod=vendor go version ) >> "$2" 2>&1; then
+  if [ "${#pkgs[@]}" -eq 0 ]; then echo none; return 0; fi
+  if ! ( cd "$1" && GOTOOLCHAIN=auto GOFLAGS=-mod=vendor go version ) >/dev/null 2>&1; then
     echo unavailable; return 0
   fi
-  if ! ( cd "$1" && GOTOOLCHAIN=auto GOFLAGS=-mod=vendor GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 \
-         go vet "${pkgs[@]}" ) >> "$2" 2>&1; then
-    echo fail-vet; return 0
-  fi
-  # -timeout bounds each test binary, so a hung test fails the run instead of stalling it.
-  if ! ( cd "$1" && GOTOOLCHAIN=auto GOFLAGS=-mod=vendor \
-         go test -count=1 -timeout 10m "${pkgs[@]}" ) >> "$2" 2>&1; then
-    echo fail-test; return 0
-  fi
+  for step in vet test; do
+    if ! go_step "$1" "$step" "${pkgs[@]}" >> "$2" 2>&1; then
+      # Same step on an unpatched checkout of the same commit.
+      if git -C "$1" worktree add --quiet --detach "$WORK/base" HEAD >/dev/null 2>&1; then
+        while IFS= read -r p; do base+=("$p"); done < <(existing_pkgs "$WORK/base")
+        if [ "${#base[@]}" -gt 0 ] && ! go_step "$WORK/base" "$step" "${base[@]}" >/dev/null 2>&1; then
+          echo "upstream-$step"; return 0
+        fi
+      fi
+      echo "fail-$step"; return 0
+    fi
+  done
   echo pass
 }
 
 # The failing part of a patched_tests() log for the issue body: no "ok"/"no test files"
-# lines, at most 40 lines of 200 characters, triple backticks defused so the excerpt
-# cannot close its code block.
+# lines, at most 40 lines of at most 200 characters, every backtick turned into a quote
+# so the excerpt cannot close its code block. awk reads the whole log, so a long one
+# cannot end the pipeline early under pipefail.
 failure_excerpt() {  # log
-  { grep -vE '^(ok |\?   )' "$1" || true; } | cut -c1-200 | head -n 40 | sed 's/```/` ` `/g'
+  awk '/^(ok |\?   )/ { next } n < 40 { gsub(/`/, "\047"); print substr($0, 1, 200); n++ }' "$1"
 }
 
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 
 # Does the augur patch still apply to current main? (highest-priority signal)
+# git apply is all-or-nothing: on a conflict it leaves the tree untouched.
 PATCH_STATE="unknown"
 if fetch_tree "$WORK/main" "$MAIN_SHA" 2>/dev/null; then
-  if git -C "$WORK/main" apply --check "$PATCH" 2>/dev/null &&
-     git -C "$WORK/main" apply "$PATCH" 2>/dev/null; then
-    PATCH_STATE="clean"
-  else
-    PATCH_STATE="conflict"
-  fi
+  if git -C "$WORK/main" apply "$PATCH" 2>/dev/null; then PATCH_STATE="clean"; else PATCH_STATE="conflict"; fi
 fi
 
 # Does the patched main still type-check and pass its tests? Only meaningful once the
@@ -317,15 +354,18 @@ PKG_LIST="$(patched_pkgs | tr '\n' ' ')"; PKG_LIST="${PKG_LIST% }"
     fail-vet)    echo "- it applies, but the **patched tree FAILS \`go vet\`** (darwin/arm64, test files included) — re-pin needs a manual rebase" ;;
     fail-test)   echo "- it applies, but the **patched tree FAILS \`go test\`** — re-pin needs a manual rebase" ;;
     unavailable) echo "- patched-tree \`go vet\`/\`go test\` could not run (no working go)" ;;
+    none)        echo "- no package the patch touches has Go files on main; patched-tree \`go vet\`/\`go test\` did not run" ;;
+    upstream-*)  echo "- the patched tree fails \`go ${TESTS_STATE#upstream-}\`, but so does unpatched main — not attributed to the patch, not graded" ;;
   esac
   echo
-  if [ "$TESTS_STATE" = "fail-vet" ] || [ "$TESTS_STATE" = "fail-test" ]; then
-    echo "**Patched-tree failure (excerpt):**"
-    echo '```'
-    failure_excerpt "$WORK/tests.log"
-    echo '```'
-    echo
-  fi
+  case "$TESTS_STATE" in
+    fail-*|upstream-*)
+      echo "**Patched-tree failure (excerpt):**"
+      echo '```'
+      failure_excerpt "$WORK/tests.log"
+      echo '```'
+      echo ;;
+  esac
 
   if [ "${#code[@]}" -gt 0 ]; then
     if [ "$GRAPH_STATE" = "ok" ]; then
@@ -370,7 +410,7 @@ PKG_LIST="$(patched_pkgs | tr '\n' ' ')"; PKG_LIST="${PKG_LIST% }"
   echo "**Runbook**"
   echo "1. Bump \`PIN\` in \`gvproxy/build.sh\` to \`$MAIN_SHA\` (or a chosen newer commit)."
   echo "2. Re-apply \`augur-egress.patch\` and rebuild (\`bash gvproxy/build.sh\`)."
-  echo "3. In a clone of upstream at the new pin with \`augur-egress.patch\` applied, run \`GOFLAGS=-mod=vendor GOOS=darwin GOARCH=arm64 go vet $PKG_LIST\` and \`GOFLAGS=-mod=vendor go test $PKG_LIST\`."
+  echo "3. In a clone of upstream at the new pin with \`augur-egress.patch\` applied, run \`GOFLAGS=-mod=vendor GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go vet $PKG_LIST\` and \`GOFLAGS=-mod=vendor go test -count=1 $PKG_LIST\`."
   echo "4. Run the macOS egress E2E on Apple Silicon (allowlisted host reachable, blocked host denied, SSH via gvproxy)."
   echo "5. If the patch conflicted, or applies but the patched tree fails \`go vet\`/\`go test\`, rebase it against main first (fix the call sites and tests it breaks), then re-run this check."
   echo
