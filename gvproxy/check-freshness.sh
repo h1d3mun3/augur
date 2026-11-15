@@ -35,21 +35,19 @@
 #
 # Usage:   bash gvproxy/check-freshness.sh [--run-patched-tests | --use-patched-tests-result]
 #
-#   (no option)                 Everything in one process: the drift check AND the
-#                               patched-tree go vet/go test. For a local run. go test
-#                               executes upstream's unreviewed test code with your
-#                               privileges.
-#   --run-patched-tests         Only the patched-tree go vet/go test, for a job that holds
-#                               no token: resolves upstream main with `git ls-remote` (no
-#                               gh), writes the go output to $TESTS_LOG_FILE (default
+#   (no option)                 Everything in one process, for a local run: the drift
+#                               check AND the patched-tree go vet/go test, which runs
+#                               upstream's test code with your privileges (see go_step()).
+#   --run-patched-tests         Only the patched-tree go vet/go test, for CI's tokenless
+#                               job: resolves upstream main with `git ls-remote` (no gh),
+#                               writes the go output to $PATCHED_TESTS_LOG (default
 #                               ./gvproxy-patched-tests.log), prints and, with
 #                               GITHUB_OUTPUT, emits `state=` and `sha=` (the upstream
 #                               commit tested). Always exits 0: the state is the result.
-#   --use-patched-tests-result  The drift check without running go vet/go test: takes the
-#                               result of a --run-patched-tests run as plain data from
-#                               TESTS_STATE, TESTS_SHA and TESTS_LOG_FILE. A state that is
-#                               not one patched_tests() prints, or a commit other than the
-#                               upstream main this run resolved, counts as `unavailable`.
+#   --use-patched-tests-result  The drift check without running go vet/go test: reads a
+#                               --run-patched-tests result from PATCHED_TESTS_STATE,
+#                               PATCHED_TESTS_SHA and PATCHED_TESTS_LOG as plain data
+#                               (see check_tests_result()).
 #
 # Requires: gh (authenticated: GH_TOKEN or `gh auth login`), git, go; --run-patched-tests
 #           needs only git and go.
@@ -58,7 +56,7 @@
 #           shipped (fails toward REVIEW). The patched-tree vet/test is skipped
 #           too, and the issue body says it did not run.
 # Honors:   BODY_FILE  (where to write the Markdown issue body; default ./gvproxy-freshness-body.md)
-#           GITHUB_OUTPUT (if set, writes severity=/title= for the workflow)
+#           GITHUB_OUTPUT (if set, writes severity=/title=/tests= for the workflow)
 set -euo pipefail
 
 MODE=all
@@ -84,9 +82,10 @@ REPO_URL="$(grep -E '^REPO=' "$BUILD_SH" | head -1 | cut -d'"' -f2)"
 SLUG="${REPO_URL#https://github.com/}"; SLUG="${SLUG%.git}"
 [ -n "$PIN" ] && [ -n "$SLUG" ] || { echo "check-freshness: could not read PIN/REPO from $BUILD_SH" >&2; exit 2; }
 
-emit() {  # severity  title
+emit() {  # severity  title  [tests state]
   if [ -n "${GITHUB_OUTPUT:-}" ]; then
     { echo "severity=$1"; echo "title=$2"; } >> "$GITHUB_OUTPUT"
+    if [ -n "${3:-}" ]; then echo "tests=$3" >> "$GITHUB_OUTPUT"; fi
   fi
 }
 
@@ -170,14 +169,14 @@ existing_pkgs() {  # dir
 # network and filesystem, and it can read its parent processes' environment. So in CI it
 # runs only under --run-patched-tests, in a job with no token, no permissions and no
 # persisted credentials, whose result the job that files the issue reads as data. Unsetting
-# the token variables below is defense in depth only, not a boundary.
+# the token and workflow-file variables below is defense in depth only, not a boundary.
 # Accepted trade-off: vet runs with CGO_ENABLED=0. Cross-type-checking with cgo on a Linux
 # runner would need a darwin C toolchain; the packages the patch touches are pure Go, and
 # the shipped binary is still built and tested on a Mac before a re-pin.
 go_step() {  # dir vet|test pkg...
   local dir="$1" step="$2"; shift 2
   ( cd "$dir" || exit 1
-    unset GH_TOKEN GITHUB_TOKEN GITHUB_OUTPUT
+    unset GH_TOKEN GITHUB_TOKEN GITHUB_OUTPUT GITHUB_ENV GITHUB_PATH GITHUB_STATE GITHUB_STEP_SUMMARY
     export GOTOOLCHAIN=auto GOFLAGS=-mod=vendor
     case "$step" in
       vet)  GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go vet "$@" ;;
@@ -186,22 +185,45 @@ go_step() {  # dir vet|test pkg...
     esac )
 }
 
+# Run step $2 on an unpatched checkout of patched tree $1's commit (made once, at
+# $WORK/base). Prints passes, fails, or unknown when the checkout cannot be made. A tree
+# where none of the patched packages exist unpatched counts as passes: those packages are
+# the patch's own.
+baseline_step() {  # dir vet|test
+  local base=() p
+  if [ ! -d "$WORK/base" ] &&
+     ! git -C "$1" worktree add --quiet --detach "$WORK/base" HEAD >/dev/null 2>&1; then
+    echo unknown; return 0
+  fi
+  while IFS= read -r p; do base+=("$p"); done < <(existing_pkgs "$WORK/base")
+  if [ "${#base[@]}" -gt 0 ] && ! go_step "$WORK/base" "$2" "${base[@]}" >/dev/null 2>&1; then
+    echo fails
+  else
+    echo passes
+  fi
+}
+
 # Does patched tree $1 still type-check and pass its tests? The patch can apply cleanly
 # yet break a call site or a test upstream added since the pin, which `go list` alone
-# never compiles. Runs `vet`, then `test`, on every package the patch touches; writes the
-# go output to $2 and prints one of:
+# never compiles. Runs `vet`, then `test` (also when vet failed on both trees), on every
+# package the patch touches; a failed step is re-run unpatched (baseline_step()). Writes
+# the go output to $2 and prints one of:
 #   pass                       both steps passed
 #   fail-vet | fail-test       that step fails on the patched tree only
 #   upstream-vet|upstream-test that step fails on unpatched main too, so the failure is
 #                              not the patch's (a new vet check in a newer Go, a flaky or
-#                              runner-dependent upstream test)
+#                              runner-dependent upstream test), and no step fails on the
+#                              patched tree only
+#   no-baseline                a step failed and the unpatched checkout could not be made
 #   none                       no package the patch touches has Go files any more
 #   unavailable                go cannot run in the tree (e.g. GOTOOLCHAIN=auto could not
 #                              fetch the Go that go.mod asks for)
 # Accepted trade-off: a failure the patch causes in a step that unpatched main already
 # fails is reported as upstream-*, not graded; it shows once upstream is fixed.
+# Accepted trade-off: each tree runs once, so a flaky upstream test can read as fail-test
+# for a day (or hide a real failure as upstream-test); the next run re-decides.
 patched_tests() {  # dir log
-  local pkgs=() base=() p step
+  local pkgs=() p step result=pass
   while IFS= read -r p; do pkgs+=("$p"); done < <(existing_pkgs "$1")
   : > "$2"
   if [ "${#pkgs[@]}" -eq 0 ]; then echo none; return 0; fi
@@ -209,18 +231,14 @@ patched_tests() {  # dir log
     echo unavailable; return 0
   fi
   for step in vet test; do
-    if ! go_step "$1" "$step" "${pkgs[@]}" >> "$2" 2>&1; then
-      # Same step on an unpatched checkout of the same commit.
-      if git -C "$1" worktree add --quiet --detach "$WORK/base" HEAD >/dev/null 2>&1; then
-        while IFS= read -r p; do base+=("$p"); done < <(existing_pkgs "$WORK/base")
-        if [ "${#base[@]}" -gt 0 ] && ! go_step "$WORK/base" "$step" "${base[@]}" >/dev/null 2>&1; then
-          echo "upstream-$step"; return 0
-        fi
-      fi
-      echo "fail-$step"; return 0
-    fi
+    if go_step "$1" "$step" "${pkgs[@]}" >> "$2" 2>&1; then continue; fi
+    case "$(baseline_step "$1" "$step")" in
+      passes) echo "fail-$step"; return 0 ;;
+      fails)  if [ "$result" = pass ]; then result="upstream-$step"; fi ;;
+      *)      echo no-baseline; return 0 ;;
+    esac
   done
-  echo pass
+  echo "$result"
 }
 
 # The failing part of a patched_tests() log for the issue body: no "ok"/"no test files"
@@ -234,48 +252,56 @@ failure_excerpt() {  # log
     awk '/^(ok |\?   )/ { next } n < 40 { gsub(/[[:cntrl:]]/, " "); gsub(/`/, "\047"); print substr($0, 1, 200); n++ }'
 }
 
-# --use-patched-tests-result: take the tokenless job's result (IN_TESTS_*) as data. Sets
-# TESTS_STATE to one of the values patched_tests() prints, or to unavailable (with
-# TESTS_NOTE saying why) when the state is not one of them or the commit tested is not
-# the upstream main this run resolved (main moved between the jobs, or the job failed).
-# Uses the log only when it is a regular file, never a symlink.
+# --use-patched-tests-result: take the tokenless job's result (PATCHED_TESTS_STATE,
+# PATCHED_TESTS_SHA, PATCHED_TESTS_LOG) as data. Sets TESTS_STATE to one of the values
+# patched_tests() prints, or to unavailable (with TESTS_NOTE saying why) when the state is
+# not one of them or the commit tested is not the upstream main this run resolved (main
+# moved between the jobs, or the job failed). Uses the log only when it is a regular
+# file, never a symlink.
 check_tests_result() {
-  case "$IN_TESTS_STATE" in
-    pass|fail-vet|fail-test|upstream-vet|upstream-test|none|unavailable) ;;
+  local state="${PATCHED_TESTS_STATE:-}" sha="${PATCHED_TESTS_SHA:-}" log="${PATCHED_TESTS_LOG:-}"
+  case "$state" in
+    pass|fail-vet|fail-test|upstream-vet|upstream-test|no-baseline|none|unavailable) ;;
     *) TESTS_STATE=unavailable; TESTS_NOTE="the test job's result is missing or not a known state"; return 0 ;;
   esac
-  if [ "$IN_TESTS_SHA" != "$MAIN_SHA" ]; then
+  if [ "$sha" != "$MAIN_SHA" ]; then
     TESTS_STATE=unavailable
-    if printf '%s' "$IN_TESTS_SHA" | grep -qE '^[0-9a-f]{40}$'; then
-      TESTS_NOTE="the test job tested upstream \`${IN_TESTS_SHA:0:8}\`, not \`$SHORT_MAIN\`"
+    if printf '%s' "$sha" | grep -qE '^[0-9a-f]{40}$'; then
+      TESTS_NOTE="the test job tested upstream \`${sha:0:8}\`, not \`$SHORT_MAIN\`"
     else
       TESTS_NOTE="the test job did not report a valid upstream commit"
     fi
     return 0
   fi
-  TESTS_STATE="$IN_TESTS_STATE"
+  TESTS_STATE="$state"
   if [ "$TESTS_STATE" = unavailable ]; then TESTS_NOTE="no working go in the test job"; fi
-  if [ -n "$IN_TESTS_LOG" ] && [ -f "$IN_TESTS_LOG" ] && [ ! -L "$IN_TESTS_LOG" ]; then
-    TESTS_LOG="$IN_TESTS_LOG"
+  if [ -n "$log" ] && [ -f "$log" ] && [ ! -L "$log" ]; then TESTS_LOG="$log"; fi
+}
+
+# Shallow-fetch upstream commit $2 into $1 and apply the augur patch. Prints clean,
+# conflict (git apply is all-or-nothing, so the tree stays unpatched) or unknown (the
+# fetch failed).
+patch_tree() {  # dir sha
+  if ! fetch_tree "$1" "$2" 2>/dev/null; then echo unknown
+  elif git -C "$1" apply "$PATCH" 2>/dev/null; then echo clean
+  else echo conflict
   fi
 }
 
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 
-# --run-patched-tests: patch upstream main and run patched_tests() on it, nothing else.
-# This is the only part of the check that executes upstream code, so the workflow runs
-# it in a job with no token and no permissions; it reports back only data.
+# --run-patched-tests: patch upstream main and run patched_tests() on it, nothing else
+# (see go_step() for why it runs apart). Reports state= (skipped on a conflict) and sha=.
 if [ "$MODE" = run-tests ]; then
-  log="${TESTS_LOG_FILE:-$PWD/gvproxy-patched-tests.log}"
+  log="${PATCHED_TESTS_LOG:-$PWD/gvproxy-patched-tests.log}"
   : > "$log"
   state=unavailable
-  sha="$(git ls-remote "$REPO_URL" refs/heads/main 2>/dev/null | awk 'NR == 1 { print $1 }')"
-  if printf '%s' "$sha" | grep -qE '^[0-9a-f]{40}$' && fetch_tree "$WORK/main" "$sha" 2>/dev/null; then
-    if ! git -C "$WORK/main" apply "$PATCH" 2>/dev/null; then
-      state=skipped
-    elif command -v go >/dev/null; then
-      state="$(patched_tests "$WORK/main" "$log")"
-    fi
+  sha="$(git ls-remote "$REPO_URL" refs/heads/main 2>/dev/null | awk 'NR == 1 { print $1 }')" || sha=""
+  if printf '%s' "$sha" | grep -qE '^[0-9a-f]{40}$'; then
+    case "$(patch_tree "$WORK/main" "$sha")" in
+      clean)    if command -v go >/dev/null; then state="$(patched_tests "$WORK/main" "$log")"; fi ;;
+      conflict) state=skipped ;;
+    esac
   else
     sha=""
   fi
@@ -285,9 +311,6 @@ if [ "$MODE" = run-tests ]; then
   fi
   exit 0
 fi
-
-# Inputs for --use-patched-tests-result (data from the tokenless job; see check_tests_result()).
-IN_TESTS_STATE="${TESTS_STATE:-}"; IN_TESTS_SHA="${TESTS_SHA:-}"; IN_TESTS_LOG="${TESTS_LOG_FILE:-}"
 
 read -r MAIN_SHA MAIN_DATE < <(gh api "repos/$SLUG/commits/main" --jq '"\(.sha) \(.commit.committer.date[0:10])"')
 PIN_DATE="$(gh api "repos/$SLUG/commits/$PIN" --jq '.commit.committer.date[0:10]')"
@@ -331,11 +354,7 @@ for c in ${COMMITS[@]+"${COMMITS[@]}"}; do
 done
 
 # Does the augur patch still apply to current main? (highest-priority signal)
-# git apply is all-or-nothing: on a conflict it leaves the tree untouched.
-PATCH_STATE="unknown"
-if fetch_tree "$WORK/main" "$MAIN_SHA" 2>/dev/null; then
-  if git -C "$WORK/main" apply "$PATCH" 2>/dev/null; then PATCH_STATE="clean"; else PATCH_STATE="conflict"; fi
-fi
+PATCH_STATE="$(patch_tree "$WORK/main" "$MAIN_SHA")"
 
 # Does the patched main still type-check and pass its tests? Only meaningful once the
 # patch applied; see patched_tests(). TESTS_LOG is the go output the excerpt is cut from,
@@ -446,11 +465,12 @@ PKG_LIST="$(patched_pkgs | tr '\n' ' ')"; PKG_LIST="${PKG_LIST% }"
     fail-test)   echo "- it applies, but the **patched tree FAILS \`go test\`** — re-pin needs a manual rebase" ;;
     unavailable) echo "- patched-tree \`go vet\`/\`go test\` could not run ($TESTS_NOTE)" ;;
     none)        echo "- no package the patch touches has Go files on main; patched-tree \`go vet\`/\`go test\` did not run" ;;
+    no-baseline) echo "- the patched tree fails \`go vet\`/\`go test\`, and the unpatched comparison could not run — not graded" ;;
     upstream-*)  echo "- the patched tree fails \`go ${TESTS_STATE#upstream-}\`, but so does unpatched main — not attributed to the patch, not graded" ;;
   esac
   echo
   case "$TESTS_STATE" in
-    fail-*|upstream-*)
+    fail-*|upstream-*|no-baseline)
       echo "**Patched-tree failure (excerpt):**"
       echo '```'
       failure_excerpt "$TESTS_LOG"
@@ -521,7 +541,7 @@ fi
 echo "  shipped code files : ${#code[@]}   dep files : ${#dep[@]}   security-flagged commits : ${#sec[@]}   (noise: ${#noise[@]})"
 echo "  body   : $BODY_FILE"
 
-emit "$SEV" "$TITLE"
+emit "$SEV" "$TITLE" "$TESTS_STATE"
 
 case "$SEV" in
   ACTION|REVIEW) exit 1 ;;

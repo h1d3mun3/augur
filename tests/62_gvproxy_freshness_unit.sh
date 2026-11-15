@@ -68,15 +68,16 @@ EOF
 cat > "$BIN/go" <<'EOF'
 #!/usr/bin/env bash
 # Records "[patched|unpatched] GOOS GOARCH CGO_ENABLED GOFLAGS GOTOOLCHAIN :: args" per call, and
-# "secret" lines naming any token or workflow-output variable it can see. FAKE_GO_FAIL names the
-# subcommand (version, vet, test) that fails, printing FAKE_GO_OUT first: on the patched tree
-# only, or on both trees when FAKE_GO_FAIL_UNPATCHED is set.
+# "secret" lines naming any token or workflow-file variable it can see. FAKE_GO_FAIL lists the
+# subcommands (version, vet, test) that fail on the patched tree, printing FAKE_GO_OUT first;
+# FAKE_GO_FAIL_UNPATCHED lists those that fail on the unpatched tree.
 tree=unpatched; grep -q 'return 2' pkg/a/a.go 2>/dev/null && tree=patched
 echo "[$tree] ${GOOS:--} ${GOARCH:--} ${CGO_ENABLED:--} ${GOFLAGS:--} ${GOTOOLCHAIN:--} :: $*" >> "$GO_LOG"
-for v in GH_TOKEN GITHUB_TOKEN GITHUB_OUTPUT; do
+for v in GH_TOKEN GITHUB_TOKEN GITHUB_OUTPUT GITHUB_ENV GITHUB_PATH GITHUB_STEP_SUMMARY; do
   if [ -n "${!v:-}" ]; then echo "secret $v visible to go $1" >> "$GO_LOG"; fi
 done
-if [ "${FAKE_GO_FAIL:-}" = "$1" ] && { [ "$tree" = patched ] || [ -n "${FAKE_GO_FAIL_UNPATCHED:-}" ]; }; then
+if [ "$tree" = patched ]; then fails=" ${FAKE_GO_FAIL:-} "; else fails=" ${FAKE_GO_FAIL_UNPATCHED:-} "; fi
+if [ "${fails#* $1 }" != "$fails" ]; then
   [ -n "${FAKE_GO_OUT:-}" ] && cat "$FAKE_GO_OUT"
   exit 1
 fi
@@ -90,12 +91,13 @@ cp "$NOGO/gh" "$BIN/gh"
 chmod +x "$BIN/go" "$BIN/gh" "$NOGO/gh"
 
 # run_check MAIN_SHA PATHDIR [OPTION] — run the script in a fresh directory ($rundir); sets rc,
-# out, body, ghout, golog. TESTS_STATE / TESTS_SHA / TESTS_LOG_FILE pass through when exported.
+# out, body, ghout, golog. PATCHED_TESTS_STATE / PATCHED_TESTS_SHA / PATCHED_TESTS_LOG pass through when exported.
 run_check() {
   rundir="$T/run.$RANDOM"; mkdir -p "$rundir"; : > "$rundir/go.log"; : > "$rundir/ghout"
   out="$(cd "$rundir" && env -u GOOS -u GOARCH -u CGO_ENABLED -u GOFLAGS -u GOTOOLCHAIN \
            PATH="$2:/usr/bin:/bin" FAKE_MAIN="$1" GO_LOG="$rundir/go.log" \
            BODY_FILE="$rundir/body.md" GITHUB_OUTPUT="$rundir/ghout" GH_TOKEN=tok GITHUB_TOKEN=tok \
+           GITHUB_ENV="$rundir/env" GITHUB_PATH="$rundir/path" GITHUB_STEP_SUMMARY="$rundir/summary" \
            bash "$GV/check-freshness.sh" ${3+"$3"} 2>&1)"
   rc=$?
   body="$(cat "$rundir/body.md" 2>/dev/null)"; ghout="$(cat "$rundir/ghout")"; golog="$(cat "$rundir/go.log")"
@@ -108,11 +110,12 @@ run_check "$MAIN_OK" "$BIN"
 eq 0 "$rc" "exit 0 (test-only drift is NOISE)"
 has "$out" "tests  : pass" "summary reports tests: pass"
 has "$ghout" "severity=NOISE" "workflow severity NOISE"
+has "$ghout" "tests=pass" "workflow gets tests=pass"
 has "$body" 'the patched tree passes `go vet` (darwin/arm64) and `go test`' "body says the patched tree passes"
 has "$golog" "darwin arm64 0 -mod=vendor auto :: vet ./pkg/a" "vet: darwin/arm64, cgo off, vendored, GOTOOLCHAIN=auto, on the patched package"
 has "$golog" "- - - -mod=vendor auto :: test -count=1 -timeout 10m ./pkg/a" "test: native, vendored, GOTOOLCHAIN=auto, with a timeout"
 has "$body" "go test -count=1 ./pkg/a" "runbook names go test on the patched packages"
-eq "" "$(printf "%s\n" "$golog" | grep -E "visible to go (vet|test)")" "go vet/test see no GH_TOKEN, GITHUB_TOKEN or GITHUB_OUTPUT"
+eq "" "$(printf "%s\n" "$golog" | grep -E "visible to go (vet|test)")" "go vet/test see no token or workflow-file variable"
 hasnt "$golog" "[unpatched]" "no baseline run when the patched tree passes"
 has "$body" "or applies but the patched tree fails" "runbook's rebase step covers a failing patched tree"
 
@@ -142,11 +145,11 @@ has "$ghout" "severity=ACTION" "workflow severity ACTION"
 has "$body" 'patched tree FAILS `go test`' "body says the patched tree fails test"
 has "$body" "--- FAIL: TestF" "body carries the test failure"
 has "$golog" "[unpatched] - - - -mod=vendor auto :: test -count=1 -timeout 10m ./pkg/a" "the failing step re-runs on unpatched main"
-eq "" "$(printf "%s\n" "$golog" | grep -E "visible to go (vet|test)")" "go vet/test see no GH_TOKEN, GITHUB_TOKEN or GITHUB_OUTPUT (baseline included)"
+eq "" "$(printf "%s\n" "$golog" | grep -E "visible to go (vet|test)")" "go vet/test see no token or workflow-file variable (baseline included)"
 
 # --- unpatched main fails the same way: not the patch's failure ------------------------------------
 section "patched tree fails go vet, unpatched main fails it too"
-export FAKE_GO_FAIL=vet FAKE_GO_OUT="$T/vet.out" FAKE_GO_FAIL_UNPATCHED=1
+export FAKE_GO_FAIL=vet FAKE_GO_OUT="$T/vet.out" FAKE_GO_FAIL_UNPATCHED=vet
 run_check "$MAIN_OK" "$BIN"
 unset FAKE_GO_FAIL_UNPATCHED
 eq 0 "$rc" "exit 0 (not ACTION)"
@@ -154,6 +157,29 @@ has "$out" "tests  : upstream-vet" "summary reports tests: upstream-vet"
 hasnt "$ghout" "severity=ACTION" "workflow severity is not ACTION"
 has "$body" 'but so does unpatched main' "body says unpatched main fails too"
 has "$body" "not enough arguments in call to F" "body still carries the excerpt"
+
+section "vet fails on both trees, test fails on the patched tree only"
+export FAKE_GO_FAIL="vet test" FAKE_GO_OUT="$T/vet.out" FAKE_GO_FAIL_UNPATCHED=vet
+run_check "$MAIN_OK" "$BIN"
+unset FAKE_GO_FAIL_UNPATCHED
+has "$out" "tests  : fail-test" "go test still runs and its patch-only failure wins"
+has "$ghout" "severity=ACTION" "workflow severity ACTION"
+has "$ghout" "tests=fail-test" "workflow gets tests=fail-test"
+
+# A git that fails one subcommand ($FAKE_GIT_FAIL), for the comparison and ls-remote failures.
+GITFAIL="$T/gitfail"; mkdir -p "$GITFAIL"
+REALGIT="$(command -v git)"
+printf '#!/usr/bin/env bash\ncase " $* " in *" $FAKE_GIT_FAIL "*) exit 128 ;; esac\nexec "%s" "$@"\n' "$REALGIT" > "$GITFAIL/git"
+chmod +x "$GITFAIL/git"
+
+section "a failed step whose unpatched comparison cannot run"
+export FAKE_GO_FAIL=vet FAKE_GO_OUT="$T/vet.out" FAKE_GIT_FAIL=worktree
+run_check "$MAIN_OK" "$GITFAIL:$BIN"
+unset FAKE_GIT_FAIL
+has "$out" "tests  : no-baseline" "summary reports tests: no-baseline"
+hasnt "$ghout" "severity=ACTION" "not blamed on the patch"
+has "$ghout" "tests=no-baseline" "workflow gets tests=no-baseline (the run goes red)"
+has "$body" "the unpatched comparison could not run" "body says why"
 
 # --- excerpt is bounded and cannot break its code block ---------------------------------------------
 section "failure excerpt is bounded"
@@ -200,9 +226,9 @@ hasnt "$body" "Patched-tree failure" "no failure excerpt"
 
 # --- split mode, tokenless half: --run-patched-tests ------------------------------------------------
 # Resolves upstream main itself (git ls-remote of the fixture's refs/heads/main), with no gh on
-# PATH at all, and reports state= / sha= plus the go output in TESTS_LOG_FILE.
+# PATH at all, and reports state= / sha= plus the go output in PATCHED_TESTS_LOG.
 GOONLY="$T/goonly"; mkdir -p "$GOONLY"; cp "$BIN/go" "$GOONLY/go"
-unset TESTS_STATE TESTS_SHA TESTS_LOG_FILE FAKE_GO_FAIL FAKE_GO_OUT
+unset PATCHED_TESTS_STATE PATCHED_TESTS_SHA PATCHED_TESTS_LOG FAKE_GO_FAIL FAKE_GO_OUT
 
 section "--run-patched-tests: patched tree passes"
 g -C "$UP" update-ref refs/heads/main "$MAIN_OK"
@@ -217,12 +243,20 @@ hasnt "$golog" ":: list" "runs no go list (no drift check in this mode)"
 hasnt "$ghout" "severity=" "emits no severity"
 
 section "--run-patched-tests: patched tree fails go vet"
-export FAKE_GO_FAIL=vet FAKE_GO_OUT="$T/vet.out" TESTS_LOG_FILE="$T/split-vet.log"
+export FAKE_GO_FAIL=vet FAKE_GO_OUT="$T/vet.out" PATCHED_TESTS_LOG="$T/split-vet.log"
 run_check "" "$GOONLY" --run-patched-tests
-unset TESTS_LOG_FILE
+unset PATCHED_TESTS_LOG
 eq 0 "$rc" "exit 0 (the state is the result)"
 has "$ghout" "state=fail-vet" "emits state=fail-vet"
-has "$(cat "$T/split-vet.log")" "not enough arguments in call to F" "go output lands in TESTS_LOG_FILE"
+has "$(cat "$T/split-vet.log")" "not enough arguments in call to F" "go output lands in PATCHED_TESTS_LOG"
+
+section "--run-patched-tests: git ls-remote fails"
+export FAKE_GIT_FAIL=ls-remote
+run_check "" "$GITFAIL:$GOONLY" --run-patched-tests
+unset FAKE_GIT_FAIL
+eq 0 "$rc" "still exits 0"
+has "$ghout" "state=unavailable" "emits state=unavailable"
+has "$ghout" "sha=" "emits an empty sha="
 
 section "--run-patched-tests: patch conflicts"
 unset FAKE_GO_FAIL FAKE_GO_OUT
@@ -241,25 +275,32 @@ no_tests_run() {
 
 section "--use-patched-tests-result: a valid failing result is honored"
 printf '# example.invalid/gtv/pkg/a\nvet: from the test job: bad `call`\n' > "$T/job.log"
-export TESTS_STATE=fail-vet TESTS_SHA="$MAIN_OK" TESTS_LOG_FILE="$T/job.log"
+export PATCHED_TESTS_STATE=fail-vet PATCHED_TESTS_SHA="$MAIN_OK" PATCHED_TESTS_LOG="$T/job.log"
 run_check "$MAIN_OK" "$BIN" --use-patched-tests-result
 eq 1 "$rc" "exit 1"
 has "$ghout" "severity=ACTION" "severity ACTION"
 has "$ghout" "title=gvproxy: patch applies but the patched tree fails go vet/test (action required)" "distinct title"
-has "$body" "from the test job: bad 'call'" "excerpt comes from TESTS_LOG_FILE, backticks defused here"
+has "$body" "from the test job: bad 'call'" "excerpt comes from PATCHED_TESTS_LOG, backticks defused here"
 no_tests_run
 
 section "--use-patched-tests-result: a valid passing result is honored"
-export TESTS_STATE=pass
+export PATCHED_TESTS_STATE=pass
 run_check "$MAIN_OK" "$BIN" --use-patched-tests-result
 eq 0 "$rc" "exit 0"
 has "$out" "tests  : pass" "summary reports tests: pass"
 no_tests_run
 
+section "--use-patched-tests-result: no-baseline is honored and passed on"
+export PATCHED_TESTS_STATE=no-baseline
+run_check "$MAIN_OK" "$BIN" --use-patched-tests-result
+has "$ghout" "tests=no-baseline" "workflow gets tests=no-baseline"
+hasnt "$ghout" "severity=ACTION" "not ACTION"
+no_tests_run
+
 for bad in "" bogus skipped "pass
 severity=ACTION" "fail-vet "; do
   section "--use-patched-tests-result: state [$bad] is not a known state"
-  export TESTS_STATE="$bad"
+  export PATCHED_TESTS_STATE="$bad"
   run_check "$MAIN_OK" "$BIN" --use-patched-tests-result
   has "$out" "tests  : unavailable" "becomes unavailable"
   hasnt "$ghout" "severity=ACTION" "is not ACTION"
@@ -268,7 +309,7 @@ severity=ACTION" "fail-vet "; do
 done
 
 section "--use-patched-tests-result: result for another upstream commit"
-export TESTS_STATE=fail-vet TESTS_SHA="$MAIN_CONFLICT"
+export PATCHED_TESTS_STATE=fail-vet PATCHED_TESTS_SHA="$MAIN_CONFLICT"
 run_check "$MAIN_OK" "$BIN" --use-patched-tests-result
 has "$out" "tests  : unavailable" "becomes unavailable"
 hasnt "$ghout" "severity=ACTION" "is not ACTION"
@@ -277,7 +318,7 @@ no_tests_run
 
 section "--use-patched-tests-result: no or malformed commit"
 for badsha in "" "not-a-sha \`x\`"; do
-  export TESTS_SHA="$badsha"
+  export PATCHED_TESTS_SHA="$badsha"
   run_check "$MAIN_OK" "$BIN" --use-patched-tests-result
   has "$out" "tests  : unavailable" "[$badsha] becomes unavailable"
   has "$body" "the test job did not report a valid upstream commit" "[$badsha] body says why"
@@ -286,18 +327,18 @@ done
 
 section "--use-patched-tests-result: a symlinked log is not read"
 printf 'SECRET-FILE-CONTENT\n' > "$T/secret"; ln -s "$T/secret" "$T/link.log"
-export TESTS_STATE=fail-vet TESTS_SHA="$MAIN_OK" TESTS_LOG_FILE="$T/link.log"
+export PATCHED_TESTS_STATE=fail-vet PATCHED_TESTS_SHA="$MAIN_OK" PATCHED_TESTS_LOG="$T/link.log"
 run_check "$MAIN_OK" "$BIN" --use-patched-tests-result
 has "$ghout" "severity=ACTION" "still ACTION"
 hasnt "$body" "SECRET-FILE-CONTENT" "the symlink's target is not quoted"
 
 section "--use-patched-tests-result: a conflicting patch ignores the result"
-export TESTS_STATE=pass TESTS_SHA="$MAIN_CONFLICT"
+export PATCHED_TESTS_STATE=pass PATCHED_TESTS_SHA="$MAIN_CONFLICT"
 run_check "$MAIN_CONFLICT" "$BIN" --use-patched-tests-result
 has "$ghout" "title=gvproxy: patch no longer applies to upstream main (action required)" "conflict title"
 has "$out" "tests  : skipped" "tests: skipped"
 no_tests_run
-unset TESTS_STATE TESTS_SHA TESTS_LOG_FILE
+unset PATCHED_TESTS_STATE PATCHED_TESTS_SHA PATCHED_TESTS_LOG
 
 section "an unknown option is refused"
 run_check "$MAIN_OK" "$BIN" --bogus

@@ -6,14 +6,12 @@ name: gvproxy-freshness
 # and pass the patched packages' tests?", and opens/refreshes a single tracking issue
 # when it has. See gvproxy/check-freshness.sh.
 #
-# Two jobs, split at the trust boundary:
-#   patched-tests  runs upstream's unreviewed test code (go test on the patched tree), so
-#                  it holds no token, no permissions and no persisted credentials, and
-#                  hands back only data: a state and the upstream commit it tested (job
-#                  outputs) and the go output (an artifact).
-#   check          the drift check and the issue steps, with issues: write. It never runs
-#                  upstream code; it validates patched-tests' result and sanitizes the log
-#                  excerpt itself (check-freshness.sh --use-patched-tests-result).
+# Two jobs, split where upstream code runs (why: see go_step() in check-freshness.sh):
+#   patched-tests  go vet/go test on the patched tree. No token, no permissions, no
+#                  persisted credentials; hands back only data: a state and the upstream
+#                  commit it tested (job outputs) and the go output (an artifact).
+#   check          the drift check and the issue steps, with issues: write. Runs no
+#                  upstream code and reads patched-tests' result as data.
 
 on:
   schedule:
@@ -29,8 +27,11 @@ concurrency:
 jobs:
   patched-tests:
     runs-on: ubuntu-latest
-    # Deliberately no permissions: this job executes upstream code. Checking out augur
-    # needs none while the repository is public.
+    # Bounds what go test's own -timeout does not: vet, the toolchain fetch, the build, and
+    # anything a test leaves running. A run stuck here would also hold up the next day's.
+    timeout-minutes: 60
+    # Deliberately no permissions. Checking out augur needs none while the repository is
+    # public.
     permissions: {}
     outputs:
       state: ${{ steps.tests.outputs.state }}
@@ -49,7 +50,7 @@ jobs:
       - name: Run go vet / go test on the patched tree
         id: tests
         env:
-          TESTS_LOG_FILE: ${{ runner.temp }}/patched-tests.log
+          PATCHED_TESTS_LOG: ${{ runner.temp }}/patched-tests.log
         run: bash gvproxy/check-freshness.sh --run-patched-tests
 
       - name: Upload the go output
@@ -66,6 +67,7 @@ jobs:
     # Runs whatever patched-tests did: a failed or missing result reads as "unavailable".
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       issues: write
@@ -74,8 +76,8 @@ jobs:
         with:
           persist-credentials: false
 
-      # The check lists gvproxy's build graph with `go list` (which runs no upstream code);
-      # GOTOOLCHAIN=auto in the script fetches a newer Go if upstream's go.mod asks for one.
+      # The check lists gvproxy's build graph with `go list`; GOTOOLCHAIN=auto in the
+      # script fetches a newer Go if upstream's go.mod asks for one.
       - uses: actions/setup-go@v5
         with:
           go-version: stable
@@ -89,16 +91,16 @@ jobs:
           path: ${{ runner.temp }}/patched-tests
 
       # patched-tests' outputs reach the script only through env, never through ${{ }} in
-      # the script text, and the script checks them before use.
+      # the script text.
       - name: Run freshness check
         id: check
         continue-on-error: true          # non-zero just means "action warranted"
         env:
           GH_TOKEN: ${{ github.token }}
           BODY_FILE: ${{ github.workspace }}/gvproxy-freshness-body.md
-          TESTS_STATE: ${{ needs.patched-tests.outputs.state }}
-          TESTS_SHA: ${{ needs.patched-tests.outputs.sha }}
-          TESTS_LOG_FILE: ${{ runner.temp }}/patched-tests/patched-tests.log
+          PATCHED_TESTS_STATE: ${{ needs.patched-tests.outputs.state }}
+          PATCHED_TESTS_SHA: ${{ needs.patched-tests.outputs.sha }}
+          PATCHED_TESTS_LOG: ${{ runner.temp }}/patched-tests/patched-tests.log
         run: bash gvproxy/check-freshness.sh --use-patched-tests-result
 
       - name: Ensure tracking label exists
@@ -137,3 +139,15 @@ jobs:
             fi
             gh issue close "$num" --comment "$msg"
           fi
+
+      # A patched-tree check that could not run never raises the severity, so without this
+      # the vet/test signal could stay off unnoticed. A red run makes it visible.
+      # Accepted trade-off: an upstream push while patched-tests runs also lands here
+      # (it tested a commit other than the one check resolved); the next run re-decides.
+      - name: Fail the run if the patched-tree check could not run
+        if: steps.check.outputs.tests == 'unavailable' || steps.check.outputs.tests == 'no-baseline'
+        env:
+          TESTS: ${{ steps.check.outputs.tests }}
+        run: |
+          echo "::error::patched-tree go vet/go test result: $TESTS (see the 'Run freshness check' step's issue body line)"
+          exit 1

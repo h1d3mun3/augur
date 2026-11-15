@@ -126,8 +126,8 @@ for darwin/arm64 (which type-checks `_test.go` files too) and then a native `go 
 on every package the patch touches (the directories of the `.go` files it names). A
 failed step is re-run on unpatched `main`: if that passes, the failure is the patch's and
 the run is `ACTION`; if it fails too (a new vet check in a newer Go, a flaky upstream
-test), the issue notes it without grading it. Either way the issue quotes the first lines
-of the output.
+test), the issue notes it without grading it, and `go test` still runs after a `go vet`
+that fails on both. Either way the issue quotes the first lines of the output.
 
 The tests are upstream's unreviewed code, so the workflow runs them in a separate job
 (`patched-tests`, via `check-freshness.sh --run-patched-tests`) that has no token, no
@@ -136,7 +136,9 @@ upstream commit it tested, and the go output as an artifact. The job holding
 `issues: write` (`check`, via `--use-patched-tests-result`) never runs upstream code (its
 `go list` runs none). It accepts only a known state for the same upstream `main` it
 resolved itself, treating anything else as "could not run", and it sanitizes and bounds
-the quoted output itself.
+the quoted output itself. When the patched-tree check could not run (or a failed step
+could not be compared with unpatched `main`), the run goes red so the missing signal is
+noticed, whatever the severity.
 
 Without a working `go` the build graph is skipped and the check falls back to paths:
 any change under `cmd/gvproxy/`/`pkg/` or to `go.mod`/`vendor` counts as `REVIEW`.
