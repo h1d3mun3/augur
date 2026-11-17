@@ -124,8 +124,11 @@ jobs:
             gh issue create --label gvproxy-freshness --title "$TITLE" --body-file "$BODY_FILE"
           fi
 
+      # Deliberately not when the patched-tree result could not be had (the run goes red
+      # instead): CURRENT/NOISE then do not show that a broken patch was fixed, and closing
+      # would drop the issue that tracks it.
       - name: Close tracking issue if nothing shipped is pending
-        if: steps.check.outputs.severity == 'CURRENT' || steps.check.outputs.severity == 'NOISE'
+        if: (steps.check.outputs.severity == 'CURRENT' || steps.check.outputs.severity == 'NOISE') && steps.check.outputs.tests != 'unavailable' && steps.check.outputs.tests != 'no-baseline'
         env:
           GH_TOKEN: ${{ github.token }}
           SEVERITY: ${{ steps.check.outputs.severity }}
@@ -133,7 +136,7 @@ jobs:
           num="$(gh issue list --label gvproxy-freshness --state open --json number --jq '.[0].number // empty')"
           if [ -n "$num" ]; then
             if [ "$SEVERITY" = "CURRENT" ]; then
-              msg="gvproxy pin caught up to upstream main; closing automatically."
+              msg="gvproxy pin is at upstream main and the patch applies there without a go vet/go test failure of its own; closing automatically."
             else
               msg="Remaining upstream drift does not reach the shipped gvproxy binary (tooling/test-only); closing automatically."
             fi
@@ -145,7 +148,8 @@ jobs:
       #     a write error, an aborted command), so every issue step above was skipped;
       #   - the patched-tree check could not run, which never raises the severity, so the
       #     vet/test signal could otherwise stay off unnoticed.
-      # Keyed on severity, not on tests: CURRENT legitimately emits no tests state.
+      # Every severity, CURRENT included, comes with a tests state, so this also catches a
+      # missing result on days upstream has not moved.
       # Accepted trade-off: an upstream push while patched-tests runs also lands here
       # (it tested a commit other than the one check resolved); the next run re-decides.
       - name: Fail the run if the check did not complete or the patched-tree check could not run

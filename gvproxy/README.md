@@ -106,7 +106,7 @@ tooling/docs/test noise, and grades what remains:
 | `ACTION`  | `augur-egress.patch` no longer applies to `main`, or applies but the patched tree fails `go vet`/`go test` | yes |
 | `REVIEW`  | upstream code compiled into the binary, a module linked into it, or a `go.mod` build setting moved | yes |
 | `NOISE`   | behind, but nothing that reaches the binary (`tools/`/docs/CI/tests, test-only deps) | closes the issue |
-| `CURRENT` | pin is at `main` | closes the issue |
+| `CURRENT` | pin is at `main`, and the patch neither conflicts nor fails `go vet`/`go test` there | closes the issue |
 
 "Reaches the binary" is decided by `go list -deps ./cmd/gvproxy` for darwin/arm64 with
 the augur patch applied, at both the pin and `main`:
@@ -139,6 +139,12 @@ resolved itself, treating anything else as "could not run", and it sanitizes and
 the quoted output itself. When the patched-tree check could not run (or a failed step
 could not be compared with unpatched `main`), the run goes red so the missing signal is
 noticed, whatever the severity.
+
+When the pin is already at `main` there is no drift to compare, but the patch is still
+applied there and the patched-tree result still taken: a patch that conflicts or fails
+`go vet`/`go test` at its own pin is `ACTION`, and a result that could not be had still
+turns the run red on a `CURRENT` day. An open issue is closed only when the patched-tree
+result was had, so a broken patch is not closed on a day its check could not run.
 
 Without a working `go` the build graph is skipped and the check falls back to paths:
 any change under `cmd/gvproxy/`/`pkg/` or to `go.mod`/`vendor` counts as `REVIEW`.

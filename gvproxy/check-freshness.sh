@@ -31,7 +31,16 @@
 #            unpatched main passes                               (exit 1)
 #   REVIEW   security/code/dependency change in the shipped tree (exit 1)
 #   NOISE    behind, but nothing that reaches the shipped binary (exit 0)
-#   CURRENT  pin is at upstream main                             (exit 0)
+#   CURRENT  pin is at upstream main, and the patch neither
+#            conflicts nor fails go vet / go test there          (exit 0)
+#
+# At upstream main the patch is still applied and the patched-tree result still taken, so
+# the ACTION cases above apply at the pin itself; only the drift comparison is skipped.
+# CURRENT therefore says nothing about whether the result was had: every graded run, CURRENT
+# included, also reports the patched-tree state (tests=: pass, fail-vet, fail-test,
+# upstream-vet, upstream-test, no-baseline, none, unavailable, or skipped when the patch
+# does not apply; see patched_tests()), and the workflow goes red on unavailable and
+# no-baseline.
 #
 # Usage:   bash gvproxy/check-freshness.sh [--run-patched-tests | --use-patched-tests-result]
 #
@@ -332,18 +341,20 @@ read -r MAIN_SHA MAIN_DATE < <(gh api "repos/$SLUG/commits/main" --jq '"\(.sha) 
 PIN_DATE="$(gh api "repos/$SLUG/commits/$PIN" --jq '.commit.committer.date[0:10]')"
 SHORT_PIN="${PIN:0:8}"; SHORT_MAIN="${MAIN_SHA:0:8}"
 
-# Already current — nothing moved.
+# Pin at upstream main (AT_MAIN): there is no drift, so the compare queries and the
+# build-graph comparison are skipped. The patch and the patched-tree result are still
+# checked below, so a patch that is broken at its own pin, or a result that could not be
+# had, is still reported.
+AT_MAIN=0; AHEAD=0; FILES=(); COMMITS=()
 if [ "$PIN" = "$MAIN_SHA" ]; then
-  echo "SEVERITY: CURRENT — gvproxy pin $SHORT_PIN is at upstream main ($MAIN_DATE)."
-  emit CURRENT ""
-  exit 0
+  AT_MAIN=1
+else
+  CMP="repos/$SLUG/compare/$PIN...$MAIN_SHA"
+  AHEAD="$(gh api "$CMP" --jq '.ahead_by')"
+  # while-read rather than mapfile so this also runs on macOS's stock bash 3.2.
+  while IFS= read -r l; do FILES+=("$l");   done < <(gh api "$CMP" --jq '.files[].filename' 2>/dev/null || true)
+  while IFS= read -r l; do COMMITS+=("$l"); done < <(gh api "$CMP" --jq '.commits[] | "\(.sha[0:8])\t\(.commit.committer.date[0:10])\t\(.commit.message | split("\n")[0])"')
 fi
-
-CMP="repos/$SLUG/compare/$PIN...$MAIN_SHA"
-AHEAD="$(gh api "$CMP" --jq '.ahead_by')"
-# while-read rather than mapfile so this also runs on macOS's stock bash 3.2.
-FILES=();   while IFS= read -r l; do FILES+=("$l");   done < <(gh api "$CMP" --jq '.files[].filename' 2>/dev/null || true)
-COMMITS=(); while IFS= read -r l; do COMMITS+=("$l"); done < <(gh api "$CMP" --jq '.commits[] | "\(.sha[0:8])\t\(.commit.committer.date[0:10])\t\(.commit.message | split("\n")[0])"')
 
 # Classify changed files: shipped code / shipped deps vs. dev-only noise. This is the
 # path-based fallback; once the build graph is available, code vs. noise is
@@ -374,7 +385,8 @@ PATCH_STATE="$(patch_tree "$WORK/main" "$MAIN_SHA")"
 
 # Does the patched main still type-check and pass its tests? Only meaningful once the
 # patch applied; see patched_tests(). TESTS_LOG is the go output the excerpt is cut from,
-# TESTS_NOTE says why the result is unavailable.
+# TESTS_NOTE says why the result is unavailable. Upstream main that could not be fetched
+# counts as unavailable, not skipped, so the missing signal turns the run red.
 TESTS_STATE="skipped"; TESTS_LOG="$WORK/tests.log"; TESTS_NOTE="no working go"
 : > "$TESTS_LOG"
 if [ "$PATCH_STATE" = "clean" ]; then
@@ -385,14 +397,19 @@ if [ "$PATCH_STATE" = "clean" ]; then
   else
     TESTS_STATE="unavailable"
   fi
+elif [ "$PATCH_STATE" = "unknown" ]; then
+  TESTS_STATE="unavailable"; TESTS_NOTE="upstream main could not be fetched"
 fi
 
 # Compare what actually goes into the binary at the pin vs. main, both with the augur
 # patch applied (the patch adds imports of its own). On a conflicting patch, main is
-# listed unpatched; the run is ACTION regardless.
+# listed unpatched; the run is ACTION regardless. At upstream main both sides are the same
+# commit, so there is nothing to compare.
 GRAPH_STATE="unavailable"
 graph_diff=""; settings_diff=""; other_bumps=""
-if [ "$PATCH_STATE" != "unknown" ] && command -v go >/dev/null &&
+if [ "$AT_MAIN" = 1 ]; then
+  GRAPH_STATE="skipped"
+elif [ "$PATCH_STATE" != "unknown" ] && command -v go >/dev/null &&
    fetch_tree "$WORK/pin" "$PIN" 2>/dev/null &&
    git -C "$WORK/pin" apply "$PATCH" 2>/dev/null; then
   if build_graph  "$WORK/pin"  > "$WORK/graph.pin"  &&
@@ -452,6 +469,8 @@ if [ "$PATCH_STATE" = "conflict" ]; then
   SEV="ACTION"; TITLE="gvproxy: patch no longer applies to upstream main (action required)"
 elif [ "$TESTS_STATE" = "fail-vet" ] || [ "$TESTS_STATE" = "fail-test" ]; then
   SEV="ACTION"; TITLE="gvproxy: patch applies but the patched tree fails go vet/test (action required)"
+elif [ "$AT_MAIN" = 1 ]; then
+  SEV="CURRENT"; TITLE=""
 elif [ "$relevant" -gt 0 ]; then
   SEV="REVIEW"; TITLE="gvproxy: upstream security/code update available (review)"
 else
@@ -459,6 +478,21 @@ else
 fi
 
 PKG_LIST="$(patched_pkgs | tr '\n' ' ')"; PKG_LIST="${PKG_LIST% }"
+
+# What fixing a broken patch takes: with drift, a rebase as part of the re-pin; at upstream
+# main, the patch is broken at its own pin.
+if [ "$AT_MAIN" = 1 ]; then
+  REBASE="the patch needs a manual rebase onto the pin"
+else
+  REBASE="re-pin needs a manual rebase"
+fi
+
+# Why the patched-tree result is missing, for the stdout summary.
+TESTS_WHY=""
+case "$TESTS_STATE" in
+  unavailable) TESTS_WHY=" ($TESTS_NOTE)" ;;
+  no-baseline) TESTS_WHY=" (a step failed and the unpatched comparison could not run)" ;;
+esac
 
 # --- Markdown issue body ---------------------------------------------------
 {
@@ -469,16 +503,20 @@ PKG_LIST="$(patched_pkgs | tr '\n' ' ')"; PKG_LIST="${PKG_LIST% }"
   echo "| pinned (\`build.sh\`) | \`$SHORT_PIN\` | $PIN_DATE |"
   echo "| upstream \`main\`     | \`$SHORT_MAIN\` | $MAIN_DATE |"
   echo
-  echo "- **$AHEAD** commits ahead of the pin"
+  if [ "$AT_MAIN" = 1 ]; then
+    echo "- the pin **is** upstream \`main\` (0 commits ahead)"
+  else
+    echo "- **$AHEAD** commits ahead of the pin"
+  fi
   case "$PATCH_STATE" in
     clean)    echo "- \`augur-egress.patch\` **applies cleanly** to main" ;;
-    conflict) echo "- \`augur-egress.patch\` **NO LONGER APPLIES** to main — re-pin needs a manual rebase" ;;
+    conflict) echo "- \`augur-egress.patch\` **NO LONGER APPLIES** to main — $REBASE" ;;
     *)        echo "- patch apply-check could not run (clone failed)" ;;
   esac
   case "$TESTS_STATE" in
     pass)        echo "- the patched tree passes \`go vet\` (darwin/arm64) and \`go test\`" ;;
-    fail-vet)    echo "- it applies, but the **patched tree FAILS \`go vet\`** (darwin/arm64, test files included) — re-pin needs a manual rebase" ;;
-    fail-test)   echo "- it applies, but the **patched tree FAILS \`go test\`** — re-pin needs a manual rebase" ;;
+    fail-vet)    echo "- it applies, but the **patched tree FAILS \`go vet\`** (darwin/arm64, test files included) — $REBASE" ;;
+    fail-test)   echo "- it applies, but the **patched tree FAILS \`go test\`** — $REBASE" ;;
     unavailable) echo "- patched-tree \`go vet\`/\`go test\` could not run ($TESTS_NOTE)" ;;
     none)        echo "- no package the patch touches has Go files on main; patched-tree \`go vet\`/\`go test\` did not run" ;;
     no-baseline) echo "- the patched tree fails \`go vet\`/\`go test\`, and the unpatched comparison could not run — not graded" ;;
@@ -535,27 +573,42 @@ PKG_LIST="$(patched_pkgs | tr '\n' ' ')"; PKG_LIST="${PKG_LIST% }"
   fi
 
   echo "**Runbook**"
-  echo "1. Bump \`PIN\` in \`gvproxy/build.sh\` to \`$MAIN_SHA\` (or a chosen newer commit)."
-  echo "2. Re-apply \`augur-egress.patch\` and rebuild (\`bash gvproxy/build.sh\`)."
-  echo "3. In a clone of upstream at the new pin with \`augur-egress.patch\` applied, run \`${GO_VET_ENV[*]} go vet $PKG_LIST\` and \`${GO_TEST_ENV[*]} go test ${GO_TEST_FLAGS[*]} $PKG_LIST\`, with none of \`${GO_CALLER_VARS[*]}\` set."
+  # At upstream main there is nothing to bump: the steps are fixing the patch at the pin.
+  if [ "$AT_MAIN" = 1 ]; then
+    echo "1. \`PIN\` in \`gvproxy/build.sh\` is already upstream main (\`$MAIN_SHA\`); keep it."
+    echo "2. Rebase \`augur-egress.patch\` onto the pin (fix the call sites and tests it breaks) and rebuild (\`bash gvproxy/build.sh\`)."
+    where="the pin"
+  else
+    echo "1. Bump \`PIN\` in \`gvproxy/build.sh\` to \`$MAIN_SHA\` (or a chosen newer commit)."
+    echo "2. Re-apply \`augur-egress.patch\` and rebuild (\`bash gvproxy/build.sh\`)."
+    where="the new pin"
+  fi
+  echo "3. In a clone of upstream at $where with \`augur-egress.patch\` applied, run \`${GO_VET_ENV[*]} go vet $PKG_LIST\` and \`${GO_TEST_ENV[*]} go test ${GO_TEST_FLAGS[*]} $PKG_LIST\`, with none of \`${GO_CALLER_VARS[*]}\` set."
   echo "4. Run the macOS egress E2E on Apple Silicon (allowlisted host reachable, blocked host denied, SSH via gvproxy)."
-  echo "5. If the patch conflicted, or applies but the patched tree fails \`go vet\`/\`go test\`, rebase it against main first (fix the call sites and tests it breaks), then re-run this check."
+  if [ "$AT_MAIN" = 0 ]; then
+    echo "5. If the patch conflicted, or applies but the patched tree fails \`go vet\`/\`go test\`, rebase it against main first (fix the call sites and tests it breaks), then re-run this check."
+  fi
   echo
   echo "_Filed automatically by \`gvproxy/check-freshness.sh\` (daily). Body refreshes in place; closes once nothing pending reaches the shipped binary._"
 } > "$BODY_FILE"
 
 # --- stdout human summary --------------------------------------------------
-echo "SEVERITY: $SEV"
-echo "  pinned : $SHORT_PIN ($PIN_DATE)"
-echo "  main   : $SHORT_MAIN ($MAIN_DATE)   [$AHEAD ahead]"
-echo "  patch  : $PATCH_STATE"
-echo "  tests  : $TESTS_STATE"
-echo "  graph  : $GRAPH_STATE"
-if [ "$GRAPH_STATE" = "ok" ]; then
-  echo "  shipped modules changed : $(printf '%s' "$graph_diff" | grep -c . || true)   build settings changed : $(printf '%s' "$settings_diff" | grep -c . || true)   other bumps : $(printf '%s' "$other_bumps" | grep -c . || true)"
+# At upstream main with nothing to act on, one line.
+if [ "$SEV" = CURRENT ]; then
+  echo "SEVERITY: CURRENT — gvproxy pin $SHORT_PIN is at upstream main ($MAIN_DATE); patched tests: $TESTS_STATE$TESTS_WHY"
+else
+  echo "SEVERITY: $SEV"
+  echo "  pinned : $SHORT_PIN ($PIN_DATE)"
+  echo "  main   : $SHORT_MAIN ($MAIN_DATE)   [$AHEAD ahead]"
+  echo "  patch  : $PATCH_STATE"
+  echo "  tests  : $TESTS_STATE$TESTS_WHY"
+  echo "  graph  : $GRAPH_STATE"
+  if [ "$GRAPH_STATE" = "ok" ]; then
+    echo "  shipped modules changed : $(printf '%s' "$graph_diff" | grep -c . || true)   build settings changed : $(printf '%s' "$settings_diff" | grep -c . || true)   other bumps : $(printf '%s' "$other_bumps" | grep -c . || true)"
+  fi
+  echo "  shipped code files : ${#code[@]}   dep files : ${#dep[@]}   security-flagged commits : ${#sec[@]}   (noise: ${#noise[@]})"
+  echo "  body   : $BODY_FILE"
 fi
-echo "  shipped code files : ${#code[@]}   dep files : ${#dep[@]}   security-flagged commits : ${#sec[@]}   (noise: ${#noise[@]})"
-echo "  body   : $BODY_FILE"
 
 emit "$SEV" "$TITLE" "$TESTS_STATE"
 

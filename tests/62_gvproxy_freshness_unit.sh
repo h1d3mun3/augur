@@ -56,8 +56,10 @@ EOF
 BIN="$T/bin"; NOGO="$T/nogo"; mkdir -p "$BIN" "$NOGO"
 cat > "$NOGO/gh" <<'EOF'
 #!/usr/bin/env bash
-# Answers the four `gh api` queries check-freshness.sh makes; logs a GOOS it can see.
+# Answers the four `gh api` queries check-freshness.sh makes; logs a GOOS it can see, and
+# each call's arguments to GH_LOG.
 if [ -n "${GOOS:-}" ] && [ -n "${GO_LOG:-}" ]; then echo "gh sees GOOS=$GOOS" >> "$GO_LOG"; fi
+if [ -n "${GH_LOG:-}" ]; then echo "gh $*" >> "$GH_LOG"; fi
 case "$*" in
   *commits/main*)           echo "$FAKE_MAIN 2026-11-01" ;;
   *commits/*)               echo "2026-10-01" ;;
@@ -96,17 +98,17 @@ cp "$NOGO/gh" "$BIN/gh"
 chmod +x "$BIN/go" "$BIN/gh" "$NOGO/gh"
 
 # run_check MAIN_SHA PATHDIR [OPTION] — run the script in a fresh directory ($rundir); sets rc,
-# out, body, ghout, golog. PATCHED_TESTS_STATE / PATCHED_TESTS_SHA / PATCHED_TESTS_LOG pass through when exported.
+# out, body, ghout, golog, ghlog. PATCHED_TESTS_STATE / PATCHED_TESTS_SHA / PATCHED_TESTS_LOG pass through when exported.
 # The go variables are unset first; RUN_ENV (an array of NAME=value) sets some again.
 run_check() {
-  rundir="$T/run.$RANDOM"; mkdir -p "$rundir"; : > "$rundir/go.log"; : > "$rundir/ghout"
+  rundir="$T/run.$RANDOM"; mkdir -p "$rundir"; : > "$rundir/go.log"; : > "$rundir/gh.log"; : > "$rundir/ghout"
   out="$(cd "$rundir" && env -u GOOS -u GOARCH -u CGO_ENABLED -u GOFLAGS -u GOTOOLCHAIN ${RUN_ENV[@]+"${RUN_ENV[@]}"} \
-           PATH="$2:/usr/bin:/bin" FAKE_MAIN="$1" GO_LOG="$rundir/go.log" \
+           PATH="$2:/usr/bin:/bin" FAKE_MAIN="$1" GO_LOG="$rundir/go.log" GH_LOG="$rundir/gh.log" \
            BODY_FILE="$rundir/body.md" GITHUB_OUTPUT="$rundir/ghout" GH_TOKEN=tok GITHUB_TOKEN=tok \
            GITHUB_ENV="$rundir/env" GITHUB_PATH="$rundir/path" GITHUB_STEP_SUMMARY="$rundir/summary" \
            bash "$GV/check-freshness.sh" ${3+"$3"} 2>&1)"
   rc=$?
-  body="$(cat "$rundir/body.md" 2>/dev/null)"; ghout="$(cat "$rundir/ghout")"; golog="$(cat "$rundir/go.log")"
+  body="$(cat "$rundir/body.md" 2>/dev/null)"; ghout="$(cat "$rundir/ghout")"; golog="$(cat "$rundir/go.log")"; ghlog="$(cat "$rundir/gh.log")"
 }
 
 # --- patched tree passes --------------------------------------------------------------------------
@@ -360,6 +362,172 @@ has "$ghout" "title=gvproxy: patch no longer applies to upstream main (action re
 has "$out" "tests  : skipped" "tests: skipped"
 no_tests_run
 unset PATCHED_TESTS_STATE PATCHED_TESTS_SHA PATCHED_TESTS_LOG
+
+# --- pin at upstream main (CURRENT): the patch and its tests are still checked ------------------------
+# FAKE_MAIN is the pin itself. No drift is compared (no compare query, no go list), but the patch is
+# applied at the pin and the patched-tree result is still graded and reported as tests=.
+no_drift_compared() {
+  has "$ghlog" "commits/main" "resolves upstream main with gh (the gh log is live)"
+  hasnt "$ghlog" "compare" "makes no compare query"
+  hasnt "$golog" ":: list" "runs no go list (no build graph to compare)"
+}
+
+section "CURRENT, local run: patched tree passes"
+unset FAKE_GO_FAIL FAKE_GO_OUT
+run_check "$PIN" "$BIN"
+eq 0 "$rc" "exit 0"
+eq "SEVERITY: CURRENT — gvproxy pin ${PIN:0:8} is at upstream main (2026-11-01); patched tests: pass" "$out" "a one-line summary with the tests state"
+has "$ghout" "severity=CURRENT" "workflow severity CURRENT"
+has "$ghout" "tests=pass" "workflow gets tests=pass"
+has "$golog" "[patched] darwin arm64 0 -mod=vendor auto :: vet ./pkg/a" "go vet runs on the patched pin"
+has "$golog" "[patched] - - - -mod=vendor auto :: test -count=1 -timeout 10m ./pkg/a" "go test runs on the patched pin"
+no_drift_compared
+
+section "CURRENT, local run: patched tree fails go vet"
+export FAKE_GO_FAIL=vet FAKE_GO_OUT="$T/vet.out"
+run_check "$PIN" "$BIN"
+eq 1 "$rc" "exit 1"
+has "$out" "SEVERITY: ACTION" "severity ACTION"
+has "$out" "tests  : fail-vet" "summary reports tests: fail-vet"
+has "$out" "graph  : skipped" "summary says the graph comparison was skipped"
+has "$ghout" "severity=ACTION" "workflow severity ACTION"
+has "$ghout" "title=gvproxy: patch applies but the patched tree fails go vet/test (action required)" "the patched-tree failure title"
+has "$ghout" "tests=fail-vet" "workflow gets tests=fail-vet"
+has "$body" "the pin **is** upstream \`main\` (0 commits ahead)" "body says the pin is upstream main"
+hasnt "$body" "**0** commits ahead" "no zero-drift count line"
+has "$body" 'patched tree FAILS `go vet`** (darwin/arm64, test files included) — the patch needs a manual rebase onto the pin' "body says the patch is broken at the pin"
+has "$body" "not enough arguments in call to F" "body carries the excerpt"
+has "$body" "is already upstream main (\`$PIN\`); keep it." "runbook does not ask to bump PIN"
+hasnt "$body" "Bump \`PIN\`" "no bump step"
+has "$body" "In a clone of upstream at the pin with" "runbook's vet/test step names the pin"
+hasnt "$body" "5. If the patch conflicted" "no rebase-against-main step"
+no_drift_compared
+
+section "CURRENT, local run: patched tree fails go test"
+export FAKE_GO_FAIL=test FAKE_GO_OUT="$T/test.out"
+run_check "$PIN" "$BIN"
+eq 1 "$rc" "exit 1"
+has "$ghout" "severity=ACTION" "workflow severity ACTION"
+has "$ghout" "title=gvproxy: patch applies but the patched tree fails go vet/test (action required)" "the patched-tree failure title"
+has "$ghout" "tests=fail-test" "workflow gets tests=fail-test"
+has "$body" 'patched tree FAILS `go test`** — the patch needs a manual rebase onto the pin' "body says the patch is broken at the pin"
+has "$body" "--- FAIL: TestF" "body carries the test failure"
+hasnt "$body" "Bump \`PIN\`" "no bump step"
+no_drift_compared
+
+section "CURRENT, local run: upstream main cannot be fetched"
+unset FAKE_GO_FAIL FAKE_GO_OUT
+export FAKE_GIT_FAIL=fetch
+run_check "$PIN" "$GITFAIL:$BIN"
+unset FAKE_GIT_FAIL
+eq 0 "$rc" "exit 0"
+has "$ghout" "severity=CURRENT" "severity CURRENT"
+has "$ghout" "tests=unavailable" "workflow gets tests=unavailable (the run goes red), not skipped"
+has "$out" "; patched tests: unavailable (upstream main could not be fetched)" "summary line says why"
+has "$body" "patch apply-check could not run (clone failed)" "body says the clone failed"
+hasnt "$golog" ":: vet" "runs no vet"
+
+section "CURRENT, local run: go cannot run in the tree"
+export FAKE_GO_FAIL=version; unset FAKE_GO_OUT
+run_check "$PIN" "$BIN"
+eq 0 "$rc" "exit 0"
+has "$out" "SEVERITY: CURRENT" "severity CURRENT"
+has "$out" "; patched tests: unavailable (no working go)" "summary line says why"
+has "$ghout" "tests=unavailable" "workflow gets tests=unavailable (the run goes red)"
+has "$body" 'could not run (no working go)' "body says why"
+
+section "CURRENT, local run: a failed step whose unpatched comparison cannot run"
+export FAKE_GO_FAIL=vet FAKE_GO_OUT="$T/vet.out" FAKE_GIT_FAIL=worktree
+run_check "$PIN" "$GITFAIL:$BIN"
+unset FAKE_GIT_FAIL
+eq 0 "$rc" "exit 0"
+has "$ghout" "severity=CURRENT" "severity CURRENT"
+has "$ghout" "tests=no-baseline" "workflow gets tests=no-baseline (the run goes red)"
+has "$out" "; patched tests: no-baseline (a step failed and the unpatched comparison could not run)" "summary line says why"
+unset FAKE_GO_FAIL FAKE_GO_OUT
+
+section "CURRENT, --use-patched-tests-result: a passing result for the pin"
+export PATCHED_TESTS_STATE=pass PATCHED_TESTS_SHA="$PIN" PATCHED_TESTS_LOG="$T/job.log"
+run_check "$PIN" "$BIN" --use-patched-tests-result
+eq 0 "$rc" "exit 0"
+has "$out" "; patched tests: pass" "summary line carries the tests state"
+has "$ghout" "severity=CURRENT" "severity CURRENT"
+has "$ghout" "tests=pass" "workflow gets tests=pass"
+no_tests_run
+no_drift_compared
+
+section "CURRENT, --use-patched-tests-result: a failing result for the pin"
+export PATCHED_TESTS_STATE=fail-vet
+run_check "$PIN" "$BIN" --use-patched-tests-result
+eq 1 "$rc" "exit 1"
+has "$ghout" "severity=ACTION" "severity ACTION"
+has "$ghout" "title=gvproxy: patch applies but the patched tree fails go vet/test (action required)" "the patched-tree failure title"
+has "$body" "from the test job: bad 'call'" "excerpt comes from PATCHED_TESTS_LOG"
+no_tests_run
+
+section "CURRENT, --use-patched-tests-result: the test job could not run go"
+export PATCHED_TESTS_STATE=unavailable
+run_check "$PIN" "$BIN" --use-patched-tests-result
+eq 0 "$rc" "exit 0"
+has "$ghout" "severity=CURRENT" "severity CURRENT"
+has "$ghout" "tests=unavailable" "workflow gets tests=unavailable"
+has "$out" "; patched tests: unavailable (no working go in the test job)" "summary line says why"
+no_tests_run
+
+section "CURRENT, --use-patched-tests-result: result for another upstream commit"
+export PATCHED_TESTS_STATE=pass PATCHED_TESTS_SHA="$MAIN_OK"
+run_check "$PIN" "$BIN" --use-patched-tests-result
+eq 0 "$rc" "exit 0"
+has "$ghout" "severity=CURRENT" "severity CURRENT"
+has "$ghout" "tests=unavailable" "a pass for another commit becomes tests=unavailable"
+has "$out" "the test job tested upstream \`${MAIN_OK:0:8}\`, not \`${PIN:0:8}\`" "summary line names both commits"
+no_tests_run
+
+section "CURRENT, --use-patched-tests-result: an unknown state"
+export PATCHED_TESTS_STATE=bogus PATCHED_TESTS_SHA="$PIN"
+run_check "$PIN" "$BIN" --use-patched-tests-result
+eq 0 "$rc" "exit 0"
+has "$ghout" "severity=CURRENT" "severity CURRENT"
+has "$ghout" "tests=unavailable" "becomes tests=unavailable"
+has "$out" "; patched tests: unavailable (the test job's result is missing or not a known state)" "summary line says why"
+no_tests_run
+
+section "CURRENT, --use-patched-tests-result: upstream main cannot be fetched"
+export PATCHED_TESTS_STATE=pass PATCHED_TESTS_SHA="$PIN" FAKE_GIT_FAIL=fetch
+run_check "$PIN" "$GITFAIL:$BIN" --use-patched-tests-result
+unset FAKE_GIT_FAIL
+has "$ghout" "tests=unavailable" "a pass that cannot be checked against a patched tree becomes tests=unavailable"
+has "$ghout" "severity=CURRENT" "severity CURRENT"
+no_tests_run
+unset PATCHED_TESTS_STATE PATCHED_TESTS_SHA PATCHED_TESTS_LOG
+
+section "behind upstream: upstream main cannot be fetched"
+export FAKE_GIT_FAIL=fetch
+run_check "$MAIN_OK" "$GITFAIL:$BIN"
+unset FAKE_GIT_FAIL
+has "$ghout" "tests=unavailable" "workflow gets tests=unavailable (the run goes red), not skipped"
+has "$out" "tests  : unavailable (upstream main could not be fetched)" "summary says why"
+
+# The patch does not apply at its own pin: build.sh pins the commit the patch conflicts with.
+printf 'PIN="%s"\nREPO="file://%s"\n' "$MAIN_CONFLICT" "$UP" > "$GV/build.sh"
+section "CURRENT, local run: the patch does not apply at the pin"
+run_check "$MAIN_CONFLICT" "$BIN"
+eq 1 "$rc" "exit 1"
+has "$ghout" "severity=ACTION" "severity ACTION"
+has "$ghout" "title=gvproxy: patch no longer applies to upstream main (action required)" "the conflict title"
+has "$ghout" "tests=skipped" "workflow gets tests=skipped"
+has "$body" "**NO LONGER APPLIES** to main — the patch needs a manual rebase onto the pin" "body says the patch is broken at the pin"
+hasnt "$golog" ":: vet" "runs no vet on a tree the patch does not apply to"
+no_drift_compared
+
+section "CURRENT, --use-patched-tests-result: the patch does not apply at the pin"
+export PATCHED_TESTS_STATE=pass PATCHED_TESTS_SHA="$MAIN_CONFLICT"
+run_check "$MAIN_CONFLICT" "$BIN" --use-patched-tests-result
+eq 1 "$rc" "exit 1"
+has "$ghout" "title=gvproxy: patch no longer applies to upstream main (action required)" "the conflict title, whatever the result says"
+no_tests_run
+unset PATCHED_TESTS_STATE PATCHED_TESTS_SHA
+printf 'PIN="%s"\nREPO="file://%s"\n' "$PIN" "$UP" > "$GV/build.sh"
 
 section "an unknown option is refused"
 run_check "$MAIN_OK" "$BIN" --bogus
