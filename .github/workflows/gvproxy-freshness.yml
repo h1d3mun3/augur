@@ -140,14 +140,23 @@ jobs:
             gh issue close "$num" --comment "$msg"
           fi
 
-      # A patched-tree check that could not run never raises the severity, so without this
-      # the vet/test signal could stay off unnoticed. A red run makes it visible.
+      # Make what the issue steps cannot show a red run:
+      #   - the check never emitted a severity (it died before the end: a gh/API failure,
+      #     a write error, an aborted command), so every issue step above was skipped;
+      #   - the patched-tree check could not run, which never raises the severity, so the
+      #     vet/test signal could otherwise stay off unnoticed.
+      # Keyed on severity, not on tests: CURRENT legitimately emits no tests state.
       # Accepted trade-off: an upstream push while patched-tests runs also lands here
       # (it tested a commit other than the one check resolved); the next run re-decides.
-      - name: Fail the run if the patched-tree check could not run
-        if: steps.check.outputs.tests == 'unavailable' || steps.check.outputs.tests == 'no-baseline'
+      - name: Fail the run if the check did not complete or the patched-tree check could not run
+        if: steps.check.outputs.severity == '' || steps.check.outputs.tests == 'unavailable' || steps.check.outputs.tests == 'no-baseline'
         env:
+          SEVERITY: ${{ steps.check.outputs.severity }}
           TESTS: ${{ steps.check.outputs.tests }}
         run: |
-          echo "::error::patched-tree go vet/go test result: $TESTS (see the 'Run freshness check' step's issue body line)"
+          if [ -z "$SEVERITY" ]; then
+            echo "::error::the freshness check did not complete (no severity emitted); see the 'Run freshness check' step's log"
+          else
+            echo "::error::patched-tree go vet/go test result: $TESTS (see the 'Run freshness check' step's issue body line)"
+          fi
           exit 1

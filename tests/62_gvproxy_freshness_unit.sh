@@ -56,7 +56,8 @@ EOF
 BIN="$T/bin"; NOGO="$T/nogo"; mkdir -p "$BIN" "$NOGO"
 cat > "$NOGO/gh" <<'EOF'
 #!/usr/bin/env bash
-# Answers the four `gh api` queries check-freshness.sh makes.
+# Answers the four `gh api` queries check-freshness.sh makes; logs a GOOS it can see.
+if [ -n "${GOOS:-}" ] && [ -n "${GO_LOG:-}" ]; then echo "gh sees GOOS=$GOOS" >> "$GO_LOG"; fi
 case "$*" in
   *commits/main*)           echo "$FAKE_MAIN 2026-11-01" ;;
   *commits/*)               echo "2026-10-01" ;;
@@ -76,6 +77,9 @@ echo "[$tree] ${GOOS:--} ${GOARCH:--} ${CGO_ENABLED:--} ${GOFLAGS:--} ${GOTOOLCH
 for v in GH_TOKEN GITHUB_TOKEN GITHUB_OUTPUT GITHUB_ENV GITHUB_PATH GITHUB_STEP_SUMMARY; do
   if [ -n "${!v:-}" ]; then echo "secret $v visible to go $1" >> "$GO_LOG"; fi
 done
+for v in GOARM GOARM64 GO386 GOAMD64; do
+  if [ -n "${!v:-}" ]; then echo "target $v=${!v} visible to go $1" >> "$GO_LOG"; fi
+done
 if [ "$tree" = patched ]; then fails=" ${FAKE_GO_FAIL:-} "; else fails=" ${FAKE_GO_FAIL_UNPATCHED:-} "; fi
 if [ "${fails#* $1 }" != "$fails" ]; then
   [ -n "${FAKE_GO_OUT:-}" ] && cat "$FAKE_GO_OUT"
@@ -92,9 +96,10 @@ chmod +x "$BIN/go" "$BIN/gh" "$NOGO/gh"
 
 # run_check MAIN_SHA PATHDIR [OPTION] — run the script in a fresh directory ($rundir); sets rc,
 # out, body, ghout, golog. PATCHED_TESTS_STATE / PATCHED_TESTS_SHA / PATCHED_TESTS_LOG pass through when exported.
+# The go variables are unset first; RUN_ENV (an array of NAME=value) sets some again.
 run_check() {
   rundir="$T/run.$RANDOM"; mkdir -p "$rundir"; : > "$rundir/go.log"; : > "$rundir/ghout"
-  out="$(cd "$rundir" && env -u GOOS -u GOARCH -u CGO_ENABLED -u GOFLAGS -u GOTOOLCHAIN \
+  out="$(cd "$rundir" && env -u GOOS -u GOARCH -u CGO_ENABLED -u GOFLAGS -u GOTOOLCHAIN ${RUN_ENV[@]+"${RUN_ENV[@]}"} \
            PATH="$2:/usr/bin:/bin" FAKE_MAIN="$1" GO_LOG="$rundir/go.log" \
            BODY_FILE="$rundir/body.md" GITHUB_OUTPUT="$rundir/ghout" GH_TOKEN=tok GITHUB_TOKEN=tok \
            GITHUB_ENV="$rundir/env" GITHUB_PATH="$rundir/path" GITHUB_STEP_SUMMARY="$rundir/summary" \
@@ -114,10 +119,25 @@ has "$ghout" "tests=pass" "workflow gets tests=pass"
 has "$body" 'the patched tree passes `go vet` (darwin/arm64) and `go test`' "body says the patched tree passes"
 has "$golog" "darwin arm64 0 -mod=vendor auto :: vet ./pkg/a" "vet: darwin/arm64, cgo off, vendored, GOTOOLCHAIN=auto, on the patched package"
 has "$golog" "- - - -mod=vendor auto :: test -count=1 -timeout 10m ./pkg/a" "test: native, vendored, GOTOOLCHAIN=auto, with a timeout"
-has "$body" "go test -count=1 ./pkg/a" "runbook names go test on the patched packages"
+has "$body" "\`GOTOOLCHAIN=auto GOFLAGS=-mod=vendor GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go vet ./pkg/a\`" "runbook gives the exact vet command the check runs"
+has "$body" "\`GOTOOLCHAIN=auto GOFLAGS=-mod=vendor go test -count=1 -timeout 10m ./pkg/a\`" "runbook gives the exact test command the check runs"
 eq "" "$(printf "%s\n" "$golog" | grep -E "visible to go (vet|test)")" "go vet/test see no token or workflow-file variable"
 hasnt "$golog" "[unpatched]" "no baseline run when the patched tree passes"
 has "$body" "or applies but the patched tree fails" "runbook's rebase step covers a failing patched tree"
+
+# --- caller-exported target variables --------------------------------------------------------------
+section "GOOS/GOARCH and friends exported by the caller do not leak into vet or test"
+unset FAKE_GO_FAIL FAKE_GO_OUT
+RUN_ENV=(GOOS=plan9 GOARCH=mips GOARM=5 GOARM64=v9.9 GO386=sse2 GOAMD64=v4 GOTOOLCHAIN=local GOFLAGS=-mod=mod)
+run_check "$MAIN_OK" "$BIN"
+unset RUN_ENV
+has "$out" "tests  : pass" "still a native pass"
+has "$golog" "[patched] darwin arm64 0 -mod=vendor auto :: vet ./pkg/a" "vet: darwin/arm64 and its own GOFLAGS/GOTOOLCHAIN"
+has "$golog" "[patched] - - - -mod=vendor auto :: test -count=1 -timeout 10m ./pkg/a" "test: GOOS/GOARCH unset, its own GOFLAGS/GOTOOLCHAIN"
+eq "" "$(printf "%s\n" "$golog" | grep "^target ")" "no go call (vet, test, version, list) sees GOARM, GOARM64, GO386 or GOAMD64"
+has "$golog" "gh sees GOOS=plan9" "the caller's values do reach the script (the case exercises inheritance)"
+has "$golog" "[patched] - - - -mod=vendor auto :: version" "the version probe: GOOS/GOARCH unset too"
+has "$golog" "[patched] darwin arm64 1 -mod=vendor auto :: list" "go list: darwin/arm64 with cgo"
 
 # --- vet fails --------------------------------------------------------------------------------------
 section "clean patch, patched tree fails go vet"

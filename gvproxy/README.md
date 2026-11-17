@@ -161,5 +161,7 @@ on `main` for weeks before it is tagged, so we pin to a `main` commit, not a rel
 
 **Responding.** Bump `PIN` in `build.sh` to the chosen commit, re-run `build.sh`
 (re-applies the patch), run `go vet` and `go test` on the patched packages in a clone
-of upstream at the new pin with the patch applied (`build.sh` removes its own), then run the macOS egress E2E on Apple Silicon. If the patch conflicted, or applies but
-the patched tree fails `go vet`/`go test` (`ACTION`), rebase it against `main` first.
+of upstream at the new pin with the patch applied (`build.sh` removes its own; the
+issue's runbook prints the exact commands the check runs), then run the macOS egress
+E2E on Apple Silicon. If the patch conflicted, or applies but the patched tree fails
+`go vet`/`go test` (`ACTION`), rebase it against `main` first.
