@@ -77,9 +77,10 @@ echo "[$tree] ${GOOS:--} ${GOARCH:--} ${CGO_ENABLED:--} ${GOFLAGS:--} ${GOTOOLCH
 for v in GH_TOKEN GITHUB_TOKEN GITHUB_OUTPUT GITHUB_ENV GITHUB_PATH GITHUB_STEP_SUMMARY; do
   if [ -n "${!v:-}" ]; then echo "secret $v visible to go $1" >> "$GO_LOG"; fi
 done
-for v in GOARM GOARM64 GO386 GOAMD64; do
+for v in GOARM GOARM64 GO386 GOAMD64 GOEXPERIMENT; do
   if [ -n "${!v:-}" ]; then echo "target $v=${!v} visible to go $1" >> "$GO_LOG"; fi
 done
+if [ "${GOWORK:-}" != off ]; then echo "target GOWORK=${GOWORK:-} visible to go $1" >> "$GO_LOG"; fi
 if [ "$tree" = patched ]; then fails=" ${FAKE_GO_FAIL:-} "; else fails=" ${FAKE_GO_FAIL_UNPATCHED:-} "; fi
 if [ "${fails#* $1 }" != "$fails" ]; then
   [ -n "${FAKE_GO_OUT:-}" ] && cat "$FAKE_GO_OUT"
@@ -119,8 +120,8 @@ has "$ghout" "tests=pass" "workflow gets tests=pass"
 has "$body" 'the patched tree passes `go vet` (darwin/arm64) and `go test`' "body says the patched tree passes"
 has "$golog" "darwin arm64 0 -mod=vendor auto :: vet ./pkg/a" "vet: darwin/arm64, cgo off, vendored, GOTOOLCHAIN=auto, on the patched package"
 has "$golog" "- - - -mod=vendor auto :: test -count=1 -timeout 10m ./pkg/a" "test: native, vendored, GOTOOLCHAIN=auto, with a timeout"
-has "$body" "\`GOTOOLCHAIN=auto GOFLAGS=-mod=vendor GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go vet ./pkg/a\`" "runbook gives the exact vet command the check runs"
-has "$body" "\`GOTOOLCHAIN=auto GOFLAGS=-mod=vendor go test -count=1 -timeout 10m ./pkg/a\`" "runbook gives the exact test command the check runs"
+has "$body" "\`GOTOOLCHAIN=auto GOFLAGS=-mod=vendor GOWORK=off GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go vet ./pkg/a\`" "runbook gives the exact vet command the check runs"
+has "$body" "\`GOTOOLCHAIN=auto GOFLAGS=-mod=vendor GOWORK=off go test -count=1 -timeout 10m ./pkg/a\`, with none of \`GOOS GOARCH GOARM GOARM64 GO386 GOAMD64 CGO_ENABLED GOEXPERIMENT\` set" "runbook gives the exact test command the check runs"
 eq "" "$(printf "%s\n" "$golog" | grep -E "visible to go (vet|test)")" "go vet/test see no token or workflow-file variable"
 hasnt "$golog" "[unpatched]" "no baseline run when the patched tree passes"
 has "$body" "or applies but the patched tree fails" "runbook's rebase step covers a failing patched tree"
@@ -128,13 +129,13 @@ has "$body" "or applies but the patched tree fails" "runbook's rebase step cover
 # --- caller-exported target variables --------------------------------------------------------------
 section "GOOS/GOARCH and friends exported by the caller do not leak into vet or test"
 unset FAKE_GO_FAIL FAKE_GO_OUT
-RUN_ENV=(GOOS=plan9 GOARCH=mips GOARM=5 GOARM64=v9.9 GO386=sse2 GOAMD64=v4 GOTOOLCHAIN=local GOFLAGS=-mod=mod)
+RUN_ENV=(GOOS=plan9 GOARCH=mips GOARM=5 GOARM64=v9.9 GO386=sse2 GOAMD64=v4 CGO_ENABLED=1 GOEXPERIMENT=bogus GOWORK=/nonexistent/go.work GOTOOLCHAIN=local GOFLAGS=-mod=mod)
 run_check "$MAIN_OK" "$BIN"
 unset RUN_ENV
 has "$out" "tests  : pass" "still a native pass"
 has "$golog" "[patched] darwin arm64 0 -mod=vendor auto :: vet ./pkg/a" "vet: darwin/arm64 and its own GOFLAGS/GOTOOLCHAIN"
-has "$golog" "[patched] - - - -mod=vendor auto :: test -count=1 -timeout 10m ./pkg/a" "test: GOOS/GOARCH unset, its own GOFLAGS/GOTOOLCHAIN"
-eq "" "$(printf "%s\n" "$golog" | grep "^target ")" "no go call (vet, test, version, list) sees GOARM, GOARM64, GO386 or GOAMD64"
+has "$golog" "[patched] - - - -mod=vendor auto :: test -count=1 -timeout 10m ./pkg/a" "test: GOOS/GOARCH/CGO_ENABLED unset, its own GOFLAGS/GOTOOLCHAIN"
+eq "" "$(printf "%s\n" "$golog" | grep "^target ")" "no go call (vet, test, version, list) sees GOARM, GOARM64, GO386, GOAMD64, GOEXPERIMENT or a GOWORK other than off"
 has "$golog" "gh sees GOOS=plan9" "the caller's values do reach the script (the case exercises inheritance)"
 has "$golog" "[patched] - - - -mod=vendor auto :: version" "the version probe: GOOS/GOARCH unset too"
 has "$golog" "[patched] darwin arm64 1 -mod=vendor auto :: list" "go list: darwin/arm64 with cgo"

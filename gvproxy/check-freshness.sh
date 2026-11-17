@@ -95,6 +95,22 @@ fetch_tree() {  # dir sha — shallow checkout of one upstream commit
     git -C "$1" checkout --quiet FETCH_HEAD
 }
 
+# The environment of every go call. Each call first unsets GO_CALLER_VARS, so a target,
+# cgo setting or experiment the caller exported for its own builds never reaches it: vet
+# and go list name darwin/arm64 themselves, and test stays native. GOWORK=off keeps a
+# go.work the caller points at out of the vendored build.
+# Accepted trade-off: a GOOS/GOARCH persisted with `go env -w` still applies; GOENV=off
+# would also drop the GOPROXY settings GOTOOLCHAIN=auto may need to fetch a toolchain.
+# The runbook prints GO_VET_ENV, GO_TEST_ENV and GO_TEST_FLAGS, so the commands it gives
+# are the ones the check runs.
+GO_CALLER_VARS=(GOOS GOARCH GOARM GOARM64 GO386 GOAMD64 CGO_ENABLED GOEXPERIMENT)
+GO_BASE_ENV=(GOTOOLCHAIN=auto GOFLAGS=-mod=vendor GOWORK=off)
+GO_DARWIN_ENV=("${GO_BASE_ENV[@]}" GOOS=darwin GOARCH=arm64)
+GO_VET_ENV=("${GO_DARWIN_ENV[@]}" CGO_ENABLED=0)
+GO_TEST_ENV=("${GO_BASE_ENV[@]}")
+# -timeout bounds each test binary, so a hung test fails the run instead of stalling it.
+GO_TEST_FLAGS=(-count=1 -timeout 10m)
+
 # Modules linked into the shipped binary, one "path@version[ => replacement]" per line.
 # Leaves out the main module itself; its files are matched by shipped_code().
 build_graph() {  # dir
@@ -117,8 +133,7 @@ shipped_code() {  # dir
 # ships, matching build.sh) whatever the host OS. go list only reads upstream's sources and
 # module files and runs none of its code, so the drift check runs it where the token is.
 list_deps() {  # dir template
-  ( cd "$1" && unset "${GO_TARGET_VARS[@]}" &&
-      GOTOOLCHAIN=auto GOFLAGS=-mod=vendor GOOS=darwin GOARCH=arm64 CGO_ENABLED=1 \
+  ( cd "$1" && unset "${GO_CALLER_VARS[@]}" && export "${GO_DARWIN_ENV[@]}" CGO_ENABLED=1 &&
       go list -deps -f "$2" ./cmd/gvproxy )
 }
 
@@ -162,20 +177,10 @@ existing_pkgs() {  # dir
   done < <(patched_pkgs)
 }
 
-# The environment and flags of each go_step() step, also printed in the runbook so the
-# commands it gives are the ones the check runs. Every go call here (go_step(), list_deps())
-# first unsets the target-selecting GO_TARGET_VARS, so a GOOS/GOARCH the caller exported
-# never reaches it: vet and go list name darwin/arm64 themselves, and test stays native.
-GO_TARGET_VARS=(GOOS GOARCH GOARM GOARM64 GO386 GOAMD64)
-GO_VET_ENV=(GOTOOLCHAIN=auto GOFLAGS=-mod=vendor GOOS=darwin GOARCH=arm64 CGO_ENABLED=0)
-GO_TEST_ENV=(GOTOOLCHAIN=auto GOFLAGS=-mod=vendor)
-# -timeout bounds each test binary, so a hung test fails the run instead of stalling it.
-GO_TEST_FLAGS=(-count=1 -timeout 10m)
-
 # One step of the patched-tree check in tree $1: `vet` type-checks, test files included,
 # for the darwin/arm64 build augur ships; `test` runs the tests natively; `version` checks
-# that go (and the toolchain GOTOOLCHAIN=auto picks for the tree) runs at all. Same vendored
-# build and toolchain selection as list_deps().
+# that go (and the toolchain GOTOOLCHAIN=auto picks for the tree) runs at all. Same base
+# environment as list_deps().
 # `go test` executes upstream main's unreviewed test code with this process's privileges,
 # network and filesystem, and it can read its parent processes' environment. So in CI it
 # runs only under --run-patched-tests, in a job with no token, no permissions and no
@@ -188,7 +193,7 @@ go_step() {  # dir vet|test|version [pkg...]
   local dir="$1" step="$2"; shift 2
   ( cd "$dir" || exit 1
     unset GH_TOKEN GITHUB_TOKEN GITHUB_OUTPUT GITHUB_ENV GITHUB_PATH GITHUB_STATE GITHUB_STEP_SUMMARY
-    unset "${GO_TARGET_VARS[@]}"
+    unset "${GO_CALLER_VARS[@]}"
     case "$step" in
       vet)     export "${GO_VET_ENV[@]}";  go vet "$@" ;;
       test)    export "${GO_TEST_ENV[@]}"; go test "${GO_TEST_FLAGS[@]}" "$@" ;;
@@ -532,7 +537,7 @@ PKG_LIST="$(patched_pkgs | tr '\n' ' ')"; PKG_LIST="${PKG_LIST% }"
   echo "**Runbook**"
   echo "1. Bump \`PIN\` in \`gvproxy/build.sh\` to \`$MAIN_SHA\` (or a chosen newer commit)."
   echo "2. Re-apply \`augur-egress.patch\` and rebuild (\`bash gvproxy/build.sh\`)."
-  echo "3. In a clone of upstream at the new pin with \`augur-egress.patch\` applied, run \`${GO_VET_ENV[*]} go vet $PKG_LIST\` and \`${GO_TEST_ENV[*]} go test ${GO_TEST_FLAGS[*]} $PKG_LIST\`."
+  echo "3. In a clone of upstream at the new pin with \`augur-egress.patch\` applied, run \`${GO_VET_ENV[*]} go vet $PKG_LIST\` and \`${GO_TEST_ENV[*]} go test ${GO_TEST_FLAGS[*]} $PKG_LIST\`, with none of \`${GO_CALLER_VARS[*]}\` set."
   echo "4. Run the macOS egress E2E on Apple Silicon (allowlisted host reachable, blocked host denied, SSH via gvproxy)."
   echo "5. If the patch conflicted, or applies but the patched tree fails \`go vet\`/\`go test\`, rebase it against main first (fix the call sites and tests it breaks), then re-run this check."
   echo
