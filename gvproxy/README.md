@@ -97,16 +97,16 @@ behind — and because gvproxy parses attacker-influenced guest frames on the ho
 an upstream hardening fix can be security-relevant to us. Two layers watch for that:
 
 **Automated (primary).** `check-freshness.sh` runs daily via
-`.github/workflows/gvproxy-freshness.yml`. It does NOT build (the real E2E needs an
-Apple Silicon host) — it compares `PIN` against upstream `main`, ignores tooling/docs/test
-noise, and grades what remains:
+`.github/workflows/gvproxy-freshness.yml`. It does NOT build the binary (the real E2E
+needs an Apple Silicon host) — it compares `PIN` against upstream `main`, ignores
+tooling/docs/test noise, and grades what remains:
 
 | severity | meaning | issue? |
 |---|---|---|
-| `ACTION`  | `augur-egress.patch` no longer applies to `main` | yes |
+| `ACTION`  | `augur-egress.patch` no longer applies to `main`, or applies but the patched tree fails `go vet`/`go test` | yes |
 | `REVIEW`  | upstream code compiled into the binary, a module linked into it, or a `go.mod` build setting moved | yes |
 | `NOISE`   | behind, but nothing that reaches the binary (`tools/`/docs/CI/tests, test-only deps) | closes the issue |
-| `CURRENT` | pin is at `main` | closes the issue |
+| `CURRENT` | pin is at `main`, and the patch neither conflicts nor fails `go vet`/`go test` there | closes the issue |
 
 "Reaches the binary" is decided by `go list -deps ./cmd/gvproxy` for darwin/arm64 with
 the augur patch applied, at both the pin and `main`:
@@ -120,8 +120,35 @@ the augur patch applied, at both the pin and `main`:
 - **Build settings**: changes to `go.mod`'s `go`/`toolchain`/`godebug`/`replace` lines
   are always `REVIEW`.
 
+A patch that applies cleanly can still break: upstream may add a test or call site
+that uses a signature the patch changes. So once it applies, the check runs `go vet`
+for darwin/arm64 (which type-checks `_test.go` files too) and then a native `go test`
+on every package the patch touches (the directories of the `.go` files it names). A
+failed step is re-run on unpatched `main`: if that passes, the failure is the patch's and
+the run is `ACTION`; if it fails too (a new vet check in a newer Go, a flaky upstream
+test), the issue notes it without grading it, and `go test` still runs after a `go vet`
+that fails on both. Either way the issue quotes the first lines of the output.
+
+The tests are upstream's unreviewed code, so the workflow runs them in a separate job
+(`patched-tests`, via `check-freshness.sh --run-patched-tests`) that has no token, no
+permissions and no persisted credentials. It reports back only data: a state, the
+upstream commit it tested, and the go output as an artifact. The job holding
+`issues: write` (`check`, via `--use-patched-tests-result`) never runs upstream code (its
+`go list` runs none). It accepts only a known state for the same upstream `main` it
+resolved itself, treating anything else as "could not run", and it sanitizes and bounds
+the quoted output itself. When the patched-tree check could not run (or a failed step
+could not be compared with unpatched `main`), the run goes red so the missing signal is
+noticed, whatever the severity.
+
+When the pin is already at `main` there is no drift to compare, but the patch is still
+applied there and the patched-tree result still taken: a patch that conflicts or fails
+`go vet`/`go test` at its own pin is `ACTION`, and a result that could not be had still
+turns the run red on a `CURRENT` day. An open issue is closed only when the patched-tree
+result was had, so a broken patch is not closed on a day its check could not run.
+
 Without a working `go` the build graph is skipped and the check falls back to paths:
 any change under `cmd/gvproxy/`/`pkg/` or to `go.mod`/`vendor` counts as `REVIEW`.
+The patched-tree `go vet`/`go test` is skipped as well, and the issue says it did not run.
 
 On `REVIEW`/`ACTION` it opens or refreshes a **single** issue labelled
 `gvproxy-freshness` (idempotent — no notification spam); on `NOISE`/`CURRENT` it
@@ -130,7 +157,8 @@ churn; the signals that matter are "does the patch still apply" and "did anythin
 reaches the binary move".
 
 Run it locally any time: `bash gvproxy/check-freshness.sh` (needs an authenticated
-`gh` and Go).
+`gh` and Go). With no option it does both halves in one process, so `go test` runs
+upstream's tests on your machine with your privileges.
 
 **Manual (backup).** Watch <https://github.com/containers/gvisor-tap-vsock> →
 **Custom → Releases + Security advisories** so an advisory reaches you even if the
@@ -138,5 +166,8 @@ keyword heuristic misses it. Note that release tags lag `main`: a security fix c
 on `main` for weeks before it is tagged, so we pin to a `main` commit, not a release.
 
 **Responding.** Bump `PIN` in `build.sh` to the chosen commit, re-run `build.sh`
-(re-applies the patch), then run the macOS egress E2E on Apple Silicon. If the patch
-conflicted (`ACTION`), rebase it against `main` first.
+(re-applies the patch), run `go vet` and `go test` on the patched packages in a clone
+of upstream at the new pin with the patch applied (`build.sh` removes its own; the
+issue's runbook prints the exact commands the check runs), then run the macOS egress
+E2E on Apple Silicon. If the patch conflicted, or applies but the patched tree fails
+`go vet`/`go test` (`ACTION`), rebase it against `main` first.
